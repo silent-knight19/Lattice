@@ -1,0 +1,58 @@
+# Lattice — Canonical Static Analysis & Linter Configuration
+# Schema: golangci-lint v2 (golangci-lint.run)
+#
+# Principles:
+# 1. Correctness over noise: Enable high-signal linters for systems programming.
+# 2. Strict error handling: Unchecked errors and unhandled type assertions fail the build.
+# 3. Canonical formatting: gofmt enforcement ensures zero style bike-shedding.
+# 4. Error wrapping integrity: errors.Is/errors.As enforced over direct equality.
+# 5. Defensible suppressions: //nolint directives require specific linter names and rationale.
+
+version: "2"
+
+linters:
+  # Explicitly enable high-signal linters for storage engine engineering
+  enable:
+    - govet        # Official Go static analysis passes (concurrency, atomics, format strings)
+    - errcheck     # Catches unhandled error return values (vital for persistent storage I/O)
+    - staticcheck  # Standard Dominik Honnef static analysis rules (bugs, dead code, simplifications)
+    - ineffassign  # Detects ineffectual assignments before overwriting (catches logic flaws)
+    - unused       # Flags unused constants, variables, functions, and types
+    - errorlint    # Enforces Go 1.13+ error wrapping semantics (errors.Is/As instead of ==)
+    - nolintlint   # Prevents blanket suppression; requires specific linter name + explanation
+
+  settings:
+    errcheck:
+      # Report unhandled type assertions (e.g. `x.(T)` without comma-ok check)
+      check-type-assertions: true
+
+    govet:
+      enable-all: true
+      disable:
+        # Shadowing is idiomatic and pervasive in Go (e.g. `if err := ...; err != nil`)
+        - shadow
+        # Memory alignment optimization can conflict with cache-line isolation and binary struct layouts
+        - fieldalignment
+
+    errorlint:
+      # Flag fmt.Errorf calls without %w
+      errorf: true
+      # Flag type assertions on errors instead of errors.As
+      asserts: true
+      # Flag direct error equality comparisons (err == Target) instead of errors.Is
+      comparison: true
+
+    nolintlint:
+      # Require all //nolint directives to specify an explanatory comment
+      require-explanation: true
+      # Require all //nolint directives to name the specific linter being suppressed
+      require-specific: true
+
+formatters:
+  enable:
+    - gofmt        # Validates source code adheres strictly to standard gofmt formatting
+
+issues:
+  # Show all issues without truncating or hiding findings
+  max-issues-per-linter: 0
+  max-same-issues: 0

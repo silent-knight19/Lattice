@@ -46,6 +46,20 @@
 * **Package-Level API Design**: Go packages should be named for what they provide, not what they contain. Generic catch-all packages such as `util/`, `common/`, or `helpers/` are architectural anti-patterns in Go; they attract unrelated utilities, obscure package responsibilities, and inevitably cause cyclic imports. Interfaces should be defined where they are consumed (consumer-driven interfaces), not where they are implemented.
 * **Import-Cycle Prevention**: In complex database engines, cyclic dependencies frequently threaten to arise (e.g., `MemTable` needs to trigger an asynchronous flush to `SSTable`, while `SSTable` compaction needs to query `MemTable` state). Cycles are prevented by: (1) defining shared domain errors and primitive types in leaf packages (`internal/errors`, `internal/binary`), (2) passing interfaces into constructors instead of concrete structs (dependency inversion), and (3) elevating coordination to parent orchestrators (`internal/engine`).
 * **Why Package Boundaries Matter in a Storage Engine**: Database engines maintain delicate invariants spanning memory allocation, file synchronization (`fsync`), concurrent locking, and crash consistency. Leaky package boundaries permit developers to bypass invariants—such as mutating in-memory structures without first writing to the WAL, or reading SSTable block data without taking block cache reference counts. Compiler-enforced boundaries guarantee that subsystem invariants cannot be violated from outside the package.
+* **`go vet` vs. Linters**: `go vet` is the official, conservative static analyzer bundled with the Go toolchain. It focuses strictly on high-probability compiler-adjacent bugs (bad printf formats, unreachable code, unkeyed composite literals, mutex copying, atomic 64-bit alignment) with an extremely low false-positive rate. In contrast, meta-linter runners like `golangci-lint` orchestrate dozens of specialized AST analyzers (`errcheck`, `staticcheck`, `errorlint`, `ineffassign`) that check for unchecked errors, error wrapping compliance, dead code, and style invariants far beyond `go vet`'s scope.
+* **Static Analysis vs. Formatting**: Formatting (`gofmt`) operates strictly on AST syntax layout—tabs vs. spaces, brace placement, indentation, newline rules—without affecting program semantics. Static analysis inspects AST nodes, control-flow graphs (CFGs), and type tables to detect semantic bugs, memory safety issues, resource leaks, and concurrency hazards at compile/development time without executing the binary.
+* **Why Compiler Correctness Is Not Enough in Systems Programming**: Go is a statically typed, memory-safe language, yet the compiler happily compiles code with catastrophic systems bugs:
+  - Ignoring error returns from `file.Sync()` or `file.Close()` compiles with zero warnings, yet causes silent data loss upon sudden power loss or process crash.
+  - Comparing wrapped errors with direct equality (`err == ErrKeyNotFound`) compiles, but fails at runtime if the error was formatted with `%w`.
+  - Passing a struct containing a `sync.Mutex` by value compiles, but creates a detached copy that completely breaks mutual exclusion.
+  - Type assertions `v := x.(string)` without the two-value comma-ok check compile, but trigger fatal runtime panics if an unexpected type is passed.
+* **The Perils of Excessive Lint Rules ("Linter Fatigue")**: Enabling dozens of superficial, stylistic, or hyper-opinionated linters (e.g. `varnamelen`, `wsl`, `cyclop`, `godot`) creates massive noise, constant false positives, and code churn without delivering measurable correctness or performance value. High noise induces "linter fatigue", driving developers to either bypass checks with blanket suppressions or write convoluted, unidiomatic workarounds. Systems engines must optimize strictly for signal: linters must protect correctness, memory safety, and durability.
+* **Enforcing Systems Durability Invariants via Static Analysis**: In a storage engine, every disk write, directory fsync, CRC checksum validation, and network frame decode returns an `error`. A single unhandled error can corrupt an entire database file. By configuring `errcheck` with `check-type-assertions: true`, we guarantee at development time that unhandled errors and unchecked interface conversions break the build before code can ever reach persistent storage.
+* **Evaluating Development Tooling Dependencies**: Development tools (e.g. `golangci-lint`) must be vetted with the same supply-chain scrutiny as runtime libraries:
+  - Tooling must be hermetic and isolated from the production `go.mod`, ensuring zero third-party dependencies bleed into the database binary.
+  - Installation must use trusted, auditable sources (e.g. verified Homebrew core bottles) rather than unverified `curl | sh` scripts.
+  - Tooling configuration must be pinned in version control (`.golangci.yml`) to guarantee identical analysis across local workstations and CI environments.
+* **Distinguishing Correctness Bugs from Stylistic Heuristics**: Systems engineers must differentiate between true correctness defects and subjective compiler heuristics. For example, `govet`'s `fieldalignment` analyzer suggests rearranging struct fields to minimize memory padding. However, in low-level database engines, struct fields are often intentionally arranged to align with hardware cache lines (64 bytes) to prevent false sharing between concurrent threads, or to mirror on-disk binary layouts. Naively following `fieldalignment` destroys concurrency isolation; hence it is intentionally disabled.
 * **Endianness**: Big-Endian (Network Byte Order) stores the most significant byte at the lowest memory address; Little-Endian stores the least significant byte first. Network protocols and on-disk files must specify a canonical byte order to remain portable across CPU architectures.
 * **Variable-Length Integers (Varints)**: 7-bit varints encode small integers in fewer bytes by using the high bit ($0\text{x}80$) as a continuation flag. An integer $\le 127$ uses 1 byte, while $2^{64}-1$ uses 10 bytes.
 * **Memory Allocation & GC Pressure**: Creating millions of small heap allocations triggers frequent Go Garbage Collector mark-and-sweep cycles, stealing CPU cycles and introducing millisecond-level tail latency spikes. `sync.Pool` provides zero-allocation buffer reuse.
@@ -57,6 +71,9 @@
 * **Decision**: Strict containment of storage engine packages under `internal/` (`internal/wal`, `internal/memtable`, `internal/sstable`, etc.) with public client isolated in `pkg/client`.
 * **Alternative Considered**: Flat root package structure or placing storage packages in `pkg/`.
 * **Trade-off**: Prevents external applications from using internal engine components as independent micro-libraries, but completely prevents public API freeze and gives absolute freedom to refactor internal storage layouts and locking primitives without breaking external consumers.
+* **Decision**: Enable high-signal linters (`govet`, `errcheck`, `staticcheck`, `ineffassign`, `unused`, `errorlint`, `nolintlint`) and `gofmt` while explicitly disabling noisy rules (`shadow`, `fieldalignment`).
+* **Alternative Considered**: Enabling all 70+ available linters in `golangci-lint` or relying solely on `go vet`.
+* **Trade-off**: Requires conscious configuration curation in `.golangci.yml`, but eliminates linter fatigue while providing bulletproof static verification against unchecked disk I/O errors and runtime type-assertion panics.
 * **Decision**: Big-Endian encoding for all fixed-width integer fields; unsigned varints for internal data block offsets.
 * **Trade-off**: Big-Endian requires bit-shifting on x86 machines, but guarantees deterministic portability across platforms and aligns with network standards.
 
@@ -64,10 +81,12 @@
 * **Dependency Attacks**: In modern infrastructure software, malicious packages or hijacked maintainer accounts can inject backdoors. By maintaining zero external dependencies in the storage core, Lattice reduces its external attack surface to zero.
 * **Varint Bomb Vulnerability**: A malicious stream containing endless continuation bytes ($0\text{x}80$) could cause an infinite loop or integer overflow. Lattice limits varint decoding to a maximum of 10 bytes; anything beyond returns `ErrVarintOverflow`.
 * **Subsystem Isolation as Defense-in-Depth**: By keeping all storage engine implementation details inside `internal/`, we prevent external code or rogue consumer modules from accessing internal unexported memory pools, raw block caches, or un-synchronized file descriptors.
+* **Audit-Proof Suppressions via `nolintlint`**: Unchecked use of `//nolint` can allow developers to bypass critical security and durability checks. By enforcing `require-specific: true` and `require-explanation: true`, any lint suppression must name the specific analyzer and justify the override in code review.
 
 ### Performance & Hardware Dynamics
 * Standard library `binary.BigEndian.PutUint64` is inlined by the Go compiler into single register swap instructions (`BSWAP` on x86), incurring zero runtime function call overhead.
 * Package boundary placement has zero runtime CPU cost in Go; inlining and compiler optimizations occur across package boundaries during compilation.
+* Disabling naive `fieldalignment` struct packing preserves intentional hardware cache-line padding (e.g. 64-byte spacing between write sequencer atomics and background flush pointers), preventing catastrophic multicore bus invalidation.
 
 ### Subsystem Interview Questions
 * **Basic**: What is a Go module, and how does `go.mod` differ from the legacy `$GOPATH` workspace model?
@@ -80,6 +99,10 @@
 * **"Did You Actually Build This?"**: What happens when two Go packages in a storage engine have mutually dependent structs (e.g., `Engine` needs `MemTable`, and `MemTable` needs `Engine` to trigger a flush)? How do you structure packages to prevent `import cycle not allowed`?
 * **"Did You Actually Build This?"**: In your initial scaffolding, what subtle bug can occur when configuring `.gitignore` for compiled binary names like `lattice` and runtime directories like `wal/`?
 * **"Did You Actually Build This?"**: Why must `cmd/` packages contain a dummy `func main() {}` in `main.go` even during a purely structural scaffolding phase?
+* **"Did You Actually Build This?"**: Why does Lattice configure `errcheck` with `check-type-assertions: true` in `.golangci.yml`?
+* **"Did You Actually Build This?"**: Why did you explicitly disable `fieldalignment` in `govet` for a database storage engine?
+* **"Did You Actually Build This?"**: What syntax difference exists between `golangci-lint` v1 and v2 regarding formatting tools like `gofmt`?
+* **"Did You Actually Build This?"**: Why did you configure `nolintlint` with `require-specific: true` and `require-explanation: true`?
 
 ---
 
@@ -480,6 +503,20 @@ This section is a living record of actual engineering obstacles, debugging sessi
   3. Created canonical `doc.go` across all 14 `internal/` packages and `pkg/client`.
 - **Core Lesson**: Toolchains and build systems have specific compiler invariants (e.g., `package main` requires an entrypoint). In systems programming, directory boundaries must be verified end-to-end with compiler tools (`go build`, `go vet`, `go test`) and Git diagnostics (`git check-ignore`) rather than assumed.
 - **Interview Relevance**: Demonstrates real-world mastery of Go compiler rules (`internal/` access control, `package main` requirements), gitignore pattern syntax pitfalls, and architectural discipline in isolating internal storage engines from public APIs.
+
+### Entry 2026-09-06 — P00-S01-M03: Static Analysis Architecture & Linter Signal Optimization
+- **Date**: 2026-09-06
+- **Micro-Phase**: P00-S01-M03
+- **Problem**: Establish a reproducible, zero-external-dependency static analysis foundation enforcing strict error handling, error wrapping, and formatting without suffering from linter fatigue or false alarms.
+- **Initial Assumption**: Can use standard v1 `.golangci.yml` syntax with `linters:` and include `gofmt` directly in the linter list.
+- **What Was Actually True**:
+  1. Modern `golangci-lint` (v2.x) strictly requires `version: "2"` at configuration root; omitting it causes `can't load config: unsupported version of the configuration` (exit code 3).
+  2. In v2 schema, formatters like `gofmt` were separated from `linters` into a dedicated `formatters` configuration section (`formatters.enable: [gofmt]`).
+  3. Generic struct packing linters (`govet.fieldalignment`) produce false alarms in storage engines where structs are intentionally padded to prevent multicore CPU cache-line false sharing (64-byte spacing) or to align with on-disk binary layouts.
+- **How It Was Discovered**: `golangci-lint config verify` validated schema migration; negative testing of unhandled errors (`errcheck`), blanket `//nolint` (`nolintlint`), and bad formatting (`gofmt`) confirmed that each analyzer accurately caught bugs and exited with code 1.
+- **Fix Applied**: Configured `.golangci.yml` (v2 schema) with `govet` (excluding `shadow` and `fieldalignment`), `errcheck` (`check-type-assertions: true`), `staticcheck`, `ineffassign`, `unused`, `errorlint`, `nolintlint`, and `gofmt` formatter; verified that `max-issues-per-linter: 0` ensures zero truncated findings.
+- **Core Lesson**: Static analysis in systems engineering must be optimized for signal over quantity. Linters must strictly protect durability invariants (forcing disk I/O error checking) while actively suppressing superficial heuristics that undermine low-level hardware concurrency design.
+- **Interview Relevance**: Demonstrates production-grade engineering maturity: deep knowledge of static analysis ASTs vs compiler passes, appreciation of cache-line dynamics over naive struct packing, supply-chain hygiene (hermetic dev tooling), and defense-in-depth code quality enforcement.
 
 ---
 

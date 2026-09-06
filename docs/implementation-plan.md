@@ -349,14 +349,14 @@ Every future micro-phase implementation response from Claude Code must use this 
 
 ```
 Current Major Phase           : Phase 00 — Repository & Engineering Foundations
-Current Sub-Phase             : Sub-Phase 00.1 — Repository Scaffolding & Tooling
-Current Micro-Phase           : P00-S01-M03 — Static Analysis & Linter Configuration
-Previous Completed Micro-Phase: P00-S01-M02 — Canonical Go Project Layout Scaffolding
+Current Sub-Phase             : Sub-Phase 00.2 — Core Error Architecture
+Current Micro-Phase           : P00-S02-M01 — Domain Error Types & Sentinel Definitions
+Previous Completed Micro-Phase: P00-S01-M03 — Static Analysis & Linter Configuration
 Blocking Issues               : None
-Tests Passing                 : `go build ./...`, `go vet ./...`, `go test ./...` passed across all 17 packages; `gofmt -l .` clean; `go mod verify` passed
-Security Review Status        : Clean (Compiler-enforced package boundary via internal/, zero external dependencies, root binaries & runtime paths anchored in .gitignore)
-Interview Knowledge Status    : Updated with Go package layout, internal/ semantics, import-cycle prevention, and interview questions
-Git Commit                    : 127c1fe (P00-S01-M02 checkpoint)
+Tests Passing                 : `go build ./...`, `go vet ./...`, `go test ./...`, `golangci-lint run ./...` passed across all 17 packages; `gofmt -l .` clean; `go mod verify` passed
+Security Review Status        : Clean (Zero external dependencies in go.mod, hermetic dev tooling via bottled golangci-lint, unhandled errors fail lint, nolintlint prevents blanket suppressions)
+Interview Knowledge Status    : Updated with static analysis vs go vet, compiler limitations, linter fatigue, and interview defense questions
+Git Commit                    : 0eb5d0c (P00-S01-M03 checkpoint)
 ```
 
 ---
@@ -474,12 +474,33 @@ TOTAL: 184 Discrete, Testable Micro-Phases
   * *Completion*: Complete canonical package scaffolding established, validated, and documented.
   * *Next Micro-Phase*: P00-S01-M03 — Static Analysis & Linter Configuration.
 * **P00-S01-M03: Static Analysis & Linter Configuration**
+  * *Status*: Completed
   * *Objective*: Establish `.golangci.yml` enforcing strict linting, error checks, and formatting.
   * *Preconditions*: P00-S01-M02.
-  * *Changes*: Add `.golangci.yml` configuring `govet`, `errcheck`, `staticcheck`, `gofmt`.
-  * *Invariants*: Unhandled errors cause linter failure.
-  * *Tests*: Run `golangci-lint run`.
-  * *Completion*: Linter passes with zero warnings.
+  * *Tooling & Configuration*:
+    - Created `.golangci.yml` adhering to `golangci-lint` v2 schema (`version: "2"`).
+    - Enabled core high-signal linters: `govet`, `errcheck`, `staticcheck`, `ineffassign`, `unused`, `errorlint`, `nolintlint`.
+    - Enabled `gofmt` under `formatters`.
+    - Strict error enforcement: configured `errcheck` with `check-type-assertions: true` to prevent unhandled interface type conversions from panicking at runtime.
+    - Error wrapping validation: configured `errorlint` with `errorf: true`, `asserts: true`, and `comparison: true` to enforce `errors.Is`/`errors.As` over direct `==` comparisons.
+    - Suppression auditing: configured `nolintlint` with `require-specific: true` and `require-explanation: true` to bar blanket `//nolint` annotations.
+    - Intentional exclusions: disabled `shadow` (standard variable shadowing in Go) and `fieldalignment` (struct padding; database engines intentionally arrange fields for cache-line isolation or binary layout rather than naive size-packing).
+  * *Invariants*: Unhandled errors cause linter failure; zero hidden findings (`max-issues-per-linter: 0`, `max-same-issues: 0`).
+  * *Verification Performed*:
+    - `golangci-lint config verify` (Exit 0, JSON schema valid)
+    - `golangci-lint run ./...` (Exit 0, 0 issues across all 17 packages)
+    - Tested negative cases: unhandled error (`errcheck`), ineffectual assignment (`ineffassign`), blanket nolint (`nolintlint`), bad formatting (`gofmt`), and raw error comparison (`errorlint`) all correctly failed with exit code 1.
+    - `go build ./...`, `go vet ./...`, `go test ./...`, `gofmt -l .`, `go mod verify` (all Exit 0).
+  * *Issues Discovered & Fixed*:
+    - `golangci-lint` v2.x requires `version: "2"` at configuration root; omitting it causes exit code 3 (`unsupported version of the configuration`).
+    - In v2 schema, formatters like `gofmt` are configured under a separate `formatters` section rather than `linters`.
+  * *Evidence Classification*:
+    - *Design Target*: Zero-noise, high-signal static analysis enforcing storage durability invariants (unhandled errors) and defensive error comparison (`errors.Is`).
+    - *Theoretical Property*: AST-based static analysis detects unchecked return values and type assertions at build time before code reaches runtime.
+    - *Measured Result*: `golangci-lint run ./...` executed against all 17 packages reporting 0 issues; negative tests proved failures on unhandled errors, malformed nolint, and bad formatting.
+    - *Observed Limitation*: `govet` `fieldalignment` flags intentional cache-line padding and struct field order designed for hardware concurrency; disabled to prevent anti-patterns in low-level systems code.
+  * *Completion*: Static analysis and linting foundation established, tested, and verified.
+  * *Next Micro-Phase*: P00-S02-M01 — Domain Error Types & Sentinel Definitions.
 
 ### Sub-Phase 00.2: Core Error Architecture
 * **P00-S02-M01: Domain Error Types & Sentinel Definitions**
