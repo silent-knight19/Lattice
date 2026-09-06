@@ -77,15 +77,34 @@
   - *Data integrity failures* (`ErrChecksumMismatch`): Indicates media corruption, bit rot, or tampering; requires read-repair or fail-stop.
   - *Recovery cues* (`ErrTornWrite`): Signals a clean tail interruption from ungraceful shutdown/power loss, authorizing automated log truncation during startup replay.
 * **Privacy & Defensive Formatting in Error Types**: Database systems frequently handle sensitive data (passwords, auth tokens, personal identifiers). If a key or value exceeds size limits, formatting the raw payload into the error string (e.g. `fmt.Sprintf("invalid key %s", key)`) risks writing sensitive customer secrets into plain-text application or cluster logs. In Lattice, `KeyTooLargeError` and `ValueTooLargeError` deliberately log only numeric byte sizes and limits, never raw bytes.
-* **Leaf Package Architecture for Domain Errors**: `internal/errors` is designed as a strict leaf package with zero internal dependencies. Because errors are shared across all layers—from low-level binary encodings to top-level engines and network transports—placing errors in a leaf package eliminates any possibility of circular import cycles (`import cycle not allowed`).
+* **Why Structured Logging Matters in Systems Software**: Traditional `fmt.Println` or unstructured text logging produces strings that require fragile regular expressions to parse in production log aggregators (e.g. Elasticsearch, Grafana Loki, Datadog). In high-throughput distributed database engines, logs must be machine-parsable JSON lines where timestamp, severity, subsystem (`component`), operation latency, node IDs, and sequence numbers are discrete, indexed key-value attributes. This enables automated alerting, real-time metrics extraction, and correlation across distributed cluster nodes.
+* **Log Levels and Operational Semantics**:
+  - `DEBUG`: Verbose diagnostics (e.g. SkipList node splits, block index binary searches, socket frame byte counts). Disabled in production by default to prevent buffer churn and I/O saturation.
+  - `INFO`: Normal state transitions and lifecycle milestones (e.g. node joined cluster, WAL segment rotated, SSTable flush completed, MemTable frozen).
+  - `WARN`: Non-critical operational anomalies that are handled automatically (e.g. transient network retry, slow disk sync, secondary replica lag).
+  - `ERROR`: Actionable failures, corruptions, or operational aborts (e.g. CRC checksum mismatch, torn write during recovery, disk full, compaction worker crash).
+* **Concurrency-Safe Logging & Mutex-Free Handlers**: In concurrent systems where hundreds of client connections, background flushers, and compaction workers log simultaneously, the logging system must be thread-safe. Standard library `log/slog` handlers (`slog.JSONHandler`) manage write synchronization internally around the underlying `io.Writer`, preventing interleaved or garbled JSON records across goroutines without requiring caller-side mutexes.
+* **Logging Errors Without Destroying Error Semantics**: When recording errors in logs, naively calling `log.Info("op failed: " + err.Error())` converts the error into an unstructured string and divorces the error identity from the log event. Lattice provides `logger.Err(err error) slog.Attr`, which records the error under the canonical `"error"` key as an `slog.Attr`. This allows log pipelines to filter on the existence of error attributes, while call sites retain access to `errors.Is` and `errors.As` on the underlying Go error object.
+* **Automated Log Privacy & Sensitive-Data Redaction**: Storage engines are the custodian of customer data. If user keys, authentication tokens, API credentials, or database values are logged during debug sessions, cluster logs become high-severity data leakage vectors. Lattice implements automated attribute replacement via `slog.HandlerOptions.ReplaceAttr`: any attribute whose key matches sensitive keywords (`password`, `secret`, `token`, `auth`, `api_key`, `credentials`, etc.) is automatically replaced with `"[REDACTED]"`. Furthermore, custom domain types can implement the `Redactable` interface (`Redact() any`) to safely scrub sensitive fields before serialization.
+* **Logging Failure Handling & Preventing Recursive Loops**: A fundamental invariant in systems software is that logging must never cause a recursive failure loop. If a disk becomes full or an output pipe breaks, attempting to log the logger's write failure can trigger an infinite logging recursion that crashes the process. The logger must fail gracefully (e.g. dropping records or reporting through independent telemetry) without escalating into unhandled panics.
+* **Why Logging Must Not Become a Hidden Global Bottleneck**: In LSM storage engines processing 100,000+ ops/sec, synchronous file logging in the critical write path (e.g. inside WAL append or SkipList insertion) causes catastrophic tail latency spikes because disk writes and JSON formatting steal CPU and block worker threads. Storage engines must log only lifecycle events at `INFO` in the foreground, leaving high-frequency operation tracing to sampling metrics or asynchronous telemetry buffers.
 * **Endianness**: Big-Endian (Network Byte Order) stores the most significant byte at the lowest memory address; Little-Endian stores the least significant byte first. Network protocols and on-disk files must specify a canonical byte order to remain portable across CPU architectures.
 * **Variable-Length Integers (Varints)**: 7-bit varints encode small integers in fewer bytes by using the high bit ($0\text{x}80$) as a continuation flag. An integer $\le 127$ uses 1 byte, while $2^{64}-1$ uses 10 bytes.
 * **Memory Allocation & GC Pressure**: Creating millions of small heap allocations triggers frequent Go Garbage Collector mark-and-sweep cycles, stealing CPU cycles and introducing millisecond-level tail latency spikes. `sync.Pool` provides zero-allocation buffer reuse.
 
 ### Decisions Made & Trade-offs
 * **Decision**: Zero external dependencies for the entire storage engine and network layer; standard library only.
-* **Alternative Considered**: Utilizing third-party serialization, networking, or logging libraries (e.g. gRPC, zap, protobuf).
-* **Trade-off**: Requires writing binary framing, SkipList, and LRU cache from scratch, but eliminates supply-chain vulnerabilities, avoids transitive dependency conflicts, and ensures complete interview defensibility.
+* **Alternative Considered**: Utilizing third-party serialization, networking, or logging libraries (e.g. gRPC, zap, zerolog, protobuf).
+* **Trade-off**: Requires writing binary framing, SkipList, LRU cache, and wrapping `log/slog` from scratch, but eliminates supply-chain vulnerabilities, avoids transitive dependency conflicts, and ensures complete interview defensibility.
+* **Decision**: Wrapping standard library `log/slog` rather than adopting third-party frameworks like Uber's `zap` or `zerolog`.
+* **Alternative Considered**: Adding `go.uber.org/zap` for marginal allocation advantages in structured logging.
+* **Trade-off**: `slog` introduced in Go 1.21 provides high-performance structured JSON and Text handlers directly in the Go standard library. Wrapping it provides full interface decoupling while preserving zero external runtime dependencies.
+* **Decision**: Automated key-based and interface-based redaction in `ReplaceAttr` (`Redactable` interface).
+* **Alternative Considered**: Relying on developers to manually redact sensitive keys at every call site.
+* **Trade-off**: Incurs a minor map lookup per log attribute, but provides defense-in-depth against accidental leakage of passwords, bearer tokens, or API keys in persistent log streams.
+* **Decision**: Zero-allocation no-op logger (`nopHandler`) for testing and suppressed logging.
+* **Alternative Considered**: Discarding logs using `io.Discard` with a standard JSON handler.
+* **Trade-off**: `io.Discard` still forces `slog` to format JSON strings and allocate attribute slices. Implementing `nopHandler.Enabled(...) bool { return false }` skips all formatting and argument evaluations completely.
 * **Decision**: Strict containment of storage engine packages under `internal/` (`internal/wal`, `internal/memtable`, `internal/sstable`, etc.) with public client isolated in `pkg/client`.
 * **Alternative Considered**: Flat root package structure or placing storage packages in `pkg/`.
 * **Trade-off**: Prevents external applications from using internal engine components as independent micro-libraries, but completely prevents public API freeze and gives absolute freedom to refactor internal storage layouts and locking primitives without breaking external consumers.
@@ -106,13 +125,14 @@
 * **Varint Bomb Vulnerability**: A malicious stream containing endless continuation bytes ($0\text{x}80$) could cause an infinite loop or integer overflow. Lattice limits varint decoding to a maximum of 10 bytes; anything beyond returns `ErrVarintOverflow`.
 * **Subsystem Isolation as Defense-in-Depth**: By keeping all storage engine implementation details inside `internal/`, we prevent external code or rogue consumer modules from accessing internal unexported memory pools, raw block caches, or un-synchronized file descriptors.
 * **Audit-Proof Suppressions via `nolintlint`**: Unchecked use of `//nolint` can allow developers to bypass critical security and durability checks. By enforcing `require-specific: true` and `require-explanation: true`, any lint suppression must name the specific analyzer and justify the override in code review.
-* **Log Redaction at Error Generation**: Error types represent a primary vector for accidental credential and secret leakage. By designing error types that capture only metadata (byte lengths, byte offsets, CRC32 checksums) and strictly omitting raw byte payloads, Lattice prevents credentials or sensitive values from ever being written to log aggregators.
+* **Log Redaction at Error Generation & Logger Level**: Error types and logging layers represent primary vectors for accidental credential and secret leakage. By designing error types that capture only metadata and providing automated logger-level key redaction (`[REDACTED]`), Lattice enforces a two-tier defense against credentials or sensitive values entering persistent log streams.
 
 ### Performance & Hardware Dynamics
 * Standard library `binary.BigEndian.PutUint64` is inlined by the Go compiler into single register swap instructions (`BSWAP` on x86), incurring zero runtime function call overhead.
 * Package boundary placement has zero runtime CPU cost in Go; inlining and compiler optimizations occur across package boundaries during compilation.
 * Disabling naive `fieldalignment` struct packing preserves intentional hardware cache-line padding (e.g. 64-byte spacing between write sequencer atomics and background flush pointers), preventing catastrophic multicore bus invalidation.
 * Pre-allocated sentinel errors (`ErrKeyNotFound`, `ErrEmptyKey`) incur zero heap allocations on error return paths, preventing GC churn during frequent cache misses or negative key queries.
+* Zero-allocation `nopHandler` (`Enabled(...) bool { return false }`) completely eliminates argument evaluation, string formatting, and heap allocation overhead in performance-critical benchmark suites where logging is disabled.
 
 ### Subsystem Interview Questions
 * **Basic**: What is a Go module, and how does `go.mod` differ from the legacy `$GOPATH` workspace model?
@@ -133,6 +153,11 @@
 * **"Did You Actually Build This?"**: What is the critical control-flow difference between `ErrChecksumMismatch` and `ErrTornWrite` during WAL startup recovery?
 * **"Did You Actually Build This?"**: Why does `internal/errors/errors.go` import the standard library as `import stdErrors "errors"`?
 * **"Did You Actually Build This?"**: Why don't Lattice's size limit errors (`KeyTooLargeError`, `ValueTooLargeError`) include the offending key or value bytes in their `.Error()` string?
+* **"Did You Actually Build This?"**: Why did you wrap Go's standard library `log/slog` rather than pulling in external logging frameworks like `zap` or `zerolog`?
+* **"Did You Actually Build This?"**: How does your logger implementation handle sensitive data redaction, and why is `ReplaceAttr` better than manual sanitization at every log call site?
+* **"Did You Actually Build This?"**: How does `NewNop()` achieve zero-allocation logging suppression in hot benchmark loops?
+* **"Did You Actually Build This?"**: How does `Err(err error)` integrate domain errors without destroying their semantic types or masking root causes?
+* **"Did You Actually Build This?"**: Why is synchronous disk logging dangerous in an LSM storage engine, and how should logging be separated between hot write paths and administrative operations?
 
 ---
 
@@ -561,6 +586,21 @@ This section is a living record of actual engineering obstacles, debugging sessi
 - **Fix Applied**: Implemented leaf package `internal/errors` with 7 sentinels and 4 contextual typed errors implementing `Is(error) bool`; omitted raw payload byte slices from error types, logging only numeric lengths, limits, and offsets; validated 100% of error unwrap and `errors.As` extraction paths under `go test -race`.
 - **Core Lesson**: Error types are part of the system's security boundary and observability contract. By designing errors that separate high-level classification (`errors.Is`) from diagnostic detail (`errors.As`), and strictly censoring raw data at the point of origin, systems engines achieve durability, auditability, and data confidentiality simultaneously.
 - **Interview Relevance**: Demonstrates advanced Go error design patterns (`Is(error) bool` matching, `errors.As` type extraction, `%w` unwrap propagation), threat-model-conscious error formatting, and modular leaf-package decoupling.
+
+### Entry 2026-09-06 — P00-S02-M02: Concurrency-Safe Structured Logging & Automated Redaction
+- **Date**: 2026-09-06
+- **Micro-Phase**: P00-S02-M02
+- **Problem**: Establish a lightweight, high-performance internal structured logging foundation in `internal/logger` wrapping Go's standard library `log/slog` that provides thread safety across hundreds of goroutines, scopes logs by subsystem (`WithComponent`), and prevents credential leakage into log files.
+- **Initial Assumption**: Can use standard `slog.Default()` or output unstructured text directly via standard `log` package, or pull in an external dependency like `go.uber.org/zap`.
+- **What Was Actually True**:
+  1. Standard `log.Print` lacks structured attributes, forcing log aggregators to use brittle regexes to extract subsystem names, latencies, and node IDs.
+  2. Pulling in third-party libraries (`zap`, `zerolog`) unnecessarily expands the runtime dependency graph and introduces supply-chain attack vectors. Standard library `log/slog` (Go 1.21+) provides high-performance JSON and text handlers out of the box with zero external dependencies.
+  3. In a storage engine handling user credentials, API keys, and session tokens, relying on developers to manually redact keys at every call site is error-prone. Hooking into `slog.HandlerOptions.ReplaceAttr` provides automated, case-insensitive key masking (`[REDACTED]`) and supports domain types implementing `Redactable`.
+  4. In benchmark suites, logging to `io.Discard` with a standard handler still incurs serialization and allocation overhead. A custom `nopHandler` with `Enabled(...) bool { return false }` short-circuits `slog` record allocations entirely.
+- **How It Was Discovered**: Concurrency testing with 100 parallel goroutines writing 5,000 log events verified zero race detector findings (`go test -race`). Unit tests verified JSON field indexing, component scoping, and redaction of mixed-case sensitive keys.
+- **Fix Applied**: Built `internal/logger` wrapping `log/slog` with `Logger` interface, JSON/Text formats, automated `ReplaceAttr` redaction for baseline sensitive keys, `Redactable` interface, subsystem scoping via `WithComponent`, `Err(err)` structured attribute helper, and zero-cost `NewNop()`.
+- **Core Lesson**: Logging is a critical security boundary and concurrency bottleneck in database engines. Automating sensitive field redaction at the handler level guarantees compliance by design, while wrapping `slog` maintains standard library purity with zero runtime dependencies.
+- **Interview Relevance**: Demonstrates mastery of Go 1.21+ `slog` architecture, handler option interceptors (`ReplaceAttr`), concurrency-safe stream logging, zero-overhead testing abstractions, and threat-model-aligned credential protection.
 
 ---
 
