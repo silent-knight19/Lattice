@@ -36,6 +36,16 @@
 * **Go Modules & Hermetic Builds**: A Go module is a collection of Go packages defined by a `go.mod` file at the root. Prior to Go 1.11, Go relied on `$GOPATH`, which lacked declarative dependency versioning, leading to fragile builds where external library changes broke local builds. `go.mod` establishes deterministic, reproducible compilation by recording the canonical module path and compiler toolchain version.
 * **Minimal Version Selection (MVS)**: Unlike package managers in other ecosystems (e.g. npm or Cargo) that select the *maximum* or latest compatible version matching a semver range, Go's MVS algorithm selects the *oldest* version of a dependency that provides the required features. This guarantees that updating unrelated dependencies never silently pulls in untested major revisions, ensuring build determinism.
 * **Checksum Database (`go.sum`)**: While `go.mod` records direct and indirect dependencies, `go.sum` contains cryptographic SHA-256 hashes of module zip files. Even if a remote Git repository alters or force-pushes a release tag, Go's checksum database halts the build with a verification mismatch.
+* **Go Package Layout Architecture (`cmd/`, `internal/`, `pkg/`)**: The standard Go layout creates explicit separation of concerns:
+  - `cmd/`: Contains entrypoint binaries (`package main`). Each subfolder (e.g., `cmd/lattice`, `cmd/lattice-cli`, `cmd/lattice-bench`) compiles to a distinct binary. Code in `cmd/` must remain minimal ("skinny main"), focusing strictly on flag parsing, signal handling, dependency wiring, and calling into internal subsystems.
+  - `internal/`: Private application and storage engine libraries. The Go compiler enforces that no package outside the `github.com/silent-knight19/lattice` tree can import anything under `internal/`.
+  - `pkg/`: Public library code intended for external consumption (e.g., `pkg/client`). Breaking changes here require major semantic version bumps.
+* **`internal/` Package Semantics & Compiler Enforcement**: Introduced in Go 1.4, the Go compiler enforces that a package residing in `.../internal/foo` can only be imported by packages rooted in the directory immediately parent to `internal`. For example, external Go projects cannot do `import "github.com/silent-knight19/lattice/internal/wal"`. Attempting to do so fails at compile time with `use of internal package not allowed`. This guarantees that internal storage formats, locking mechanisms, and file layout structs remain private, eliminating accidental Hyrum's Law dependencies.
+* **Command/Package Separation ("Skinny Main")**: A storage engine binary (`cmd/lattice`) must avoid embedding domain or concurrency logic in `main.go`. `main()` should only: parse CLI flags, read configuration files, initialize dependencies, register OS signal listeners (`SIGTERM`, `SIGINT`), and block until graceful shutdown completes. All engine orchestration belongs in `internal/engine`, which allows integration tests to instantiate the entire engine in-process without invoking CLI binaries.
+* **Dependency Boundaries & Acyclic Directed Graph (DAG)**: Go strictly prohibits cyclic dependencies (`import cycle not allowed`). Package dependencies must form a strict Directed Acyclic Graph (DAG). Lower layers (e.g., `internal/binary`, `internal/errors`) are leaf nodes with zero dependencies on storage or engine packages. Mid-level subsystems (`internal/wal`, `internal/memtable`, `internal/sstable`) depend only on leaf utilities. Top-level orchestration (`internal/engine`) composes the storage subsystems, and `cmd/lattice` composes the engine with networking (`internal/transport`).
+* **Package-Level API Design**: Go packages should be named for what they provide, not what they contain. Generic catch-all packages such as `util/`, `common/`, or `helpers/` are architectural anti-patterns in Go; they attract unrelated utilities, obscure package responsibilities, and inevitably cause cyclic imports. Interfaces should be defined where they are consumed (consumer-driven interfaces), not where they are implemented.
+* **Import-Cycle Prevention**: In complex database engines, cyclic dependencies frequently threaten to arise (e.g., `MemTable` needs to trigger an asynchronous flush to `SSTable`, while `SSTable` compaction needs to query `MemTable` state). Cycles are prevented by: (1) defining shared domain errors and primitive types in leaf packages (`internal/errors`, `internal/binary`), (2) passing interfaces into constructors instead of concrete structs (dependency inversion), and (3) elevating coordination to parent orchestrators (`internal/engine`).
+* **Why Package Boundaries Matter in a Storage Engine**: Database engines maintain delicate invariants spanning memory allocation, file synchronization (`fsync`), concurrent locking, and crash consistency. Leaky package boundaries permit developers to bypass invariants—such as mutating in-memory structures without first writing to the WAL, or reading SSTable block data without taking block cache reference counts. Compiler-enforced boundaries guarantee that subsystem invariants cannot be violated from outside the package.
 * **Endianness**: Big-Endian (Network Byte Order) stores the most significant byte at the lowest memory address; Little-Endian stores the least significant byte first. Network protocols and on-disk files must specify a canonical byte order to remain portable across CPU architectures.
 * **Variable-Length Integers (Varints)**: 7-bit varints encode small integers in fewer bytes by using the high bit ($0\text{x}80$) as a continuation flag. An integer $\le 127$ uses 1 byte, while $2^{64}-1$ uses 10 bytes.
 * **Memory Allocation & GC Pressure**: Creating millions of small heap allocations triggers frequent Go Garbage Collector mark-and-sweep cycles, stealing CPU cycles and introducing millisecond-level tail latency spikes. `sync.Pool` provides zero-allocation buffer reuse.
@@ -44,15 +54,20 @@
 * **Decision**: Zero external dependencies for the entire storage engine and network layer; standard library only.
 * **Alternative Considered**: Utilizing third-party serialization, networking, or logging libraries (e.g. gRPC, zap, protobuf).
 * **Trade-off**: Requires writing binary framing, SkipList, and LRU cache from scratch, but eliminates supply-chain vulnerabilities, avoids transitive dependency conflicts, and ensures complete interview defensibility.
+* **Decision**: Strict containment of storage engine packages under `internal/` (`internal/wal`, `internal/memtable`, `internal/sstable`, etc.) with public client isolated in `pkg/client`.
+* **Alternative Considered**: Flat root package structure or placing storage packages in `pkg/`.
+* **Trade-off**: Prevents external applications from using internal engine components as independent micro-libraries, but completely prevents public API freeze and gives absolute freedom to refactor internal storage layouts and locking primitives without breaking external consumers.
 * **Decision**: Big-Endian encoding for all fixed-width integer fields; unsigned varints for internal data block offsets.
 * **Trade-off**: Big-Endian requires bit-shifting on x86 machines, but guarantees deterministic portability across platforms and aligns with network standards.
 
 ### Security & Supply-Chain Considerations
 * **Dependency Attacks**: In modern infrastructure software, malicious packages or hijacked maintainer accounts can inject backdoors. By maintaining zero external dependencies in the storage core, Lattice reduces its external attack surface to zero.
 * **Varint Bomb Vulnerability**: A malicious stream containing endless continuation bytes ($0\text{x}80$) could cause an infinite loop or integer overflow. Lattice limits varint decoding to a maximum of 10 bytes; anything beyond returns `ErrVarintOverflow`.
+* **Subsystem Isolation as Defense-in-Depth**: By keeping all storage engine implementation details inside `internal/`, we prevent external code or rogue consumer modules from accessing internal unexported memory pools, raw block caches, or un-synchronized file descriptors.
 
 ### Performance & Hardware Dynamics
 * Standard library `binary.BigEndian.PutUint64` is inlined by the Go compiler into single register swap instructions (`BSWAP` on x86), incurring zero runtime function call overhead.
+* Package boundary placement has zero runtime CPU cost in Go; inlining and compiler optimizations occur across package boundaries during compilation.
 
 ### Subsystem Interview Questions
 * **Basic**: What is a Go module, and how does `go.mod` differ from the legacy `$GOPATH` workspace model?
@@ -61,6 +76,10 @@
 * **Deep**: Why is zero external dependencies considered a major architectural advantage for a distributed database engine?
 * **"Did You Actually Build This?"**: What happens if an external dependency author alters an already-tagged release in Git, and how does Go's toolchain detect it?
 * **"Did You Actually Build This?"**: What is the purpose of `.editorconfig` in a Go systems project, and why must Go source files use tabs rather than spaces for indentation?
+* **"Did You Actually Build This?"**: Why does Lattice place `wal`, `memtable`, and `sstable` under `internal/` rather than the repository root or `pkg/`?
+* **"Did You Actually Build This?"**: What happens when two Go packages in a storage engine have mutually dependent structs (e.g., `Engine` needs `MemTable`, and `MemTable` needs `Engine` to trigger a flush)? How do you structure packages to prevent `import cycle not allowed`?
+* **"Did You Actually Build This?"**: In your initial scaffolding, what subtle bug can occur when configuring `.gitignore` for compiled binary names like `lattice` and runtime directories like `wal/`?
+* **"Did You Actually Build This?"**: Why must `cmd/` packages contain a dummy `func main() {}` in `main.go` even during a purely structural scaffolding phase?
 
 ---
 
@@ -445,6 +464,22 @@ This section is a living record of actual engineering obstacles, debugging sessi
 - **Fix Applied**: Initialized `go.mod` (Go 1.22+) with zero external dependencies; configured `.gitignore` with strict filters for binaries, test coverage, pprof dumps, and database runtime files; configured `.editorconfig` for standard Go formatting.
 - **Core Lesson**: Systems databases must implement defense-in-depth at the filesystem boundary from day zero, preventing sensitive runtime data or binary files from entering version control.
 - **Interview Relevance**: Demonstrates deep software engineering discipline: hermetic reproducible builds, understanding of Go's Minimal Version Selection (MVS), and zero-dependency architecture.
+
+### Entry 2026-09-06 — P00-S01-M02: Canonical Go Project Scaffolding & Compiler Boundaries
+- **Date**: 2026-09-06
+- **Micro-Phase**: P00-S01-M02
+- **Problem**: Establish canonical Go directory layout (`cmd/`, `internal/`, `pkg/`) across 17 distinct packages without introducing premature database implementations, while guaranteeing toolchain buildability and clean Git tracking.
+- **Initial Assumption**: Creating package directories with `doc.go` alone is sufficient for `go build ./...`, and adding binary names (`lattice`, `lattice-cli`, `lattice-bench`) or runtime folders (`wal/`, `data/`) directly to `.gitignore` cleanly isolates runtime outputs.
+- **What Was Actually True**:
+  1. The Go toolchain requires executable packages (`package main` in `cmd/*`) to declare `func main() {}`; omitting it causes `go build ./...` to fail with `function main is undeclared in the main package`.
+  2. Git treats unanchored entries in `.gitignore` (e.g. `lattice` or `wal/`) as wildcard matches across the entire repository tree, inadvertently silencing `cmd/lattice/` and `internal/wal/` from version control.
+- **How It Was Discovered**: `go build ./...` produced compilation errors on empty `cmd/` packages, and `git status` showed `cmd/lattice` and `internal/wal` missing until diagnosed via `git check-ignore -v`.
+- **Fix Applied**:
+  1. Added anchored leading slashes (`/lattice`, `/wal/`, `/data/`) in `.gitignore` to restrict exclusion to root binaries and database data directories.
+  2. Added minimal empty `func main() {}` in `cmd/*/main.go` alongside `doc.go` to satisfy Go compiler requirements without introducing premature logic.
+  3. Created canonical `doc.go` across all 14 `internal/` packages and `pkg/client`.
+- **Core Lesson**: Toolchains and build systems have specific compiler invariants (e.g., `package main` requires an entrypoint). In systems programming, directory boundaries must be verified end-to-end with compiler tools (`go build`, `go vet`, `go test`) and Git diagnostics (`git check-ignore`) rather than assumed.
+- **Interview Relevance**: Demonstrates real-world mastery of Go compiler rules (`internal/` access control, `package main` requirements), gitignore pattern syntax pitfalls, and architectural discipline in isolating internal storage engines from public APIs.
 
 ---
 

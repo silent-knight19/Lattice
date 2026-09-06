@@ -2,9 +2,9 @@
 
 # Compiled Binaries & Executables
 bin/
-lattice
-lattice-cli
-lattice-bench
+/lattice
+/lattice-cli
+/lattice-bench
 *.exe
 *.exe~
 *.dll
@@ -27,8 +27,8 @@ mutex.pprof
 trace.out
 
 # Storage Engine & Database Runtime Directories
-data/
-wal/
+/data/
+/wal/
 *.sst
 *.sst.tmp
 *.log.tmp
