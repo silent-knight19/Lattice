@@ -600,7 +600,26 @@ This section is a living record of actual engineering obstacles, debugging sessi
 - **How It Was Discovered**: Concurrency testing with 100 parallel goroutines writing 5,000 log events verified zero race detector findings (`go test -race`). Unit tests verified JSON field indexing, component scoping, and redaction of mixed-case sensitive keys.
 - **Fix Applied**: Built `internal/logger` wrapping `log/slog` with `Logger` interface, JSON/Text formats, automated `ReplaceAttr` redaction for baseline sensitive keys, `Redactable` interface, subsystem scoping via `WithComponent`, `Err(err)` structured attribute helper, and zero-cost `NewNop()`.
 - **Core Lesson**: Logging is a critical security boundary and concurrency bottleneck in database engines. Automating sensitive field redaction at the handler level guarantees compliance by design, while wrapping `slog` maintains standard library purity with zero runtime dependencies.
-- **Interview Relevance**: Demonstrates mastery of Go 1.21+ `slog` architecture, handler option interceptors (`ReplaceAttr`), concurrency-safe stream logging, zero-overhead testing abstractions, and threat-model-aligned credential protection.
+### Entry 2026-09-06 — Phase 00 Final Security Audit: Typed Nil Receiver Traps, Interface Reflection, and Compound Key Redaction
+- **Date**: 2026-09-06
+- **Phase**: Phase 00 Final Security & Correctness Audit
+- **Problem**: Hostile testing of Phase 00 revealed two critical panic vectors (typed nil receivers in domain errors and `Redactable` interface assertion) and a sensitive data leakage vector (compound keys bypassing exact-match redaction).
+- **Initial Assumption**: 
+  1. Go interface nil checks `r != nil` prevent nil pointer dereferences on methods.
+  2. Domain error `Error()` methods will only be called on non-nil pointers.
+  3. Exact keyword matching (`"password"`, `"api_key"`) in `ReplaceAttr` is sufficient to redact secrets.
+- **What Was Actually True**:
+  1. In Go, an interface storing a typed nil pointer `(*MyType)(nil)` is NOT equal to `nil` because its concrete type word is non-nil. When `a.Value.Any().(Redactable)` succeeds on a typed nil pointer, `r != nil` evaluates to `true`, and calling `r.Redact()` immediately triggers a segmentation fault (`invalid memory address or nil pointer dereference`), crashing the database process.
+  2. A function returning `error` frequently returns a typed pointer initialized to nil. Calling `err.Error()` on `(*KeyTooLargeError)(nil)` panicked with nil pointer dereference.
+  3. Attackers or developers logging compound keys like `"db_password"`, `"client_secret"`, `"auth_token"`, `"session_token"`, `"api-key"`, and `"private-key"` bypassed exact map lookups and leaked raw secrets into plain-text logs.
+- **How It Was Discovered**: Adversarial probing and hostile fuzzing during the comprehensive Phase 00 security audit.
+- **Fix Applied**: 
+  1. Added nil-receiver guards to all typed error `Error()` methods, returning the sentinel error string safely.
+  2. Built `safeRedact()` using `reflect.ValueOf(r)` to detect typed nil pointers across pointers, interfaces, maps, slices, and channels, coupled with `recover()` to prevent panics in custom `Redact()` implementations from terminating the server.
+  3. Implemented `isSensitiveKey()` with delimiter normalization (canonicalizing `-` to `_`) and compound pattern matching for high-risk stems (`password`, `secret`, `credential`, `private_key`, `api_key`, `*_token`, `token`, `auth`, `authorization`), while avoiding false positives on metadata like `token_count`.
+  4. Added permanent regression test suites in `internal/errors/errors_test.go` and `internal/logger/logger_test.go`.
+- **Core Lesson**: In Go systems programming, interface nil checks are treacherous due to the `(type, value)` interface representation. Defensive libraries must use reflection or explicit receiver guards, and logging security must never rely on naive exact string matches for credentials.
+- **Interview Relevance**: Demonstrates elite mastery of Go internals (interface memory layout, nil interface vs nil pointer trap, runtime panic recovery), adversarial security testing, and robust defense-in-depth API design.
 
 ---
 
