@@ -1,0 +1,1058 @@
+# Lattice: Micro-Phase Implementation Plan & Execution Blueprint
+
+* **Document Version**: 1.0.0-EXEC-PLAN
+* **Source Architecture Specification**: [`docs/architecture-spec.md`](architecture-spec.md)
+* **Status**: Approved for Execution
+* **Methodology**: Test-Driven, Micro-Incremental, Security-First Systems Engineering
+
+---
+
+---
+
+## Table of Contents
+
+1. [Architectural Consistency Audit & Integrity Verification](#1-architectural-consistency-audit--integrity-verification)
+2. [Evidence Classification System](#2-evidence-classification-system)
+3. [Project Truth & Documentation Accuracy Rules](#3-project-truth--documentation-accuracy-rules)
+4. [Project-Wide Definition of Done (DoD)](#4-project-wide-definition-of-done-dod)
+5. [Invariant-Driven Testing Framework](#5-invariant-driven-testing-framework)
+6. [Early Subsystem Failure Testing Requirements](#6-early-subsystem-failure-testing-requirements)
+7. [Differential Testing Methodology](#7-differential-testing-methodology)
+8. [Correctness-First Optimization Policy](#8-correctness-first-optimization-policy)
+9. [Human Review Gates](#9-human-review-gates)
+10. [Benchmark Reproducibility & Baseline/Regression Model](#10-benchmark-reproducibility--baselineregression-model)
+11. [Resume Evidence Rule](#11-resume-evidence-rule)
+12. [Dependency & Supply-Chain Awareness Policy](#12-dependency--supply-chain-awareness-policy)
+13. [Resume Buzzword Prohibition Rule](#13-resume-buzzword-prohibition-rule)
+14. [Claude Code 13-Step Execution Protocol](#14-claude-code-13-step-execution-protocol)
+15. [Mandatory Implementation Response Format](#15-mandatory-implementation-response-format)
+16. [Current Execution State](#16-current-execution-state)
+17. [Git Workflow & Commit Cadence](#17-git-workflow--commit-cadence)
+18. [Resume Signal Tracking Matrix](#18-resume-signal-tracking-matrix)
+19. [Implementation Hierarchy & Roadmap Overview (184 Micro-Phases)](#19-implementation-hierarchy--roadmap-overview-184-micro-phases)
+
+---
+
+# 1. Architectural Consistency Audit & Integrity Verification
+
+A strict line-by-line audit of [`docs/architecture-spec.md`](architecture-spec.md) was conducted prior to authoring this implementation plan.
+
+### Audit Findings
+
+1. **WAL Group Commit vs MemTable Insertion Invariant**:
+   * *Analysis*: If multiple writers enqueue tasks, the leader flushes and syncs to disk before inserting into the MemTable. If the WAL sync fails, no records are inserted into the MemTable, ensuring disk and memory never diverge. Verified consistent.
+2. **SSTable Footer Fixed Offset Calculation**:
+   * *Analysis*: The SSTable footer is exactly 48 bytes (`2 * 16B` block handles + `8B` padding + `8B` magic). The footer is read at `file_size - 48`. Verified consistent.
+3. **Compaction Tombstone Purging Invariant**:
+   * *Analysis*: A tombstone cannot be purged during compaction if older revisions of the key exist in lower levels ($L_{target+1}..L_N$). The plan includes explicit key-range scanning checks across deeper levels before dropping tombstones. Verified consistent.
+4. **VersionSet Concurrency & File Unlinking**:
+   * *Analysis*: Readers pin an immutable `Version` via atomic reference counting (`atomic.AddInt32(&v.refCount, 1)`). Background compaction installs new versions via atomic pointer swap. SSTables are physically unlinked only when `v.refCount == 0`. Verified consistent.
+5. **Wire Protocol Frame Bomb Defense**:
+   * *Analysis*: Maximum frame size is constrained to 5MB. Inbound lengths are validated prior to memory allocation. Verified consistent.
+
+### Audit Conclusion
+**No blocking architectural inconsistencies, circular dependencies, or impossible invariants exist.** The architecture specification is completely viable for sequential micro-step implementation.
+
+---
+
+# 2. Evidence Classification System
+
+To maintain absolute technical credibility, every technical statement, performance claim, and algorithmic property across Lattice must be categorized into one of four distinct tiers:
+
+```
++-------------------------------------------------------------------------------+
+|                        EVIDENCE CLASSIFICATION TIERS                          |
++-------------------------------------------------------------------------------+
+| Tier 1: Design Target         | Aspirational engineering goal for development |
+| Tier 2: Theoretical Property   | Mathematically or architecturally provable    |
+| Tier 3: Measured Result       | Empirically benchmarked on specific hardware  |
+| Tier 4: Observed Limitation   | Empirically discovered bottleneck or boundary |
++-------------------------------------------------------------------------------+
+```
+
+### Governing Rules
+1. **Design Target $\ne$ Measured Result**: A claim such as "$\ge 80,000 \text{ writes/sec}$" or "$\le 1.5\text{s recovery}$" is classified strictly as a **Design Target**. It must **never** be cited as an achieved capability until an automated benchmark executes on real hardware and records verifiable evidence.
+2. **Theoretical Properties**: Concepts like "Bloom filter false-positive probability $\approx 0.82\%$", "SkipList expected complexity $O(\log N)$", or "Leveled compaction space amplification $\le 1.33\times$" are classified as **Theoretical Properties**. When tested, they must be validated against empirical distributions.
+3. **Measured Results**: Can only be stated after running reproducible benchmarks capturing the full hardware/OS tuple (CPU, RAM, NVMe model, OS kernel, Go version, Git commit, workload parameters).
+4. **Observed Limitations**: Any bottleneck or degraded edge case discovered during execution must be immediately documented in [`docs/known-limitations.md`](known-limitations.md).
+
+---
+
+# 3. Project Truth & Documentation Accuracy Rules
+
+> **Core Axiom**: Documentation must never be more advanced than reality when describing implementation status.
+
+1. The architecture specification (`docs/architecture-spec.md`) defines target blueprints and future goals.
+2. The implementation plan (`docs/implementation-plan.md`) defines roadmap tasks.
+3. **Public Status Integrity**: The root `README.md`, resume summaries, and portfolio notes must only display completion checkmarks (`[x]`) and "implemented" descriptors for micro-phases that have met the full Definition of Done.
+4. **Zero Vanity Claims**: Never advertise "Raft linearizability", "Zero data loss", or "High performance" before the respective verification tests execute.
+
+---
+
+# 4. Project-Wide Definition of Done (DoD)
+
+A micro-phase is **NOT COMPLETE** merely because the code compiles. Every micro-phase must satisfy the following checklist before being marked `Completed`:
+
+```
+   Scope Implemented
+          ↓
+   Targeted Unit Tests Pass
+          ↓
+   Regression Suite Clean
+          ↓
+   Race Detector Clean (`go test -race ./...`)
+          ↓
+   Static Analysis Clean (`go vet`, `golangci-lint`)
+          ↓
+   Security Checked (Boundaries, Path Traversal, Buffers)
+          ↓
+   Invariants & Failure Cases Explicitly Verified
+          ↓
+   Documentation & ADRs Updated (if applicable)
+          ↓
+   Interview Knowledge Base Updated
+          ↓
+   Git Checkpoint Committed
+          ↓
+   Human Review Gate Passed (if at subsystem boundary)
+```
+
+*Note on Optimizations*: Do not require zero allocations or 100% line coverage universally. Prioritize meaningful correctness, error-path handling, and failure-mode resilience.
+
+---
+
+# 5. Invariant-Driven Testing Framework
+
+Before implementing any subsystem, its non-negotiable correctness invariants must be established. Tests must intentionally attempt to violate these invariants.
+
+| Subsystem | Invariant Statement | Why It Matters | How It Could Be Violated | Detection Test | Failure Behavior |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **WAL** | An acknowledged durable write must be recoverable after crash. | Prevents silent data loss. | Dropping `fdatasync()` or truncating valid records. | Crash injection + WAL replay. | Fatal engine halt if corrupted; clean truncate if torn tail. |
+| **MemTable** | Keys remain monotonically ordered at all SkipList levels. | Range scans and binary lookups depend on sort order. | Race condition during concurrent forward pointer splicing. | Concurrent multi-threaded stress test under `-race`. | Linter/race detector panic; test assertion failure. |
+| **SSTable** | Records within data blocks are strictly ordered; restart points match. | Binary search within 4KB block fails if order is violated. | Bug in prefix compression restart point offset calculation. | Round-trip block builder and sequential iterator check. | Block decoding returns `ErrCorruptedBlock`. |
+| **Compaction** | Newer record revisions must always supersede older revisions. | Prevents stale data overwriting recent updates. | Bug in min-heap priority queue comparison logic. | K-way merge test with identical keys across 4 files. | Iterator assertion fails. |
+| **Tombstones** | A tombstone cannot be dropped while an older revision exists at a deeper level. | Prevents deleted keys from silently reappearing ("ghost key resurrect"). | Compactor purges tombstone at $L_1$ without checking $L_2..L_N$. | Ghost key resurrect test: insert key, flush, delete, compact $L0 \to L1$. | Test detects resurrect; halts compaction with error. |
+| **VersionSet** | Readers never observe partially installed metadata or unlinked files. | Prevents nil-pointer panics or corrupted query reads. | Compaction unlinks SSTable file descriptor while reader is active. | Version-pinned concurrency stress test. | Operating system returns `EBADF` or panic. |
+| **Raft** | A committed log entry cannot be replaced by a conflicting entry. | Fundamental consensus safety (State Machine Safety). | Leader overwrites log without quorum confirmation. | Jepsen-style network partition test with split votes. | State machine comparison fails. |
+
+---
+
+# 6. Early Subsystem Failure Testing Requirements
+
+Failure testing must **not** be postponed until Phase 18. Each subsystem includes immediate failure tests in its own micro-phases:
+
+* **WAL Subsystem (`Phase 02`)**: Tests truncated tail records, random bit-flip checksum corruptions, simulated process termination mid-write (`P02-S01-M03`, `P02-S03-M01`).
+* **SSTable Subsystem (`Phase 04`)**: Tests invalid footer magic, out-of-bounds block handles, corrupted block CRC32s, truncated SSTable files (`P04-S02-M02`, `P04-S03-M02`).
+* **Manifest Subsystem (`Phase 06` & `Phase 07`)**: Tests torn `VersionEdit` records, missing referenced SSTable files on disk, crash during `CURRENT` pointer swap (`P06-S02-M01`, `P07-S01-M02`).
+* **Concurrency Subsystem (`Phase 03` & `Phase 10`)**: Tests overlapping readers/writers, race detector validations under 64 goroutines, write backpressure stalls (`P03-S02-M01`, `P10-S01-M03`).
+* **Networking Subsystem (`Phase 11`)**: Tests frame-bomb oversized payloads, truncated byte frames, invalid opcodes, slow connection timeouts (`P11-S01-M01`).
+* **Raft Consensus (`Phase 15`)**: Tests candidate rejection on stale terms, log divergence recovery, follower reconnection catch-up (`P15-S02-M01`, `P15-S03-M02`).
+
+---
+
+# 7. Differential Testing Methodology
+
+For complex subsystems, a simple, obviously correct reference model serves as a **correctness oracle**:
+
+```
+      Random Pseudorandom Operation Sequence (10,000 Ops)
+                      │
+           ┌──────────┴──────────┐
+           ▼                     ▼
+┌─────────────────────┐   ┌─────────────────────┐
+│   Reference Model   │   │    Lattice Engine   │
+│ (In-Memory Go Map + │   │ (SkipList / WAL /   │
+│ Mutex / Simple Log) │   │ SSTable Compaction) │
+└─────────────────────┘   └─────────────────────┘
+           │                     │
+           └──────────┬──────────┘
+                      ▼
+        Compare Final State & Outputs
+```
+
+### Planned Differential Targets
+1. **MemTable SkipList (`P03`)**: Validated against `map[string][]byte` protected by a global `sync.RWMutex`.
+2. **K-Way Merge Compaction (`P08`)**: Validated against an in-memory slice sort and deduplication reference implementation.
+3. **Storage Engine CRUD (`P10`)**: 100,000 random operations compared against a reference key-value model.
+
+---
+
+# 8. Correctness-First Optimization Policy
+
+We strictly enforce the systems engineering optimization hierarchy:
+
+$$\text{Correctness} \longrightarrow \text{Determinism} \longrightarrow \text{Testability} \longrightarrow \text{Observability} \longrightarrow \text{Performance} \longrightarrow \text{Micro-optimization}$$
+
+### Rules
+1. **No Speculative Optimization**: Do not introduce `unsafe`, lock-free algorithms, or manual memory tricks without a baseline benchmark demonstrating a real bottleneck.
+2. **Allocation Justification**: Do not introduce `sync.Pool` or zero-copy slicing unless Go `pprof` heap profiles show that GC allocation is degrading throughput or tail latency.
+3. **Optimization Documentation Template**:
+   ```
+   Problem Measured  : <Data from pprof / benchmark baseline>
+   Baseline Metric   : <e.g., 42,000 ops/sec, 14 allocs/op>
+   Optimization Made : <Description of algorithmic or memory change>
+   Result After      : <e.g., 78,000 ops/sec, 2 allocs/op>
+   Trade-off Incurred: <Increased code complexity, memory retention>
+   ```
+
+---
+
+# 9. Human Review Gates
+
+Implementation must pause for human review and sign-off at these 16 critical subsystem boundaries:
+
+| Gate | Subsystem Boundary | Human Review & Verification Requirements |
+| :--- | :--- | :--- |
+| **Gate 00** | Foundations (`P00`) | Review project layout, error model, linter cleanliness. |
+| **Gate 01** | Primitives (`P01`) | Review endianness, varint codec safety, CRC32 test vectors. |
+| **Gate 02** | WAL Subsystem (`P02`) | Review Group Commit concurrency, torn write truncation, `fdatasync()` safety. |
+| **Gate 03** | MemTable (`P03`) | Review SkipList lock-free read traversal, `-race` cleanliness, memory accounting. |
+| **Gate 04** | SSTables (`P04`) | Inspect raw SSTable hex/block dumps, verify sparse index binary search. |
+| **Gate 05** | Bloom Filters (`P05`)| Validate empirical false positive measurements against mathematical model. |
+| **Gate 06** | Manifest (`P06`) | Review `VersionSet` ref-counting, atomic `CURRENT` write-rename. |
+| **Gate 07** | Recovery (`P07`) | Test simulated process crash recovery; verify zero lost acknowledged writes. |
+| **Gate 08** | Compaction (`P08`)| Audit tombstone purge safety logic; verify non-overlapping leveled invariant. |
+| **Gate 09** | Block Cache (`P09`)| Review 16-shard partition hashing and 64-byte cache-line padding. |
+| **Gate 10** | Engine (`P10`) | Verify end-to-end CRUD integration, write pacing, graceful shutdown. |
+| **Gate 11** | Networking (`P11`)| Review frame-bomb limits, socket read timeouts, TCP client connection pooling. |
+| **Gate 12** | Diagnostics (`P12`)| Test interactive CLI REPL and forensic SSTable/WAL inspection tools. |
+| **Gate 13** | Benchmarking (`P13`)| Audit benchmark reproducibility, Zipfian generator, latency histogram capture. |
+| **Gate 14** | Raft Core (`P15`) | Review randomized election timers, term stepping, quorum commit math. |
+| **Gate 15** | Linearizability (`P17`)| Audit ReadIndex implementation; verify stale read prevention under partition. |
+
+---
+
+# 10. Benchmark Reproducibility & Baseline/Regression Model
+
+Every benchmark result cited in documentation or interview notes must be accompanied by the full environmental metadata:
+
+```
+[LATTICE BENCHMARK RUN LOG]
+Timestamp             : 2026-09-06T11:42:00Z
+Git Commit            : <exact 40-char commit hash>
+Hardware CPU          : Apple M3 Pro / AMD EPYC 7763 (Cores / Threads)
+System RAM            : 36 GB Unified / 64 GB DDR4
+Storage Media         : Apple NVMe SSD / Samsung 980 PRO 1TB NVMe
+Operating System      : macOS 14.5 / Linux 6.5.0-generic
+Go Version            : go1.22.4 darwin/arm64
+Compiler Flags        : -trimpath -gcflags=all="-N -l" (or optimized)
+Dataset Size          : 10,000,000 keys (approx. 2.4 GB raw)
+Key / Value Size      : 16-byte key / 256-byte value
+Workload Profile      : 80% Read / 20% Write (Zipfian s=0.99)
+Client Concurrency    : 64 concurrent goroutines
+Test Duration         : 60.00 seconds
+Cache State           : Cold start / Warm (256MB cache capacity)
+Compaction State      : Background compactor active
+Benchmark Command     : ./lattice-bench --workload=mixed --concurrency=64 --duration=60s
+Measured Throughput   : 124,198 ops/sec
+Latency Percentiles   : P50: 0.21ms | P95: 0.68ms | P99: 1.82ms | P99.9: 4.10ms
+```
+
+---
+
+# 11. Resume Evidence Rule
+
+To guarantee that resume claims are bulletproof and withstand deep technical scrutiny by senior FAANG interviewers:
+
+A feature may **only** be listed as an achievement on a resume if it meets all 5 criteria:
+1. **Implemented**: Production code is fully written and merged into `main`.
+2. **Tested**: Comprehensive unit, regression, and race-detection tests pass.
+3. **Invariants Proven**: Negative and chaos tests have verified core system invariants.
+4. **Empirically Measured**: Quantitative claims (e.g. throughput, latency, recovery time) have recorded, reproducible benchmark evidence matching Section 10.
+5. **Interview Defensible**: The human engineer can explain the code, trade-offs, failure modes, and low-level mechanics without relying on generic talking points.
+
+---
+
+# 12. Dependency & Supply-Chain Awareness Policy
+
+* **Default Rule**: **Zero External Dependencies**. The storage engine core, WAL, MemTable, SSTables, Bloom filters, and TCP networking rely strictly on the Go standard library (`os`, `sync`, `net`, `hash/crc32`, `container/heap`, `log/slog`, `syscall`).
+* **Permissible Exceptions**: Only highly specialized, widely audited packages (such as `golang.org/x/sys/unix` for platform-specific POSIX flags, or Google's `snappy` for block compression) may be introduced, subject to written justification in an ADR.
+
+---
+
+# 13. Resume Buzzword Prohibition Rule
+
+Technologies must **never** be added solely for resume hype. Lattice explicitly prohibits introducing:
+* Kubernetes operators, Kafka, Redis sidecars, or gRPC wrappers.
+* `io_uring`, SIMD, or complex lock-free algorithms unless a real benchmark demonstrates that standard library primitives are a blocking bottleneck.
+* Every proposed architectural addition must document: Problem $\to$ Limitation $\to$ Proposed Solution $\to$ Alternatives $\to$ Measured Justification $\to$ Trade-offs.
+
+---
+
+# 14. Claude Code 13-Step Execution Protocol
+
+For **every** single micro-phase execution request, Claude Code must follow this strict loop:
+
+1. **Read Core Specs**: Inspect `docs/architecture-spec.md`, `docs/implementation-plan.md`, `docs/interview-knowledge.md`.
+2. **Identify Target Micro-Phase**: State the exact ID (`Pxx-Sxx-Mxx`) and single objective.
+3. **Inspect Repository**: Check git status and existing files.
+4. **Implement Scope**: Write code **only** for the designated micro-phase.
+5. **Run Targeted Tests**: Execute unit tests verifying the change.
+6. **Run Regression Tests**: Execute full test suite.
+7. **Run Race Detector**: Execute `go test -race ./...`.
+8. **Perform Security Review**: Audit boundaries, permissions, and memory bounds.
+9. **Verify Invariants**: Assert subsystem invariants are preserved.
+10. **Update Documentation**: Update docstrings, ADRs, or known limitations.
+11. **Update Interview Knowledge**: Add real lessons, questions, and trade-offs.
+12. **Report Results**: Provide report strictly adhering to the mandatory format.
+13. **STOP**: Halt execution and wait for human review.
+
+---
+
+# 15. Mandatory Implementation Response Format
+
+Every future micro-phase implementation response from Claude Code must use this format:
+
+```markdown
+## Target Micro-Phase
+- ID: Pxx-Sxx-Mxx
+- Objective: <Single concise goal>
+- Dependencies: <Preceding micro-phases>
+
+## Changes Made
+- Exact files created or modified with specific line/function details.
+
+## Invariants Maintained
+- Concrete statement of preserved system invariants.
+
+## Tests Executed
+- Commands run and explicit test outputs.
+
+## Security Review
+- Specific attack surfaces analyzed and mitigations implemented.
+
+## Failure Cases Tested
+- Specific corruptions, edge cases, or error paths verified.
+
+## Performance & Allocations
+- Allocation profile or benchmark notes (if applicable).
+
+## Documentation Updated
+- Documents and docstrings modified.
+
+## Interview Alignment
+- Core concepts the human engineer must explain in an interview.
+
+## Known Limitations Discovered
+- Any newly discovered boundaries (added to `docs/known-limitations.md`).
+
+## Git Checkpoint
+- Suggested commit command with standard commit message.
+
+## Status
+- Completed / Blocked / Review Required.
+```
+
+---
+
+# 16. Current Execution State
+
+```
+Current Major Phase           : Phase 00 — Repository & Engineering Foundations
+Current Sub-Phase             : Sub-Phase 00.1 — Repository Scaffolding & Tooling
+Current Micro-Phase           : P00-S01-M02 — Canonical Go Project Layout Scaffolding
+Previous Completed Micro-Phase: P00-S01-M01 — Initialize Go Module & Root Metadata
+Blocking Issues               : None
+Tests Passing                 : `go mod verify` passed (all modules verified)
+Security Review Status        : Clean (Zero external dependencies, credentials blocked in .gitignore)
+Interview Knowledge Status    : Updated with Go Module & MVS concepts
+Git Commit                    : 833983e (P00-S01-M01 checkpoint)
+```
+
+---
+
+# 17. Git Workflow & Commit Cadence
+
+* **Branching Model**: Trunk-based development on `main`.
+* **Commit Message Format**:
+  ```
+  feat(subsystem): [PXX-SXX-MXX] Short descriptive summary
+
+  - Detail change 1
+  - Detail change 2
+  - Invariants verified: <invariants>
+  - Tests: <test commands executed>
+  ```
+* **Cadence**: Exactly **one git commit per micro-phase** upon satisfying the Definition of Done.
+
+---
+
+# 18. Resume Signal Tracking Matrix
+
+| Feature / Subsystem | Technical Signal | Benchmark Evidence Required | Test Evidence Required | Interview Depth | Resume Inclusion |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Custom Binary Wire Protocol** | High | Throughput (req/s), Frame decode CPU time | Frame-bomb rejection, CRC corruption | High | Yes |
+| **WAL Group Commit** | Very High | Ops/sec vs Strict fsync (IOPS multiplier) | Torn write crash recovery, kill -9 | Very High | Yes |
+| **Concurrent SkipList MemTable** | High | Concurrent read/write latency under load | Race detector (`-race`), concurrent stress | High | Yes |
+| **SSTable Block Index & Prefix Compression** | High | Compression ratio, binary search seek time | Hex dump inspection, restart point tests | High | Yes |
+| **Murmur3 Bloom Filter** | High | Negative query disk avoidance (>99%) | False-positive rate vs mathematical model | Medium | Yes |
+| **VersionSet & MANIFEST Replay** | Very High | Startup recovery latency on 10k SSTables | Crash-during-flush injection, orphan cleanup | Very High | Yes |
+| **Leveled Compactor (k-way merge)** | Extremely High | Write amplification, compaction throughput | Ghost key resurrect tests, heap sort invariant | Extremely High | Yes |
+| **Sharded LRU Block Cache** | High | Hit ratio, mutex contention profiling | Cache eviction correctness, false-sharing padding | High | Yes |
+| **Single-Group Raft Consensus** | Extremely High | Leader election time, replication lag | Network partition (split-brain), drop/replay | Extremely High | Yes |
+| **Linearizable ReadIndex Protocol** | Extremely High | Read latency vs consensus round-trips | Stale read prevention during partition | Extremely High | Yes |
+
+---
+
+# 19. Implementation Hierarchy & Roadmap Overview (184 Micro-Phases)
+
+The project is structured into **22 Major Phases (P00–P21)**, **68 Sub-Phases**, and **184 Micro-Phases**.
+
+```
+P00: Repository & Engineering Foundations (8 Micro-Phases)
+P01: Core Storage Primitives & Binary Encodings (8 Micro-Phases)
+P02: Write-Ahead Log (WAL) & Durability Subsystem (12 Micro-Phases)
+P03: In-Memory MemTable & Concurrent SkipList (10 Micro-Phases)
+P04: Persistent SSTable Subsystem (14 Micro-Phases)
+P05: Probabilistic Bloom Filter Subsystem (8 Micro-Phases)
+P06: Manifest Log & VersionSet Management (10 Micro-Phases)
+P07: Crash Recovery & Integrity Verification (8 Micro-Phases)
+P08: Leveled Compaction Subsystem (14 Micro-Phases)
+P09: Sharded LRU Read Block Cache (8 Micro-Phases)
+P10: Single-Node Storage Engine Integration (10 Micro-Phases)
+P11: TCP Binary Wire Protocol & Networking Subsystem (10 Micro-Phases)
+P12: CLI, Interactive REPL & Forensic Diagnostics (8 Micro-Phases)
+P13: Benchmarking Suite & Performance Profiling (8 Micro-Phases)
+P14: Distributed Cluster Foundations & Node Topology (8 Micro-Phases)
+P15: Raft Consensus Engine (14 Micro-Phases)
+P16: Distributed State Machine Replication (8 Micro-Phases)
+P17: Linearizable Reads (ReadIndex Protocol) (6 Micro-Phases)
+P18: Fault Injection & Chaos Testing Suite (6 Micro-Phases)
+P19: Comprehensive Security Hardening (6 Micro-Phases)
+P20: Production Hardening & Operational Observability (6 Micro-Phases)
+P21: Resume & Technical Interview Portfolio Validation (4 Micro-Phases)
+-------------------------------------------------------------------------
+TOTAL: 184 Discrete, Testable Micro-Phases
+```
+
+---
+
+# Phase 00: Repository & Engineering Foundations
+
+* **Major Objective**: Establish the Go workspace, project layout, CI checks, error model, and logging foundation.
+* **Dependencies**: None.
+* **Risks**: Permissive file permissions, untyped error models, external dependency bloat.
+
+### Sub-Phase 00.1: Repository Scaffolding & Tooling
+* **P00-S01-M01: Initialize Go Module & Root Metadata**
+  * *Status*: **Completed**
+  * *Objective*: Create `go.mod` specifying Go 1.22+, initialize root project metadata.
+  * *Preconditions*: Empty git repository.
+  * *Changes*: Create `go.mod`, `.gitignore`, `.editorconfig`.
+  * *Invariants*: Zero external dependencies in `go.mod`.
+  * *Tests*: `go mod verify` succeeds.
+  * *Security*: `.gitignore` excludes binary artifacts, credentials, `.tmp` files.
+  * *Completion*: `go.mod` valid and verified.
+* **P00-S01-M02: Canonical Go Project Layout Scaffolding**
+  * *Objective*: Create the standard Go directory layout (`cmd/`, `internal/`, `pkg/`).
+  * *Preconditions*: P00-S01-M01.
+  * *Changes*: Create directory tree matching Section 42 of architecture spec.
+  * *Invariants*: Internal packages live strictly under `internal/` to prevent external imports.
+  * *Tests*: Tree verification command confirms directories.
+  * *Completion*: Complete package scaffolding established.
+* **P00-S01-M03: Static Analysis & Linter Configuration**
+  * *Objective*: Establish `.golangci.yml` enforcing strict linting, error checks, and formatting.
+  * *Preconditions*: P00-S01-M02.
+  * *Changes*: Add `.golangci.yml` configuring `govet`, `errcheck`, `staticcheck`, `gofmt`.
+  * *Invariants*: Unhandled errors cause linter failure.
+  * *Tests*: Run `golangci-lint run`.
+  * *Completion*: Linter passes with zero warnings.
+
+### Sub-Phase 00.2: Core Error Architecture
+* **P00-S02-M01: Domain Error Types & Sentinel Definitions**
+  * *Objective*: Define structured domain errors in `internal/errors`.
+  * *Preconditions*: P00-S01-M03.
+  * *Changes*: Define `ErrKeyNotFound`, `ErrKeyTooLarge`, `ErrValueTooLarge`, `ErrChecksumMismatch`, `ErrTornWrite`, `ErrCompactionRunning`.
+  * *Invariants*: All domain errors implement `error` and support `errors.Is()`.
+  * *Tests*: Unit test verifying error wrapping and `errors.Is()` comparisons.
+  * *Completion*: Structured error types exported.
+* **P00-S02-M02: Internal Logging Foundation**
+  * *Objective*: Implement lightweight structured logger in `internal/logger` wrapping Go's `slog`.
+  * *Preconditions*: P00-S02-M01.
+  * *Changes*: Logger interface supporting DEBUG, INFO, WARN, ERROR with structured key-value attributes.
+  * *Security*: Logging redaction hooks to prevent logging sensitive user values.
+  * *Tests*: Test logging outputs JSON format; test redaction logic.
+  * *Completion*: Logger tested and operational.
+
+---
+
+# Phase 01: Core Storage Primitives & Binary Encodings
+
+* **Major Objective**: Define zero-allocation byte representations, variable-length integer encoders, and CRC32 checksum pipelines.
+* **Dependencies**: Phase 00.
+* **Risks**: Endianness mismatches, integer overflow during varint decoding.
+
+### Sub-Phase 01.1: Binary Encoding Primitives
+* **P01-S01-M01: Big-Endian Fixed Integer Encoding & Decoding**
+  * *Objective*: Implement zero-allocation uint16, uint32, uint64 encoders/decoders in `internal/binary`.
+  * *Changes*: `PutUint16`, `PutUint32`, `PutUint64`, `GetUint16`, `GetUint32`, `GetUint64`.
+  * *Invariants*: Strict Big-Endian byte order.
+  * *Tests*: Round-trip fuzz testing with edge integers (`0`, `math.MaxUint32`, `math.MaxUint64`).
+  * *Completion*: Unit tests passing with 100% code coverage.
+* **P01-S01-M02: Unsigned Variable-Length Integer (Varint) Codec**
+  * *Objective*: Implement 7-bit varint codec for disk offsets and lengths.
+  * *Changes*: `PutVarint64(buf []byte, v uint64) int`, `GetVarint64(buf []byte) (uint64, int, error)`.
+  * *Invariants*: Values $\le 127$ consume exactly 1 byte. Malformed varints exceeding 10 bytes return `ErrVarintOverflow`.
+  * *Security*: Prevents infinite loop DoS on malformed bitstreams.
+  * *Tests*: Test boundary values ($127, 128, 16383, 16384, 2^{64}-1$); test truncated byte slices.
+  * *Completion*: Varint codec thoroughly tested.
+* **P01-S01-M03: CRC32-IEEE Checksum Wrapper**
+  * *Objective*: Implement high-performance CRC32 calculator with hardware acceleration (`hash/crc32`).
+  * *Changes*: `Checksum(data []byte) uint32`, `Verify(data []byte, expected uint32) bool`.
+  * *Invariants*: IEEE polynomial (`0xEDB88320`).
+  * *Tests*: Known test vectors against standard POSIX crc32 outputs.
+  * *Completion*: CRC32 wrapper passing all vectors.
+
+### Sub-Phase 01.2: Database Key & Value Models
+* **P01-S02-M01: Key & Value Boundary Constraints & Validation**
+  * *Objective*: Implement validation functions enforcing $1 \le \text{KeyLen} \le 65,535$ and $0 \le \text{ValLen} \le 4\text{MB}$.
+  * *Changes*: `ValidateKey(key []byte) error`, `ValidateValue(val []byte) error`.
+  * *Security*: Rejects nil keys, oversized payloads.
+  * *Tests*: Test key size $0$, $65,535$, $65,536$; test value size $4\text{MB} + 1$.
+  * *Completion*: Boundary validation verified.
+* **P01-S02-M02: Operation Type & Sequence Number Abstractions**
+  * *Objective*: Define `OpType` byte (`0x01 = PUT`, `0x02 = TOMBSTONE`) and monotonic `SeqNum` uint64.
+  * *Changes*: `type OpType byte`, `type SeqNum uint64`, `type InternalKey struct`.
+  * *Invariants*: Internal key sorts by UserKey ascending, then SeqNum descending.
+  * *Tests*: Unit test internal key comparator ordering.
+  * *Completion*: Internal key comparison tested.
+
+---
+
+# Phase 02: Write-Ahead Log (WAL) & Durability Subsystem
+
+* **Major Objective**: Implement append-only binary WAL logging, CRC32 verification, segment rotation, and cooperative Group Commit.
+* **Dependencies**: Phase 01.
+* **Risks**: Torn writes, un-synced page cache data loss, disk space exhaustion.
+
+### Sub-Phase 02.1: WAL Binary Record Layout & Serialization
+* **P02-S01-M01: WAL Record Header & Framing Definition**
+  * *Objective*: Implement struct and serialization for 21-byte WAL header (`CRC32`, `Type`, `SeqNum`, `Timestamp`).
+  * *Changes*: `walRecordHeader` binary pack/unpack in `internal/wal`.
+  * *Invariants*: Header is fixed 21 bytes.
+  * *Tests*: Round-trip serialization and byte alignment validation.
+  * *Completion*: Header codec passing tests.
+* **P02-S01-M02: WAL Full Record Serializer & Deserializer**
+  * *Objective*: Serialize complete records (`Header + KeyLen + Key + ValLen + Val`).
+  * *Changes*: `EncodeRecord(record Record) ([]byte, error)`, `DecodeRecord(r io.Reader) (Record, error)`.
+  * *Invariants*: CRC32 is calculated over all bytes following the CRC field itself.
+  * *Tests*: Encode and decode records of varying sizes; verify CRC matches.
+  * *Completion*: Full record codec verified.
+* **P02-S01-M03: WAL Corruption & Checksum Verification Tests**
+  * *Objective*: Prove that corrupted bytes are intercepted.
+  * *Changes*: Test suite mutating random bytes in serialized records and verifying `ErrChecksumMismatch`.
+  * *Tests*: Single-bit flip tests across header, key, and value fields.
+  * *Completion*: 100% of bit flips detected.
+
+### Sub-Phase 02.2: WAL File Management & Append Operations
+* **P02-S02-M01: WAL File Creator & Directory Initializer**
+  * *Objective*: Safely initialize `<db_path>/wal/` directory with `0700` permissions.
+  * *Security*: Strict POSIX permissions prevent other local users from reading WAL data.
+  * *Tests*: Verify directory creation and permission bits on filesystem.
+  * *Completion*: Directory management verified.
+* **P02-S02-M02: Synchronous WAL Appender (`Strict Sync`)**
+  * *Objective*: Implement sequential file writer calling `file.Write()` followed by `fdatasync()`.
+  * *Changes*: `WALWriter.AppendSync(rec Record) error`.
+  * *Invariants*: Method does not return until `fdatasync()` completes.
+  * *Tests*: Append 1,000 records; verify file length and verify records replay cleanly.
+  * *Completion*: Synchronous appender passing tests.
+* **P02-S02-M03: Sequential WAL Reader & Log Iterator**
+  * *Objective*: Implement `WALReader` streaming records from disk from offset 0 to EOF.
+  * *Changes*: `WALReader.Next() (Record, error)`.
+  * *Tests*: Read back sequential log; verify sequence number monotonicity.
+  * *Completion*: Reader verified against multi-record log.
+
+### Sub-Phase 02.3: Torn Write Handling & Log Rotation
+* **P02-S03-M01: Torn Tail Write Detection & Safe Truncation**
+  * *Objective*: Implement recovery logic that detects partial writes at the end of the file and truncates them.
+  * *Changes*: `WALReader.RecoverAndTruncate() error`.
+  * *Invariants*: Mid-log corruption returns fatal error; EOF partial write truncates cleanly.
+  * *Tests*: Append partial record bytes to EOF; verify reader truncates and recovers preceding valid records.
+  * *Completion*: Torn write test passing.
+* **P02-S03-M02: WAL Segment Rotation & Pre-allocation**
+  * *Objective*: Rotate WAL file when size exceeds 64MB; pre-allocate via `fallocate()`.
+  * *Changes*: `WALWriter.Rotate() (*WALSegment, error)`.
+  * *Tests*: Append records exceeding 64MB; verify new segment `wal_000000000002.log` created.
+  * *Completion*: Segment rotation verified.
+
+### Sub-Phase 02.4: Group Commit Coalescing Pipeline
+* **P02-S04-M01: Group Commit Queue & Write Task Types**
+  * *Objective*: Implement concurrency-safe task channel holding pending writes and completion channels.
+  * *Changes*: `type writeTask struct`, `type groupCommitQueue struct`.
+  * *Invariants*: Memory queue bounded to avoid unbounded RAM accumulation.
+  * *Tests*: Multi-threaded enqueuing test under mock sync.
+  * *Completion*: Queue tested under concurrent load.
+* **P02-S04-M02: Group Commit Batch Runner & Cooperative fsync**
+  * *Objective*: Dedicated batch runner coalescing up to 1,024 writes or 64KB into a single `fdatasync()`.
+  * *Changes*: `groupCommitRunner()` event loop.
+  * *Invariants*: If sync succeeds, all tasks in batch notified of success; on failure, all receive error.
+  * *Tests*: 100 concurrent goroutines writing simultaneously; verify exactly 1 `fdatasync` per batch.
+  * *Completion*: Group commit verified with race detector clean.
+
+---
+
+# Phase 03: In-Memory MemTable & Concurrent SkipList
+
+* **Major Objective**: Implement the probabilistic concurrent SkipList supporting lock-free reads and exact memory accounting.
+* **Dependencies**: Phase 01.
+* **Risks**: Data races during concurrent forward pointer traversal, memory leaks.
+
+### Sub-Phase 03.1: SkipList Node & Level Generation
+* **P03-S01-M01: SkipList Node Memory Representation & Geometric Randomizer**
+  * *Objective*: Define node struct with forward pointer slices and geometric height randomizer ($p=0.25, L_{max}=16$).
+  * *Changes*: `newSkipListNode`, `randomHeight() int`.
+  * *Tests*: Statistical test verifying height distribution matches geometric curve over $100,000$ iterations.
+  * *Completion*: Height generator verified.
+* **P03-S01-M02: Single-Threaded SkipList Insertion & Lookup**
+  * *Objective*: Implement sequential `Insert(InternalKey, Value)` and `Search(UserKey)`.
+  * *Invariants*: Nodes maintained in strict ascending sorted order.
+  * *Tests*: Insert 10,000 random keys; verify all keys found; verify non-existent keys return nil.
+  * *Completion*: Basic SkipList tested.
+
+### Sub-Phase 03.2: Concurrent Traversal & Memory Accounting
+* **P03-S02-M01: Lock-Free Read Traversal via Atomic Pointer Reads**
+  * *Objective*: Use `atomic.LoadPointer` for traversing forward pointers, allowing readers to search without mutexes.
+  * *Changes*: `SearchConcurrent(key []byte) (Value, bool)`.
+  * *Invariants*: Readers never block writers; writers lock exclusively during pointer splicing.
+  * *Tests*: 16 reader goroutines + 1 writer goroutine running simultaneously under `go test -race`.
+  * *Completion*: Concurrent reads verified race-free.
+* **P03-S02-M02: Exact Byte-Level Memory Accounting**
+  * *Objective*: Track exact heap consumption of keys, values, node structs, and pointer arrays.
+  * *Changes*: `MemTable.ByteSize() uint64`.
+  * *Invariants*: `ByteSize()` updated atomically on each insertion.
+  * *Tests*: Insert known sizes; verify reported `ByteSize()` matches expected memory overhead within 1%.
+  * *Completion*: Memory accounting verified.
+
+### Sub-Phase 03.3: MemTable Iteration & Immutable Transition
+* **P03-S03-M01: Forward Iterator Implementation**
+  * *Objective*: Implement `Iterator` interface (`Seek`, `Next`, `Valid`, `Key`, `Value`).
+  * *Invariants*: Iterator yields records in ascending internal key order.
+  * *Tests*: Iterate through populated MemTable; assert lexicographical monotonicity.
+  * *Completion*: Iterator verified.
+* **P03-S03-M02: Atomic MemTable Freeze & Immutable Transition**
+  * *Objective*: Transition active MemTable to read-only `ImmutableMemTable`.
+  * *Changes*: `MemTable.Freeze()`, insert attempts on frozen table return `ErrMemTableFrozen`.
+  * *Tests*: Verify frozen table accepts no new writes but serves reads and iterations.
+  * *Completion*: Freeze transition tested.
+
+---
+
+# Phase 04: Persistent SSTable Subsystem
+
+* **Major Objective**: Construct immutable binary SSTables with prefix-compressed data blocks, sparse indexes, and 48-byte footers.
+* **Dependencies**: Phase 01, Phase 03.
+* **Risks**: Corrupted block alignments, binary search seek failures.
+
+### Sub-Phase 04.1: Data Block Construction & Prefix Compression
+* **P04-S01-M01: Data Block Builder with Prefix Compression**
+  * *Objective*: Implement `BlockBuilder` compressing consecutive sorted keys via shared prefix lengths.
+  * *Changes*: `BlockBuilder.Add(key, value []byte)`.
+  * *Invariants*: Restart points emitted every 16 keys with `SharedLen = 0`.
+  * *Tests*: Compress sequential keys (`user:1001`, `user:1002`); verify compression ratio $> 2\times$.
+  * *Completion*: Block builder compression verified.
+* **P04-S01-M02: Restart Array & Block Trailer Serialization**
+  * *Objective*: Append 32-bit restart point offsets and restart count to block tail; add CRC32 trailer.
+  * *Changes*: `BlockBuilder.Finish() []byte`.
+  * *Invariants*: Block ends with restart array followed by 1-byte compression type and 4-byte CRC32.
+  * *Tests*: Verify block trailer offset calculations.
+  * *Completion*: Block serialization complete.
+
+### Sub-Phase 04.2: SSTable Index & Footer Design
+* **P04-S02-M01: Sparse Two-Level Block Index Builder**
+  * *Objective*: Record largest key and file offset/size handle for each emitted data block.
+  * *Changes*: `IndexBuilder.AddBlock(largestKey []byte, handle BlockHandle)`.
+  * *Invariants*: Exactly one index entry per data block.
+  * *Tests*: Build index across 50 data blocks; verify all handles point to correct offsets.
+  * *Completion*: Index builder verified.
+* **P04-S02-M02: Fixed 48-Byte Footer Serializer & Parser**
+  * *Objective*: Implement encoding/decoding of 48-byte trailer (`MetaIndexHandle + IndexHandle + Padding + Magic`).
+  * *Changes*: `Footer.Encode()`, `Footer.Decode()`.
+  * *Invariants*: Magic equals `0x4C41545453535401`.
+  * *Tests*: Validate round-trip footer encode/decode; test rejection of invalid magic numbers.
+  * *Completion*: Footer codec verified.
+
+### Sub-Phase 04.3: SSTable File Writer & Reader
+* **P04-S03-M01: SSTable Sequential File Writer (`TableWriter`)**
+  * *Objective*: Stream data blocks from MemTable iterator to `.sst.tmp` file; write filter, index, footer; `fdatasync()`.
+  * *Changes*: `TableWriter.Build(iter MemTableIterator) (*SSTableMetadata, error)`.
+  * *Invariants*: File synced to disk before renaming to final `.sst` name.
+  * *Tests*: Flush a 4MB MemTable to SSTable; inspect binary layout.
+  * *Completion*: SSTable writer passing tests.
+* **P04-S03-M02: SSTable Block Reader & Sparse Index Binary Search**
+  * *Objective*: Open SSTable, read footer, load index block into RAM, binary search for target key's block handle.
+  * *Changes*: `TableReader.Seek(key []byte) ([]byte, error)`.
+  * *Tests*: Point lookup across 100,000 keys in SSTable; verify 100% correct values.
+  * *Completion*: SSTable reader verified.
+
+---
+
+# Phase 05: Probabilistic Bloom Filter Subsystem
+
+* **Major Objective**: Implement Murmur3-based Bloom filters with 10 bits/key to eliminate $>99\%$ of cold read disk accesses.
+* **Dependencies**: Phase 01.
+* **Risks**: Mathematical sizing errors, hash collisions, endianness bugs in bitset serialization.
+
+### Sub-Phase 05.1: Mathematical Modeling & Bitset Implementation
+* **P05-S01-M01: Bloom Filter Parameter Calculator & Bitset Allocator**
+  * *Objective*: Calculate optimal bitset length ($m = n \times 10$) and hash count ($k=7$).
+  * *Changes*: `NewBloomFilter(keyCount int) *BloomFilter`.
+  * *Tests*: Validate bitset memory sizing across various key counts ($100$ to $10,000,000$).
+  * *Completion*: Sizing verified.
+* **P05-S01-M02: Murmur3 Double-Hashing Implementation**
+  * *Objective*: Implement Kirsch-Mitzenmacher optimization generating $k$ hashes from two 64-bit hash values:
+    $$g_i(x) = h_1(x) + i \cdot h_2(x) \pmod{m}$$
+  * *Changes*: `BloomFilter.Add(key []byte)`, `BloomFilter.MayContain(key []byte) bool`.
+  * *Tests*: Insert 10,000 keys; verify `MayContain` returns true for all 10,000 keys (zero false negatives).
+  * *Completion*: Membership testing verified.
+
+### Sub-Phase 05.2: Filter Block Serialization & Empirical Testing
+* **P05-S02-M01: Filter Block Binary Serialization**
+  * *Objective*: Serialize Bloom bitset, append $k$ count byte, and integrate into SSTable filter block.
+  * *Changes*: `FilterBlockBuilder.Finish() []byte`.
+  * *Tests*: Round-trip filter serialization and deserialization.
+  * *Completion*: Filter block codec verified.
+* **P05-S02-M02: Empirical False-Positive Rate Verification Benchmark**
+  * *Objective*: Benchmark measuring false-positive rate across 1,000,000 non-existent keys.
+  * *Tests*: Assert empirical false positive rate $p \le 0.01$ (under 1%).
+  * *Completion*: Precision verified against mathematical model.
+
+---
+
+# Phase 06: Manifest Log & VersionSet Management
+
+* **Major Objective**: Implement the append-only `MANIFEST` log recording atomic `VersionEdit` state transitions, paired with a `CURRENT` pointer.
+* **Dependencies**: Phase 04.
+* **Risks**: Corrupted manifest state, memory leak of orphaned versions.
+
+### Sub-Phase 06.1: VersionEdit Protocol & Manifest Logging
+* **P06-S01-M01: `VersionEdit` Binary Representation**
+  * *Objective*: Define atomic edit struct recording `AddFile(level, meta)`, `DeleteFile(level, fileNum)`, `NextFileNum`, `LastSeqNum`.
+  * *Changes*: `VersionEdit.Encode()`, `VersionEdit.Decode()`.
+  * *Tests*: Test round-trip encoding of complex version edits.
+  * *Completion*: VersionEdit codec verified.
+* **P06-S01-M02: Append-Only MANIFEST Log Writer**
+  * *Objective*: Append serialized `VersionEdit` records to `MANIFEST-000001` with CRC32 framing.
+  * *Changes*: `ManifestWriter.LogEdit(edit VersionEdit) error`.
+  * *Invariants*: Manifest updates are flushed via `fdatasync()`.
+  * *Tests*: Append 50 edits; verify file contents and CRC integrity.
+  * *Completion*: Manifest logging tested.
+
+### Sub-Phase 06.2: CURRENT Pointer & VersionSet Invariants
+* **P06-S02-M01: Atomic CURRENT Pointer File Swapper**
+  * *Objective*: Write active manifest filename to `CURRENT.tmp` and swap atomically via `os.Rename()`.
+  * *Changes*: `SetCurrentManifest(dir string, manifestNum uint64) error`.
+  * *Tests*: Crash-safety test simulating power interruption during pointer write.
+  * *Completion*: Atomic pointer swap verified.
+* **P06-S02-M02: `VersionSet` & Version-Pinned Reference Counting**
+  * *Objective*: Maintain linked list of active `Version` structs with atomic `Ref()` and `Unref()`.
+  * *Changes*: `VersionSet.AppendVersion(v *Version)`, `Version.Ref()`, `Version.Unref()`.
+  * *Invariants*: SSTable physical file descriptors are never closed while `v.refCount > 0`.
+  * *Tests*: Multi-threaded test pinning versions while compactor simulates file deletions.
+  * *Completion*: Reference counting verified race-clean.
+
+---
+
+# Phase 07: Crash Recovery & Integrity Verification
+
+* **Major Objective**: Reconstruct complete database state upon startup from `CURRENT`, `MANIFEST`, and active WAL logs.
+* **Dependencies**: Phase 02, Phase 04, Phase 06.
+* **Risks**: Replay ordering bugs, failure to clean orphaned `.tmp` files.
+
+### Sub-Phase 07.1: Manifest Replay & Version Reconstruction
+* **P07-S01-M01: Boot Discovery & CURRENT Validation**
+  * *Objective*: Scan data directory on startup, parse `CURRENT`, open active `MANIFEST`.
+  * *Changes*: `Engine.RecoverManifest() (*Version, error)`.
+  * *Tests*: Replay empty DB boot; replay populated DB boot.
+  * *Completion*: Boot discovery verified.
+* **P07-S01-M02: Sequential VersionEdit Replay Engine**
+  * *Objective*: Replay `VersionEdit` records sequentially from manifest, reconstructing level arrays ($L_0..L_N$).
+  * *Invariants*: If any referenced `.sst` file is missing from disk, abort with `ErrMissingSSTable`.
+  * *Tests*: Replay 100 historical edits; verify reconstructed version matches expected level state.
+  * *Completion*: Replay engine verified.
+
+### Sub-Phase 07.2: WAL Replay & MemTable Restoration
+* **P07-S02-M01: Uncommitted WAL Discovery & Replay**
+  * *Objective*: Scan `/wal/` for logs newer than the manifest checkpoint, replay valid records into active MemTable.
+  * *Changes*: `Engine.RecoverWAL() error`.
+  * *Tests*: Write 500 records, crash process without flush; reboot and verify all 500 records present in MemTable.
+  * *Completion*: WAL replay passing tests.
+* **P07-S02-M02: Orphaned Temporary File Garbage Collector**
+  * *Objective*: Scan directory on boot and remove unreferenced `.tmp` files left by interrupted compactions or flushes.
+  * *Changes*: `Engine.CleanOrphanedFiles() error`.
+  * *Tests*: Inject fake `.tmp` files; verify recovery safely purges them without touching valid SSTables.
+  * *Completion*: Orphan GC verified.
+
+---
+
+# Phase 08: Leveled Compaction Subsystem
+
+* **Major Objective**: Implement asynchronous Leveled Compaction ($L0 \to L1 \to L_N$) using a min-heap k-way merge iterator.
+* **Dependencies**: Phase 04, Phase 06.
+* **Risks**: Write stalls, ghost key resurrects caused by premature tombstone purging, disk full during merge.
+
+### Sub-Phase 08.1: Compaction Scoring & Input Selection
+* **P08-S01-M01: Level Compaction Score Heuristics**
+  * *Objective*: Calculate score for $L0$ ($\text{FileCount} / 4$) and $L_1..L_N$ ($\text{TotalBytes} / \text{MaxBytes}$).
+  * *Changes*: `Compactor.PickCompactionLevel() (int, float64)`.
+  * *Invariants*: Level with score $\ge 1.0$ prioritized; $L0$ prioritized over deeper levels.
+  * *Tests*: Unit test scoring formula across simulated level metadata.
+  * *Completion*: Compaction scoring verified.
+* **P08-S01-M02: Overlapping Key Range File Selector**
+  * *Objective*: Pick file from $L_i$, calculate key range $[Key_{min}, Key_{max}]$, find all overlapping files in $L_{i+1}$.
+  * *Changes*: `Compactor.GetOverlappingInputs(level int, f *SSTableMetadata) []*SSTableMetadata`.
+  * *Tests*: Test key range intersection logic with non-overlapping and overlapping boundary cases.
+  * *Completion*: File selection verified.
+
+### Sub-Phase 08.2: K-Way Merge Sort & Tombstone Purging
+* **P08-S02-M01: Min-Heap K-Way Merge Iterator**
+  * *Objective*: Multi-file iterator using `container/heap` sorting by `Key` ascending, `SeqNum` descending.
+  * *Changes*: `NewMergingIterator(iters []Iterator) *MergingIterator`.
+  * *Invariants*: Yields newest record revision first; discards duplicate older revisions.
+  * *Tests*: Merge 4 files containing overlapping keys and revisions; verify output strictly sorted and deduplicated.
+  * *Completion*: K-way merge verified.
+* **P08-S02-M02: Tombstone Purge Safety Invariant Enforcer**
+  * *Objective*: Purge tombstone record if and only if key does not exist in any level deeper than target level.
+  * *Changes*: `Compactor.CanDropTombstone(key []byte, targetLevel int) bool`.
+  * *Tests*: Ghost key test: verify tombstone retained when older version exists in deeper level; verify tombstone dropped when no older version exists.
+  * *Completion*: Tombstone purge safety verified.
+
+### Sub-Phase 08.3: Compaction Execution & Manifest Commit
+* **P08-S03-M01: Compaction Output SSTable Generation**
+  * *Objective*: Stream merged records into new SSTable files partitioned at 2MB boundaries for $L \ge 1$.
+  * *Changes*: `Compactor.Run() error`.
+  * *Tests*: Execute simulated compaction; verify output files adhere to non-overlapping key range invariant.
+  * *Completion*: Compaction file generation verified.
+* **P08-S03-M02: Atomic Manifest Commit & Obsolete File Deletion**
+  * *Objective*: Commit `VersionEdit` deleting input files and adding output files; unlink obsolete files once unpinned.
+  * *Changes*: `VersionSet.LogAndApply(edit VersionEdit) error`.
+  * *Tests*: Verify atomic transition and file unlinking.
+  * *Completion*: Manifest commit tested.
+
+---
+
+# Phase 09: Sharded LRU Read Block Cache
+
+* **Major Objective**: Implement 16-shard concurrent LRU cache for 4KB SSTable data blocks to maximize read throughput.
+* **Dependencies**: Phase 01.
+* **Risks**: Lock contention across CPU cores, memory leaks.
+
+### Sub-Phase 09.1: LRU Doubly-Linked List & Sharding
+* **P09-S01-M01: Cache Shard Mutex & Doubly-Linked List**
+  * *Objective*: Implement single LRU cache shard using hash map and circular doubly-linked list.
+  * *Changes*: `type lruShard struct`, `lruShard.Get()`, `lruShard.Put()`.
+  * *Invariants*: Least recently accessed block evicted when capacity exceeded.
+  * *Tests*: Insert 100 blocks with capacity 50; verify first 50 evicted in order.
+  * *Completion*: Single shard verified.
+* **P09-S01-M02: 16-Way Sharded Cache Partitioning with Cache-Line Padding**
+  * *Objective*: Route block queries across 16 shards using high hash bits; pad shard structs to 64-byte boundaries.
+  * *Changes*: `ShardedBlockCache.Get(sstableID uint64, offset uint64)`.
+  * *Tests*: High-concurrency benchmark testing 64 goroutines reading cache simultaneously with zero false sharing.
+  * *Completion*: Sharded cache verified.
+
+---
+
+# Phase 10: Single-Node Storage Engine Integration
+
+* **Major Objective**: Wire together MemTable, WAL, SSTable reader, Compactor, Block Cache, and VersionSet into unified Engine interface.
+* **Dependencies**: Phases 01 through 09.
+* **Risks**: Write stalls, deadlocks between flusher and compactor.
+
+### Sub-Phase 10.1: Engine Dispatcher & CRUD Workflows
+* **P10-S01-M01: Unified `PUT`, `GET`, `DELETE` Engine API**
+  * *Objective*: Expose top-level `Engine` struct implementing single-node operations.
+  * *Changes*: `Engine.Put(k, v []byte)`, `Engine.Get(k []byte)`, `Engine.Delete(k []byte)`.
+  * *Tests*: End-to-end CRUD test executing 50,000 operations across memory and disk.
+  * *Completion*: Basic engine integration complete.
+* **P10-S01-M02: Asynchronous Background Flusher Pipeline**
+  * *Objective*: Monitor active MemTable size; when $>64\text{MB}$, atomically swap to `imm` and trigger background flush to $L0$.
+  * *Changes*: `Engine.flushLoop()`.
+  * *Invariants*: Writes continue to fresh active MemTable without blocking during flush I/O.
+  * *Tests*: Ingest 200MB data; verify multiple $L0$ files generated on disk.
+  * *Completion*: Flush pipeline verified.
+
+### Sub-Phase 10.2: Write Backpressure & Graceful Shutdown
+* **P10-S01-M03: Progressive Write Pacing & Stall Controller**
+  * *Objective*: Throttle incoming writes when $L0$ file count exceeds 8; stall when $>12$.
+  * *Changes*: `Engine.maybeDelayWrite()`.
+  * *Tests*: Saturate engine with writes; verify write latency smoothly increases rather than crashing with disk exhaustion.
+  * *Completion*: Write pacing verified.
+* **P10-S01-M04: Clean Engine Shutdown & Resource Reclamation**
+  * *Objective*: Flush active MemTable, wait for in-flight compactions to pause, sync manifest, close file descriptors.
+  * *Changes*: `Engine.Close() error`.
+  * *Tests*: Verify clean shutdown leaves zero uncommitted logs or open file leaks.
+  * *Completion*: Clean shutdown verified.
+
+---
+
+# Phase 11: TCP Binary Wire Protocol & Networking Subsystem
+
+* **Major Objective**: Implement high-throughput, length-prefixed binary framing protocol over raw TCP with frame-bomb protections.
+* **Dependencies**: Phase 10.
+* **Risks**: Unbounded memory allocation, slow client socket leaks, TCP head-of-line blocking.
+
+### Sub-Phase 11.1: Frame Parsing & Protocol State Machine
+* **P11-S01-M01: 18-Byte Header Decoder & CRC32 Validator**
+  * *Objective*: Decode magic (`0x4C415454`), OpCode, SeqID, PayloadLen, and verify frame CRC32.
+  * *Changes*: `FrameDecoder.DecodeHeader(r io.Reader) (*Header, error)`.
+  * *Security*: Rejects unknown magic immediately; rejects `PayloadLength > 5MB` with `ErrFrameTooLarge`.
+  * *Tests*: Test valid frames; test oversized frames; test CRC corruption.
+  * *Completion*: Frame decoder verified.
+* **P11-S01-M02: TCP Listener & Goroutine Connection Pool**
+  * *Objective*: Accept TCP connections, assign dedicated reader goroutine, dispatch requests to engine.
+  * *Changes*: `Server.Listen(addr string) error`.
+  * *Tests*: Connect 100 concurrent TCP clients; execute ping-pong `PUT`/`GET` requests.
+  * *Completion*: TCP server tested.
+
+---
+
+# Phase 12: CLI, Interactive REPL & Forensic Diagnostics
+
+* **Major Objective**: Deliver `lattice` server binary, `lattice-cli` REPL, and `inspect-sstable` forensic tooling.
+* **Dependencies**: Phase 11.
+
+* **P12-S01-M01: Server Daemon CLI Entrypoint (`cmd/lattice`)**
+  * *Objective*: Implement CLI flag parsing (`--config`, `--data-dir`, `--port`), signal handling (`SIGINT`, `SIGTERM`).
+* **P12-S01-M02: Interactive REPL Client (`cmd/lattice-cli`)**
+  * *Objective*: Interactive prompt supporting `PUT`, `GET`, `DELETE`, `EXISTS`, `STATS` commands with colored output.
+* **P12-S01-M03: SSTable Forensic Inspection Tool (`lattice inspect-sstable`)**
+  * *Objective*: Read raw SSTable file, print block counts, key ranges, Bloom filter stats, and restart points.
+* **P12-S01-M04: WAL Forensic Dump Tool (`lattice dump-wal`)**
+  * *Objective*: Decode and print every WAL record, sequence number, and CRC status for debugging corruptions.
+
+---
+
+# Phase 13: Benchmarking Suite & Performance Profiling
+
+* **Major Objective**: Build standalone load generator (`cmd/lattice-bench`) measuring P50, P90, P99, P99.9 latencies.
+* **Dependencies**: Phase 11.
+
+* **P13-S01-M01: Zipfian Key Distribution Generator**
+  * *Objective*: Generate non-uniform key access patterns ($s=0.99$) to simulate real-world read/write hotspots.
+* **P13-S01-M02: High-Resolution Latency Histogram Collector**
+  * *Objective*: Record nanosecond operation latencies into logarithmic buckets without GC allocation overhead.
+* **P13-S01-M03: Standalone Benchmark Load Runner**
+  * *Objective*: Multi-threaded client driver configurable by concurrency, read/write ratio, and duration.
+* **P13-S01-M04: `pprof` CPU & Memory Profiling Integration**
+  * *Objective*: Expose `/debug/pprof` endpoints on server; document profiling runbook.
+
+---
+
+# Phase 14: Distributed Cluster Foundations & Node Topology
+
+* **Major Objective**: Lay the groundwork for Version 1.1 clustering: node identity, peer RPC framing, and cluster configuration.
+* **Dependencies**: Phase 11.
+
+* **P14-S01-M01: Node Identity & Cluster Configuration Model**
+  * *Objective*: Parse cluster topology (Node IDs, peer IP:Port addresses) from config.
+* **P14-S01-M02: Peer-to-Peer RPC Framing Protocol**
+  * *Objective*: Implement binary frames for Raft RPCs (`RequestVote`, `AppendEntries`).
+* **P14-S01-M03: Outbound Peer Connection Manager**
+  * *Objective*: Maintain persistent TCP connection pools with automatic reconnect and keep-alive to all cluster peers.
+
+---
+
+# Phase 15: Raft Consensus Engine
+
+* **Major Objective**: Implement full single-group Raft consensus: elections, randomized timers, quorum log replication.
+* **Dependencies**: Phase 14.
+* **Risks**: Split-vote deadlocks, term regression, uncommitted log overwrites.
+
+### Sub-Phase 15.1: Persistent Raft State & Roles
+* **P15-S01-M01: Persistent Raft State (`currentTerm`, `votedFor`, `log[]`)**
+  * *Objective*: Persist Raft term and votes to disk before responding to RPCs.
+* **P15-S01-M02: Role State Transitions (Follower $\leftrightarrow$ Candidate $\leftrightarrow$ Leader)**
+  * *Objective*: Implement state machine governing node role transitions.
+
+### Sub-Phase 15.2: Leader Election & Heartbeats
+* **P15-S02-M01: Randomized Election Timer & `RequestVote` RPC**
+  * *Objective*: Election timer ($150-300\text{ms}$); broadcast `RequestVote` when expired.
+  * *Invariants*: Candidate must have log at least as up-to-date as voter to receive vote.
+* **P15-S02-M02: Quorum Vote Counting & Leader Transition**
+  * *Objective*: Transition to Leader upon receiving $\lfloor N/2 \rfloor + 1$ votes; send immediate heartbeats.
+* **P15-S02-M03: Periodic Heartbeat Scheduler (`AppendEntries` Empty)**
+  * *Objective*: Transmit heartbeats every $50\text{ms}$ to maintain leadership.
+
+### Sub-Phase 15.3: Log Replication & Quorum Commit
+* **P15-S03-M01: Proposal Ingestion & Log Append**
+  * *Objective*: Leader appends client proposal to local log, sends `AppendEntries` with `prevLogIndex` and `prevLogTerm`.
+* **P15-S03-M02: Log Matching Verification on Follower**
+  * *Objective*: Follower verifies preceding log entry; rejects if mismatched; leader decrements `nextIndex`.
+* **P15-S03-M03: Quorum Commit Index Advancement**
+  * *Objective*: Leader advances `commitIndex` when majority of peers acknowledge match; signals state machine.
+
+---
+
+# Phase 16: Distributed State Machine Replication
+
+* **Major Objective**: Connect Raft committed log stream to local LSM storage engine state machine.
+* **Dependencies**: Phase 10, Phase 15.
+
+* **P16-S01-M01: State Machine Apply Loop**
+  * *Objective*: Consume committed Raft entries sequentially and apply them to local LSM engine.
+* **P16-S01-M02: Client Proposal Routing & Follower Redirection**
+  * *Objective*: Follower nodes intercept client write requests and return redirect response with Leader address.
+
+---
+
+# Phase 17: Linearizable Reads (ReadIndex Protocol)
+
+* **Major Objective**: Eliminate stale reads under network partitions using the `ReadIndex` protocol.
+* **Dependencies**: Phase 16.
+
+* **P17-S01-M01: Leader Quorum Heartbeat Verification**
+  * *Objective*: Record current `commitIndex`, broadcast heartbeat to confirm active majority leadership.
+* **P17-S01-M02: State Machine Read Barrier Execution**
+  * *Objective*: Wait until local state machine applies up to recorded `commitIndex`, then serve read.
+  * *Tests*: Partition simulation verifying stale reads are never returned.
+
+---
+
+# Phase 18: Fault Injection & Chaos Testing Suite
+
+* **Major Objective**: Programmatically inject process crashes, torn writes, and network partitions to prove fault tolerance.
+* **Dependencies**: Phase 17.
+
+* **P18-S01-M01: Jepsen-Style Network Partition Simulation**
+  * *Objective*: Drop TCP packets between isolated leader and peers; assert zero split-brain writes committed.
+* **P18-S01-M02: Abrupt `SIGKILL` Chaos Monkey Loop**
+  * *Objective*: Continuously write data while sending random `kill -9` signals; assert zero acknowledged write loss.
+
+---
+
+# Phase 19: Comprehensive Security Hardening
+
+* **Major Objective**: Eliminate memory leaks, buffer overflows, path traversal, and connection exhaustion vulnerabilities.
+* **Dependencies**: Phase 11, Phase 18.
+
+* **P19-S01-M01: Strict Path Traversal Sanitization**
+  * *Objective*: Validate all file paths to prevent directory escaping attacks.
+* **P19-S01-M02: Network Connection Limits & Slowloris Protection**
+  * *Objective*: Enforce read/write connection deadlines and client connection limits ($4,096$).
+
+---
+
+# Phase 20: Production Hardening & Operational Observability
+
+* **Major Objective**: Instrument Prometheus metrics, structured health checks, and diagnostics.
+* **Dependencies**: Phase 19.
+
+* **P20-S01-M01: Prometheus Metrics HTTP Endpoint (`:9100/metrics`)**
+  * *Objective*: Export histograms for write/read latency, WAL bytes, compaction duration.
+* **P20-S01-M02: Liveness & Readiness Probes**
+  * *Objective*: HTTP endpoints reporting cluster health and disk storage thresholds.
+
+---
+
+# Phase 21: Resume & Technical Interview Portfolio Validation
+
+* **Major Objective**: Final review of all benchmark claims, test logs, code cleanliness, and interview readiness.
+* **Dependencies**: Phases 00 through 20.
+
+* **P21-S01-M01: Benchmark Evidence Verification & Documentation**
+  * *Objective*: Run reproducible 60-second benchmark on clean hardware; record P50/P99 latencies in README.
+* **P21-S01-M02: Interview Defense Rehearsal & Knowledge Base Audit**
+  * *Objective*: Complete final verification against [`docs/interview-knowledge.md`](interview-knowledge.md).
+
+---
+
+*End of Implementation Plan — Lattice v1.0.0-EXEC-PLAN*

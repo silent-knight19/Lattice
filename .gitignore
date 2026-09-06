@@ -1,0 +1,62 @@
+# Lattice — Systems Engine .gitignore
+
+# Compiled Binaries & Executables
+bin/
+lattice
+lattice-cli
+lattice-bench
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test & Coverage Artifacts
+*.test
+*.out
+c.out
+coverage.txt
+coverage.html
+
+# Profiling & Diagnostics (pprof)
+*.pprof
+cpu.pprof
+mem.pprof
+block.pprof
+mutex.pprof
+trace.out
+
+# Storage Engine & Database Runtime Directories
+data/
+wal/
+*.sst
+*.sst.tmp
+*.log.tmp
+*.tmp
+
+# Crash Dumps & Debugging Symbols
+core
+*.core
+*.dSYM/
+
+# OS-Specific Files
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+
+# IDE & Editor Directories
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Credentials & Secrets (Defense-in-Depth)
+*.pem
+*.key
+*.crt
+*.p12
+.env
+.env.*
