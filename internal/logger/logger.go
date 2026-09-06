@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"reflect"
 	"strings"
 )
 
@@ -189,6 +190,55 @@ func (l *defaultLogger) WithComponent(name string) Logger {
 	return &defaultLogger{inner: l.inner.With(slog.String("component", name))}
 }
 
+// safeRedact extracts the safe representation of a Redactable instance.
+// It defends against typed nil pointers and recovers from panics in custom Redact() implementations.
+func safeRedact(r Redactable) (res any, ok bool) {
+	if r == nil {
+		return nil, true
+	}
+	val := reflect.ValueOf(r)
+	switch val.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
+		if val.IsNil() {
+			return nil, true
+		}
+	}
+
+	defer func() {
+		if rec := recover(); rec != nil {
+			res = RedactedPlaceholder
+			ok = true
+		}
+	}()
+
+	return r.Redact(), true
+}
+
+// isSensitiveKey checks whether an attribute key matches exact or compound sensitive patterns.
+func isSensitiveKey(key string, exactMap map[string]struct{}) bool {
+	canonical := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(key)), "-", "_")
+	if _, exists := exactMap[canonical]; exists {
+		return true
+	}
+
+	if strings.Contains(canonical, "password") ||
+		strings.Contains(canonical, "passwd") ||
+		strings.Contains(canonical, "secret") ||
+		strings.Contains(canonical, "credential") ||
+		strings.Contains(canonical, "private_key") ||
+		strings.Contains(canonical, "privatekey") ||
+		strings.Contains(canonical, "api_key") ||
+		strings.Contains(canonical, "apikey") ||
+		strings.HasSuffix(canonical, "_token") ||
+		canonical == "token" ||
+		canonical == "auth" ||
+		canonical == "authorization" {
+		return true
+	}
+
+	return false
+}
+
 // makeReplaceAttr builds an attribute replacement function that masks sensitive keys
 // and supports custom Redactable types.
 func makeReplaceAttr(customRedacted []string) func(groups []string, a slog.Attr) slog.Attr {
@@ -197,7 +247,7 @@ func makeReplaceAttr(customRedacted []string) func(groups []string, a slog.Attr)
 		redactedMap[k] = struct{}{}
 	}
 	for _, k := range customRedacted {
-		normalized := strings.ToLower(strings.TrimSpace(k))
+		normalized := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(k)), "-", "_")
 		if normalized != "" {
 			redactedMap[normalized] = struct{}{}
 		}
@@ -209,13 +259,14 @@ func makeReplaceAttr(customRedacted []string) func(groups []string, a slog.Attr)
 		}
 
 		// Check if the attribute value implements Redactable.
-		if r, ok := a.Value.Any().(Redactable); ok && r != nil {
-			return slog.Any(a.Key, r.Redact())
+		if r, ok := a.Value.Any().(Redactable); ok {
+			if safeVal, safe := safeRedact(r); safe {
+				return slog.Any(a.Key, safeVal)
+			}
 		}
 
 		// Check if the attribute key is marked for redaction.
-		normalizedKey := strings.ToLower(strings.TrimSpace(a.Key))
-		if _, shouldRedact := redactedMap[normalizedKey]; shouldRedact {
+		if isSensitiveKey(a.Key, redactedMap) {
 			return slog.String(a.Key, RedactedPlaceholder)
 		}
 

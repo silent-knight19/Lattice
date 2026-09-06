@@ -43,6 +43,9 @@ type KeyTooLargeError struct {
 }
 
 func (e *KeyTooLargeError) Error() string {
+	if e == nil {
+		return ErrKeyTooLarge.Error()
+	}
 	return fmt.Sprintf("key size %d bytes exceeds maximum allowed size of %d bytes", e.KeySize, e.MaxSize)
 }
 
@@ -60,6 +63,9 @@ type ValueTooLargeError struct {
 }
 
 func (e *ValueTooLargeError) Error() string {
+	if e == nil {
+		return ErrValueTooLarge.Error()
+	}
 	return fmt.Sprintf("value size %d bytes exceeds maximum allowed size of %d bytes", e.ValueSize, e.MaxSize)
 }
 
@@ -77,6 +83,9 @@ type ChecksumMismatchError struct {
 }
 
 func (e *ChecksumMismatchError) Error() string {
+	if e == nil {
+		return ErrChecksumMismatch.Error()
+	}
 	return fmt.Sprintf("checksum mismatch at offset %d: expected 0x%08x, got 0x%08x", e.Offset, e.Expected, e.Actual)
 }
 
@@ -94,6 +103,9 @@ type TornWriteError struct {
 }
 
 func (e *TornWriteError) Error() string {
+	if e == nil {
+		return ErrTornWrite.Error()
+	}
 	if e.Reason != "" {
 		return fmt.Sprintf("torn write detected at tail offset %d: %s", e.Offset, e.Reason)
 	}

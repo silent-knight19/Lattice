@@ -465,3 +465,134 @@ func TestEmptyWriterDiscard(t *testing.T) {
 	log := logger.NewJSON(io.Discard, logger.LevelInfo)
 	log.Info("writing to discard", "status", "ok")
 }
+
+func TestCompoundSensitiveKeyRedaction(t *testing.T) {
+	compoundKeys := []struct {
+		key   string
+		value string
+	}{
+		{"db_password", "super-secret-db-pass"},
+		{"client_secret", "oauth-client-secret-999"},
+		{"auth_token", "bearer-token-val"},
+		{"session_token", "session-token-xyz"},
+		{"api-key", "api-key-with-hyphen"},
+		{"private-key", "private-key-with-hyphen"},
+		{"jwt_token", "jwt-token-string"},
+	}
+
+	for _, tc := range compoundKeys {
+		t.Run(tc.key, func(t *testing.T) {
+			var buf bytes.Buffer
+			log := logger.NewJSON(&buf, logger.LevelInfo)
+			log.Info("compound key test", tc.key, tc.value, "token_count", 42)
+
+			var data map[string]any
+			if err := json.Unmarshal(buf.Bytes(), &data); err != nil {
+				t.Fatalf("failed to parse JSON: %v", err)
+			}
+
+			if data[tc.key] != logger.RedactedPlaceholder {
+				t.Errorf("expected key %q to be redacted, got %v", tc.key, data[tc.key])
+			}
+			// Verify token_count was NOT mistakenly redacted
+			if tc.key != "token_count" {
+				if count, ok := data["token_count"].(float64); !ok || int(count) != 42 {
+					t.Errorf("expected token_count to remain intact as 42, got %v", data["token_count"])
+				}
+			}
+		})
+	}
+}
+
+type typedNilRedactable struct {
+	Secret string
+}
+
+func (n *typedNilRedactable) Redact() any {
+	return map[string]string{"Secret": n.Secret}
+}
+
+func TestNilRedactablePointer(t *testing.T) {
+	var buf bytes.Buffer
+	log := logger.NewJSON(&buf, logger.LevelInfo)
+
+	var nilObj *typedNilRedactable = nil
+
+	// Must not panic when logging typed nil Redactable
+	log.Info("testing nil redactable", "nil_redactable", nilObj)
+
+	var data map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &data); err != nil {
+		t.Fatalf("failed to parse JSON: %v", err)
+	}
+
+	if data["nil_redactable"] != nil {
+		t.Errorf("expected nil_redactable to be nil/null, got %v", data["nil_redactable"])
+	}
+}
+
+type panickingRedactable struct{}
+
+func (p panickingRedactable) Redact() any {
+	panic("exploit attempt in custom Redact()")
+}
+
+func TestPanickingRedactable(t *testing.T) {
+	var buf bytes.Buffer
+	log := logger.NewJSON(&buf, logger.LevelInfo)
+
+	// Must recover from panicking Redact() and not crash the process
+	log.Info("testing panicking redactable", "exploit", panickingRedactable{})
+
+	var data map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &data); err != nil {
+		t.Fatalf("failed to parse JSON: %v", err)
+	}
+
+	if data["exploit"] != logger.RedactedPlaceholder {
+		t.Errorf("expected panicking redactable to be masked with placeholder, got %v", data["exploit"])
+	}
+}
+
+type errWriter struct {
+	err error
+}
+
+func (w *errWriter) Write(p []byte) (int, error) {
+	return 0, w.err
+}
+
+func TestFailingWriterDoesNotPanic(t *testing.T) {
+	w := &errWriter{err: errors.New("simulated disk I/O error")}
+	log := logger.NewJSON(w, logger.LevelInfo)
+
+	// Writing to failing writer must not panic
+	log.Info("message to failing writer", "key", "val")
+}
+
+func TestMalformedArguments(t *testing.T) {
+	var buf bytes.Buffer
+	log := logger.NewJSON(&buf, logger.LevelInfo)
+
+	// Odd number of arguments: must not panic
+	log.Info("odd arguments", "key_only")
+
+	// Non-string keys: must not panic
+	log.Info("non-string key", 12345, "val")
+
+	if buf.Len() == 0 {
+		t.Errorf("expected log output to be produced despite malformed arguments")
+	}
+}
+
+func TestHugeAttributePayload(t *testing.T) {
+	var buf bytes.Buffer
+	log := logger.NewJSON(&buf, logger.LevelInfo)
+
+	hugePayload := strings.Repeat("X", 1024*1024) // 1 MB
+	log.Info("huge payload", "data", hugePayload)
+
+	if buf.Len() < 1024*1024 {
+		t.Errorf("expected output buffer to contain 1MB payload")
+	}
+}

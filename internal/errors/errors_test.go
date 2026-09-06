@@ -273,3 +273,38 @@ func TestErrorsAsNegativeExtraction(t *testing.T) {
 		t.Errorf("target pointer should remain nil when extraction fails")
 	}
 }
+
+func TestNilReceiverTypedErrors(t *testing.T) {
+	var k *errors.KeyTooLargeError
+	var v *errors.ValueTooLargeError
+	var c *errors.ChecksumMismatchError
+	var tw *errors.TornWriteError
+
+	// Ensure calling Error() on nil typed pointers does not panic and returns sentinel strings
+	if k.Error() != errors.ErrKeyTooLarge.Error() {
+		t.Errorf("expected %q, got %q", errors.ErrKeyTooLarge.Error(), k.Error())
+	}
+	if v.Error() != errors.ErrValueTooLarge.Error() {
+		t.Errorf("expected %q, got %q", errors.ErrValueTooLarge.Error(), v.Error())
+	}
+	if c.Error() != errors.ErrChecksumMismatch.Error() {
+		t.Errorf("expected %q, got %q", errors.ErrChecksumMismatch.Error(), c.Error())
+	}
+	if tw.Error() != errors.ErrTornWrite.Error() {
+		t.Errorf("expected %q, got %q", errors.ErrTornWrite.Error(), tw.Error())
+	}
+
+	// Ensure calling Is() on nil typed pointers matches corresponding sentinels
+	if !k.Is(errors.ErrKeyTooLarge) {
+		t.Errorf("nil *KeyTooLargeError must match ErrKeyTooLarge via Is()")
+	}
+	if !v.Is(errors.ErrValueTooLarge) {
+		t.Errorf("nil *ValueTooLargeError must match ErrValueTooLarge via Is()")
+	}
+	if !c.Is(errors.ErrChecksumMismatch) {
+		t.Errorf("nil *ChecksumMismatchError must match ErrChecksumMismatch via Is()")
+	}
+	if !tw.Is(errors.ErrTornWrite) {
+		t.Errorf("nil *TornWriteError must match ErrTornWrite via Is()")
+	}
+}
