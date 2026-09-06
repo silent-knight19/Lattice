@@ -2,7 +2,7 @@
 
 > **A High-Performance Distributed Key-Value Storage Engine Being Built from the Ground Up**
 
-[![Status: Engineering Foundations](https://img.shields.io/badge/Status-Engineering%20Foundations-blue.svg)](#)
+[![Status: Phase 00 Complete](https://img.shields.io/badge/Status-Phase%2000%20Complete-blue.svg)](#)
 [![Design Spec](https://img.shields.io/badge/Docs-Architecture%20Spec-blue.svg)](docs/architecture-spec.md)
 [![Implementation Plan](https://img.shields.io/badge/Docs-Implementation%20Plan-green.svg)](docs/implementation-plan.md)
 [![Interview Knowledge](https://img.shields.io/badge/Docs-Interview%20Defense-purple.svg)](docs/interview-knowledge.md)
@@ -79,8 +79,8 @@ The system design specifies the following architectural targets (currently under
 * [x] **Architecture Decision Records (ADR 001–008)** — Completed in [`docs/decisions/`](docs/decisions/)
 * [x] **Living Known Limitations Document** — Completed in [`docs/known-limitations.md`](docs/known-limitations.md)
 * [x] **System Security Threat Model** — Completed in [`docs/threat-model.md`](docs/threat-model.md)
-* [ ] **Phase 00: Repository & Engineering Foundations** (Ready for `P00-S01-M01`)
-* [ ] **Phase 01: Core Storage Primitives & Binary Encodings**
+* [x] **Phase 00: Repository & Engineering Foundations** — Completed (Audit: Pass with Remediations)
+* [ ] **Phase 01: Core Storage Primitives & Binary Encodings** (Next: `P01-S01-M01`)
 * [ ] **Phase 02: Write-Ahead Log (WAL) & Durability Subsystem**
 * [ ] **Phase 03: In-Memory MemTable & Concurrent SkipList**
 * [ ] **Phase 04: Persistent SSTable Subsystem**
