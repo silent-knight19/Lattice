@@ -60,6 +60,24 @@
   - Installation must use trusted, auditable sources (e.g. verified Homebrew core bottles) rather than unverified `curl | sh` scripts.
   - Tooling configuration must be pinned in version control (`.golangci.yml`) to guarantee identical analysis across local workstations and CI environments.
 * **Distinguishing Correctness Bugs from Stylistic Heuristics**: Systems engineers must differentiate between true correctness defects and subjective compiler heuristics. For example, `govet`'s `fieldalignment` analyzer suggests rearranging struct fields to minimize memory padding. However, in low-level database engines, struct fields are often intentionally arranged to align with hardware cache lines (64 bytes) to prevent false sharing between concurrent threads, or to mirror on-disk binary layouts. Naively following `fieldalignment` destroys concurrency isolation; hence it is intentionally disabled.
+* **Sentinel Errors vs. Contextual Typed Errors**:
+  - *Sentinel errors* (e.g. `ErrKeyNotFound = errors.New("key not found")`) provide constant, pre-allocated identity. They are optimal for expected domain conditions where the error identity alone dictates control flow (e.g., return 404/not-found to client) without allocation overhead.
+  - *Typed errors* (e.g. `KeyTooLargeError`, `ChecksumMismatchError`) are custom structs implementing the `error` interface. They carry structured diagnostic data (e.g., offsets, expected vs actual checksums, byte limits) essential for debugging, recovery, or logging.
+* **Go 1.13+ Error Wrapping & `errors.Is` / `errors.As` Mechanics**:
+  - In Go 1.13+, wrapping an error using `fmt.Errorf("...: %w", err)` creates an error chain linked by an `Unwrap() error` (or `Unwrap() []error` in Go 1.20+) method.
+  - `errors.Is(err, target)` walks the chain using `Unwrap()`. At each node, it checks for equality or calls `Is(error) bool` if implemented on the error.
+  - `errors.As(err, target)` walks the chain looking for an error assignable to the type pointed to by `target`.
+  - By implementing `func (e *KeyTooLargeError) Is(target error) bool { return target == ErrKeyTooLarge }`, a custom typed error automatically satisfies `errors.Is(wrapped, ErrKeyTooLarge)` anywhere in the unwrap chain!
+* **Why Direct Error Equality (`err == ...`) Is Dangerous**: In modern Go, functions regularly annotate errors with contextual subsystem names (`fmt.Errorf("sstable read block: %w", err)`). If caller code compares using direct equality (`err == ErrChecksumMismatch`), the comparison returns `false` because the wrapped wrapper struct is not identical to the original sentinel. Comparing with `errors.Is(err, ErrChecksumMismatch)` traverses the unwrap chain and correctly detects the root cause.
+* **Storage Engine Error Taxonomy & Semantic Boundaries**:
+  - A storage engine must clearly separate operational states from catastrophic data corruptions.
+  - *Expected domain conditions* (`ErrKeyNotFound`, `ErrEmptyKey`): Handled routinely in normal client request lifecycles.
+  - *Constraint violations* (`ErrKeyTooLarge`, `ErrValueTooLarge`): Rejected at the boundary to prevent memory or buffer exhaustion.
+  - *Transient resource conflicts* (`ErrCompactionRunning`): Operational cues that tell schedulers or maintenance workers to retry later.
+  - *Data integrity failures* (`ErrChecksumMismatch`): Indicates media corruption, bit rot, or tampering; requires read-repair or fail-stop.
+  - *Recovery cues* (`ErrTornWrite`): Signals a clean tail interruption from ungraceful shutdown/power loss, authorizing automated log truncation during startup replay.
+* **Privacy & Defensive Formatting in Error Types**: Database systems frequently handle sensitive data (passwords, auth tokens, personal identifiers). If a key or value exceeds size limits, formatting the raw payload into the error string (e.g. `fmt.Sprintf("invalid key %s", key)`) risks writing sensitive customer secrets into plain-text application or cluster logs. In Lattice, `KeyTooLargeError` and `ValueTooLargeError` deliberately log only numeric byte sizes and limits, never raw bytes.
+* **Leaf Package Architecture for Domain Errors**: `internal/errors` is designed as a strict leaf package with zero internal dependencies. Because errors are shared across all layers—from low-level binary encodings to top-level engines and network transports—placing errors in a leaf package eliminates any possibility of circular import cycles (`import cycle not allowed`).
 * **Endianness**: Big-Endian (Network Byte Order) stores the most significant byte at the lowest memory address; Little-Endian stores the least significant byte first. Network protocols and on-disk files must specify a canonical byte order to remain portable across CPU architectures.
 * **Variable-Length Integers (Varints)**: 7-bit varints encode small integers in fewer bytes by using the high bit ($0\text{x}80$) as a continuation flag. An integer $\le 127$ uses 1 byte, while $2^{64}-1$ uses 10 bytes.
 * **Memory Allocation & GC Pressure**: Creating millions of small heap allocations triggers frequent Go Garbage Collector mark-and-sweep cycles, stealing CPU cycles and introducing millisecond-level tail latency spikes. `sync.Pool` provides zero-allocation buffer reuse.
@@ -74,6 +92,12 @@
 * **Decision**: Enable high-signal linters (`govet`, `errcheck`, `staticcheck`, `ineffassign`, `unused`, `errorlint`, `nolintlint`) and `gofmt` while explicitly disabling noisy rules (`shadow`, `fieldalignment`).
 * **Alternative Considered**: Enabling all 70+ available linters in `golangci-lint` or relying solely on `go vet`.
 * **Trade-off**: Requires conscious configuration curation in `.golangci.yml`, but eliminates linter fatigue while providing bulletproof static verification against unchecked disk I/O errors and runtime type-assertion panics.
+* **Decision**: Dual sentinel and contextual typed error architecture (`KeyTooLargeError`, `ValueTooLargeError`, `ChecksumMismatchError`, `TornWriteError` implementing `Is(target error) bool` matching sentinels).
+* **Alternative Considered**: Sentinel errors only (string-based) or heavy hierarchical exception classes.
+* **Trade-off**: Requires defining both sentinels and error structs with custom `Is()` methods, but provides zero-allocation sentinel checks for simple callers while enabling structured diagnostic inspection (`errors.As`) without breaking `%w` unwrap chains.
+* **Decision**: Omitting raw key/value byte slices from size violation error structs (`KeyTooLargeError`, `ValueTooLargeError`), recording only sizes and thresholds.
+* **Alternative Considered**: Formatting raw key/value strings into error messages for debugging convenience.
+* **Trade-off**: Callers cannot inspect the raw payload directly from the error object, but completely prevents sensitive customer data, tokens, or PII from leaking into logs.
 * **Decision**: Big-Endian encoding for all fixed-width integer fields; unsigned varints for internal data block offsets.
 * **Trade-off**: Big-Endian requires bit-shifting on x86 machines, but guarantees deterministic portability across platforms and aligns with network standards.
 
@@ -82,11 +106,13 @@
 * **Varint Bomb Vulnerability**: A malicious stream containing endless continuation bytes ($0\text{x}80$) could cause an infinite loop or integer overflow. Lattice limits varint decoding to a maximum of 10 bytes; anything beyond returns `ErrVarintOverflow`.
 * **Subsystem Isolation as Defense-in-Depth**: By keeping all storage engine implementation details inside `internal/`, we prevent external code or rogue consumer modules from accessing internal unexported memory pools, raw block caches, or un-synchronized file descriptors.
 * **Audit-Proof Suppressions via `nolintlint`**: Unchecked use of `//nolint` can allow developers to bypass critical security and durability checks. By enforcing `require-specific: true` and `require-explanation: true`, any lint suppression must name the specific analyzer and justify the override in code review.
+* **Log Redaction at Error Generation**: Error types represent a primary vector for accidental credential and secret leakage. By designing error types that capture only metadata (byte lengths, byte offsets, CRC32 checksums) and strictly omitting raw byte payloads, Lattice prevents credentials or sensitive values from ever being written to log aggregators.
 
 ### Performance & Hardware Dynamics
 * Standard library `binary.BigEndian.PutUint64` is inlined by the Go compiler into single register swap instructions (`BSWAP` on x86), incurring zero runtime function call overhead.
 * Package boundary placement has zero runtime CPU cost in Go; inlining and compiler optimizations occur across package boundaries during compilation.
 * Disabling naive `fieldalignment` struct packing preserves intentional hardware cache-line padding (e.g. 64-byte spacing between write sequencer atomics and background flush pointers), preventing catastrophic multicore bus invalidation.
+* Pre-allocated sentinel errors (`ErrKeyNotFound`, `ErrEmptyKey`) incur zero heap allocations on error return paths, preventing GC churn during frequent cache misses or negative key queries.
 
 ### Subsystem Interview Questions
 * **Basic**: What is a Go module, and how does `go.mod` differ from the legacy `$GOPATH` workspace model?
@@ -103,6 +129,10 @@
 * **"Did You Actually Build This?"**: Why did you explicitly disable `fieldalignment` in `govet` for a database storage engine?
 * **"Did You Actually Build This?"**: What syntax difference exists between `golangci-lint` v1 and v2 regarding formatting tools like `gofmt`?
 * **"Did You Actually Build This?"**: Why did you configure `nolintlint` with `require-specific: true` and `require-explanation: true`?
+* **"Did You Actually Build This?"**: Why does `KeyTooLargeError` implement `Is(target error) bool` returning `target == ErrKeyTooLarge`?
+* **"Did You Actually Build This?"**: What is the critical control-flow difference between `ErrChecksumMismatch` and `ErrTornWrite` during WAL startup recovery?
+* **"Did You Actually Build This?"**: Why does `internal/errors/errors.go` import the standard library as `import stdErrors "errors"`?
+* **"Did You Actually Build This?"**: Why don't Lattice's size limit errors (`KeyTooLargeError`, `ValueTooLargeError`) include the offending key or value bytes in their `.Error()` string?
 
 ---
 
@@ -517,6 +547,20 @@ This section is a living record of actual engineering obstacles, debugging sessi
 - **Fix Applied**: Configured `.golangci.yml` (v2 schema) with `govet` (excluding `shadow` and `fieldalignment`), `errcheck` (`check-type-assertions: true`), `staticcheck`, `ineffassign`, `unused`, `errorlint`, `nolintlint`, and `gofmt` formatter; verified that `max-issues-per-linter: 0` ensures zero truncated findings.
 - **Core Lesson**: Static analysis in systems engineering must be optimized for signal over quantity. Linters must strictly protect durability invariants (forcing disk I/O error checking) while actively suppressing superficial heuristics that undermine low-level hardware concurrency design.
 - **Interview Relevance**: Demonstrates production-grade engineering maturity: deep knowledge of static analysis ASTs vs compiler passes, appreciation of cache-line dynamics over naive struct packing, supply-chain hygiene (hermetic dev tooling), and defense-in-depth code quality enforcement.
+
+### Entry 2026-09-06 — P00-S02-M01: Establishing Domain Error Vocabulary & Non-Leaking Diagnostics
+- **Date**: 2026-09-06
+- **Micro-Phase**: P00-S02-M01
+- **Problem**: Define a cohesive, leaf-package domain error architecture in `internal/errors` that distinguishes operational conditions from media corruptions and recovery signals, without leaking sensitive customer payload data into log streams.
+- **Initial Assumption**: Can define simple string sentinels or embed raw keys and values directly into error formatting strings for debugging convenience.
+- **What Was Actually True**:
+  1. Formatting user-supplied keys and values into error strings (e.g. `fmt.Sprintf("key %s exceeds limit", key)`) creates a critical security vulnerability: passwords, authorization bearer tokens, and PII get written directly to plain-text application logs during validation failures.
+  2. Callers need both constant sentinel identity (for zero-allocation `errors.Is(err, ErrKeyTooLarge)`) and structured diagnostics (e.g., actual size vs limit). This requires custom error structs (`KeyTooLargeError`, `ValueTooLargeError`, `ChecksumMismatchError`, `TornWriteError`) implementing `Is(target error) bool` returning equality against the sentinel.
+  3. Inside `package errors`, importing the standard library `errors` package creates an identifier collision unless aliased (e.g., `import stdErrors "errors"`).
+- **How It Was Discovered**: Security threat modeling of logging pipelines and race-detector unit testing of `%w` error unwrap chains in `internal/errors/errors_test.go`.
+- **Fix Applied**: Implemented leaf package `internal/errors` with 7 sentinels and 4 contextual typed errors implementing `Is(error) bool`; omitted raw payload byte slices from error types, logging only numeric lengths, limits, and offsets; validated 100% of error unwrap and `errors.As` extraction paths under `go test -race`.
+- **Core Lesson**: Error types are part of the system's security boundary and observability contract. By designing errors that separate high-level classification (`errors.Is`) from diagnostic detail (`errors.As`), and strictly censoring raw data at the point of origin, systems engines achieve durability, auditability, and data confidentiality simultaneously.
+- **Interview Relevance**: Demonstrates advanced Go error design patterns (`Is(error) bool` matching, `errors.As` type extraction, `%w` unwrap propagation), threat-model-conscious error formatting, and modular leaf-package decoupling.
 
 ---
 

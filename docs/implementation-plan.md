@@ -350,13 +350,13 @@ Every future micro-phase implementation response from Claude Code must use this 
 ```
 Current Major Phase           : Phase 00 — Repository & Engineering Foundations
 Current Sub-Phase             : Sub-Phase 00.2 — Core Error Architecture
-Current Micro-Phase           : P00-S02-M01 — Domain Error Types & Sentinel Definitions
-Previous Completed Micro-Phase: P00-S01-M03 — Static Analysis & Linter Configuration
+Current Micro-Phase           : P00-S02-M02 — Internal Logging Foundation
+Previous Completed Micro-Phase: P00-S02-M01 — Domain Error Types & Sentinel Definitions
 Blocking Issues               : None
-Tests Passing                 : `go build ./...`, `go vet ./...`, `go test ./...`, `golangci-lint run ./...` passed across all 17 packages; `gofmt -l .` clean; `go mod verify` passed
-Security Review Status        : Clean (Zero external dependencies in go.mod, hermetic dev tooling via bottled golangci-lint, unhandled errors fail lint, nolintlint prevents blanket suppressions)
-Interview Knowledge Status    : Updated with static analysis vs go vet, compiler limitations, linter fatigue, and interview defense questions
-Git Commit                    : 0eb5d0c (P00-S01-M03 checkpoint)
+Tests Passing                 : `go test -race ./...` (8/8 error test suites passing), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
+Security Review Status        : Clean (Zero sensitive payload leakage in error strings, no raw key/value printing, audit-proof wrapping)
+Interview Knowledge Status    : Updated with sentinel vs typed errors, errors.Is/As mechanics, %w wrapping, and interview defense questions
+Git Commit                    : 9478968 (P00-S02-M01 checkpoint)
 ```
 
 ---
@@ -504,12 +504,35 @@ TOTAL: 184 Discrete, Testable Micro-Phases
 
 ### Sub-Phase 00.2: Core Error Architecture
 * **P00-S02-M01: Domain Error Types & Sentinel Definitions**
+  * *Status*: Completed
   * *Objective*: Define structured domain errors in `internal/errors`.
   * *Preconditions*: P00-S01-M03.
-  * *Changes*: Define `ErrKeyNotFound`, `ErrKeyTooLarge`, `ErrValueTooLarge`, `ErrChecksumMismatch`, `ErrTornWrite`, `ErrCompactionRunning`.
-  * *Invariants*: All domain errors implement `error` and support `errors.Is()`.
-  * *Tests*: Unit test verifying error wrapping and `errors.Is()` comparisons.
-  * *Completion*: Structured error types exported.
+  * *Domain Errors Defined*:
+    - Sentinels in `internal/errors/errors.go`: `ErrKeyNotFound`, `ErrEmptyKey`, `ErrKeyTooLarge`, `ErrValueTooLarge`, `ErrChecksumMismatch`, `ErrTornWrite`, `ErrCompactionRunning`.
+    - Contextual typed errors: `KeyTooLargeError`, `ValueTooLargeError`, `ChecksumMismatchError`, `TornWriteError`, each implementing `Error() string` and `Is(target error) bool` matching its corresponding sentinel.
+  * *Invariants*:
+    - All domain errors implement `error` and participate in `errors.Is()` / `errors.As()`.
+    - Leaf package isolation: `internal/errors` has zero internal dependencies to prevent import cycles.
+    - Zero data leakage: raw key or value bytes are never formatted into error strings; only numeric sizes, limits, CRC32 checksums, and log offsets are logged.
+  * *Tests*: Added `internal/errors/errors_test.go` verifying:
+    - Sentinel identity and error message string checks.
+    - Single and multi-level `%w` wrapping with `errors.Is()`.
+    - Typed error `errors.Is()` matching and negative matches.
+    - `errors.As()` field extraction (`KeySize`, `MaxSize`, `Expected`, `Actual`, `Offset`, `Reason`).
+    - Negative extraction and cross-sentinel mismatch guarantees.
+  * *Verification Performed*:
+    - `go test -race -v ./...` (PASS, 0 race conditions, 8 test suites passing)
+    - `go vet ./...` (Exit 0, static analysis clean)
+    - `golangci-lint run ./...` (Exit 0, 0 issues)
+    - `gofmt -l .` (Clean, zero unformatted files)
+    - `go mod verify` (Exit 0, hermetic modules verified)
+  * *Evidence Classification*:
+    - *Design Target*: Minimal, cohesive domain error vocabulary allowing callers to differentiate operational conditions (missing key, size violations, torn write recovery).
+    - *Theoretical Property*: `errors.Is` recursively unwraps errors and queries `Is(error) bool`, allowing typed structs to match sentinels without pointer equality.
+    - *Measured Result*: 8 unit test suites in `internal/errors` passed under race detector (`-race`) in 1.585s with 0 linter warnings.
+    - *Observed Limitation*: Leaf package `internal/errors` intentionally aliases standard library `import stdErrors "errors"` to avoid package namespace collision.
+  * *Completion*: Domain error foundation established, tested, and verified.
+  * *Next Micro-Phase*: P00-S02-M02 — Internal Logging Foundation.
 * **P00-S02-M02: Internal Logging Foundation**
   * *Objective*: Implement lightweight structured logger in `internal/logger` wrapping Go's `slog`.
   * *Preconditions*: P00-S02-M01.
