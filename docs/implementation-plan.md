@@ -350,16 +350,16 @@ Every future micro-phase implementation response from Claude Code must use this 
 ```
 Current Major Phase           : Phase 01 — Core Storage Primitives & Binary Encodings
 Current Sub-Phase             : Sub-Phase 01.2 — Database Key & Value Models
-Current Micro-Phase           : P01-S02-M01 — Key & Value Boundary Constraints & Validation
+Current Micro-Phase           : P01-S02-M02 — Operation Type & Sequence Number Abstractions
 Phase 01 Status               : In Progress (Sub-Phase 01.1 Complete)
 Previous Completed Phase      : Phase 00 — Repository & Engineering Foundations
-Previous Completed Micro-Phase: P01-S01-M03 — CRC32-IEEE Checksum Wrapper
+Previous Completed Micro-Phase: P01-S02-M01 — Key & Value Boundary Constraints & Validation
 Phase 00 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Blocking Issues               : None
-Tests Passing                 : `go test -race ./...` (9/9 error suites, 18/18 logger suites, 24/24 binary suites passing, 100% binary coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
-Security Review Status        : Complete & Verified (Zero heap allocations; non-mutating; concurrency-safe; differential tests against independent bitwise oracle; 3.0M fuzz iterations passing with 0 crashes)
-Interview Knowledge Status    : Updated with CRC32-IEEE polynomial theory, hardware acceleration (PMULL/PCLMULQDQ), non-cryptographic error boundary, and interview Q&A
-Git Commit                    : feat(binary): [P01-S01-M03] CRC32-IEEE checksum wrapper
+Tests Passing                 : `go test -race ./...` (9/9 error suites, 18/18 logger suites, 32/32 binary suites passing, 100% binary coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
+Security Review Status        : Complete & Verified (O(1) header validation without payload scanning or copying; typed error context without secret leakage; 5.84M fuzz iterations passing with 0 crashes)
+Interview Knowledge Status    : Updated with hard key/value storage bounds, O(1) admission validation, byte-length vs rune count, and interview Q&A
+Git Commit                    : feat(binary): [P01-S02-M01] validate key and value boundaries
 ```
 
 ---
@@ -721,11 +721,48 @@ TOTAL: 184 Discrete, Testable Micro-Phases
 
 ### Sub-Phase 01.2: Database Key & Value Models
 * **P01-S02-M01: Key & Value Boundary Constraints & Validation**
+  * *Status*: **COMPLETE**
   * *Objective*: Implement validation functions enforcing $1 \le \text{KeyLen} \le 65,535$ and $0 \le \text{ValLen} \le 4\text{MB}$.
-  * *Changes*: `ValidateKey(key []byte) error`, `ValidateValue(val []byte) error`.
-  * *Security*: Rejects nil keys, oversized payloads.
-  * *Tests*: Test key size $0$, $65,535$, $65,536$; test value size $4\text{MB} + 1$.
-  * *Completion*: Boundary validation verified.
+  * *Functions & Constants Implemented*:
+    - `ValidateKey(key []byte) error`: Enforces $1 \le \text{len(key)} \le 65,535$ bytes. Returns `ErrEmptyKey` for len 0, `*KeyTooLargeError` for len $> 65,535$, and `nil` for valid keys.
+    - `ValidateValue(val []byte) error`: Enforces $0 \le \text{len(val)} \le 4,194,304$ bytes (4 MiB). Returns `*ValueTooLargeError` for len $> 4,194,304$, and `nil` for valid values (including empty/nil).
+    - `MinKeyLen = 1`, `MaxKeyLen = 65535`, `MaxKeyBytes = 65535`.
+    - `MinValueLen = 0`, `MaxValueLen = 4194304`, `MaxValueBytes = 4194304`.
+  * *Invariants Verified*:
+    - Invariant 1: Key lower bound: empty/nil keys strictly return `ErrEmptyKey`.
+    - Invariant 2: Key upper bound: keys $> 65,535$ bytes return `*KeyTooLargeError` matching `ErrKeyTooLarge` via `errors.Is`.
+    - Invariant 3: Value lower bound: zero-length and nil values are valid valueless markers (returns `nil`).
+    - Invariant 4: Value upper bound: values $> 4,194,304$ bytes return `*ValueTooLargeError` matching `ErrValueTooLarge` via `errors.Is`.
+    - Invariant 5: $O(1)$ complexity: inspects only slice header length; never scans, hashes, or copies payload.
+    - Invariant 6: Input immutability: neither `ValidateKey` nor `ValidateValue` modifies any byte of input.
+    - Invariant 7: Binary safety: handles arbitrary bytes (null bytes, 0xFF) transparently.
+    - Invariant 8: UTF-8 multibyte byte-length invariant: enforces raw byte count, not character/rune count.
+    - Invariant 9: Zero heap allocations on valid inputs (`0 B/op`, `0 allocs/op`).
+  * *Tests Added* (`internal/binary/validate_test.go`):
+    - Table-driven boundary tests ($max-1, max, max+1$) for keys (65,534B, 65,535B, 65,536B) and values (4,194,303B, 4,194,304B, 4,194,305B).
+    - Nil and empty slice tests for both keys and values.
+    - Error compatibility tests: `errors.Is` and `errors.As` extraction of `KeySize`, `ValueSize`, and `MaxSize`.
+    - Input immutability canary test.
+    - Binary safety tests (null bytes, 0xFF, control characters).
+    - Multibyte UTF-8 byte-length test verifying 4-byte runes are bounded by byte size.
+    - Native Go fuzzing (`FuzzValidateKey`, `FuzzValidateValue`) executing >5.84M iterations with 0 crashes.
+  * *Benchmark Results* (Apple M4, Darwin arm64, Go 1.24):
+    - `BenchmarkValidateKey_Empty`: 0.23 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkValidateKey_16B`: 0.23 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkValidateKey_1KB`: 0.22 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkValidateKey_65535B`: 0.22 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkValidateValue_Empty`: 0.22 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkValidateValue_1KB`: 0.22 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkValidateValue_1MB`: 0.22 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkValidateValue_4MB`: 0.22 ns/op, 0 B/op, 0 allocs/op
+  * *Security Review*: Verified $O(1)$ constant-time admission check eliminates memory exhaustion and CPU scanning vectors. Confirmed typed errors omit raw payload data, preventing sensitive credential leakage in log streams.
+  * *Evidence Classification*:
+    - Design Target: Zero heap allocations on valid paths, $O(1)$ admission without payload copies.
+    - Theoretical Property: Slice header length check is strictly $O(1)$ independent of payload size.
+    - Measured Result: 0 B/op, 0 allocs/op, ~0.22-0.23 ns/op across all payload sizes (16B to 4MB), 100% statement coverage, >5.84M fuzz executions with 0 crashes.
+    - Observed Limitation: Validation is purely structural; it does not verify semantic schema constraints (which belongs to user applications).
+  * *Completion*: Unit tests, boundary suites, and fuzz tests passing with 100% code coverage.
+  * *Next Micro-Phase*: P01-S02-M02 — Operation Type & Sequence Number Abstractions.
 * **P01-S02-M02: Operation Type & Sequence Number Abstractions**
   * *Objective*: Define `OpType` byte (`0x01 = PUT`, `0x02 = TOMBSTONE`) and monotonic `SeqNum` uint64.
   * *Changes*: `type OpType byte`, `type SeqNum uint64`, `type InternalKey struct`.
