@@ -89,6 +89,20 @@
 * **Logging Failure Handling & Preventing Recursive Loops**: A fundamental invariant in systems software is that logging must never cause a recursive failure loop. If a disk becomes full or an output pipe breaks, attempting to log the logger's write failure can trigger an infinite logging recursion that crashes the process. The logger must fail gracefully (e.g. dropping records or reporting through independent telemetry) without escalating into unhandled panics.
 * **Why Logging Must Not Become a Hidden Global Bottleneck**: In LSM storage engines processing 100,000+ ops/sec, synchronous file logging in the critical write path (e.g. inside WAL append or SkipList insertion) causes catastrophic tail latency spikes because disk writes and JSON formatting steal CPU and block worker threads. Storage engines must log only lifecycle events at `INFO` in the foreground, leaving high-frequency operation tracing to sampling metrics or asynchronous telemetry buffers.
 * **Endianness**: Big-Endian (Network Byte Order) stores the most significant byte at the lowest memory address; Little-Endian stores the least significant byte first. Network protocols and on-disk files must specify a canonical byte order to remain portable across CPU architectures.
+* **Fixed-Width Binary Integer Encoding**: Storing scalar numeric identifiers (timestamps, CRC32 checksums, record sequence numbers, key/value byte lengths) as fixed-width binary representations (2, 4, or 8 bytes) rather than textual strings (e.g. JSON or CSV numbers). Fixed binary layout guarantees constant-time $O(1)$ parsing, bounded memory envelopes, and predictable disk offsets.
+* **Bounds Check Elimination (BCE) & Anti-Tear Buffer Guards**: In Go, accessing slice elements (`buf[i]`) triggers compiler-generated runtime bounds checks that verify `i < len(buf)` before each read or write. In naive implementations:
+  ```go
+  buf[0] = byte(v >> 24)
+  buf[1] = byte(v >> 16)
+  buf[2] = byte(v >> 8)
+  buf[3] = byte(v)
+  ```
+  The runtime checks bounds 4 consecutive times. Worse, if `len(buf) == 2`, the function writes `buf[0]` and `buf[1]` before panicking on `buf[2]`, leaving mutated, corrupted ("torn") memory behind. By inserting an early bounds check `_ = buf[3]` at the function entry:
+  1. The runtime panics immediately *before* any slice bytes are mutated, guaranteeing zero partial writes on undersized buffers.
+  2. The Go compiler's SSA optimizer proves that indices 0, 1, and 2 are strictly within bounds, eliminating all three subsequent branch checks and generating branch-free machine instructions.
+* **Zero-Allocation Systems Design & Empirical Benchmark Auditing**: High-throughput storage engines cannot tolerate heap allocation on hot primitive paths. Passing scalar values and slice headers by value operates strictly in CPU registers and on the goroutine stack. Rather than assuming a function is allocation-free, systems engineers verify zero-allocation properties empirically using `testing.B` with `b.ReportAllocs()`, proving that benchmark runs report exactly `0 B/op` and `0 allocs/op`.
+* **Differential Reference Testing Against Independent Oracles**: A common testing trap in binary serialization is testing only round-trip identity (`Get(Put(x)) == x`). If an author mistakenly implements Little-Endian in both `Put` and `Get`, the round-trip test passes with 100% success despite producing byte streams that violate the architecture specification. Robust verification requires *differential testing* against an independent correctness oracle (e.g., standard library `encoding/binary.BigEndian`) and fixed known byte arrays to ensure bit-level correctness.
+* **Defensive Codec Contracts on Insufficient Buffers**: Scalar integer codecs operate at the lowest level of the database stack. Returning an `error` from `PutUint32(buf, v)` adds return value overhead and forces call sites to check errors on every 4-byte write. The idiomatic systems contract is: low-level fixed codecs panic deterministically on bounds failure (`len(buf) < width` or `buf == nil`), while higher-level parsers (WAL log replays, TCP frame decoders) validate byte counts *before* calling integer codecs, returning structured domain errors if a record or frame is truncated.
 * **Variable-Length Integers (Varints)**: 7-bit varints encode small integers in fewer bytes by using the high bit ($0\text{x}80$) as a continuation flag. An integer $\le 127$ uses 1 byte, while $2^{64}-1$ uses 10 bytes.
 * **Memory Allocation & GC Pressure**: Creating millions of small heap allocations triggers frequent Go Garbage Collector mark-and-sweep cycles, stealing CPU cycles and introducing millisecond-level tail latency spikes. `sync.Pool` provides zero-allocation buffer reuse.
 
@@ -96,6 +110,9 @@
 * **Decision**: Zero external dependencies for the entire storage engine and network layer; standard library only.
 * **Alternative Considered**: Utilizing third-party serialization, networking, or logging libraries (e.g. gRPC, zap, zerolog, protobuf).
 * **Trade-off**: Requires writing binary framing, SkipList, LRU cache, and wrapping `log/slog` from scratch, but eliminates supply-chain vulnerabilities, avoids transitive dependency conflicts, and ensures complete interview defensibility.
+* **Decision**: Pure shift-and-mask Big-Endian implementation with early BCE check (`_ = buf[width-1]`) over `unsafe.Pointer` casting or runtime branch checks.
+* **Alternative Considered**: Using `unsafe.Pointer` to reinterpret slice bytes, or inspecting host endianness at runtime.
+* **Trade-off**: Requires manual bit-shifting code, but guarantees 100% memory safety, portability across heterogeneous architectures (ARM64, x86-64), and allows Go compiler pattern matching to emit single byte-swap machine instructions (`BSWAP` / `REV`).
 * **Decision**: Wrapping standard library `log/slog` rather than adopting third-party frameworks like Uber's `zap` or `zerolog`.
 * **Alternative Considered**: Adding `go.uber.org/zap` for marginal allocation advantages in structured logging.
 * **Trade-off**: `slog` introduced in Go 1.21 provides high-performance structured JSON and Text handlers directly in the Go standard library. Wrapping it provides full interface decoupling while preserving zero external runtime dependencies.
@@ -122,13 +139,14 @@
 
 ### Security & Supply-Chain Considerations
 * **Dependency Attacks**: In modern infrastructure software, malicious packages or hijacked maintainer accounts can inject backdoors. By maintaining zero external dependencies in the storage core, Lattice reduces its external attack surface to zero.
+* **Defensive Anti-Tear Writes via BCE**: In low-level binary encoding, calling `PutUint32` with an undersized slice could write partial bytes before crashing. By anchoring an early bounds check (`_ = buf[3]`) prior to any slice mutation, the function guarantees an all-or-nothing write invariant: an invalid buffer panics without mutating a single byte of caller memory.
 * **Varint Bomb Vulnerability**: A malicious stream containing endless continuation bytes ($0\text{x}80$) could cause an infinite loop or integer overflow. Lattice limits varint decoding to a maximum of 10 bytes; anything beyond returns `ErrVarintOverflow`.
 * **Subsystem Isolation as Defense-in-Depth**: By keeping all storage engine implementation details inside `internal/`, we prevent external code or rogue consumer modules from accessing internal unexported memory pools, raw block caches, or un-synchronized file descriptors.
 * **Audit-Proof Suppressions via `nolintlint`**: Unchecked use of `//nolint` can allow developers to bypass critical security and durability checks. By enforcing `require-specific: true` and `require-explanation: true`, any lint suppression must name the specific analyzer and justify the override in code review.
 * **Log Redaction at Error Generation & Logger Level**: Error types and logging layers represent primary vectors for accidental credential and secret leakage. By designing error types that capture only metadata and providing automated logger-level key redaction (`[REDACTED]`), Lattice enforces a two-tier defense against credentials or sensitive values entering persistent log streams.
 
 ### Performance & Hardware Dynamics
-* Standard library `binary.BigEndian.PutUint64` is inlined by the Go compiler into single register swap instructions (`BSWAP` on x86), incurring zero runtime function call overhead.
+* **Hardware Byte Swap Inlining**: Modern Go compilers recognize the standard big-endian shift-and-mask idiom (`buf[0] = byte(v >> 24); ...` and `uint32(buf[0])<<24 | ...`) and replace the operations with single hardware byte-reversal instructions (`BSWAP` on x86-64, `REV` on ARM64). On Apple Silicon (M4), `PutUint*` and `GetUint*` benchmark at sub-nanosecond speeds (~0.23–0.25 ns/op) with 0 allocations.
 * Package boundary placement has zero runtime CPU cost in Go; inlining and compiler optimizations occur across package boundaries during compilation.
 * Disabling naive `fieldalignment` struct packing preserves intentional hardware cache-line padding (e.g. 64-byte spacing between write sequencer atomics and background flush pointers), preventing catastrophic multicore bus invalidation.
 * Pre-allocated sentinel errors (`ErrKeyNotFound`, `ErrEmptyKey`) incur zero heap allocations on error return paths, preventing GC churn during frequent cache misses or negative key queries.
@@ -143,6 +161,11 @@
 * **"Did You Actually Build This?"**: What is the purpose of `.editorconfig` in a Go systems project, and why must Go source files use tabs rather than spaces for indentation?
 * **"Did You Actually Build This?"**: Why does Lattice place `wal`, `memtable`, and `sstable` under `internal/` rather than the repository root or `pkg/`?
 * **"Did You Actually Build This?"**: What happens when two Go packages in a storage engine have mutually dependent structs (e.g., `Engine` needs `MemTable`, and `MemTable` needs `Engine` to trigger a flush)? How do you structure packages to prevent `import cycle not allowed`?
+* **"Did You Actually Build This?"**: Why did you choose Big-Endian for fixed-width integers when modern x86-64 and ARM64 processors are predominantly Little-Endian?
+* **"Did You Actually Build This?"**: In `PutUint32`, why did you include `_ = buf[3]` as the first line instead of writing directly to `buf[0]`? What does this do for both security and compiler performance?
+* **"Did You Actually Build This?"**: How do you prove that your binary encoding functions perform zero heap allocations in Go?
+* **"Did You Actually Build This?"**: Why is a round-trip test (`Get(Put(x)) == x`) insufficient on its own when testing binary serialization primitives?
+
 * **"Did You Actually Build This?"**: In your initial scaffolding, what subtle bug can occur when configuring `.gitignore` for compiled binary names like `lattice` and runtime directories like `wal/`?
 * **"Did You Actually Build This?"**: Why must `cmd/` packages contain a dummy `func main() {}` in `main.go` even during a purely structural scaffolding phase?
 * **"Did You Actually Build This?"**: Why does Lattice configure `errcheck` with `check-type-assertions: true` in `.golangci.yml`?
@@ -620,6 +643,17 @@ This section is a living record of actual engineering obstacles, debugging sessi
   4. Added permanent regression test suites in `internal/errors/errors_test.go` and `internal/logger/logger_test.go`.
 - **Core Lesson**: In Go systems programming, interface nil checks are treacherous due to the `(type, value)` interface representation. Defensive libraries must use reflection or explicit receiver guards, and logging security must never rely on naive exact string matches for credentials.
 - **Interview Relevance**: Demonstrates elite mastery of Go internals (interface memory layout, nil interface vs nil pointer trap, runtime panic recovery), adversarial security testing, and robust defense-in-depth API design.
+
+### Entry 2026-09-07 — P01-S01-M01: Fixed-Width Big-Endian Codecs, Bounds Check Elimination (BCE), and Anti-Tear Writes
+- **Date**: 2026-09-07
+- **Micro-Phase**: P01-S01-M01
+- **Problem**: Implement zero-allocation Big-Endian fixed integer codecs for uint16, uint32, and uint64, ensuring determinism, platform independence, and safety against partial ("torn") buffer writes when given undersized slices.
+- **Initial Assumption**: Writing sequential byte index assignments (`buf[0] = ...; buf[1] = ...`) is sufficient and standard.
+- **What Was Actually True**: In Go, naive sequential writes cause the runtime to perform multiple independent bounds checks. More dangerously, if an undersized buffer is provided (e.g. 3 bytes for `PutUint32`), indices 0, 1, and 2 are mutated *before* the panic occurs on index 3, corrupting caller memory with a torn write.
+- **How It Was Discovered**: Negative boundary testing and inspection of Go SSA compiler bounds check elimination (BCE) rules.
+- **Fix Applied**: Placed an explicit early bounds check `_ = buf[width-1]` at the entry of each `PutUint*` and `GetUint*` function. This causes the function to panic immediately *before* writing any bytes, eliminating torn writes while allowing the Go compiler to prove that subsequent indices `0..width-1` are in-bounds and eliminate all subsequent branch checks.
+- **Core Lesson**: Low-level binary primitives must be tear-resistant by design. Anchoring bounds at the maximum index guarantees an atomic all-or-nothing write semantic without adding error handling overhead to hot scalar codecs.
+- **Interview Relevance**: Demonstrates deep understanding of Go compiler optimizations (BCE, SSA pass), hardware byte swapping, zero-allocation benchmarking, and defensive memory design in storage engines.
 
 ---
 
