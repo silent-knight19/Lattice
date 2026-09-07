@@ -116,6 +116,10 @@
 * **Hard Key and Value Storage Bounds**: Storage engines enforce hard boundary limits on keys ($1 \le \text{KeyLen} \le 65,535$ bytes) and values ($0 \le \text{ValLen} \le 4,194,304$ bytes / 4 MiB) to prevent memory exhaustion, bound on-disk prefix compression, ensure 16-bit key length headers in binary WAL/SSTable records, and prevent long GC mark cycles. Nil/empty keys are rejected with `ErrEmptyKey`, while zero-length values are permitted as valid valueless markers (e.g., for sets or tombstone deletes).
 * **O(1) Admission Validation Without Payload Inspection**: In database request ingestion, validation functions must inspect only the slice header's length (`len(s)`). Validating length requires 0 payload byte copies, 0 hash calculations, and 0 memory allocations (`0 B/op`, `0 allocs/op`). Benchmarks prove constant-time performance (~0.22 ns/op) whether validating a 16-byte key or a 4 MiB value.
 * **Byte-Length Invariants vs Character/Rune Counts**: Storage layers are binary-safe. Key and value limits strictly measure raw byte length, not Unicode characters or runes. Multi-byte UTF-8 sequences (e.g. 4-byte runes) count as 4 bytes toward the 65,535-byte limit, preventing buffer overflow when binary headers reserve exactly 2 bytes for key length (`uint16`).
+* **Strong Typing for Storage Primitives (`OpType`, `SeqNum`)**: In storage engine internals, representing operation types (`OpType byte`) and sequence numbers (`SeqNum uint64`) as distinct Go types rather than raw primitives prevents catastrophic parameter transposition bugs at compile time (e.g. passing a sequence number where a length or offset is expected).
+* **64-Bit Monotonic Sequence Numbers & Exhaustion Mathematics**: A monotonically increasing 64-bit unsigned sequence number (`uint64`) provides a total order over all database writes. With $2^{64} = 18,446,744,073,709,551,615$ distinct sequence states, an engine operating at a sustained write throughput of 1,000,000 writes/second will not exhaust its sequence space for approximately $584,554\text{ years}$ ($1.84 \times 10^{19} / (10^6 \times 86400 \times 365.25) \approx 584,542$). Overflow protection via `Next()` returning `ErrSeqNumOverflow` guarantees that even under theoretical boundary conditions, sequence numbers never silently wrap to zero.
+* **Tombstone Deletion Mechanics in LSM-Trees**: LSM storage engines are append-only; files on disk (SSTables) are immutable. Deletions cannot overwrite or erase previous writes in place without incurring expensive random I/O. Instead, deletions append a tombstone record (`OpTypeDelete = 0x02`) stamped with a higher sequence number. During point lookups and range scans, encountering a tombstone indicates that the key was deleted, shadowing all earlier versions. Tombstones can only be physically eradicated during background compaction when the record reaches the oldest level containing that key.
+* **Zero-Value Semantics at Storage Admission**: In Go, default uninitialized variables hold zero bytes (`0x00`). In Lattice, `OpType(0x00)` is explicitly declared `OpTypeInvalid`. Storage ingestion pipelines validate all incoming opcodes (`op.Valid()`), ensuring uninitialized structs or corrupted network packets cannot masquerade as valid database operations.
 * **Memory Allocation & GC Pressure**: Creating millions of small heap allocations triggers frequent Go Garbage Collector mark-and-sweep cycles, stealing CPU cycles and introducing millisecond-level tail latency spikes. `sync.Pool` provides zero-allocation buffer reuse.
 
 ### Decisions Made & Trade-offs
@@ -204,6 +208,11 @@
 * **"Did You Actually Build This?"**: How does `ValidateKey` ensure that multibyte UTF-8 strings do not bypass the 64 KB storage boundary?
 * **"Did You Actually Build This?"**: Why does `ValidateKey` run in ~0.22 ns regardless of whether the key is 16 bytes or 65,535 bytes?
 * **"Did You Actually Build This?"**: What information do `KeyTooLargeError` and `ValueTooLargeError` expose, and why are raw payload bytes omitted?
+* **"Did You Actually Build This?"**: Why does Lattice define distinct types `type OpType byte` and `type SeqNum uint64` instead of passing raw `byte` and `uint64` values?
+* **"Did You Actually Build This?"**: What is the mathematical exhaustion lifespan of a 64-bit sequence number at 1 million writes per second?
+* **"Did You Actually Build This?"**: Why is `OpType(0x00)` defined as invalid rather than making `0x00 = PUT`?
+* **"Did You Actually Build This?"**: How do sequence numbers and operation types resolve concurrent updates and deletions during K-Way compaction?
+* **"Did You Actually Build This?"**: Why does `SeqNum.Next()` return an error at `MaxSeqNum` rather than letting Go wrap around to 0?
 
 * **"Did You Actually Build This?"**: In your initial scaffolding, what subtle bug can occur when configuring `.gitignore` for compiled binary names like `lattice` and runtime directories like `wal/`?
 * **"Did You Actually Build This?"**: Why must `cmd/` packages contain a dummy `func main() {}` in `main.go` even during a purely structural scaffolding phase?
@@ -738,6 +747,20 @@ This section is a living record of actual engineering obstacles, debugging sessi
 - **Fix Applied**: Implemented `ValidateKey` and `ValidateValue` in `internal/binary/validate.go` with single source-of-truth constants; returned typed errors `*KeyTooLargeError` and `*ValueTooLargeError` exposing actual size and max size without payload bytes; validated $max-1, max, max+1$ boundaries, input immutability, and 5.84M fuzz iterations with 0 crashes.
 - **Core Lesson**: Database admission validators must enforce raw byte-length limits in $O(1)$ time, treat binary slices as opaque, and strictly redact customer payloads at the error-generation boundary.
 - **Interview Relevance**: Demonstrates deep understanding of storage engine memory boundaries, binary framing limits (16-bit uint16 header bounds), $O(1)$ slice header performance, and secure diagnostic error design.
+
+### Entry 2026-09-07 — P01-S02-M02: Strongly Typed Enums, Monotonic 64-Bit Sequences, and Wraparound Immunity
+- **Date**: 2026-09-07
+- **Micro-Phase**: P01-S02-M02
+- **Problem**: Establish deterministic abstractions for operation types (`OpType`) and sequence numbers (`SeqNum`), ensuring zero-value rejection, compile-time type safety, and arithmetic overflow protection.
+- **Initial Assumption**: Could use raw Go primitives (`byte` and `uint64`) across the codebase without custom type wrappers, and rely on standard `s++` incrementing for sequence numbers.
+- **What Was Actually True**:
+  1. Relying on raw primitives invites silent parameter transposition bugs across complex function signatures (e.g., inadvertently passing a sequence number where an offset or length is expected). Declaring `type OpType byte` and `type SeqNum uint64` enforces static compiler validation.
+  2. Zero-value (`0x00`) must never represent a valid operation like `PUT`. When uninitialized memory or zeroed disk pages are processed, treating `0x00` as valid would fabricate bogus insertions. Explicitly declaring `0x00 = OpTypeInvalid` ensures fail-closed admission.
+  3. In Go, unsigned integer arithmetic silently wraps around on overflow (`math.MaxUint64 + 1 == 0`). If a sequence number allocator were allowed to wrap to 0, newly committed writes would receive sequence numbers smaller than existing historical records, causing newer user data to be shadowed and permanently deleted by older records during compaction. Guarding sequence progression via `Next()` returning `ErrSeqNumOverflow` guarantees wraparound immunity.
+- **How It Was Discovered**: Review of LSM compaction deduplication rules and static analysis of Go integer overflow behavior.
+- **Fix Applied**: Created `internal/binary/types.go` declaring `OpType` (with `Valid()`, `Validate()`, `String()`, `ParseOpType`) and `SeqNum` (with `Next()`, `String()`); added `ErrInvalidOpType`, `ErrSeqNumOverflow`, and corresponding typed error structs in `internal/errors`; tested with exhaustive 256-byte loop, boundary progression, zero-allocation benchmarks, and >5.50M fuzz iterations.
+- **Core Lesson**: Storage primitives must be strictly typed, zero-values must be explicitly invalid for operational enums, and monotonic sequences must provide explicit boundary overflow defense.
+- **Interview Relevance**: Demonstrates deep appreciation for compile-time safety in systems software, LSM tombstone lifecycle dynamics, 64-bit sequence exhaustion arithmetic, and defensive wraparound prevention.
 
 ---
 

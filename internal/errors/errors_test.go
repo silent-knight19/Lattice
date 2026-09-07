@@ -24,6 +24,8 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrCompactionRunning", errors.ErrCompactionRunning, "compaction already in progress"},
 		{"ErrVarintOverflow", errors.ErrVarintOverflow, "varint exceeds maximum 64-bit integer size"},
 		{"ErrVarintTruncated", errors.ErrVarintTruncated, "varint buffer truncated or incomplete"},
+		{"ErrInvalidOpType", errors.ErrInvalidOpType, "invalid operation type"},
+		{"ErrSeqNumOverflow", errors.ErrSeqNumOverflow, "sequence number overflow"},
 	}
 
 	for _, tc := range sentinels {
@@ -56,6 +58,8 @@ func TestSentinelWrappingWithErrorsIs(t *testing.T) {
 		{"ErrCompactionRunning", errors.ErrCompactionRunning},
 		{"ErrVarintOverflow", errors.ErrVarintOverflow},
 		{"ErrVarintTruncated", errors.ErrVarintTruncated},
+		{"ErrInvalidOpType", errors.ErrInvalidOpType},
+		{"ErrSeqNumOverflow", errors.ErrSeqNumOverflow},
 	}
 
 	for _, tc := range tests {
@@ -86,6 +90,8 @@ func TestSentinelNegativeComparisons(t *testing.T) {
 		errors.ErrCompactionRunning,
 		errors.ErrVarintOverflow,
 		errors.ErrVarintTruncated,
+		errors.ErrInvalidOpType,
+		errors.ErrSeqNumOverflow,
 	}
 
 	for i, a := range allSentinels {
@@ -285,6 +291,8 @@ func TestNilReceiverTypedErrors(t *testing.T) {
 	var v *errors.ValueTooLargeError
 	var c *errors.ChecksumMismatchError
 	var tw *errors.TornWriteError
+	var op *errors.InvalidOpTypeError
+	var seq *errors.SeqNumOverflowError
 
 	// Ensure calling Error() on nil typed pointers does not panic and returns sentinel strings
 	if k.Error() != errors.ErrKeyTooLarge.Error() {
@@ -299,6 +307,12 @@ func TestNilReceiverTypedErrors(t *testing.T) {
 	if tw.Error() != errors.ErrTornWrite.Error() {
 		t.Errorf("expected %q, got %q", errors.ErrTornWrite.Error(), tw.Error())
 	}
+	if op.Error() != errors.ErrInvalidOpType.Error() {
+		t.Errorf("expected %q, got %q", errors.ErrInvalidOpType.Error(), op.Error())
+	}
+	if seq.Error() != errors.ErrSeqNumOverflow.Error() {
+		t.Errorf("expected %q, got %q", errors.ErrSeqNumOverflow.Error(), seq.Error())
+	}
 
 	// Ensure calling Is() on nil typed pointers matches corresponding sentinels
 	if !k.Is(errors.ErrKeyTooLarge) {
@@ -312,5 +326,85 @@ func TestNilReceiverTypedErrors(t *testing.T) {
 	}
 	if !tw.Is(errors.ErrTornWrite) {
 		t.Errorf("nil *TornWriteError must match ErrTornWrite via Is()")
+	}
+	if !op.Is(errors.ErrInvalidOpType) {
+		t.Errorf("nil *InvalidOpTypeError must match ErrInvalidOpType via Is()")
+	}
+	if !seq.Is(errors.ErrSeqNumOverflow) {
+		t.Errorf("nil *SeqNumOverflowError must match ErrSeqNumOverflow via Is()")
+	}
+}
+
+func TestInvalidOpTypeError(t *testing.T) {
+	typedErr := &errors.InvalidOpTypeError{
+		Op: 0xFF,
+	}
+
+	// Must match sentinel via errors.Is
+	if !stdErrors.Is(typedErr, errors.ErrInvalidOpType) {
+		t.Errorf("InvalidOpTypeError must match ErrInvalidOpType via errors.Is")
+	}
+
+	// Negative match against other sentinels
+	if stdErrors.Is(typedErr, errors.ErrKeyNotFound) {
+		t.Errorf("InvalidOpTypeError must not match ErrKeyNotFound")
+	}
+
+	// Wrapped match via errors.Is
+	wrapped := fmt.Errorf("wal decode: %w", typedErr)
+	if !stdErrors.Is(wrapped, errors.ErrInvalidOpType) {
+		t.Errorf("wrapped InvalidOpTypeError must match ErrInvalidOpType via errors.Is")
+	}
+
+	// Extraction via errors.As
+	var extracted *errors.InvalidOpTypeError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("errors.As failed to extract *InvalidOpTypeError")
+	}
+	if extracted.Op != 0xFF {
+		t.Errorf("extracted Op mismatch: got 0x%02x, expected 0xff", extracted.Op)
+	}
+
+	// Error string formatting
+	msg := typedErr.Error()
+	if !strings.Contains(msg, "0xff") {
+		t.Errorf("unexpected error message: %q", msg)
+	}
+}
+
+func TestSeqNumOverflowError(t *testing.T) {
+	typedErr := &errors.SeqNumOverflowError{
+		Current: 18446744073709551615,
+	}
+
+	// Must match sentinel via errors.Is
+	if !stdErrors.Is(typedErr, errors.ErrSeqNumOverflow) {
+		t.Errorf("SeqNumOverflowError must match ErrSeqNumOverflow via errors.Is")
+	}
+
+	// Negative match against other sentinels
+	if stdErrors.Is(typedErr, errors.ErrVarintOverflow) {
+		t.Errorf("SeqNumOverflowError must not match ErrVarintOverflow")
+	}
+
+	// Wrapped match via errors.Is
+	wrapped := fmt.Errorf("sequence generator: %w", typedErr)
+	if !stdErrors.Is(wrapped, errors.ErrSeqNumOverflow) {
+		t.Errorf("wrapped SeqNumOverflowError must match ErrSeqNumOverflow via errors.Is")
+	}
+
+	// Extraction via errors.As
+	var extracted *errors.SeqNumOverflowError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("errors.As failed to extract *SeqNumOverflowError")
+	}
+	if extracted.Current != 18446744073709551615 {
+		t.Errorf("extracted Current mismatch: got %d", extracted.Current)
+	}
+
+	// Error string formatting
+	msg := typedErr.Error()
+	if !strings.Contains(msg, "18446744073709551615") {
+		t.Errorf("unexpected error message: %q", msg)
 	}
 }

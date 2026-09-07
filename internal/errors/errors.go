@@ -41,6 +41,14 @@ var (
 	// ErrVarintTruncated indicates that a buffer ended prematurely while decoding
 	// a varint before encountering a terminating byte.
 	ErrVarintTruncated = stdErrors.New("varint buffer truncated or incomplete")
+
+	// ErrInvalidOpType indicates that an operation type byte does not correspond
+	// to any recognized database operation (only PUT and DELETE/TOMBSTONE are valid).
+	ErrInvalidOpType = stdErrors.New("invalid operation type")
+
+	// ErrSeqNumOverflow indicates that incrementing a sequence number would exceed
+	// the maximum 64-bit unsigned integer representation (wraparound prohibited).
+	ErrSeqNumOverflow = stdErrors.New("sequence number overflow")
 )
 
 // KeyTooLargeError provides structured context when a key violates maximum size limits.
@@ -124,4 +132,41 @@ func (e *TornWriteError) Error() string {
 // Is reports whether this error matches target sentinel ErrTornWrite.
 func (e *TornWriteError) Is(target error) bool {
 	return target == ErrTornWrite
+}
+
+// InvalidOpTypeError provides structured context when an unrecognized operation type byte is encountered.
+// It matches ErrInvalidOpType when interrogated with errors.Is().
+type InvalidOpTypeError struct {
+	Op byte
+}
+
+func (e *InvalidOpTypeError) Error() string {
+	if e == nil {
+		return ErrInvalidOpType.Error()
+	}
+	return fmt.Sprintf("invalid operation type: 0x%02x", e.Op)
+}
+
+// Is reports whether this error matches target sentinel ErrInvalidOpType.
+func (e *InvalidOpTypeError) Is(target error) bool {
+	return target == ErrInvalidOpType
+}
+
+// SeqNumOverflowError provides structured context when incrementing a sequence number
+// exceeds the maximum 64-bit unsigned integer limit.
+// It matches ErrSeqNumOverflow when interrogated with errors.Is().
+type SeqNumOverflowError struct {
+	Current uint64
+}
+
+func (e *SeqNumOverflowError) Error() string {
+	if e == nil {
+		return ErrSeqNumOverflow.Error()
+	}
+	return fmt.Sprintf("sequence number overflow: current %d is at maximum uint64 limit", e.Current)
+}
+
+// Is reports whether this error matches target sentinel ErrSeqNumOverflow.
+func (e *SeqNumOverflowError) Is(target error) bool {
+	return target == ErrSeqNumOverflow
 }
