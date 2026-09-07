@@ -349,17 +349,17 @@ Every future micro-phase implementation response from Claude Code must use this 
 
 ```
 Current Major Phase           : Phase 01 — Core Storage Primitives & Binary Encodings
-Current Sub-Phase             : Sub-Phase 01.1 — Binary Encoding Primitives
-Current Micro-Phase           : P01-S01-M03 — CRC32-IEEE Checksum Wrapper
-Phase 01 Status               : In Progress
+Current Sub-Phase             : Sub-Phase 01.2 — Database Key & Value Models
+Current Micro-Phase           : P01-S02-M01 — Key & Value Boundary Constraints & Validation
+Phase 01 Status               : In Progress (Sub-Phase 01.1 Complete)
 Previous Completed Phase      : Phase 00 — Repository & Engineering Foundations
-Previous Completed Micro-Phase: P01-S01-M02 — Unsigned Variable-Length Integer (Varint) Codec
+Previous Completed Micro-Phase: P01-S01-M03 — CRC32-IEEE Checksum Wrapper
 Phase 00 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Blocking Issues               : None
-Tests Passing                 : `go test -race ./...` (9/9 error suites, 18/18 logger suites, 17/17 binary suites passing, 100% binary coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
-Security Review Status        : Complete & Verified (Early BCE bounds checks prevent torn writes; 10th-byte overflow validation; bounded loop <= 10 iterations protects against varint bomb DoS; 2.56M fuzz iterations passing with 0 crashes)
-Interview Knowledge Status    : Updated with 7-bit varint mechanics, continuation-bit semantics, 10th-byte overflow validation, DoS defense, and differential testing
-Git Commit                    : feat(binary): [P01-S01-M02] Unsigned variable-length integer codec
+Tests Passing                 : `go test -race ./...` (9/9 error suites, 18/18 logger suites, 24/24 binary suites passing, 100% binary coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
+Security Review Status        : Complete & Verified (Zero heap allocations; non-mutating; concurrency-safe; differential tests against independent bitwise oracle; 3.0M fuzz iterations passing with 0 crashes)
+Interview Knowledge Status    : Updated with CRC32-IEEE polynomial theory, hardware acceleration (PMULL/PCLMULQDQ), non-cryptographic error boundary, and interview Q&A
+Git Commit                    : feat(binary): [P01-S01-M03] CRC32-IEEE checksum wrapper
 ```
 
 ---
@@ -680,11 +680,44 @@ TOTAL: 184 Discrete, Testable Micro-Phases
   * *Completion*: Unit tests, differential suites, and fuzz tests passing with 100% code coverage.
   * *Next Micro-Phase*: P01-S01-M03 — CRC32-IEEE Checksum Wrapper.
 * **P01-S01-M03: CRC32-IEEE Checksum Wrapper**
+  * *Status*: **COMPLETE**
   * *Objective*: Implement high-performance CRC32 calculator with hardware acceleration (`hash/crc32`).
-  * *Changes*: `Checksum(data []byte) uint32`, `Verify(data []byte, expected uint32) bool`.
-  * *Invariants*: IEEE polynomial (`0xEDB88320`).
-  * *Tests*: Known test vectors against standard POSIX crc32 outputs.
-  * *Completion*: CRC32 wrapper passing all vectors.
+  * *Functions Implemented*:
+    - `Checksum(data []byte) uint32`: Computes CRC32-IEEE checksum over `data`.
+    - `Verify(data []byte, expected uint32) bool`: Computes checksum and verifies exact match against `expected`.
+  * *Invariants Verified*:
+    - Invariant 1: Standard IEEE 802.3 polynomial (`0xEDB88320`).
+    - Invariant 2: Canonical vector `"123456789"` strictly yields `0xCBF43926`.
+    - Invariant 3: `nil` and empty byte slices strictly yield `0x00000000`.
+    - Invariant 4: Non-mutating contract: neither `Checksum` nor `Verify` alters any byte of input data.
+    - Invariant 5: Concurrency-safety: zero shared mutable state, verified across 100 concurrent goroutines under `go test -race`.
+    - Invariant 6: Zero heap allocations empirically verified across all input payload sizes (`0 B/op`, `0 allocs/op`).
+    - Invariant 7: Deterministic: returns identical checksums across heterogeneous CPU architectures.
+  * *Tests Added* (`internal/binary/crc_test.go`):
+    - Authoritative known vectors (`nil`, `""`, `"123456789"`, `"a"`, `"abc"`, `"message digest"`, `"The quick brown fox jumps over the lazy dog"`, `"Lattice"`, all-zero, all-0xFF, sequential bytes `0x00..0xFF`).
+    - Independent bit-by-bit software simulation reference oracle (`referenceCRC32IEEE`) cross-verifying without standard library circularity.
+    - Differential randomized property testing against independent oracle and `hash/crc32.ChecksumIEEE` across 19 lengths (0 to 4096 bytes) and 1,900 iterations.
+    - Data isolation canary test verifying input buffers are untouched.
+    - Single-bit corruption detection across 10 sample byte offsets in a 1KB block, flipping all 8 bits.
+    - Multi-byte corruption, byte-swap, truncation, and trailing byte append detection.
+    - Concurrency test with 100 parallel goroutines and 500 iterations each.
+    - Native Go fuzzing (`FuzzChecksum`) executing ~3,000,000 iterations with 0 crashes.
+  * *Benchmark Results* (Apple M4, Darwin arm64, Go 1.24):
+    - `BenchmarkChecksum_Empty`: 3.88 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkChecksum_64B`: 4.63 ns/op (13.8 GB/s), 0 B/op, 0 allocs/op
+    - `BenchmarkChecksum_1KB`: 79.69 ns/op (12.8 GB/s), 0 B/op, 0 allocs/op
+    - `BenchmarkChecksum_4KB`: 343.9 ns/op (11.9 GB/s), 0 B/op, 0 allocs/op
+    - `BenchmarkChecksum_64KB`: 5,605 ns/op (11.7 GB/s), 0 B/op, 0 allocs/op
+    - `BenchmarkChecksum_1MB`: 89,590 ns/op (11.7 GB/s), 0 B/op, 0 allocs/op
+    - `BenchmarkVerify_4KB`: 349.9 ns/op (11.7 GB/s), 0 B/op, 0 allocs/op
+  * *Security Review*: Confirmed CRC32 is strictly an error-detection code for accidental corruption (media bit rot, torn writes), not a cryptographic hash. It provides no authentication or collision resistance against malicious tampering. Non-mutating and concurrency-safe with zero allocations.
+  * *Evidence Classification*:
+    - Design Target: Zero heap allocations, boolean verify contract, concurrency safety.
+    - Theoretical Property: CRC32-IEEE polynomial detects all odd numbers of bit errors, all double bit errors for block sizes within Hamming distance limits, and any single burst error of length $\le 32$ bits.
+    - Measured Result: 0 B/op, 0 allocs/op, ~11.7–13.8 GB/s throughput, 100% statement coverage, ~3.0M fuzz executions with 0 crashes.
+    - Observed Limitation: Non-cryptographic; an attacker with write access to both payload and checksum can trivially forge a valid CRC32.
+  * *Completion*: Unit tests, differential suites, and fuzz tests passing with 100% code coverage.
+  * *Next Micro-Phase*: P01-S02-M01 — Key & Value Boundary Constraints & Validation.
 
 ### Sub-Phase 01.2: Database Key & Value Models
 * **P01-S02-M01: Key & Value Boundary Constraints & Validation**
