@@ -18,7 +18,7 @@ var (
 	// ErrKeyTooLarge indicates that a key exceeds the maximum allowed size (64 KB).
 	ErrKeyTooLarge = stdErrors.New("key exceeds maximum allowed size")
 
-	// ErrValueTooLarge indicates that a value exceeds the maximum allowed size (2 MB).
+	// ErrValueTooLarge indicates that a value exceeds the maximum allowed size (4 MB).
 	ErrValueTooLarge = stdErrors.New("value exceeds maximum allowed size")
 
 	// ErrChecksumMismatch indicates that a CRC32 checksum verification failed,

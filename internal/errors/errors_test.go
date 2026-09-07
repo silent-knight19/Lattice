@@ -143,8 +143,8 @@ func TestKeyTooLargeError(t *testing.T) {
 
 func TestValueTooLargeError(t *testing.T) {
 	typedErr := &errors.ValueTooLargeError{
-		ValueSize: 3000000,
-		MaxSize:   2097152,
+		ValueSize: 5000000,
+		MaxSize:   4194304,
 	}
 
 	// Must match sentinel via errors.Is
@@ -168,13 +168,13 @@ func TestValueTooLargeError(t *testing.T) {
 	if !stdErrors.As(wrapped, &extracted) {
 		t.Fatalf("errors.As failed to extract *ValueTooLargeError from wrapped chain")
 	}
-	if extracted.ValueSize != 3000000 || extracted.MaxSize != 2097152 {
+	if extracted.ValueSize != 5000000 || extracted.MaxSize != 4194304 {
 		t.Errorf("extracted fields mismatch: got ValueSize=%d, MaxSize=%d", extracted.ValueSize, extracted.MaxSize)
 	}
 
 	// Error string validation
 	msg := typedErr.Error()
-	if !strings.Contains(msg, "3000000") || !strings.Contains(msg, "2097152") {
+	if !strings.Contains(msg, "5000000") || !strings.Contains(msg, "4194304") {
 		t.Errorf("unexpected error string formatting: %q", msg)
 	}
 }
