@@ -504,6 +504,111 @@ func TestCompoundSensitiveKeyRedaction(t *testing.T) {
 	}
 }
 
+func TestSensitiveRedactionBypassReproducer(t *testing.T) {
+	bypassKeys := []struct {
+		key   string
+		value string
+	}{
+		{"metadata.authorization", "Bearer top-secret-token"},
+		{"user.token", "user-session-token"},
+		{"user:token", "user-colon-token"},
+		{"user/token", "user-slash-token"},
+		{"accessToken", "oauth-access-12345"},
+		{"refreshToken", "oauth-refresh-67890"},
+		{"authToken", "auth-token-val"},
+		{"bearerToken", "bearer-token-val"},
+		{"http_authorization", "Basic dXNlcjpwYXNz"},
+		{"user_auth", "user-auth-secret"},
+		{"user.auth", "user-dot-auth-secret"},
+	}
+
+	for _, tc := range bypassKeys {
+		t.Run(tc.key, func(t *testing.T) {
+			var buf bytes.Buffer
+			log := logger.NewJSON(&buf, logger.LevelInfo)
+			log.Info("bypass test", tc.key, tc.value, "token_count", 42)
+
+			var data map[string]any
+			if err := json.Unmarshal(buf.Bytes(), &data); err != nil {
+				t.Fatalf("failed to parse JSON: %v", err)
+			}
+
+			if data[tc.key] != logger.RedactedPlaceholder {
+				t.Errorf("REDACTION BYPASS DETECTED for key %q: got %q, want %q",
+					tc.key, data[tc.key], logger.RedactedPlaceholder)
+			}
+		})
+	}
+}
+
+func TestAdversarialObfuscationAndKeyRedaction(t *testing.T) {
+	testCases := []struct {
+		name  string
+		key   string
+		value any
+	}{
+		{"nested dotted password", "user.password", "secret123"},
+		{"bracketed password", "user[password]", "secret123"},
+		{"colons and slashes", "config://auth/token", "secret123"},
+		{"leading trailing punctuation", ":::user:::password:::", "secret123"},
+		{"whitespace and dashes", "  --PASSWORD--  ", "secret123"},
+		{"PascalCase APIKey", "APIKey", "secret123"},
+		{"PascalCase PrivateKey", "PrivateKey", "secret123"},
+		{"PascalCase ClientSecret", "ClientSecret", "secret123"},
+		{"PascalCase SessionToken", "SessionToken", "secret123"},
+		{"deeply nested compound", "request.oauth_access_token", "secret123"},
+		{"nested api key value", "nested.api_key.value", "secret123"},
+		{"byte slice secret value", "user_secret", []byte("raw-bytes-secret")},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			log := logger.NewJSON(&buf, logger.LevelInfo)
+			log.Info("adversarial test", tc.key, tc.value)
+
+			var data map[string]any
+			if err := json.Unmarshal(buf.Bytes(), &data); err != nil {
+				t.Fatalf("failed to parse JSON: %v", err)
+			}
+
+			if data[tc.key] != logger.RedactedPlaceholder {
+				t.Errorf("expected key %q to be redacted, got %v", tc.key, data[tc.key])
+			}
+		})
+	}
+}
+
+func TestFalsePositiveResistance(t *testing.T) {
+	benignCases := []struct {
+		key   string
+		value any
+	}{
+		{"token_count", 42},
+		{"tokens_per_sec", 1000},
+		{"author", "Shakespeare"},
+		{"authority", "root-ca"},
+		{"authenticate_user_flag", true},
+	}
+
+	for _, tc := range benignCases {
+		t.Run(tc.key, func(t *testing.T) {
+			var buf bytes.Buffer
+			log := logger.NewJSON(&buf, logger.LevelInfo)
+			log.Info("benign test", tc.key, tc.value)
+
+			var data map[string]any
+			if err := json.Unmarshal(buf.Bytes(), &data); err != nil {
+				t.Fatalf("failed to parse JSON: %v", err)
+			}
+
+			if data[tc.key] == logger.RedactedPlaceholder {
+				t.Errorf("false positive: benign key %q was incorrectly redacted!", tc.key)
+			}
+		})
+	}
+}
+
 type typedNilRedactable struct {
 	Secret string
 }
@@ -595,4 +700,82 @@ func TestHugeAttributePayload(t *testing.T) {
 	if buf.Len() < 1024*1024 {
 		t.Errorf("expected output buffer to contain 1MB payload")
 	}
+}
+
+func BenchmarkNewNop(b *testing.B) {
+	log := logger.NewNop()
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		log.Info("nop heartbeat", "seq", i, "key", "val")
+	}
+}
+
+func BenchmarkJSON_NoRedaction(b *testing.B) {
+	log := logger.NewJSON(io.Discard, logger.LevelInfo)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		log.Info("standard message", "component", "storage", "seq", i)
+	}
+}
+
+func BenchmarkJSON_WithRedaction(b *testing.B) {
+	log := logger.NewJSON(io.Discard, logger.LevelInfo)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		log.Info("auth event", "user.password", "secret123", "token", "tok123")
+	}
+}
+
+func BenchmarkJSON_Parallel(b *testing.B) {
+	log := logger.NewJSON(io.Discard, logger.LevelInfo)
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			i++
+			log.Info("concurrent log", "worker", i, "token", "secret-token")
+		}
+	})
+}
+
+func FuzzLoggerKeyRedaction(f *testing.F) {
+	seeds := []struct {
+		key string
+		val string
+	}{
+		{"password", "p1"},
+		{"user.password", "p2"},
+		{"metadata.authorization", "Bearer tok"},
+		{"accessToken", "tok3"},
+		{"token_count", "100"},
+		{"author", "test"},
+		{"nested:auth:token", "tok4"},
+		{"", ""},
+		{"---", "---"},
+		{"__proto__", "exploit"},
+		{"very_long_key_" + strings.Repeat("A", 1000), "val"},
+	}
+
+	for _, s := range seeds {
+		f.Add(s.key, s.val)
+	}
+
+	f.Fuzz(func(t *testing.T, key string, val string) {
+		var buf bytes.Buffer
+		log := logger.NewJSON(&buf, logger.LevelInfo)
+		// Must not panic or crash
+		log.Info("fuzz record", key, val)
+
+		// If output produced, must be valid JSON
+		if buf.Len() > 0 {
+			var parsed map[string]any
+			if err := json.Unmarshal(buf.Bytes(), &parsed); err != nil {
+				t.Fatalf("fuzz generated invalid JSON: %v, raw: %s", err, buf.String())
+			}
+		}
+	})
 }

@@ -338,6 +338,42 @@ func TestNilReceiverTypedErrors(t *testing.T) {
 	}
 }
 
+func TestInterfaceWrappedTypedNilErrors(t *testing.T) {
+	// Verify that typed nils stored in the error interface dispatch safely and match sentinels
+	typedNils := []struct {
+		name     string
+		err      error
+		sentinel error
+	}{
+		{"KeyTooLargeError", (*errors.KeyTooLargeError)(nil), errors.ErrKeyTooLarge},
+		{"ValueTooLargeError", (*errors.ValueTooLargeError)(nil), errors.ErrValueTooLarge},
+		{"ChecksumMismatchError", (*errors.ChecksumMismatchError)(nil), errors.ErrChecksumMismatch},
+		{"TornWriteError", (*errors.TornWriteError)(nil), errors.ErrTornWrite},
+		{"InvalidOpTypeError", (*errors.InvalidOpTypeError)(nil), errors.ErrInvalidOpType},
+		{"SeqNumOverflowError", (*errors.SeqNumOverflowError)(nil), errors.ErrSeqNumOverflow},
+	}
+
+	for _, tc := range typedNils {
+		t.Run(tc.name, func(t *testing.T) {
+			// Interface dispatch on Error() must not panic and must equal sentinel error string
+			msg := tc.err.Error()
+			if msg != tc.sentinel.Error() {
+				t.Errorf("expected %q, got %q", tc.sentinel.Error(), msg)
+			}
+
+			// errors.Is via interface dispatch must match corresponding sentinel
+			if !stdErrors.Is(tc.err, tc.sentinel) {
+				t.Errorf("interface-wrapped typed nil %s must match sentinel %v via errors.Is()", tc.name, tc.sentinel)
+			}
+
+			// errors.Is must not match an unrelated sentinel
+			if stdErrors.Is(tc.err, errors.ErrKeyNotFound) {
+				t.Errorf("interface-wrapped typed nil %s must not match unrelated ErrKeyNotFound", tc.name)
+			}
+		})
+	}
+}
+
 func TestInvalidOpTypeError(t *testing.T) {
 	typedErr := &errors.InvalidOpTypeError{
 		Op: 0xFF,

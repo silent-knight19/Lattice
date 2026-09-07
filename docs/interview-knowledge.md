@@ -142,7 +142,7 @@
 * **Trade-off**: Requires manual bit-shifting code, but guarantees 100% memory safety, portability across heterogeneous architectures (ARM64, x86-64), and allows Go compiler pattern matching to emit single byte-swap machine instructions (`BSWAP` / `REV`).
 * **Decision**: Bounded varint decoder with explicit 10th-byte validation (`b > 1`) and returning `(0, 0, err)` on any failure.
 * **Alternative Considered**: Unbounded scanning for `b < 0x80`, or returning partial bytes consumed on error.
-* **Trade-off**: Requires strict overflow and truncation branching, but guarantees complete immunity against Varint Bomb DoS attacks and prevents callers from advancing read cursors on corrupted streams.
+* **Trade-off**: Requires strict overflow and truncation branching, but bounds execution against Varint continuation-bit DoS attacks (capped at 10 iterations) and prevents callers from advancing read cursors on corrupted streams.
 * **Decision**: Wrapping standard library `log/slog` rather than adopting third-party frameworks like Uber's `zap` or `zerolog`.
 * **Alternative Considered**: Adding `go.uber.org/zap` for marginal allocation advantages in structured logging.
 * **Trade-off**: `slog` introduced in Go 1.21 provides high-performance structured JSON and Text handlers directly in the Go standard library. Wrapping it provides full interface decoupling while preserving zero external runtime dependencies.

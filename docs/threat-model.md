@@ -77,7 +77,7 @@
 * **Likelihood**: Medium.
 * **Existing Mitigation**: File numbers are strictly typed `uint64` integers. File paths are synthesized exclusively using `filepath.Join(dataDir, fmt.Sprintf("%06d.sst", fileNum))`. Raw string inputs from CLI diagnostics are checked against strict alphanumeric whitelists (`^[a-zA-Z0-9_-]+$`) and validated with `filepath.Clean()`.
 * **Automated Test**: Unit tests supplying `../../etc/passwd` to file loaders; assert `ErrInvalidPath` returned.
-* **Residual Risk**: Zero (No user-supplied path concatenation permitted).
+* **Residual Risk**: Negligible (Mitigated by integer-synthesized paths and filepath cleaning).
 
 ---
 
@@ -137,7 +137,7 @@
 * **Likelihood**: Medium.
 * **Existing Mitigation**: Data directories are initialized with POSIX `0700` (`rwx------`) and files are created with `0600` (`rw-------`). The engine checks and warns if permissions are compromised.
 * **Automated Test**: Test verifying file mode bits upon creation.
-* **Residual Risk**: Zero on dedicated host environments.
+* **Residual Risk**: Low (Enforced via POSIX mode bits 0700/0600 on host filesystem).
 
 ---
 

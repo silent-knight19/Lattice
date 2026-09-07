@@ -7,6 +7,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"unicode"
 )
 
 // Level defines the logging severity level for Lattice.
@@ -214,25 +215,89 @@ func safeRedact(r Redactable) (res any, ok bool) {
 	return r.Redact(), true
 }
 
+// normalizeKey converts an attribute key into canonical snake_case.
+// It trims whitespace, treats camelCase/PascalCase boundaries and common delimiters
+// (-, ., :, /, \, [, ], (, ), {, }, spaces, etc.) as word boundaries, lowercases characters,
+// and collapses repeated underscores.
+func normalizeKey(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+
+	var b strings.Builder
+	b.Grow(len(s) + 4)
+	runes := []rune(s)
+	n := len(runes)
+
+	for i := 0; i < n; i++ {
+		r := runes[i]
+		switch r {
+		case '-', '.', ':', '/', '\\', '[', ']', '(', ')', '{', '}', ' ', '\t', '_', '@', '#', '$', '%', '^', '&', '*', '=', '+', '|', '~', '`', '<', '>', '?', '!':
+			b.WriteByte('_')
+			continue
+		}
+
+		if unicode.IsUpper(r) {
+			if i > 0 && (unicode.IsLower(runes[i-1]) || unicode.IsDigit(runes[i-1])) {
+				b.WriteByte('_')
+			} else if i > 0 && i+1 < n && unicode.IsUpper(runes[i-1]) && unicode.IsLower(runes[i+1]) {
+				b.WriteByte('_')
+			}
+			b.WriteRune(unicode.ToLower(r))
+			continue
+		}
+
+		b.WriteRune(unicode.ToLower(r))
+	}
+
+	raw := b.String()
+	for strings.Contains(raw, "__") {
+		raw = strings.ReplaceAll(raw, "__", "_")
+	}
+	return strings.Trim(raw, "_")
+}
+
+// isAuth checks if the canonical key contains "auth" as a discrete word segment.
+// This matches "auth", "user_auth", "auth_token", etc., while avoiding false positives like
+// "author", "authority", or "authenticate".
+func isAuth(canonical string) bool {
+	return canonical == "auth" ||
+		strings.HasPrefix(canonical, "auth_") ||
+		strings.HasSuffix(canonical, "_auth") ||
+		strings.Contains(canonical, "_auth_")
+}
+
 // isSensitiveKey checks whether an attribute key matches exact or compound sensitive patterns.
 func isSensitiveKey(key string, exactMap map[string]struct{}) bool {
-	canonical := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(key)), "-", "_")
+	canonical := normalizeKey(key)
+	if canonical == "" {
+		return false
+	}
 	if _, exists := exactMap[canonical]; exists {
+		return true
+	}
+
+	stripped := strings.ReplaceAll(canonical, "_", "")
+	if _, exists := exactMap[stripped]; exists {
 		return true
 	}
 
 	if strings.Contains(canonical, "password") ||
 		strings.Contains(canonical, "passwd") ||
+		strings.Contains(canonical, "pass_word") ||
+		strings.Contains(stripped, "password") ||
+		strings.Contains(stripped, "passwd") ||
 		strings.Contains(canonical, "secret") ||
 		strings.Contains(canonical, "credential") ||
 		strings.Contains(canonical, "private_key") ||
 		strings.Contains(canonical, "privatekey") ||
 		strings.Contains(canonical, "api_key") ||
 		strings.Contains(canonical, "apikey") ||
+		strings.Contains(canonical, "authorization") ||
 		strings.HasSuffix(canonical, "_token") ||
 		canonical == "token" ||
-		canonical == "auth" ||
-		canonical == "authorization" {
+		isAuth(canonical) {
 		return true
 	}
 
@@ -247,7 +312,7 @@ func makeReplaceAttr(customRedacted []string) func(groups []string, a slog.Attr)
 		redactedMap[k] = struct{}{}
 	}
 	for _, k := range customRedacted {
-		normalized := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(k)), "-", "_")
+		normalized := normalizeKey(k)
 		if normalized != "" {
 			redactedMap[normalized] = struct{}{}
 		}

@@ -657,7 +657,7 @@ TOTAL: 184 Discrete, Testable Micro-Phases
     - Negative boundary panic tests verifying anti-tear protection on undersized buffers.
     - Comprehensive truncation matrix (`nil`, empty, 1, 2, 3, and 9-byte continuation chains).
     - Overflow matrix (10th-byte continuation bit set, 10th-byte payload $> 1$, 11-byte to 15-byte chains).
-    - Varint Bomb DoS attack immunity test (1,000,000 bytes of `0x80` rejected in sub-microsecond time).
+    - Varint Bomb DoS bounded execution test (1,000,000 bytes of `0x80` rejected in sub-microsecond time).
     - Non-canonical overlong compatibility test.
     - Differential property testing against `encoding/binary.PutUvarint` and `Uvarint` (10,000 iterations).
     - Native Go fuzz testing (`FuzzGetVarint64` and `FuzzRoundTripVarint64`) executing >2.56M iterations with 0 crashes.
