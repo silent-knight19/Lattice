@@ -22,6 +22,8 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrChecksumMismatch", errors.ErrChecksumMismatch, "checksum mismatch: data corrupted"},
 		{"ErrTornWrite", errors.ErrTornWrite, "torn write detected at tail of log"},
 		{"ErrCompactionRunning", errors.ErrCompactionRunning, "compaction already in progress"},
+		{"ErrVarintOverflow", errors.ErrVarintOverflow, "varint exceeds maximum 64-bit integer size"},
+		{"ErrVarintTruncated", errors.ErrVarintTruncated, "varint buffer truncated or incomplete"},
 	}
 
 	for _, tc := range sentinels {
@@ -52,6 +54,8 @@ func TestSentinelWrappingWithErrorsIs(t *testing.T) {
 		{"ErrChecksumMismatch", errors.ErrChecksumMismatch},
 		{"ErrTornWrite", errors.ErrTornWrite},
 		{"ErrCompactionRunning", errors.ErrCompactionRunning},
+		{"ErrVarintOverflow", errors.ErrVarintOverflow},
+		{"ErrVarintTruncated", errors.ErrVarintTruncated},
 	}
 
 	for _, tc := range tests {
@@ -80,6 +84,8 @@ func TestSentinelNegativeComparisons(t *testing.T) {
 		errors.ErrChecksumMismatch,
 		errors.ErrTornWrite,
 		errors.ErrCompactionRunning,
+		errors.ErrVarintOverflow,
+		errors.ErrVarintTruncated,
 	}
 
 	for i, a := range allSentinels {

@@ -350,16 +350,16 @@ Every future micro-phase implementation response from Claude Code must use this 
 ```
 Current Major Phase           : Phase 01 — Core Storage Primitives & Binary Encodings
 Current Sub-Phase             : Sub-Phase 01.1 — Binary Encoding Primitives
-Current Micro-Phase           : P01-S01-M02 — Unsigned Variable-Length Integer (Varint) Codec
+Current Micro-Phase           : P01-S01-M03 — CRC32-IEEE Checksum Wrapper
 Phase 01 Status               : In Progress
 Previous Completed Phase      : Phase 00 — Repository & Engineering Foundations
-Previous Completed Micro-Phase: P01-S01-M01 — Big-Endian Fixed Integer Encoding & Decoding
+Previous Completed Micro-Phase: P01-S01-M02 — Unsigned Variable-Length Integer (Varint) Codec
 Phase 00 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Blocking Issues               : None
-Tests Passing                 : `go test -race ./...` (9/9 error suites, 18/18 logger suites, 10/10 binary suites passing, 100% binary coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
-Security Review Status        : Complete & Verified (Early BCE bounds checks prevent torn writes on undersized buffers; zero heap allocations verified; 3.8M fuzz iterations passing with 0 crashes)
-Interview Knowledge Status    : Updated with Big-Endian serialization theory, BCE optimization, zero-allocation verification, and differential testing
-Git Commit                    : feat(binary): [P01-S01-M01] Big-endian fixed integer encoding and decoding
+Tests Passing                 : `go test -race ./...` (9/9 error suites, 18/18 logger suites, 17/17 binary suites passing, 100% binary coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
+Security Review Status        : Complete & Verified (Early BCE bounds checks prevent torn writes; 10th-byte overflow validation; bounded loop <= 10 iterations protects against varint bomb DoS; 2.56M fuzz iterations passing with 0 crashes)
+Interview Knowledge Status    : Updated with 7-bit varint mechanics, continuation-bit semantics, 10th-byte overflow validation, DoS defense, and differential testing
+Git Commit                    : feat(binary): [P01-S01-M02] Unsigned variable-length integer codec
 ```
 
 ---
@@ -635,12 +635,50 @@ TOTAL: 184 Discrete, Testable Micro-Phases
   * *Completion*: Unit tests, differential suites, and fuzz tests passing with 100% code coverage.
   * *Next Micro-Phase*: P01-S01-M02 — Unsigned Variable-Length Integer (Varint) Codec.
 * **P01-S01-M02: Unsigned Variable-Length Integer (Varint) Codec**
+  * *Status*: **COMPLETE**
   * *Objective*: Implement 7-bit varint codec for disk offsets and lengths.
-  * *Changes*: `PutVarint64(buf []byte, v uint64) int`, `GetVarint64(buf []byte) (uint64, int, error)`.
-  * *Invariants*: Values $\le 127$ consume exactly 1 byte. Malformed varints exceeding 10 bytes return `ErrVarintOverflow`.
-  * *Security*: Prevents infinite loop DoS on malformed bitstreams.
-  * *Tests*: Test boundary values ($127, 128, 16383, 16384, 2^{64}-1$); test truncated byte slices.
-  * *Completion*: Varint codec thoroughly tested.
+  * *Functions Implemented*:
+    - `PutVarint64(buf []byte, v uint64) int`: Encodes a uint64 into `buf` using canonical 7-bit varint encoding.
+    - `GetVarint64(buf []byte) (uint64, int, error)`: Decodes a uint64 from `buf`, returning bytes consumed and error.
+    - `VarintLen(v uint64) int`: Helper computing exact bytes required for encoding `v` ($1 \le n \le 10$).
+    - `const MaxVarintLen64 = 10`: Maximum byte length for a 64-bit varint.
+  * *Invariants Verified*:
+    - Invariant 1: Values $\le 127$ consume exactly 1 byte.
+    - Invariant 2: Canonical encodings strictly use the minimum required number of bytes (monotonic growth at boundaries 128, 16384, etc.).
+    - Invariant 3: No valid uint64 value requires more than 10 bytes.
+    - Invariant 4: Overflow enforcement: Malformed varints exceeding 10 bytes or with invalid payload bits in the 10th byte ($b > 1$) return `ErrVarintOverflow`.
+    - Invariant 5: Truncation enforcement: Empty buffers or buffers terminating while continuation bit $0\text{x}80$ is set return `ErrVarintTruncated`.
+    - Invariant 6: Anti-DoS Bounded Execution: Decoder loop executes at most 10 iterations regardless of input buffer size (verified against 1,000,000-byte attack streams).
+    - Invariant 7: Anti-Tear Protection: `PutVarint64` verifies `len(buf) >= VarintLen(v)` upfront via `_ = buf[needed-1]`, preventing partial writes on undersized buffers.
+    - Invariant 8: Zero heap allocations empirically verified across all value widths (`0 B/op`, `0 allocs/op`).
+  * *Tests Added* (`internal/binary/varint_test.go`):
+    - Exact byte sequence tests against known vectors (`0`, `1`, `127`, `128`, `129`, `255`, `256`, `16383`, `16384`, `2097151`, `2097152`, `268435455`, `268435456`, `math.MaxUint32`, $1 \ll 32$, $(1 \ll 63) - 1$, $1 \ll 63$, `math.MaxUint64`).
+    - Oversized buffer canary tests verifying isolation of trailing bytes.
+    - Negative boundary panic tests verifying anti-tear protection on undersized buffers.
+    - Comprehensive truncation matrix (`nil`, empty, 1, 2, 3, and 9-byte continuation chains).
+    - Overflow matrix (10th-byte continuation bit set, 10th-byte payload $> 1$, 11-byte to 15-byte chains).
+    - Varint Bomb DoS attack immunity test (1,000,000 bytes of `0x80` rejected in sub-microsecond time).
+    - Non-canonical overlong compatibility test.
+    - Differential property testing against `encoding/binary.PutUvarint` and `Uvarint` (10,000 iterations).
+    - Native Go fuzz testing (`FuzzGetVarint64` and `FuzzRoundTripVarint64`) executing >2.56M iterations with 0 crashes.
+  * *Benchmark Results* (Apple M4, Darwin arm64, Go 1.24):
+    - `BenchmarkPutVarint64_1Byte`: 0.25 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkPutVarint64_2Bytes`: 0.73 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkPutVarint64_5Bytes`: 1.66 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkPutVarint64_10Bytes`: 2.60 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkGetVarint64_1Byte`: 0.78 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkGetVarint64_2Bytes`: 1.49 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkGetVarint64_5Bytes`: 2.74 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkGetVarint64_10Bytes`: 4.33 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkRoundTripVarint64`: 4.07 ns/op, 0 B/op, 0 allocs/op
+  * *Security Review*: Verified that varint decoding work is strictly bounded to $\le 10$ iterations, preventing CPU exhaustion from malformed streams. Verified that 10th-byte validation prevents uint64 silent wrap-around on overflow.
+  * *Evidence Classification*:
+    - Design Target: Zero heap allocations, strict bounded loop execution.
+    - Theoretical Property: 7-bit varints encode $\le 127$ in 1 byte and $2^{64}-1$ in at most 10 bytes.
+    - Measured Result: 0 B/op, 0 allocs/op, ~0.25–4.3 ns/op latency, 100% statement coverage, 2.56M+ fuzz executions with 0 crashes.
+    - Observed Limitation: Decoder accepts valid non-canonical encodings for compatibility with standard encoders, though Lattice's encoder strictly emits canonical minimal forms.
+  * *Completion*: Unit tests, differential suites, and fuzz tests passing with 100% code coverage.
+  * *Next Micro-Phase*: P01-S01-M03 — CRC32-IEEE Checksum Wrapper.
 * **P01-S01-M03: CRC32-IEEE Checksum Wrapper**
   * *Objective*: Implement high-performance CRC32 calculator with hardware acceleration (`hash/crc32`).
   * *Changes*: `Checksum(data []byte) uint32`, `Verify(data []byte, expected uint32) bool`.

@@ -102,8 +102,14 @@
   2. The Go compiler's SSA optimizer proves that indices 0, 1, and 2 are strictly within bounds, eliminating all three subsequent branch checks and generating branch-free machine instructions.
 * **Zero-Allocation Systems Design & Empirical Benchmark Auditing**: High-throughput storage engines cannot tolerate heap allocation on hot primitive paths. Passing scalar values and slice headers by value operates strictly in CPU registers and on the goroutine stack. Rather than assuming a function is allocation-free, systems engineers verify zero-allocation properties empirically using `testing.B` with `b.ReportAllocs()`, proving that benchmark runs report exactly `0 B/op` and `0 allocs/op`.
 * **Differential Reference Testing Against Independent Oracles**: A common testing trap in binary serialization is testing only round-trip identity (`Get(Put(x)) == x`). If an author mistakenly implements Little-Endian in both `Put` and `Get`, the round-trip test passes with 100% success despite producing byte streams that violate the architecture specification. Robust verification requires *differential testing* against an independent correctness oracle (e.g., standard library `encoding/binary.BigEndian`) and fixed known byte arrays to ensure bit-level correctness.
-* **Defensive Codec Contracts on Insufficient Buffers**: Scalar integer codecs operate at the lowest level of the database stack. Returning an `error` from `PutUint32(buf, v)` adds return value overhead and forces call sites to check errors on every 4-byte write. The idiomatic systems contract is: low-level fixed codecs panic deterministically on bounds failure (`len(buf) < width` or `buf == nil`), while higher-level parsers (WAL log replays, TCP frame decoders) validate byte counts *before* calling integer codecs, returning structured domain errors if a record or frame is truncated.
-* **Variable-Length Integers (Varints)**: 7-bit varints encode small integers in fewer bytes by using the high bit ($0\text{x}80$) as a continuation flag. An integer $\le 127$ uses 1 byte, while $2^{64}-1$ uses 10 bytes.
+* **Variable-Length Integers (Varints)**: 7-bit varints (LEB128 format) encode unsigned integers into a variable number of bytes to save disk space and network bandwidth. Each byte uses 7 bits for data and the high bit ($0\text{x}80$) as a continuation flag. An integer $\le 127$ uses 1 byte, while $2^{64}-1$ uses 10 bytes. In SSTables and WAL metadata where most block offsets, record lengths, and shared key prefixes are small, varints compress metadata by up to $75\%$ compared to fixed 64-bit integers.
+* **The 10th-Byte Constraint in 64-Bit Varints**: In a 7-bit varint, 9 bytes provide $9 \times 7 = 63$ bits. To reach 64 bits, a 10th byte is required, but it can only supply **1 bit** (the 64th bit, index 63). Therefore, for the 10th byte:
+  - Payload bits 1..6 cannot be set (`b & 0x7E == 0`), because setting them represents values $\ge 2^{64}$, overflowing `uint64`.
+  - The continuation bit cannot be set (`b & 0x80 == 0`), because that would request an 11th byte, which is illegal for a 64-bit integer.
+  - In code, both conditions are caught in a single branch: if $i == 9$ and $b > 1$, the input is strictly an overflow (`ErrVarintOverflow`). The only valid bytes at index 9 are `0x00` and `0x01`.
+* **Varint Bomb DoS Defense & Bounded Execution**: A malicious network client or corrupted disk record can transmit an endless stream of bytes with the continuation bit set (`0x80 0x80 0x80 ...`). If a decoder loops until it encounters $b < 0\text{x}80$ without an iteration limit, it can enter an infinite loop or scan gigabytes of memory, causing severe CPU exhaustion (Denial-of-Service). Lattice guarantees bounded execution: the decoding loop terminates at index 9, executing at most 10 iterations regardless of how large the input buffer is.
+* **Truncation Error Semantics & Zero-on-Error Return Contract**: When a buffer terminates before a varint is complete (e.g. `[0x80]` or empty buffer), `GetVarint64` returns `(0, 0, errors.ErrVarintTruncated)`. Returning `0` bytes consumed on error is a critical safety guarantee: it prevents callers from accidentally advancing their buffer read cursor when a frame or record is incomplete.
+* **Canonical vs Non-Canonical Varint Encodings**: A canonical varint uses the minimum required number of bytes (e.g. `0` encoded as `[0x00]`). An overlong or non-canonical varint encodes a small number using unnecessary continuation bytes whose payload bits are 0 (e.g. `0` encoded as `[0x80, 0x00]`). Lattice's encoder (`PutVarint64`) strictly emits canonical minimal encodings. Its decoder accepts valid non-canonical encodings up to 10 bytes for standard compatibility (matching Go's `encoding/binary.Uvarint`), while strictly rejecting overflows.
 * **Memory Allocation & GC Pressure**: Creating millions of small heap allocations triggers frequent Go Garbage Collector mark-and-sweep cycles, stealing CPU cycles and introducing millisecond-level tail latency spikes. `sync.Pool` provides zero-allocation buffer reuse.
 
 ### Decisions Made & Trade-offs
@@ -113,6 +119,9 @@
 * **Decision**: Pure shift-and-mask Big-Endian implementation with early BCE check (`_ = buf[width-1]`) over `unsafe.Pointer` casting or runtime branch checks.
 * **Alternative Considered**: Using `unsafe.Pointer` to reinterpret slice bytes, or inspecting host endianness at runtime.
 * **Trade-off**: Requires manual bit-shifting code, but guarantees 100% memory safety, portability across heterogeneous architectures (ARM64, x86-64), and allows Go compiler pattern matching to emit single byte-swap machine instructions (`BSWAP` / `REV`).
+* **Decision**: Bounded varint decoder with explicit 10th-byte validation (`b > 1`) and returning `(0, 0, err)` on any failure.
+* **Alternative Considered**: Unbounded scanning for `b < 0x80`, or returning partial bytes consumed on error.
+* **Trade-off**: Requires strict overflow and truncation branching, but guarantees complete immunity against Varint Bomb DoS attacks and prevents callers from advancing read cursors on corrupted streams.
 * **Decision**: Wrapping standard library `log/slog` rather than adopting third-party frameworks like Uber's `zap` or `zerolog`.
 * **Alternative Considered**: Adding `go.uber.org/zap` for marginal allocation advantages in structured logging.
 * **Trade-off**: `slog` introduced in Go 1.21 provides high-performance structured JSON and Text handlers directly in the Go standard library. Wrapping it provides full interface decoupling while preserving zero external runtime dependencies.
@@ -165,6 +174,14 @@
 * **"Did You Actually Build This?"**: In `PutUint32`, why did you include `_ = buf[3]` as the first line instead of writing directly to `buf[0]`? What does this do for both security and compiler performance?
 * **"Did You Actually Build This?"**: How do you prove that your binary encoding functions perform zero heap allocations in Go?
 * **"Did You Actually Build This?"**: Why is a round-trip test (`Get(Put(x)) == x`) insufficient on its own when testing binary serialization primitives?
+* **"Did You Actually Build This?"**: Why is 127 a boundary in 7-bit varint encoding, and why does 128 require another byte?
+* **"Did You Actually Build This?"**: Why does `math.MaxUint64` need 10 bytes, and what is the special constraint on the tenth byte?
+* **"Did You Actually Build This?"**: How does `GetVarint64` detect integer overflow and avoid silent wraparound?
+* **"Did You Actually Build This?"**: How does the decoder avoid infinite loops when fed hostile input like a "Varint Bomb"?
+* **"Did You Actually Build This?"**: How is canonical encoding enforced by `PutVarint64`, and what is the decoder's policy on non-canonical encodings?
+* **"Did You Actually Build This?"**: What exact return contract does `GetVarint64` adhere to when input is truncated, and why does it return zero bytes consumed?
+* **"Did You Actually Build This?"**: Why must the test suite use an independent reference oracle instead of relying solely on round-trip `Get(Put(x)) == x` tests?
+* **"Did You Actually Build This?"**: How do you prevent partial ("torn") buffer mutations in `PutVarint64` when the destination slice is undersized?
 
 * **"Did You Actually Build This?"**: In your initial scaffolding, what subtle bug can occur when configuring `.gitignore` for compiled binary names like `lattice` and runtime directories like `wal/`?
 * **"Did You Actually Build This?"**: Why must `cmd/` packages contain a dummy `func main() {}` in `main.go` even during a purely structural scaffolding phase?
@@ -654,6 +671,21 @@ This section is a living record of actual engineering obstacles, debugging sessi
 - **Fix Applied**: Placed an explicit early bounds check `_ = buf[width-1]` at the entry of each `PutUint*` and `GetUint*` function. This causes the function to panic immediately *before* writing any bytes, eliminating torn writes while allowing the Go compiler to prove that subsequent indices `0..width-1` are in-bounds and eliminate all subsequent branch checks.
 - **Core Lesson**: Low-level binary primitives must be tear-resistant by design. Anchoring bounds at the maximum index guarantees an atomic all-or-nothing write semantic without adding error handling overhead to hot scalar codecs.
 - **Interview Relevance**: Demonstrates deep understanding of Go compiler optimizations (BCE, SSA pass), hardware byte swapping, zero-allocation benchmarking, and defensive memory design in storage engines.
+
+### Entry 2026-09-07 — P01-S01-M02: 7-Bit Varints, 10th-Byte Overflow Invariants, and DoS-Resistant Bounded Decoding
+- **Date**: 2026-09-07
+- **Micro-Phase**: P01-S01-M02
+- **Problem**: Implement a high-performance, zero-allocation 7-bit unsigned varint codec (`PutVarint64`, `GetVarint64`, `VarintLen`) resilient against malformed streams, integer overflow, truncated buffers, and unbounded scan CPU exhaustion attacks (Varint Bomb DoS).
+- **Initial Assumption**: Can loop `for b >= 0x80` shifting 7 bits per byte until a terminating byte is found, and allow standard integer overflow wrapping if a stream is oversized.
+- **What Was Actually True**:
+  1. An attacker or corrupted disk segment transmitting continuous `0x80` bytes can force an unbounded loop to scan entire memory buffers, burning CPU cycles in an infinite scan loop (Varint Bomb DoS).
+  2. 64-bit unsigned integers require at most 10 bytes ($9 \times 7 = 63$ bits, leaving exactly 1 bit in byte 10). If byte 10 contains payload bits 1..6 (`b & 0x7E != 0`) or continuation bit 7 (`b & 0x80 != 0`), it represents values $\ge 2^{64}$ or an illegal 11th byte, both requiring strict `ErrVarintOverflow`.
+  3. Truncated inputs must return `(0, 0, ErrVarintTruncated)` rather than partial byte counts, ensuring callers do not advance read pointers on incomplete frames.
+  4. In `PutVarint64`, writing bytes sequentially into an undersized slice corrupts caller memory before panicking. Pre-computing `VarintLen(v)` and touching `_ = buf[needed-1]` upfront guarantees an atomic all-or-nothing write.
+- **How It Was Discovered**: Boundary analysis of $2^{64}-1$ byte vectors, adversarial testing with $1,000,000$ consecutive `0x80` bytes, and native Go fuzzing (`FuzzGetVarint64`, `FuzzRoundTripVarint64`).
+- **Fix Applied**: Implemented bounded loop (`i < MaxVarintLen64`), 10th-byte overflow check (`i == 9 && b > 1`), atomic anti-tear BCE check in `PutVarint64`, zero-on-error return contract `(0, 0, err)`, and extensive tests against independent reference implementations and `encoding/binary.Uvarint`.
+- **Core Lesson**: Binary parsers exposed to untrusted disk or network inputs must guarantee strictly bounded execution. Any loop processing variable-length data must be capped at the theoretical maximum length of the underlying data type.
+- **Interview Relevance**: Demonstrates deep understanding of LEB128/varint mechanics, bitwise arithmetic limits, DoS vector mitigation in storage engines, and zero-allocation systems engineering.
 
 ---
 

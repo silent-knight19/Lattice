@@ -32,6 +32,15 @@ var (
 	// ErrCompactionRunning indicates that a requested compaction operation cannot
 	// proceed because another compaction worker is actively processing the targeted levels.
 	ErrCompactionRunning = stdErrors.New("compaction already in progress")
+
+	// ErrVarintOverflow indicates that a varint byte sequence exceeds the maximum
+	// 64-bit unsigned integer representation (exceeds 10 bytes, or the 10th byte
+	// contains invalid payload bits).
+	ErrVarintOverflow = stdErrors.New("varint exceeds maximum 64-bit integer size")
+
+	// ErrVarintTruncated indicates that a buffer ended prematurely while decoding
+	// a varint before encountering a terminating byte.
+	ErrVarintTruncated = stdErrors.New("varint buffer truncated or incomplete")
 )
 
 // KeyTooLargeError provides structured context when a key violates maximum size limits.
