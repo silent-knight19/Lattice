@@ -534,6 +534,12 @@ func FuzzInternalKeyRoundTrip(f *testing.F) {
 // Benchmarks
 // -----------------------------------------------------------------------------
 
+var (
+	sinkCompare        int
+	sinkInternalKeyBuf []byte
+	sinkInternalKey    binary.InternalKey
+)
+
 func BenchmarkCompareInternalKey_16B(b *testing.B) {
 	k1 := binary.InternalKey{UserKey: []byte("0123456789abcdef"), SeqNum: 100, OpType: binary.OpTypePut}
 	k2 := binary.InternalKey{UserKey: []byte("0123456789abcdeg"), SeqNum: 100, OpType: binary.OpTypePut}
@@ -542,7 +548,7 @@ func BenchmarkCompareInternalKey_16B(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_ = binary.CompareInternalKey(k1, k2)
+		sinkCompare = binary.CompareInternalKey(k1, k2)
 	}
 }
 
@@ -558,7 +564,7 @@ func BenchmarkCompareInternalKey_1KB(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_ = binary.CompareInternalKey(k1, k2)
+		sinkCompare = binary.CompareInternalKey(k1, k2)
 	}
 }
 
@@ -574,7 +580,7 @@ func BenchmarkCompareInternalKey_64KB(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_ = binary.CompareInternalKey(k1, k2)
+		sinkCompare = binary.CompareInternalKey(k1, k2)
 	}
 }
 
@@ -587,7 +593,7 @@ func BenchmarkCompareInternalKey_SameKey_DifferentSeq(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_ = binary.CompareInternalKey(k1, k2)
+		sinkCompare = binary.CompareInternalKey(k1, k2)
 	}
 }
 
@@ -599,7 +605,7 @@ func BenchmarkAppendInternalKey(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_ = binary.AppendInternalKey(buf[:0], ik)
+		sinkInternalKeyBuf = binary.AppendInternalKey(buf[:0], ik)
 	}
 }
 
@@ -611,10 +617,11 @@ func BenchmarkDecodeInternalKey(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_, err := binary.DecodeInternalKey(encoded)
+		k, err := binary.DecodeInternalKey(encoded)
 		if err != nil {
 			b.Fatal(err)
 		}
+		sinkInternalKey = k
 	}
 }
 

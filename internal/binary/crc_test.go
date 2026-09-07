@@ -340,13 +340,19 @@ func FuzzChecksum(f *testing.F) {
 
 // Benchmark suites measuring ns/op, B/op, and allocs/op across payload sizes.
 
+// Global sink variables prevent compiler dead-code elimination of benchmarks
+var (
+	sinkChecksum uint32
+	sinkVerify   bool
+)
+
 func BenchmarkChecksum_Empty(b *testing.B) {
 	data := []byte{}
 	b.SetBytes(0)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = Checksum(data)
+		sinkChecksum = Checksum(data)
 	}
 }
 
@@ -357,7 +363,7 @@ func BenchmarkChecksum_64B(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = Checksum(data)
+		sinkChecksum = Checksum(data)
 	}
 }
 
@@ -368,7 +374,7 @@ func BenchmarkChecksum_1KB(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = Checksum(data)
+		sinkChecksum = Checksum(data)
 	}
 }
 
@@ -379,7 +385,7 @@ func BenchmarkChecksum_4KB(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = Checksum(data)
+		sinkChecksum = Checksum(data)
 	}
 }
 
@@ -390,7 +396,7 @@ func BenchmarkChecksum_64KB(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = Checksum(data)
+		sinkChecksum = Checksum(data)
 	}
 }
 
@@ -401,7 +407,7 @@ func BenchmarkChecksum_1MB(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = Checksum(data)
+		sinkChecksum = Checksum(data)
 	}
 }
 
@@ -413,7 +419,7 @@ func BenchmarkVerify_4KB(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = Verify(data, expected)
+		sinkVerify = Verify(data, expected)
 	}
 }
 

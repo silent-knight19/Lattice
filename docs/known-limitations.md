@@ -100,4 +100,46 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 7. Varint Non-Canonical (Overlong) Encoding Acceptance
+* **Limitation**: The varint decoder (`GetVarint64`) accepts non-canonical (overlong) byte sequences representing values $\le 2^{64}-1$ up to 10 bytes (e.g., `0` encoded as `[0x80, 0x00]`), rather than rejecting all non-minimal encodings.
+* **Why It Exists**: To maintain broad binary compatibility with standard library encoders (`encoding/binary.PutUvarint`) and third-party tools that may emit non-canonical representations.
+* **Impact**: Two distinct byte sequences can decode to the same `uint64` value.
+* **How It Was Detected**: Architectural audit of Phase 01 binary primitives.
+* **Current Mitigation**: Lattice's encoder (`PutVarint64`) strictly emits minimal canonical forms; decoder strictly enforces the 10-byte bound and rejects integer overflow (`b > 1` on 10th byte).
+* **Future Solution**: Provide a strict-mode decoder (`GetCanonicalVarint64`) if cryptographic or deterministic hashing requirements demand strict canonical representations.
+* **Dimensional Impact**:
+  * Correctness: **None** (Values decode mathematically correctly).
+  * Performance: **None**.
+  * Scalability: **None**.
+
+---
+
+### 8. InternalKey Zero-Allocation Borrowing Requires Caller Mutation Discipline
+* **Limitation**: Direct initialization of `InternalKey` struct literals (`InternalKey{UserKey: ...}`) borrows the caller's slice without allocation, bypassing `NewInternalKey`'s defensive copy.
+* **Why It Exists**: High-performance inner loops (e.g., point lookups and range scans across MemTable and SSTable blocks) cannot tolerate heap allocations per comparison.
+* **Impact**: If a caller mutates the borrowed `UserKey` slice after passing it to an in-memory component, internal index ordering can be corrupted.
+* **How It Was Detected**: Phase 01 memory safety and ownership audit.
+* **Current Mitigation**: `NewInternalKey` and `DecodeInternalKey` defensively copy slices on ingest; borrowed struct literals are restricted by convention to read-only comparator probes.
+* **Future Solution**: Continue enforcing ownership boundaries across package boundaries in engine and MemTable abstractions.
+* **Dimensional Impact**:
+  * Correctness: **High if misused** (Caller must respect read-only convention).
+  * Performance: **Optimal** (Enables $0\text{ B/op}$ read path).
+  * Scalability: **None**.
+
+---
+
+### 9. Scalar Sequence Number Monotonicity vs Global Atomic Allocation
+* **Limitation**: `SeqNum.Next()` provides local incrementation with overflow detection (`ErrSeqNumOverflow`), but does not coordinate sequence numbers across concurrent goroutines.
+* **Why It Exists**: `SeqNum` is a value-type primitive (`type SeqNum uint64`) in `internal/binary`, designed to be lightweight, zero-allocation, and register-passed without lock overhead.
+* **Impact**: Calling `Next()` on a local `SeqNum` value cannot be used directly as a thread-safe sequence generator.
+* **How It Was Detected**: Architectural consistency audit between representation primitives and concurrency models.
+* **Current Mitigation**: Documented distinction between representation type and stateful allocator.
+* **Future Solution**: Phase 02 WAL writer introduces atomic global sequence coordinator (`atomic.Uint64`).
+* **Dimensional Impact**:
+  * Correctness: **None** (Enforced at architectural layer).
+  * Performance: **Optimal**.
+  * Scalability: **None**.
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*

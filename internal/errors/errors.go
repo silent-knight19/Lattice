@@ -15,7 +15,7 @@ var (
 	// ErrEmptyKey indicates that a zero-length key was provided where a valid key is required.
 	ErrEmptyKey = stdErrors.New("key cannot be empty")
 
-	// ErrKeyTooLarge indicates that a key exceeds the maximum allowed size (64 KB).
+	// ErrKeyTooLarge indicates that a key exceeds the maximum allowed size (65,535 bytes / 64 KB - 1).
 	ErrKeyTooLarge = stdErrors.New("key exceeds maximum allowed size")
 
 	// ErrValueTooLarge indicates that a value exceeds the maximum allowed size (4 MB).

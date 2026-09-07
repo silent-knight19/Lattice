@@ -370,14 +370,15 @@ func FuzzValidateValue(f *testing.F) {
 	})
 }
 
-// Benchmarks
+// Global sink variables prevent compiler dead-code elimination of benchmarks
+var sinkErr error
 
 func BenchmarkValidateKey_Empty(b *testing.B) {
 	key := []byte{}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = ValidateKey(key)
+		sinkErr = ValidateKey(key)
 	}
 }
 
@@ -386,7 +387,7 @@ func BenchmarkValidateKey_16B(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = ValidateKey(key)
+		sinkErr = ValidateKey(key)
 	}
 }
 
@@ -395,7 +396,7 @@ func BenchmarkValidateKey_1KB(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = ValidateKey(key)
+		sinkErr = ValidateKey(key)
 	}
 }
 
@@ -404,7 +405,7 @@ func BenchmarkValidateKey_65535B(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = ValidateKey(key)
+		sinkErr = ValidateKey(key)
 	}
 }
 
@@ -413,7 +414,7 @@ func BenchmarkValidateValue_Empty(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = ValidateValue(val)
+		sinkErr = ValidateValue(val)
 	}
 }
 
@@ -422,7 +423,7 @@ func BenchmarkValidateValue_1KB(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = ValidateValue(val)
+		sinkErr = ValidateValue(val)
 	}
 }
 
@@ -431,7 +432,7 @@ func BenchmarkValidateValue_1MB(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = ValidateValue(val)
+		sinkErr = ValidateValue(val)
 	}
 }
 
@@ -440,6 +441,6 @@ func BenchmarkValidateValue_4MB(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = ValidateValue(val)
+		sinkErr = ValidateValue(val)
 	}
 }

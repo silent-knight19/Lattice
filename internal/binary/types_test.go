@@ -354,27 +354,31 @@ func FuzzSeqNumNext(f *testing.F) {
 // Zero-Allocation Benchmarks
 // -----------------------------------------------------------------------------
 
+var (
+	sinkBool   bool
+	sinkErr    error
+	sinkString string
+	sinkOp     binary.OpType
+	sinkSeq    binary.SeqNum
+)
+
 func BenchmarkOpType_Valid(b *testing.B) {
-	op := binary.OpTypePut
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		if !op.Valid() {
-			b.Fatal("unexpected invalid")
-		}
+		op := binary.OpType(byte(i&1 + 1))
+		sinkBool = op.Valid()
 	}
 }
 
 func BenchmarkOpType_Validate_Valid(b *testing.B) {
-	op := binary.OpTypeDelete
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		if err := op.Validate(); err != nil {
-			b.Fatal(err)
-		}
+		op := binary.OpType(byte(i&1 + 1))
+		sinkErr = op.Validate()
 	}
 }
 
@@ -384,20 +388,19 @@ func BenchmarkOpType_String_Put(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_ = op.String()
+		sinkString = op.String()
 	}
 }
 
 func BenchmarkParseOpType_Valid(b *testing.B) {
-	raw := byte(0x01)
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
+		raw := byte(i&1 + 1)
 		op, err := binary.ParseOpType(raw)
-		if err != nil || op != binary.OpTypePut {
-			b.Fatal("unexpected parse failure")
-		}
+		sinkOp = op
+		sinkErr = err
 	}
 }
 
@@ -408,9 +411,8 @@ func BenchmarkSeqNum_Next_Valid(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		next, err := s.Next()
-		if err != nil || next != 101 {
-			b.Fatal("unexpected next failure")
-		}
+		sinkSeq = next
+		sinkErr = err
 	}
 }
 
@@ -420,6 +422,6 @@ func BenchmarkSeqNum_String(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_ = s.String()
+		sinkString = s.String()
 	}
 }

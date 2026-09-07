@@ -498,6 +498,7 @@ func BenchmarkPutUint16(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		binary.PutUint16(buf, uint16(i))
+		sinkUint16 = uint16(buf[0])
 	}
 }
 
@@ -520,6 +521,7 @@ func BenchmarkPutUint32(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		binary.PutUint32(buf, uint32(i))
+		sinkUint32 = uint32(buf[0])
 	}
 }
 
@@ -542,6 +544,7 @@ func BenchmarkPutUint64(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		binary.PutUint64(buf, uint64(i))
+		sinkUint64 = uint64(buf[0])
 	}
 }
 
