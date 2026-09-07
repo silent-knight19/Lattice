@@ -26,6 +26,7 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrVarintTruncated", errors.ErrVarintTruncated, "varint buffer truncated or incomplete"},
 		{"ErrInvalidOpType", errors.ErrInvalidOpType, "invalid operation type"},
 		{"ErrSeqNumOverflow", errors.ErrSeqNumOverflow, "sequence number overflow"},
+		{"ErrInternalKeyTruncated", errors.ErrInternalKeyTruncated, "internal key buffer truncated: missing trailer or user key"},
 	}
 
 	for _, tc := range sentinels {
@@ -60,6 +61,7 @@ func TestSentinelWrappingWithErrorsIs(t *testing.T) {
 		{"ErrVarintTruncated", errors.ErrVarintTruncated},
 		{"ErrInvalidOpType", errors.ErrInvalidOpType},
 		{"ErrSeqNumOverflow", errors.ErrSeqNumOverflow},
+		{"ErrInternalKeyTruncated", errors.ErrInternalKeyTruncated},
 	}
 
 	for _, tc := range tests {
@@ -92,6 +94,7 @@ func TestSentinelNegativeComparisons(t *testing.T) {
 		errors.ErrVarintTruncated,
 		errors.ErrInvalidOpType,
 		errors.ErrSeqNumOverflow,
+		errors.ErrInternalKeyTruncated,
 	}
 
 	for i, a := range allSentinels {

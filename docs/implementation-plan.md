@@ -348,18 +348,18 @@ Every future micro-phase implementation response from Claude Code must use this 
 # 16. Current Execution State
 
 ```
-Current Major Phase           : Phase 01 — Core Storage Primitives & Binary Encodings
-Current Sub-Phase             : Sub-Phase 01.2 — Database Key & Value Models
-Current Micro-Phase           : P01-S02-M03 — InternalKey Data Model & Comparator
-Phase 01 Status               : In Progress (Sub-Phase 01.1 Complete)
-Previous Completed Phase      : Phase 00 — Repository & Engineering Foundations
-Previous Completed Micro-Phase: P01-S02-M02 — Operation Type & Sequence Number Abstractions
+Current Major Phase           : Phase 02 — Write-Ahead Log (WAL) & Durability Subsystem
+Current Sub-Phase             : Sub-Phase 02.1 — WAL Binary Record Layout & Serialization
+Current Micro-Phase           : P02-S01-M01 — WAL Record Header & Framing Definition
+Phase 01 Status               : COMPLETE (Sub-Phases 01.1 & 01.2 Complete)
+Previous Completed Phase      : Phase 01 — Core Storage Primitives & Binary Encodings
+Previous Completed Micro-Phase: P01-S02-M03 — InternalKey Data Model & Comparator
 Phase 00 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Blocking Issues               : None
-Tests Passing                 : `go test -race ./...` (11/11 error suites, 18/18 logger suites, 40/40 binary suites passing, 100% binary coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
-Security Review Status        : Complete & Verified (Strict byte enum validation rejects invalid operations; 64-bit unsigned sequence overflow protection prevents silent wraparound; >5.50M fuzz iterations passing with 0 crashes)
-Interview Knowledge Status    : Updated with OpType/SeqNum abstractions, 64-bit sequence exhaustion math, zero-value semantics, and interview Q&A
-Git Commit                    : feat(binary): [P01-S02-M02] add operation type and sequence abstractions
+Tests Passing                 : `go test -race ./...` (12/12 error suites, 18/18 logger suites, 48/48 binary suites passing, 100% binary coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
+Security Review Status        : Complete & Verified (Defensive slice copying protects against caller mutation; canonical three-way comparator guarantees strict total ordering; >5.82M fuzz iterations passing with 0 crashes)
+Interview Knowledge Status    : Updated with InternalKey version ordering, LSM newest-first search semantics, comparator mathematical laws, and interview Q&A
+Git Commit                    : feat(binary): [P01-S02-M03] add InternalKey model and comparator
 ```
 
 ---
@@ -807,11 +807,51 @@ TOTAL: 184 Discrete, Testable Micro-Phases
   * *Completion*: Unit tests, boundary suites, and fuzz tests passing with 100% code coverage.
   * *Next Micro-Phase*: P01-S02-M03 — InternalKey Data Model & Comparator.
 * **P01-S02-M03: InternalKey Data Model & Comparator**
+  * *Status*: **COMPLETE**
   * *Objective*: Define `InternalKey` struct (`UserKey []byte`, `SeqNum SeqNum`, `OpType OpType`) and bidirectional binary encoding/decoding.
-  * *Changes*: `type InternalKey struct`, `EncodeInternalKey`, `DecodeInternalKey`, `CompareInternalKey`.
-  * *Invariants*: Internal key sorts by `UserKey` ascending, then `SeqNum` descending, then `OpType` descending.
-  * *Tests*: Unit test internal key comparator ordering and round-trip serialization.
-  * *Completion*: Pending.
+  * *Functions & Types Implemented*:
+    - `type InternalKey struct { UserKey []byte; SeqNum SeqNum; OpType OpType }`
+    - `InternalKeyTrailerLen = 9` (8 bytes SeqNum + 1 byte OpType)
+    - `NewInternalKey(userKey []byte, seqNum SeqNum, opType OpType) (InternalKey, error)`: Validates inputs via `ValidateKey` and `opType.Validate()`, making an owned copy of `userKey`.
+    - `(k InternalKey) Clone() InternalKey`: Returns deep copy of InternalKey with cloned UserKey slice.
+    - `(k InternalKey) String() string`: Human-readable diagnostic formatting with `%q` escaped key.
+    - `(k InternalKey) Equal(other InternalKey) bool`: Reports whether `CompareInternalKey(k, other) == 0`.
+    - `(k InternalKey) Compare(other InternalKey) int`: Receiver method calling `CompareInternalKey(k, other)`.
+    - `CompareInternalKey(a, b InternalKey) int`: Canonical comparator (UserKey ascending $\to$ SeqNum descending $\to$ OpType descending).
+    - `AppendInternalKey(dst []byte, key InternalKey) []byte`: Appends UserKey + 8-byte Big-Endian SeqNum + 1-byte OpType.
+    - `EncodeInternalKey(key InternalKey) []byte`: Serializes into newly allocated byte slice.
+    - `DecodeInternalKey(data []byte) (InternalKey, error)`: Deserializes, validates, and returns owned InternalKey.
+    - Sentinel error `ErrInternalKeyTruncated` in `internal/errors`.
+  * *Invariants Verified*:
+    - Invariant 1: Canonical ordering: UserKey ascending (raw byte lexicographical order) $\to$ SeqNum descending (higher sequence numbers sort before lower ones) $\to$ OpType descending (DELETE sorts before PUT).
+    - Invariant 2: Mathematical comparator laws: reflexivity (`Compare(x, x) == 0`), antisymmetry (`sign(Compare(x, y)) == -sign(Compare(y, x))`), transitivity (if $x < y$ and $y < z \implies x < z$).
+    - Invariant 3: LSM newest-first search invariant: for any given user key, higher sequence numbers sort earlier, guaranteeing that point lookups and iterators encounter the newest revision first.
+    - Invariant 4: Ownership & immutability: constructor `NewInternalKey` and `DecodeInternalKey` make owned defensive copies, isolating internal state from caller buffer mutations. Direct struct initialization enables zero-allocation borrowed usage for hot internal search loops.
+    - Invariant 5: Zero heap allocations on comparison and append paths (`0 B/op`, `0 allocs/op`).
+    - Invariant 6: Binary layout: $N + 9$ bytes (`[ UserKey | SeqNum (8B Big-Endian) | OpType (1B) ]`), correctly bounded by $10 \le \text{len} \le 65,544$ bytes.
+  * *Tests Added* (`internal/binary/internalkey_test.go`, `internal/errors/errors_test.go`):
+    - Construction and boundary validation (1B, typical, 65,535B, empty, oversized, invalid OpType).
+    - Defensive copy caller mutation protection test.
+    - Comparator ordering matrix (UserKey ascending, SeqNum descending, OpType descending).
+    - Mathematical comparator laws across sample keys and 5,000 randomized triples.
+    - Sorting integration with `sort.Slice` verifying newest versions emerge first.
+    - Binary round-trip encoding/decoding and error handling (truncated, oversized, corrupted opcode).
+    - Native Go fuzzing: `FuzzCompareInternalKey` (2.92M iterations) and `FuzzInternalKeyRoundTrip` (2.89M iterations) with 0 crashes.
+  * *Benchmark Results* (Apple M4, Darwin arm64, Go 1.24):
+    - `BenchmarkCompareInternalKey_16B`: 2.49 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkCompareInternalKey_1KB`: 24.72 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkCompareInternalKey_64KB`: 1541 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkCompareInternalKey_SameKey_DifferentSeq`: 2.23 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkAppendInternalKey`: 3.02 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkDecodeInternalKey`: 8.13 ns/op, 24 B/op, 1 allocs/op
+  * *Security Review*: Defensive slice copying eliminates caller-aliased memory mutation exploits. Three-way comparator guarantees strict weak ordering, preventing sorting panics or infinite binary search loops.
+  * *Evidence Classification*:
+    - Design Target: Deterministic multi-version key representation and allocation-free comparator.
+    - Theoretical Property: Comparator provides a strict weak ordering (total ordering when all 3 fields match), satisfying the prerequisites of binary search and priority queues.
+    - Measured Result: 0 B/op, 0 allocs/op for comparator, 100% statement coverage in `internal/binary`, >5.82M fuzz executions with 0 crashes.
+    - Observed Limitation: UserKey comparison complexity is $O(\min(len_a, len_b))$; sequence and opcode tie-breaking is $O(1)$.
+  * *Completion*: Unit tests, boundary suites, fuzz suites, and benchmarks passing with 100% code coverage. Sub-Phase 01.2 and Phase 01 COMPLETE.
+  * *Next Micro-Phase*: P02-S01-M01 — WAL Record Header & Framing Definition.
 
 ---
 

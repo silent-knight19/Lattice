@@ -49,6 +49,10 @@ var (
 	// ErrSeqNumOverflow indicates that incrementing a sequence number would exceed
 	// the maximum 64-bit unsigned integer representation (wraparound prohibited).
 	ErrSeqNumOverflow = stdErrors.New("sequence number overflow")
+
+	// ErrInternalKeyTruncated indicates that an encoded internal key byte sequence
+	// is shorter than the minimum required size (user key + 9-byte sequence/op trailer).
+	ErrInternalKeyTruncated = stdErrors.New("internal key buffer truncated: missing trailer or user key")
 )
 
 // KeyTooLargeError provides structured context when a key violates maximum size limits.
