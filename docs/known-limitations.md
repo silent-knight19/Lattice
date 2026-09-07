@@ -142,4 +142,18 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 10. Key-Based Redaction Heuristic for Unrecognized Non-Sensitive Keys
+* **Limitation**: Key-based log redaction automatically masks attributes matching known sensitive keywords or configured custom keys (and sensitive keys take strict precedence over custom `Redactable` values). However, if arbitrary credentials or secrets are logged under an innocuous, unrecognized key name (e.g. `description`, `misc_data`) as plain string/scalar types without implementing `Redactable`, the logger cannot infer semantic sensitivity.
+* **Why It Exists**: `slog` operates on key-value pairs without deep natural language processing or arbitrary secret sniffing in hot logging paths, which would destroy throughput.
+* **Impact**: Plain primitive secrets passed under non-sensitive keys bypass automated masking unless the type implements `Redactable` or the key is added to `Config.RedactedKeys`.
+* **How It Was Detected**: Security contract analysis of `internal/logger`.
+* **Current Mitigation**: Strict sensitive-key precedence over `Redactable` prevents bypass when keys are classified as sensitive; domain structs carrying sensitive data implement `Redactable` to scrub themselves regardless of key name; custom keys can be configured via `Config.RedactedKeys`.
+* **Future Solution**: Provide opt-in regex-based value scrubber for diagnostic environments where strict audit compliance is required.
+* **Dimensional Impact**:
+  * Correctness: **None** (Explicit contracts are enforced).
+  * Performance: **Optimal** ($O(1)$ keyword and stem matching).
+  * Scalability: **None**.
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*

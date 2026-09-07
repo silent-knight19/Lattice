@@ -545,11 +545,11 @@ TOTAL: 184 Discrete, Testable Micro-Phases
       - `Level` enum (`LevelDebug`, `LevelInfo`, `LevelWarn`, `LevelError`) and string mapping.
       - `Format` enum (`FormatJSON`, `FormatText`).
       - `Logger` interface with context methods (`DebugContext`, `InfoContext`, `WarnContext`, `ErrorContext`), attributes (`With`), and subsystem scoping (`WithComponent`).
-      - Automated sensitive key redaction (`[REDACTED]`) via `ReplaceAttr` covering 13 baseline keywords (`password`, `secret`, `token`, `auth`, `authorization`, `api_key`, `apikey`, `private_key`, `credential`, `credentials`, `access_token`, `refresh_token`) and custom configured keys.
+      - Automated sensitive key redaction (`[REDACTED]`) via `ReplaceAttr` covering 13 baseline keywords (`password`, `secret`, `token`, `auth`, `authorization`, `api_key`, `apikey`, `private_key`, `credential`, `credentials`, `access_token`, `refresh_token`), compound/stem variants, and custom configured keys.
       - `Redactable` interface (`Redact() any`) for custom domain struct scrubbing.
       - `Err(err error) slog.Attr` for idiomatic error attribute integration.
       - `nopHandler` and `NewNop()` for zero-allocation silent logging in benchmarks.
-  * *Security*: Automated two-tier redaction in `ReplaceAttr` prevents leaking credentials, tokens, or sensitive values to persistent log streams.
+  * *Security*: Automated defense-in-depth redaction in `ReplaceAttr`: sensitive attribute keys strictly take precedence over custom `Redactable` values (immediately replacing with `[REDACTED]` without evaluating `Redact()`), while non-sensitive keys evaluate `Redactable` with reflection nil guards and panic recovery.
   * *Tests Added*: `internal/logger/logger_test.go` covering:
     - Log level filtering (`LevelInfo` suppresses `Debug`).
     - JSON formatting and field structure validation (`time`, `level`, `msg`, attributes).
@@ -582,8 +582,9 @@ TOTAL: 184 Discrete, Testable Micro-Phases
   1. *Typed-Nil Redactable Panic*: Interface nil check trap in `internal/logger/logger.go` causing nil pointer dereference on typed nil pointers implementing `Redactable`. Fixed via reflection nil detection and panic recovery in `safeRedact()`.
   2. *Nil Receiver Panics in Typed Domain Errors*: Calling `.Error()` on typed nil pointers of `KeyTooLargeError`, `ValueTooLargeError`, `ChecksumMismatchError`, and `TornWriteError` panicked with nil pointer dereference. Fixed via explicit `if e == nil` receiver guards returning sentinel messages.
   3. *Compound Key Redaction Bypass*: Sensitive keys like `db_password`, `client_secret`, `auth_token`, `session_token`, `api-key`, and `private-key` escaped exact-match map lookups. Fixed via hyphen normalization and stem pattern matching in `isSensitiveKey()`.
-* **Permanent Regression Tests**: Added `TestNilReceiverTypedErrors` in `internal/errors/errors_test.go` and 6 security regression test suites in `internal/logger/logger_test.go`.
-* **Phase 00 Verification Status**: All 27 test suites passing under `go test -race -count=1 ./...`, `golangci-lint run ./...` reporting 0 issues, and `go mod verify` clean.
+  4. *Sensitive Key vs Redactable Precedence Ambiguity*: Evaluating `a.Value.Any().(Redactable)` before `isSensitiveKey` permitted buggy or hostile `Redact()` implementations to leak secrets under sensitive keys. Remediated by enforcing strict precedence: sensitive keys immediately replace with `[REDACTED]` without invoking `Redact()`.
+* **Permanent Regression Tests**: Added `TestNilReceiverTypedErrors` in `internal/errors/errors_test.go` and 12 security regression test suites in `internal/logger/logger_test.go`.
+* **Phase 00 Verification Status**: All test suites passing under `go test -race -count=1 ./...`, `golangci-lint run ./...` reporting 0 issues, and `go mod verify` clean.
 * **Phase 00 Status**: **COMPLETED & SEALED**. Phase 01 is ready to begin at `P01-S01-M01`.
 
 ---

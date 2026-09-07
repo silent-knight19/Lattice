@@ -141,4 +141,16 @@
 
 ---
 
+### Threat 8: Accidental Credential / Secret Leakage in Diagnostic Logs
+* **Asset**: Authentication credentials, user passwords, session tokens, API keys, and private keys.
+* **Threat**: Developers or internal subsystems log structs or context containing credentials under diagnostic log streams, persisting secrets to disk or transmitting them to central log aggregators. Furthermore, a buggy or hostile custom `Redact()` implementation could return an unscrubbed secret when logged under a sensitive key.
+* **Attack Surface**: Structured logging sink (`slog.Logger`), log files, SIEM collectors.
+* **Impact**: High (Confidentiality breach, privilege escalation).
+* **Likelihood**: Medium (Common human error in production systems).
+* **Existing Mitigation**: Automated sensitive-key redaction via `ReplaceAttr` covering baseline keywords and stem variants. Under the defense-in-depth policy, sensitive attribute keys take strict precedence over custom `Redactable` value transformations. If an attribute key is classified as sensitive, the logger replaces the entire value with `[REDACTED]` immediately without evaluating custom `Redact()` logic. For non-sensitive keys, `Redactable` values are evaluated with typed-nil detection and panic recovery.
+* **Automated Test**: Unit and adversarial tests (`TestSensitiveKeyPrecedenceOverHostileRedactable`, `TestPanickingRedactablePrecedence`, `TestConcurrentRedactionPrecedence`) asserting that sensitive keys never invoke `Redact()`, never leak secrets, and never panic.
+* **Residual Risk**: Low for sensitive keys; key-based redaction remains heuristic for arbitrary secrets logged under unrecognized or non-sensitive key names without `Redactable`.
+
+---
+
 *End of Security Threat Model — Lattice v1.0.0-THREAT-MODEL*

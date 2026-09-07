@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	domainErrors "github.com/silent-knight19/lattice/internal/errors"
@@ -623,7 +624,7 @@ func TestNilRedactablePointer(t *testing.T) {
 
 	var nilObj *typedNilRedactable = nil
 
-	// Must not panic when logging typed nil Redactable
+	// Non-sensitive key: must not panic when logging typed nil Redactable, serializes as nil/null
 	log.Info("testing nil redactable", "nil_redactable", nilObj)
 
 	var data map[string]any
@@ -636,26 +637,372 @@ func TestNilRedactablePointer(t *testing.T) {
 	}
 }
 
-type panickingRedactable struct{}
+func TestTypedNilRedactablePrecedence(t *testing.T) {
+	var nilObj *typedNilRedactable = nil
+
+	// Case A: Sensitive key + typed-nil Redactable
+	// Must immediately redact with [REDACTED] and not panic
+	{
+		var buf bytes.Buffer
+		log := logger.NewJSON(&buf, logger.LevelInfo)
+		log.Info("sensitive typed-nil test", "password", nilObj)
+
+		var data map[string]any
+		if err := json.Unmarshal(buf.Bytes(), &data); err != nil {
+			t.Fatalf("failed to parse JSON: %v", err)
+		}
+		if data["password"] != logger.RedactedPlaceholder {
+			t.Errorf("expected sensitive key with typed-nil to be %q, got %v", logger.RedactedPlaceholder, data["password"])
+		}
+	}
+
+	// Case B: Non-sensitive key + typed-nil Redactable
+	// Evaluated safely without panic, serialized as nil/null
+	{
+		var buf bytes.Buffer
+		log := logger.NewJSON(&buf, logger.LevelInfo)
+		log.Info("non-sensitive typed-nil test", "storage_object", nilObj)
+
+		var data map[string]any
+		if err := json.Unmarshal(buf.Bytes(), &data); err != nil {
+			t.Fatalf("failed to parse JSON: %v", err)
+		}
+		if data["storage_object"] != nil {
+			t.Errorf("expected non-sensitive key with typed-nil to be nil/null, got %v", data["storage_object"])
+		}
+	}
+}
+
+type hostileRedactable struct {
+	invoked *bool
+	secret  string
+}
+
+func (h hostileRedactable) Redact() any {
+	if h.invoked != nil {
+		*h.invoked = true
+	}
+	return h.secret
+}
+
+func TestSensitiveKeyPrecedenceOverHostileRedactable(t *testing.T) {
+	sensitiveKeys := []string{
+		"password",
+		"user.password",
+		"authorization",
+		"metadata.authorization",
+		"accessToken",
+		"refreshToken",
+		"user_auth",
+		"http_authorization",
+		"auth_token",
+	}
+
+	for _, key := range sensitiveKeys {
+		t.Run(key, func(t *testing.T) {
+			invoked := false
+			obj := hostileRedactable{
+				invoked: &invoked,
+				secret:  "EXPOSED-LEAKED-SECRET-42",
+			}
+
+			var buf bytes.Buffer
+			log := logger.NewJSON(&buf, logger.LevelInfo)
+			log.Info("sensitive operation", key, obj)
+
+			var data map[string]any
+			if err := json.Unmarshal(buf.Bytes(), &data); err != nil {
+				t.Fatalf("failed to parse JSON: %v", err)
+			}
+
+			// 1. Output must be [REDACTED]
+			if data[key] != logger.RedactedPlaceholder {
+				t.Errorf("expected key %q to be redacted with placeholder, got %v", key, data[key])
+			}
+
+			// 2. Secret must NOT appear anywhere in the output
+			if strings.Contains(buf.String(), "EXPOSED-LEAKED-SECRET-42") {
+				t.Errorf("secret leaked in log output for key %q: %s", key, buf.String())
+			}
+
+			// 3. Redact() must NOT be invoked when the attribute key is sensitive
+			if invoked {
+				t.Errorf("SECURITY DEFECT: Redact() was invoked for sensitive key %q!", key)
+			}
+		})
+	}
+}
+
+type trackingSafeRedactable struct {
+	invoked *bool
+	label   string
+	secret  string
+}
+
+func (s trackingSafeRedactable) Redact() any {
+	if s.invoked != nil {
+		*s.invoked = true
+	}
+	return map[string]string{
+		"label":  s.label,
+		"secret": "[SAFE_SCRUBBED]",
+	}
+}
+
+func TestNonSensitiveKeyRedactableExecution(t *testing.T) {
+	nonSensitiveKeys := []string{
+		"internal_key",
+		"storage_object",
+		"component_state",
+	}
+
+	for _, key := range nonSensitiveKeys {
+		t.Run(key, func(t *testing.T) {
+			invoked := false
+			obj := trackingSafeRedactable{
+				invoked: &invoked,
+				label:   "state-valid",
+				secret:  "raw-in-memory-state",
+			}
+
+			var buf bytes.Buffer
+			log := logger.NewJSON(&buf, logger.LevelInfo)
+			log.Info("safe operation", key, obj)
+
+			var data map[string]any
+			if err := json.Unmarshal(buf.Bytes(), &data); err != nil {
+				t.Fatalf("failed to parse JSON: %v", err)
+			}
+
+			// 1. Redact() must be invoked
+			if !invoked {
+				t.Errorf("expected Redact() to be invoked for non-sensitive key %q", key)
+			}
+
+			// 2. Output must contain safe scrubbed representation
+			valObj, ok := data[key].(map[string]any)
+			if !ok {
+				t.Fatalf("expected %q to be an object, got %T: %v", key, data[key], data[key])
+			}
+			if valObj["secret"] != "[SAFE_SCRUBBED]" {
+				t.Errorf("expected safe scrubbed secret, got %v", valObj["secret"])
+			}
+			if valObj["label"] != "state-valid" {
+				t.Errorf("expected label state-valid, got %v", valObj["label"])
+			}
+
+			// 3. Raw secret must NOT appear
+			if strings.Contains(buf.String(), "raw-in-memory-state") {
+				t.Errorf("raw secret leaked in log output for key %q", key)
+			}
+		})
+	}
+}
+
+type panickingRedactable struct {
+	panicMsg string
+}
 
 func (p panickingRedactable) Redact() any {
+	if p.panicMsg != "" {
+		panic(p.panicMsg)
+	}
 	panic("exploit attempt in custom Redact()")
 }
 
-func TestPanickingRedactable(t *testing.T) {
-	var buf bytes.Buffer
-	log := logger.NewJSON(&buf, logger.LevelInfo)
-
-	// Must recover from panicking Redact() and not crash the process
-	log.Info("testing panicking redactable", "exploit", panickingRedactable{})
-
-	var data map[string]any
-	if err := json.Unmarshal(buf.Bytes(), &data); err != nil {
-		t.Fatalf("failed to parse JSON: %v", err)
+func TestPanickingRedactablePrecedence(t *testing.T) {
+	// Case A: Sensitive key + panicking Redactable
+	// Redact() MUST NOT be invoked, so panic MUST NEVER OCCUR.
+	sensitiveKeys := []string{
+		"password",
+		"auth_token",
+		"metadata.authorization",
 	}
 
-	if data["exploit"] != logger.RedactedPlaceholder {
-		t.Errorf("expected panicking redactable to be masked with placeholder, got %v", data["exploit"])
+	for _, key := range sensitiveKeys {
+		t.Run("sensitive_"+key, func(t *testing.T) {
+			obj := panickingRedactable{
+				panicMsg: "CRITICAL FAILURE: Redact() was illegally called on sensitive key!",
+			}
+
+			var buf bytes.Buffer
+			log := logger.NewJSON(&buf, logger.LevelInfo)
+
+			// If Redact() was invoked, this would panic and fail the test.
+			log.Info("sensitive operation with panicking object", key, obj)
+
+			var data map[string]any
+			if err := json.Unmarshal(buf.Bytes(), &data); err != nil {
+				t.Fatalf("failed to parse JSON: %v", err)
+			}
+
+			if data[key] != logger.RedactedPlaceholder {
+				t.Errorf("expected key %q to be redacted with placeholder, got %v", key, data[key])
+			}
+		})
+	}
+
+	// Case B: Non-sensitive key + panicking Redactable
+	// Redact() is invoked, panics, safeRedact catches it, returns [REDACTED], no process crash.
+	t.Run("non_sensitive_recovery", func(t *testing.T) {
+		var buf bytes.Buffer
+		log := logger.NewJSON(&buf, logger.LevelInfo)
+
+		log.Info("testing panicking redactable recovery", "storage_object", panickingRedactable{})
+
+		var data map[string]any
+		if err := json.Unmarshal(buf.Bytes(), &data); err != nil {
+			t.Fatalf("failed to parse JSON: %v", err)
+		}
+
+		if data["storage_object"] != logger.RedactedPlaceholder {
+			t.Errorf("expected recovered panicking redactable to be masked with placeholder, got %v", data["storage_object"])
+		}
+	})
+}
+
+func TestFalsePositiveKeysWithRedactable(t *testing.T) {
+	benignKeys := []string{
+		"author",
+		"authority",
+		"authenticate_user_flag",
+		"token_count",
+		"tokens_per_sec",
+	}
+
+	for _, key := range benignKeys {
+		t.Run(key, func(t *testing.T) {
+			invoked := false
+			obj := trackingSafeRedactable{
+				invoked: &invoked,
+				label:   "metric-valid",
+				secret:  "safe-metric-detail",
+			}
+
+			var buf bytes.Buffer
+			log := logger.NewJSON(&buf, logger.LevelInfo)
+			log.Info("benign test with redactable", key, obj)
+
+			var data map[string]any
+			if err := json.Unmarshal(buf.Bytes(), &data); err != nil {
+				t.Fatalf("failed to parse JSON: %v", err)
+			}
+
+			// Redact() should be called
+			if !invoked {
+				t.Errorf("expected Redact() to be invoked for benign key %q", key)
+			}
+
+			// Output should be safe representation, NOT [REDACTED]
+			if data[key] == logger.RedactedPlaceholder {
+				t.Errorf("false positive: benign key %q was incorrectly masked as [REDACTED]", key)
+			}
+
+			valObj, ok := data[key].(map[string]any)
+			if !ok {
+				t.Fatalf("expected %q to be an object, got %T: %v", key, data[key], data[key])
+			}
+			if valObj["label"] != "metric-valid" {
+				t.Errorf("expected label metric-valid, got %v", valObj["label"])
+			}
+		})
+	}
+}
+
+type concurrentHostileRedactable struct {
+	invoked *atomic.Int64
+	secret  string
+}
+
+func (c concurrentHostileRedactable) Redact() any {
+	if c.invoked != nil {
+		c.invoked.Add(1)
+	}
+	return c.secret
+}
+
+type concurrentSafeRedactable struct {
+	invoked *atomic.Int64
+	val     string
+}
+
+func (c concurrentSafeRedactable) Redact() any {
+	if c.invoked != nil {
+		c.invoked.Add(1)
+	}
+	return map[string]string{"safe": c.val}
+}
+
+func TestConcurrentRedactionPrecedence(t *testing.T) {
+	const goroutines = 50
+	const iterations = 100
+
+	var sensitiveInvocations atomic.Int64
+	var nonSensitiveInvocations atomic.Int64
+
+	var buf syncBuffer
+	log := logger.NewJSON(&buf, logger.LevelInfo)
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for g := 0; g < goroutines; g++ {
+		go func(workerID int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				// Sensitive key: Redact() MUST NOT be called
+				hostile := concurrentHostileRedactable{
+					invoked: &sensitiveInvocations,
+					secret:  "CONCURRENT-HOSTILE-SECRET-DATA",
+				}
+				log.Info("concurrent sensitive", "password", hostile, "worker", workerID)
+
+				// Non-sensitive key: Redact() MUST be called
+				safe := concurrentSafeRedactable{
+					invoked: &nonSensitiveInvocations,
+					val:     "safe-state",
+				}
+				log.Info("concurrent non-sensitive", "storage_object", safe, "worker", workerID)
+			}
+		}(g)
+	}
+
+	wg.Wait()
+
+	// 1. Sensitive key Redact() must NEVER have been invoked
+	if got := sensitiveInvocations.Load(); got != 0 {
+		t.Fatalf("SECURITY VIOLATION: sensitive key Redact() was invoked %d times concurrently!", got)
+	}
+
+	// 2. Non-sensitive key Redact() must have been invoked exactly once per non-sensitive log call
+	expectedNonSensitive := int64(goroutines * iterations)
+	if got := nonSensitiveInvocations.Load(); got != expectedNonSensitive {
+		t.Fatalf("expected non-sensitive Redact() to be invoked %d times, got %d", expectedNonSensitive, got)
+	}
+
+	// 3. Sensitive secret must NOT appear anywhere in the output
+	rawOutput := buf.String()
+	if strings.Contains(rawOutput, "CONCURRENT-HOSTILE-SECRET-DATA") {
+		t.Fatal("CONCURRENT-HOSTILE-SECRET-DATA leaked in concurrent log buffer!")
+	}
+
+	// 4. Safe representation must be present
+	if !strings.Contains(rawOutput, "safe-state") {
+		t.Fatal("expected safe-state to be present in concurrent log buffer")
+	}
+
+	// 5. Verify all lines are valid JSON
+	lines := buf.Lines()
+	for idx, line := range lines {
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("line %d is not valid JSON: %v, raw: %s", idx, err, line)
+		}
+		if pwd, ok := entry["password"]; ok {
+			if pwd != logger.RedactedPlaceholder {
+				t.Fatalf("line %d: password expected %q, got %v", idx, logger.RedactedPlaceholder, pwd)
+			}
+		}
 	}
 }
 
@@ -740,6 +1087,35 @@ func BenchmarkJSON_Parallel(b *testing.B) {
 			log.Info("concurrent log", "worker", i, "token", "secret-token")
 		}
 	})
+}
+
+func BenchmarkJSON_SensitiveKey_RedactableValue(b *testing.B) {
+	log := logger.NewJSON(io.Discard, logger.LevelInfo)
+	obj := testRedactableObject{Name: "bench", Secret: "secret"}
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		log.Info("bench record", "password", obj)
+	}
+}
+
+func BenchmarkJSON_NonSensitiveKey_RedactableValue(b *testing.B) {
+	log := logger.NewJSON(io.Discard, logger.LevelInfo)
+	obj := testRedactableObject{Name: "bench", Secret: "secret"}
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		log.Info("bench record", "storage_object", obj)
+	}
+}
+
+func BenchmarkJSON_SensitiveKey_OrdinaryValue(b *testing.B) {
+	log := logger.NewJSON(io.Discard, logger.LevelInfo)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		log.Info("bench record", "password", "raw-secret-string")
+	}
 }
 
 func FuzzLoggerKeyRedaction(f *testing.F) {

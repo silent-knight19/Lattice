@@ -80,6 +80,11 @@ func (f Format) String() string {
 
 // Redactable allows custom domain types to provide safe representations
 // for logging, stripping credentials, internal keys, or raw payloads.
+//
+// Security Precedence: Sensitive attribute keys take strict precedence over Redactable.
+// If an attribute key is classified as sensitive, the logger replaces the entire value
+// with RedactedPlaceholder immediately without invoking Redact(). Redact() is only evaluated
+// for non-sensitive attribute keys.
 type Redactable interface {
 	Redact() any
 }
@@ -306,6 +311,14 @@ func isSensitiveKey(key string, exactMap map[string]struct{}) bool {
 
 // makeReplaceAttr builds an attribute replacement function that masks sensitive keys
 // and supports custom Redactable types.
+//
+// Security Precedence:
+//  1. Empty attributes are preserved/dropped by slog.
+//  2. Sensitive attribute keys ALWAYS take precedence over custom Redactable values.
+//     If an attribute key is classified as sensitive, the entire value is immediately replaced
+//     with RedactedPlaceholder without invoking Redact().
+//  3. For non-sensitive keys, if the value implements Redactable, safeRedact is evaluated.
+//  4. All other attributes remain unchanged.
 func makeReplaceAttr(customRedacted []string) func(groups []string, a slog.Attr) slog.Attr {
 	redactedMap := make(map[string]struct{}, len(defaultSensitiveKeys)+len(customRedacted))
 	for k := range defaultSensitiveKeys {
@@ -323,16 +336,17 @@ func makeReplaceAttr(customRedacted []string) func(groups []string, a slog.Attr)
 			return a
 		}
 
-		// Check if the attribute value implements Redactable.
+		// Precedence 1: Sensitive attribute key always wins.
+		// Immediately mask with RedactedPlaceholder without evaluating custom Redact() logic.
+		if isSensitiveKey(a.Key, redactedMap) {
+			return slog.String(a.Key, RedactedPlaceholder)
+		}
+
+		// Precedence 2: For non-sensitive keys, evaluate custom Redactable implementations.
 		if r, ok := a.Value.Any().(Redactable); ok {
 			if safeVal, safe := safeRedact(r); safe {
 				return slog.Any(a.Key, safeVal)
 			}
-		}
-
-		// Check if the attribute key is marked for redaction.
-		if isSensitiveKey(a.Key, redactedMap) {
-			return slog.String(a.Key, RedactedPlaceholder)
 		}
 
 		return a
