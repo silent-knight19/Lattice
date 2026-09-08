@@ -465,6 +465,49 @@ func TestSeqNumOverflowError(t *testing.T) {
 	}
 }
 
+func TestSegmentIDOverflowError(t *testing.T) {
+	typedErr := &errors.SegmentIDOverflowError{
+		Current: 18446744073709551615,
+	}
+
+	// Must match sentinel via errors.Is
+	if !stdErrors.Is(typedErr, errors.ErrSegmentIDOverflow) {
+		t.Errorf("SegmentIDOverflowError must match ErrSegmentIDOverflow via errors.Is")
+	}
+
+	// Negative match against other sentinels
+	if stdErrors.Is(typedErr, errors.ErrSeqNumOverflow) {
+		t.Errorf("SegmentIDOverflowError must not match ErrSeqNumOverflow")
+	}
+
+	// Wrapped match via errors.Is
+	wrapped := fmt.Errorf("wal segment rotation: %w", typedErr)
+	if !stdErrors.Is(wrapped, errors.ErrSegmentIDOverflow) {
+		t.Errorf("wrapped SegmentIDOverflowError must match ErrSegmentIDOverflow via errors.Is")
+	}
+
+	// Extraction via errors.As
+	var extracted *errors.SegmentIDOverflowError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("errors.As failed to extract *SegmentIDOverflowError")
+	}
+	if extracted.Current != 18446744073709551615 {
+		t.Errorf("extracted Current mismatch: got %d", extracted.Current)
+	}
+
+	// Error string formatting
+	msg := typedErr.Error()
+	if !strings.Contains(msg, "18446744073709551615") {
+		t.Errorf("unexpected error message: %q", msg)
+	}
+
+	// Nil receiver error message
+	var nilErr *errors.SegmentIDOverflowError
+	if nilErr.Error() != errors.ErrSegmentIDOverflow.Error() {
+		t.Errorf("nil receiver must return sentinel message")
+	}
+}
+
 func TestHeaderTruncatedSentinel(t *testing.T) {
 	if errors.ErrHeaderTruncated == nil {
 		t.Fatalf("ErrHeaderTruncated must not be nil")

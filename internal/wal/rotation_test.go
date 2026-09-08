@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -1361,4 +1362,195 @@ func TestRotation_ExactByteFitMatrix(t *testing.T) {
 			t.Errorf("expected segment 1 size 31, got %d", info1.Size())
 		}
 	})
+}
+
+// 35. MaxUint64 explicit Rotate() failure.
+// Expected:
+//   - error != nil matching ErrSegmentIDOverflow
+//   - activeID remains math.MaxUint64
+//   - active writer is still present and not closed
+//   - no wal_000000000000.log exists
+func TestRotation_MaxUint64_ExplicitRotate(t *testing.T) {
+	dir := t.TempDir()
+	rw, err := wal.OpenRotatingWriter(dir, wal.Options{
+		InitialSegmentID: math.MaxUint64,
+		SegmentSize:      1000,
+	})
+	if err != nil {
+		t.Fatalf("OpenRotatingWriter failed: %v", err)
+	}
+	defer func() { _ = rw.Close() }()
+
+	if rw.ActiveSegmentID() != math.MaxUint64 {
+		t.Fatalf("expected active segment ID math.MaxUint64, got %d", rw.ActiveSegmentID())
+	}
+
+	// Explicit Rotate() must fail with ErrSegmentIDOverflow
+	err = rw.Rotate()
+	if err == nil {
+		t.Fatalf("expected Rotate() to fail on MaxUint64 overflow, got nil")
+	}
+	if !stdErrors.Is(err, errors.ErrSegmentIDOverflow) {
+		t.Errorf("expected error matching ErrSegmentIDOverflow, got: %v", err)
+	}
+
+	// Active segment ID must remain math.MaxUint64
+	if rw.ActiveSegmentID() != math.MaxUint64 {
+		t.Errorf("expected active segment ID to remain math.MaxUint64, got %d", rw.ActiveSegmentID())
+	}
+
+	// Active writer must still be present and usable (not set to nil or closed)
+	if rw.ActiveWriter() == nil {
+		t.Fatalf("expected active writer to remain present after rejected overflow rotation")
+	}
+
+	// Segment 0 must NOT exist on disk
+	zeroPath := wal.SegmentPath(dir, 0)
+	if _, statErr := os.Stat(zeroPath); !os.IsNotExist(statErr) {
+		t.Errorf("wal_000000000000.log must not exist on disk!")
+	}
+}
+
+// 36. MaxUint64 rotation attempted repeatedly.
+// Expected:
+//   - deterministic failure every time
+//   - active segment remains unchanged
+//   - active writer remains valid
+//   - no state corruption
+func TestRotation_MaxUint64_RepeatedRotation(t *testing.T) {
+	dir := t.TempDir()
+	rw, err := wal.OpenRotatingWriter(dir, wal.Options{
+		InitialSegmentID: math.MaxUint64,
+		SegmentSize:      1000,
+	})
+	if err != nil {
+		t.Fatalf("OpenRotatingWriter failed: %v", err)
+	}
+	defer func() { _ = rw.Close() }()
+
+	for i := 0; i < 5; i++ {
+		err := rw.Rotate()
+		if err == nil {
+			t.Fatalf("iteration %d: expected error, got nil", i)
+		}
+		if !stdErrors.Is(err, errors.ErrSegmentIDOverflow) {
+			t.Errorf("iteration %d: expected ErrSegmentIDOverflow, got: %v", i, err)
+		}
+		if rw.ActiveSegmentID() != math.MaxUint64 {
+			t.Errorf("iteration %d: active segment changed to %d", i, rw.ActiveSegmentID())
+		}
+		if rw.ActiveWriter() == nil {
+			t.Errorf("iteration %d: active writer became nil", i)
+		}
+	}
+}
+
+// 37. Append after rejected overflow rotation.
+// Expected:
+//   - append still succeeds on the existing active segment
+//   - no rotation occurs
+//   - record is written to MaxUint64 segment
+//   - record can be read back cleanly
+func TestRotation_MaxUint64_AppendAfterRejectedRotation(t *testing.T) {
+	dir := t.TempDir()
+	// Segment size = 50 (smaller than record to test threshold crossing on MaxUint64)
+	rw, err := wal.OpenRotatingWriter(dir, wal.Options{
+		InitialSegmentID: math.MaxUint64,
+		SegmentSize:      50,
+	})
+	if err != nil {
+		t.Fatalf("OpenRotatingWriter failed: %v", err)
+	}
+	defer func() { _ = rw.Close() }()
+
+	// First attempt explicit rotation, which fails
+	if err := rw.Rotate(); !stdErrors.Is(err, errors.ErrSegmentIDOverflow) {
+		t.Fatalf("expected ErrSegmentIDOverflow, got: %v", err)
+	}
+
+	// Now append a record: should succeed on MaxUint64 segment without rotation
+	rec1 := makeRotRecord(1, "key-maxuint64", "val-maxuint64")
+	if err := rw.AppendSync(rec1); err != nil {
+		t.Fatalf("AppendSync failed after rejected rotation: %v", err)
+	}
+
+	if rw.ActiveSegmentID() != math.MaxUint64 {
+		t.Errorf("expected active segment to remain math.MaxUint64, got %d", rw.ActiveSegmentID())
+	}
+
+	// Append a second record: threshold 50 is exceeded, but activeID is MaxUint64 so rotation is bypassed
+	rec2 := makeRotRecord(2, "key-maxuint64-2", "val-maxuint64-2")
+	if err := rw.AppendSync(rec2); err != nil {
+		t.Fatalf("AppendSync second record failed on MaxUint64 segment: %v", err)
+	}
+
+	// Close and verify records were written to math.MaxUint64 segment file
+	maxPath := wal.SegmentPath(dir, math.MaxUint64)
+	if err := rw.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	reader, err := wal.OpenReader(maxPath)
+	if err != nil {
+		t.Fatalf("OpenReader on MaxUint64 segment failed: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+
+	r1, err := reader.Next()
+	if err != nil {
+		t.Fatalf("reader.Next for rec1 failed: %v", err)
+	}
+	if string(r1.Key) != "key-maxuint64" {
+		t.Errorf("rec1 key mismatch: %s", string(r1.Key))
+	}
+
+	r2, err := reader.Next()
+	if err != nil {
+		t.Fatalf("reader.Next for rec2 failed: %v", err)
+	}
+	if string(r2.Key) != "key-maxuint64-2" {
+		t.Errorf("rec2 key mismatch: %s", string(r2.Key))
+	}
+
+	if _, err := reader.Next(); !stdErrors.Is(err, io.EOF) {
+		t.Errorf("expected clean io.EOF after records, got: %v", err)
+	}
+
+	// Verify no segment 0 was ever created
+	zeroPath := wal.SegmentPath(dir, 0)
+	if _, statErr := os.Stat(zeroPath); !os.IsNotExist(statErr) {
+		t.Errorf("wal_000000000000.log must not exist on disk!")
+	}
+}
+
+// 38. Boundary & naming consistency: SegmentName / ParseSegmentID with 0 and MaxUint64.
+// Expected:
+//   - ParseSegmentID rejects ID 0
+//   - SegmentName(0) produces wal_000000000000.log and is rejected by ParseSegmentID
+//   - SegmentName(MaxUint64) produces valid segment name parseable back to MaxUint64
+func TestRotation_MaxUint64_BoundaryAndNamingConsistency(t *testing.T) {
+	// SegmentName(0) produces wal_000000000000.log
+	zeroName := wal.SegmentName(0)
+	if zeroName != "wal_000000000000.log" {
+		t.Errorf("SegmentName(0) mismatch: %q", zeroName)
+	}
+
+	// ParseSegmentID must reject ID 0
+	_, err := wal.ParseSegmentID(zeroName)
+	if err == nil {
+		t.Errorf("expected ParseSegmentID to reject %q, got nil error", zeroName)
+	}
+	if !stdErrors.Is(err, os.ErrInvalid) {
+		t.Errorf("expected error wrapping os.ErrInvalid, got: %v", err)
+	}
+
+	// SegmentName(math.MaxUint64) produces valid name that round-trips
+	maxName := wal.SegmentName(math.MaxUint64)
+	id, err := wal.ParseSegmentID(maxName)
+	if err != nil {
+		t.Fatalf("ParseSegmentID(%q) failed: %v", maxName, err)
+	}
+	if id != math.MaxUint64 {
+		t.Errorf("expected ID math.MaxUint64, got %d", id)
+	}
 }

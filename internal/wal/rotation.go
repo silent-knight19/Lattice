@@ -2,6 +2,7 @@ package wal
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -26,7 +27,7 @@ const SegmentFilenamePrefix = "wal_"
 // SegmentFilenameSuffix is the canonical file extension for WAL segment files.
 const SegmentFilenameSuffix = ".log"
 
-// SegmentFilenameLen is the exact character length of a canonical WAL segment filename:
+// SegmentFilenameLen is the standard character length of a 12-digit WAL segment filename:
 // len("wal_") [4] + 12 digits [12] + len(".log") [4] = 20.
 const SegmentFilenameLen = 20
 
@@ -53,13 +54,14 @@ func RecordWireSize(rec Record) int64 {
 // Format Requirements:
 //   - Must start with prefix "wal_"
 //   - Must end with suffix ".log"
-//   - Must contain exactly 12 ASCII decimal digits between prefix and suffix
-//   - Segment ID must be strictly positive (>= 1)
+//   - Must contain between 12 and 20 ASCII decimal digits between prefix and suffix
+//   - Filenames with > 12 digits must not contain superfluous leading zeros
+//   - Segment ID must be strictly positive (>= 1, ID 0 is strictly rejected)
 //
 // Returns an error wrapping os.ErrInvalid if the filename does not strictly conform.
 func ParseSegmentID(name string) (uint64, error) {
-	if len(name) != SegmentFilenameLen {
-		return 0, fmt.Errorf("wal: invalid segment filename %q (length %d, expected %d): %w", name, len(name), SegmentFilenameLen, os.ErrInvalid)
+	if len(name) < SegmentFilenameLen {
+		return 0, fmt.Errorf("wal: invalid segment filename %q (length %d, expected >= %d): %w", name, len(name), SegmentFilenameLen, os.ErrInvalid)
 	}
 	if !strings.HasPrefix(name, SegmentFilenamePrefix) {
 		return 0, fmt.Errorf("wal: invalid segment filename prefix %q: %w", name, os.ErrInvalid)
@@ -69,6 +71,12 @@ func ParseSegmentID(name string) (uint64, error) {
 	}
 
 	digitStr := name[len(SegmentFilenamePrefix) : len(name)-len(SegmentFilenameSuffix)]
+	if len(digitStr) < 12 || len(digitStr) > 20 {
+		return 0, fmt.Errorf("wal: invalid segment filename digit count %d in %q: %w", len(digitStr), name, os.ErrInvalid)
+	}
+	if len(digitStr) > 12 && digitStr[0] == '0' {
+		return 0, fmt.Errorf("wal: segment filename %q has superfluous leading zeros: %w", name, os.ErrInvalid)
+	}
 	for i := 0; i < len(digitStr); i++ {
 		if digitStr[i] < '0' || digitStr[i] > '9' {
 			return 0, fmt.Errorf("wal: non-digit character %q in segment filename %q: %w", digitStr[i], name, os.ErrInvalid)
@@ -330,11 +338,15 @@ func (rw *RotatingWriter) AppendSync(rec Record) error {
 	// Rotation Condition:
 	// If the current segment has existing records and appending this record would
 	// exceed the configured segment boundary, rotate to next segment first.
+	// If the active segment is already at math.MaxUint64, rotation is prohibited
+	// (segment ID cannot overflow to 0), so the record is appended to the current segment.
 	// If the current segment is empty (activeLen == 0), the record is accepted into
 	// the empty segment (oversized record policy) to prevent infinite rotation deadlocks.
 	if rw.activeLen > 0 && (rw.activeLen+recWireSize > rw.opts.SegmentSize) {
-		if err := rw.rotateLocked(); err != nil {
-			return fmt.Errorf("wal: rotation triggered by append failed: %w", err)
+		if rw.activeID < math.MaxUint64 {
+			if err := rw.rotateLocked(); err != nil {
+				return fmt.Errorf("wal: rotation triggered by append failed: %w", err)
+			}
 		}
 	}
 
@@ -377,6 +389,14 @@ func (rw *RotatingWriter) rotateLocked() error {
 
 	oldWriter := rw.active
 	oldID := rw.activeID
+
+	// Guard against segment ID overflow: math.MaxUint64 + 1 wraps to 0.
+	// Rotation is rejected BEFORE closing the active writer or touching the filesystem.
+	// The active writer remains usable and activeID remains math.MaxUint64.
+	if oldID == math.MaxUint64 {
+		return &errors.SegmentIDOverflowError{Current: oldID}
+	}
+
 	nextID := oldID + 1
 
 	// Step 1: Seal, flush, and close current active segment

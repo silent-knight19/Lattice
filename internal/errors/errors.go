@@ -76,6 +76,10 @@ var (
 
 	// ErrReaderClosed indicates that an operation was attempted on a closed WAL reader.
 	ErrReaderClosed = stdErrors.New("wal reader is closed")
+
+	// ErrSegmentIDOverflow indicates that incrementing a WAL segment ID would exceed
+	// the maximum 64-bit unsigned integer representation (wraparound prohibited).
+	ErrSegmentIDOverflow = stdErrors.New("segment ID overflow")
 )
 
 // KeyTooLargeError provides structured context when a key violates maximum size limits.
@@ -196,6 +200,25 @@ func (e *SeqNumOverflowError) Error() string {
 // Is reports whether this error matches target sentinel ErrSeqNumOverflow.
 func (e *SeqNumOverflowError) Is(target error) bool {
 	return target == ErrSeqNumOverflow
+}
+
+// SegmentIDOverflowError provides structured context when incrementing a segment ID
+// exceeds the maximum 64-bit unsigned integer limit.
+// It matches ErrSegmentIDOverflow when interrogated with errors.Is().
+type SegmentIDOverflowError struct {
+	Current uint64
+}
+
+func (e *SegmentIDOverflowError) Error() string {
+	if e == nil {
+		return ErrSegmentIDOverflow.Error()
+	}
+	return fmt.Sprintf("segment ID overflow: current %d is at maximum uint64 limit", e.Current)
+}
+
+// Is reports whether this error matches target sentinel ErrSegmentIDOverflow.
+func (e *SegmentIDOverflowError) Is(target error) bool {
+	return target == ErrSegmentIDOverflow
 }
 
 // InvalidRecordTypeError provides structured context when an unrecognized WAL record type byte is encountered.
