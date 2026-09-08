@@ -196,13 +196,13 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
-### 14. Static Security Audit Completed and Storage Dynamic Audit (SEC-03) Verified
-* **Limitation**: Static analysis (`SEC-01`, `SEC-02`) and persistence/storage dynamic security auditing (`SEC-03`) are fully complete and verified. However, dynamic network protocol fuzzing, distributed consensus fault injection, and multi-node Byzantine testing remain deferred until their respective subsystems are implemented.
-* **Why It Exists**: In accordance with the security roadmap hierarchy, storage persistence (`SEC-03`) is audited immediately following Phase 02. Network transport (Phase 11) and Raft consensus (Phase 13) do not yet exist in the codebase.
-* **Impact**: Storage, WAL, filesystem races, torn writes, malformed framing, and permission boundaries are rigorously verified under adversarial tests. Network and cluster-level dynamic testing will activate when those subsystems are built.
+### 14. Static Security Audit, Storage Dynamic Audit (SEC-03), and In-Memory Engine Audit (SEC-04) Verified
+* **Limitation**: Static analysis (`SEC-01`, `SEC-02`), persistence/storage dynamic auditing (`SEC-03`), and in-memory multi-version engine auditing (`SEC-04`) are fully complete and verified. However, dynamic network protocol fuzzing, distributed consensus fault injection, and multi-node Byzantine testing remain deferred until their respective subsystems are implemented.
+* **Why It Exists**: In accordance with the security roadmap hierarchy, storage persistence (`SEC-03`) and in-memory core ordering/bounds primitives (`SEC-04`) are audited against implemented code. Network transport (Phase 11) and Raft consensus (Phase 13) do not yet exist in the codebase.
+* **Impact**: Storage, WAL, filesystem races, torn writes, malformed framing, permission boundaries, and in-memory InternalKey multi-version ordering/bounds are rigorously verified under adversarial tests. Network and cluster-level dynamic testing will activate when those subsystems are built.
 * **How It Was Detected**: Security roadmap staging and architecture boundaries.
-* **Current Mitigation**: Comprehensive dynamic test suites in `internal/wal` (`sec03_*_test.go`), native Go fuzzing, fault injection seams, and race detection.
-* **Future Solution**: Execute `SEC-04` (in-memory concurrent audit alongside MemTable), `SEC-05` (network protocol fuzzing), and `SEC-06` (distributed consensus chaos testing).
+* **Current Mitigation**: Comprehensive dynamic test suites in `internal/wal` (`sec03_*_test.go`), `internal/binary` (`sec04_*_test.go`), native Go fuzzing, fault injection seams, and race detection.
+* **Future Solution**: Execute `SEC-05` (network protocol fuzzing) and `SEC-06` (distributed consensus chaos testing) once networking and Raft are implemented.
 * **Dimensional Impact**:
   * Correctness: **None** (Existing subsystems verified).
   * Performance: **None**.
@@ -220,6 +220,20 @@ This document tracks all **genuine architectural and operational limitations** o
 * **Dimensional Impact**:
   * Correctness: **None** (Recovery fails closed on any discrepancy).
   * Performance: **Optimal** (Avoids synchronous directory lock stalls).
+  * Scalability: **None**.
+
+---
+
+### 16. In-Memory InternalKey Direct Initialization vs Boundary Copying (SEC-04-HARD-01)
+* **Limitation**: `InternalKey` struct fields (`UserKey []byte`) are exported to allow zero-allocation slice borrowing inside internal engine hot loops (such as SSTable block decoders and memtable traversals). Direct instantiation (`InternalKey{UserKey: slice}`) borrows the caller's slice without copying.
+* **Why It Exists**: High-performance LSM engines require zero heap allocations along read and compaction hot paths. Forcing defensive copies at every internal struct initialization would multiply garbage collection overhead by $O(N)$ across billions of record comparisons.
+* **Impact**: If an external or untrusted caller constructs an `InternalKey` via direct struct initialization rather than the canonical constructor `binary.NewInternalKey()`, later mutations to the caller slice will mutate the `InternalKey`'s referenced key.
+* **How It Was Detected**: Identified as Hardening Opportunity `SEC-04-HARD-01` during the SEC-04 in-memory engine security audit.
+* **Current Mitigation**: `binary.NewInternalKey()` and `binary.DecodeInternalKey()` strictly perform defensive copies (`copy(make([]byte, len(k)), k)`). `ik.Clone()` provides deep copy isolation. Storage engine entry points enforce `NewInternalKey()`.
+* **Future Solution**: When implementing the Phase 03 MemTable, enforce that `MemTable.Put()` always performs a defensive copy or allocates into an append-only arena before linking nodes into the SkipList.
+* **Dimensional Impact**:
+  * Correctness: **None** when public constructors are utilized.
+  * Performance: **Optimal** (Enables zero-allocation internal engine comparisons).
   * Scalability: **None**.
 
 ---
