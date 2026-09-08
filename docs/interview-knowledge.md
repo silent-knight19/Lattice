@@ -294,8 +294,8 @@
   - Write-Ahead Logs store customer plaintext keys, values, and transaction metadata. If initialized with default umasks (e.g. `0755` or `0777`), other unprivileged local users or processes on multi-tenant servers could read or tamper with database logs.
   - Lattice enforces `0700` (`rwx------`): owner full access, zero access for group and others.
   - Because `0700` specifies `0` for group and other bits, process umask can never accidentally add permissions to group or others (`0700 &^ umask` preserves zeroed group/other bits).
-  - Furthermore, if an existing WAL directory possesses loose permissions (e.g. `info.Mode().Perm() & 0077 != 0`), `InitDir` automatically hardens it to `0700` via `os.Chmod`.
-* **Atomic Creation & TOCTOU Race Elimination**:
+  - Furthermore, if an existing WAL directory possesses loose permissions (e.g. `info.Mode().Perm() & 0077 != 0`), `InitDir` automatically hardens it to `0700` using descriptor-based `fchmod` (`f.Chmod`) combined with `os.SameFile` inode pinning to prevent symlink-substitution TOCTOU attacks.
+* **Atomic Creation & TOCTOU Race Mitigation**:
   - In concurrent database systems, naive initialization patterns perform a check-then-act sequence:
     ```go
     // ANTI-PATTERN: Vulnerable to TOCTOU race
@@ -304,17 +304,18 @@
     }
     ```
     This sequence creates a Time-of-Check to Time-of-Use (TOCTOU) vulnerability where a concurrent goroutine or hostile process creates a file, symlink, or directory in the microsecond between `Stat()` and `Mkdir()`.
-  - Lattice executes direct atomic `os.Mkdir(walPath, DirMode)`. If it succeeds, the directory was created atomically by the kernel. If it returns `os.ErrExist`, the path already exists, and Lattice transitions to authoritative inspection.
-* **Symlink Rejection & Conflicting Object Defense**:
-  - Inspection of existing paths uses `os.Lstat(walPath)` rather than `os.Stat(walPath)`.
+  - Lattice executes direct atomic `os.Mkdir(walPath, DirMode)`. If it succeeds, the directory was created atomically by the kernel, eliminating create/check races. If it returns `os.ErrExist`, the path already exists, and Lattice transitions to authoritative inspection and descriptor-based hardening.
+* **Symlink Rejection, Inode Pinning & Conflicting Object Defense**:
+  - Inspection of existing paths begins with `os.Lstat(walPath)` rather than `os.Stat(walPath)`.
   - `os.Lstat` does not follow symbolic links. If an attacker or misconfigured deployment places a symlink at `<db_path>/wal` pointing to `/etc` or a separate sensitive volume, `os.Stat` would report a directory, causing the database to write logs into the symlink target.
   - `os.Lstat` detects `info.Mode() & os.ModeSymlink != 0` and immediately aborts with `*errors.NotADirectoryError` (matching `errors.ErrNotADirectory`).
+  - To prevent a TOCTOU race where an existing directory is replaced with a symlink between type verification and permission hardening, Lattice opens the directory descriptor (`os.Open`), verifies the descriptor refers to a directory and matches the initial `Lstat` inode via `os.SameFile(info, finfo)`, executes `f.Chmod(0700)` (`fchmod` operating strictly on the open file descriptor without pathname resolution), and verifies with a post-hardening `os.Lstat` that the pathname was not swapped during hardening.
   - Likewise, if `<db_path>/wal` is an existing regular file, FIFO, socket, or device, `InitDir` rejects it without modifying, truncating, or deleting the conflicting object.
 * **Idempotency & Pre-existing File Safety**:
   - Database reboots and repeated initialization calls must be non-destructive.
-  - Calling `InitDir` on an already initialized WAL directory converges cleanly. Pre-existing WAL segments (`wal_*.log`) and database state files (`MANIFEST`, `CURRENT`) are never truncated, modified, or deleted.
+  - Calling `InitDir` on an already initialized WAL directory converges cleanly. Pre-existing WAL segments (`wal_*.log`) and database state files (`MANIFEST`, `CURRENT`) are never truncated, modified, or deleted. The directory inode itself is preserved without recreation.
 * **Concurrency Without Application Mutexes**:
-  - Multiple goroutines calling `InitDir` simultaneously converge safely via OS-level atomic `os.Mkdir` and `os.Lstat` inspection without requiring application-level mutex locks.
+  - Multiple goroutines calling `InitDir` simultaneously converge safely via OS-level atomic `os.Mkdir`, `os.Lstat` inspection, and descriptor-pinned `fchmod` without requiring application-level mutex locks.
 
 ### Subsystem Interview Questions
 * **Basic**: Why does a database need a Write-Ahead Log?
@@ -328,6 +329,7 @@
 * **Deep**: Why is CRC32 insufficient for cryptographic tamper detection in distributed logs, and what are its mathematical error-detection guarantees versus an HMAC?
 * **Deep**: How does Lattice avoid Time-of-Check to Time-of-Use (TOCTOU) race conditions when initializing the WAL directory?
 * **Deep**: Why does Lattice use `os.Lstat` instead of `os.Stat` when inspecting an existing WAL path, and what security threat does this mitigate?
+* **Deep**: In the existing-directory permission hardening path, why is pathname-based `os.Chmod` vulnerable to TOCTOU, and how does Lattice mitigate it using descriptor-based `fchmod` and `os.SameFile`?
 * **Follow-up**: How do you prevent group commit queues from consuming unbounded RAM if the disk becomes completely saturated?
 * **"Did You Actually Build This?"**: How do you distinguish between an uncompleted torn write at the tail of the WAL versus a corrupted record in the middle of the file during startup recovery?
 * **"Did You Actually Build This?"**: How do you handle readers that return fewer bytes than requested without an error (short reads) or readers that return data and io.EOF in the same call?
@@ -925,29 +927,30 @@ This section is a living record of actual engineering obstacles, debugging sessi
 - **Core Lesson**: Error detection mechanisms must be layered: structural validation defends process resources, while checksums defend data integrity. Systems engineers must know exactly what each layer guarantees and never mistake cyclic redundancy codes for cryptographic authentication.
 - **Interview Relevance**: Demonstrates mastery of error-detection theory, defense-in-depth security boundaries, deterministic exhaustive verification, and the precise mathematical boundaries of CRC32.
 
-### Entry 2026-09-08 — Phase 02: Secure WAL Directory Initialization, 0700 Permissions & TOCTOU-Free Symlink Defense
+### Entry 2026-09-08 — Phase 02: Secure WAL Directory Initialization, 0700 Permissions, Inode Pinning & TOCTOU-Free Symlink Defense
 - **Date**: 2026-09-08
 - **Phase**: Phase 02 Sub-Phase 02.2 Micro-Phase 01 (`P02-S02-M01`)
-- **Problem**: In multi-tenant systems, WAL files contain plaintext data that must not be readable or traversable by other local users. Initializing the WAL directory with naive check-then-act sequences (`os.Stat` followed by `os.Mkdir`) creates dangerous Time-of-Check to Time-of-Use (TOCTOU) race conditions under concurrent execution. Furthermore, if `<db_path>/wal` is pre-created by an attacker as a symbolic link pointing to a sensitive system directory, standard directory creation calls might write into unintended locations. Finally, directory initialization must be completely idempotent and non-destructive to existing WAL files.
-- **Initial Assumption**: Using `os.MkdirAll` or `os.Stat` then `os.Mkdir` is sufficient for directory setup.
+- **Problem**: In multi-tenant systems, WAL files contain plaintext data that must not be readable or traversable by other local users. Initializing the WAL directory with naive check-then-act sequences (`os.Stat` followed by `os.Mkdir`) creates dangerous Time-of-Check to Time-of-Use (TOCTOU) race conditions under concurrent execution. Furthermore, if `<db_path>/wal` is pre-created by an attacker as a symbolic link pointing to a sensitive system directory, standard directory creation calls might write into unintended locations. In the existing-directory permission-hardening path, naive `os.Chmod(walPath, 0700)` relies on a second pathname lookup that is vulnerable to symlink substitution between `Lstat` and `Chmod`. Finally, directory initialization must be completely idempotent and non-destructive to existing WAL files.
+- **Initial Assumption**: Using `os.MkdirAll` or `os.Stat` then `os.Mkdir` is sufficient for directory setup, and pathname-based `os.Chmod` is safe after `os.Lstat`.
 - **What Was Actually True**:
-  1. **Atomic Creation Over TOCTOU**: Executing `os.Mkdir(walPath, DirMode)` directly lets the OS kernel handle atomicity. If it succeeds, the directory was created without race. If it returns `os.ErrExist`, the path already exists and Lattice authoritatively inspects the entry.
+  1. **Atomic Creation Over TOCTOU**: Executing `os.Mkdir(walPath, DirMode)` directly lets the OS kernel handle atomicity. If it succeeds, the directory was created without race, eliminating create/check races. If it returns `os.ErrExist`, the path already exists and Lattice authoritatively inspects the entry.
   2. **Symlink Rejection via `os.Lstat`**: Standard `os.Stat` follows symbolic links, obscuring whether the target directory was hijacked via symlink. Using `os.Lstat` inspects the link itself. Detecting `info.Mode() & os.ModeSymlink != 0` allows immediately aborting with `*errors.NotADirectoryError`, preventing symlink traversal or redirection attacks.
-  3. **Restrictive Permissions & Umask Guarantees**: Target permission mode is `0700` (`rwx------`). Because group and other bits are explicitly 0, process umask cannot accidentally grant permissions to group or other users (`0700 &^ umask` preserves zeroed group/other bits). If an existing directory was created with loose permissions (e.g. `0755` or `0777`), `InitDir` automatically hardens it to `0700` via `os.Chmod`.
-  4. **Non-Destructive Idempotency**: `InitDir` never deletes, truncates, or overwrites existing files. Pre-existing WAL segments (`wal_*.log`) and database files (`MANIFEST`, `CURRENT`) remain completely untouched across repeated or concurrent initializations.
+  3. **Descriptor-Based Permission Hardening & Inode Pinning**: Target permission mode is `0700` (`rwx------`). Because group and other bits are explicitly 0, process umask cannot accidentally grant permissions to group or other users (`0700 &^ umask` preserves zeroed group/other bits). If an existing directory was created with loose permissions (e.g. `0755` or `0777`), `InitDir` avoids pathname-based `os.Chmod`. Instead, it opens the directory descriptor (`os.Open`), verifies `finfo.IsDir()` and `os.SameFile(info, finfo)` to pin the inode, executes `f.Chmod(DirMode)` (`fchmod` directly on the open descriptor, never following symlinks), and validates via post-`Lstat` `os.SameFile` comparison.
+  4. **Non-Destructive Idempotency & Inode Preservation**: `InitDir` never deletes, truncates, recreates, or overwrites existing files or directories. Pre-existing WAL segments (`wal_*.log`) and database files (`MANIFEST`, `CURRENT`) remain completely untouched across repeated or concurrent initializations, and the directory inode is preserved.
   5. **Mutex-Free Concurrency**: 50 goroutines racing to initialize the same WAL directory converge safely without requiring application-level mutexes.
 - **How It Was Verified**:
   1. `TestInitDir_FreshDatabasePath`: Verified creation and 0700 mode on fresh database root.
   2. `TestInitDir_Idempotency`: Verified repeated calls return the same path with zero side effects.
   3. `TestInitDir_PermissionHardening`: Verified that 0777 pre-existing directories are tightened to 0700.
-  4. `TestInitDir_ExistingRegularFileAtWALPath`: Verified that existing regular files fail with `ErrNotADirectory` and are preserved without modification.
-  5. `TestInitDir_ExistingSymlinks`: Tested directory symlinks, file symlinks, and broken symlinks; all 3 rejected with `ErrNotADirectory`.
-  6. `TestInitDir_DbPathAsSymlink`: Proved that if `dbPath` itself is a symlink to an external volume, `InitDir` creates the real WAL directory inside the symlink target cleanly.
-  7. `TestInitDir_ConcurrentInitialization`: Tested 50 concurrent goroutines released via barrier; 100% converged on the valid 0700 directory with 0 errors.
-  8. `TestInitDir_FilesystemFailureModes`: Verified error propagation on empty path (`os.ErrInvalid`), missing parent (`fs.ErrNotExist`), file parent, and read-only parent (`fs.ErrPermission`).
-  9. `TestInitDir_PreservesExistingFiles`: Proved pre-existing WAL logs and database files are 100% byte-for-byte preserved.
-- **Core Lesson**: Filesystem security begins at directory creation. Eliminate TOCTOU by relying on atomic kernel syscalls, inspect existing entries with `Lstat` to defeat symlink hijacking, enforce 0700 permissions to protect data confidentiality, and guarantee that re-initialization is strictly non-destructive.
-- **Interview Relevance**: Demonstrates mastery of POSIX file permissions, umask dynamics, TOCTOU race elimination, symlink security threats, and non-destructive idempotent systems design.
+  4. `TestInitDir_ExistingDirectoryInodePreservation`: Proved pre-existing loose and 0700 directory inodes are strictly preserved via `os.SameFile` without deletion or recreation.
+  5. `TestInitDir_ExistingRegularFileAtWALPath`: Verified that existing regular files fail with `ErrNotADirectory` and are preserved without modification.
+  6. `TestInitDir_ExistingSymlinks`: Tested directory symlinks, file symlinks, and broken symlinks; all 3 rejected with `ErrNotADirectory`.
+  7. `TestInitDir_DbPathAsSymlink`: Proved that if `dbPath` itself is a symlink to an external volume, `InitDir` creates the real WAL directory inside the symlink target cleanly.
+  8. `TestInitDir_ConcurrentInitialization`: Tested 50 concurrent goroutines released via barrier; 100% converged on the valid 0700 directory with 0 errors.
+  9. `TestInitDir_FilesystemFailureModes`: Verified error propagation on empty path (`os.ErrInvalid`), missing parent (`fs.ErrNotExist`), file parent, and read-only parent (`fs.ErrPermission`).
+  10. `TestInitDir_PreservesExistingFiles`: Proved pre-existing WAL logs and database files are 100% byte-for-byte preserved.
+- **Core Lesson**: Filesystem security begins at directory creation. Eliminate create/check races by relying on atomic kernel syscalls, inspect existing entries with `Lstat` to defeat symlink hijacking, pin inodes and use descriptor-based `fchmod` to eliminate symlink-substitution TOCTOU during permission hardening, enforce 0700 permissions to protect data confidentiality, and guarantee that re-initialization is strictly non-destructive.
+- **Interview Relevance**: Demonstrates mastery of POSIX file permissions, umask dynamics, descriptor-based filesystem operations (`fchmod`), inode pinning (`os.SameFile`), TOCTOU race mitigation, symlink security threats, and non-destructive idempotent systems design.
 
 ---
 

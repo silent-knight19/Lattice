@@ -37,8 +37,8 @@ func DirPath(dbPath string) string {
 //     Fails fast with os.ErrInvalid if dbPath is empty.
 //  2. Atomic Creation & TOCTOU Prevention:
 //     Executes a direct atomic creation attempt via os.Mkdir(walPath, DirMode).
-//     Avoids unsafe time-of-check-to-time-of-use (TOCTOU) sequences (e.g. Stat followed by Mkdir)
-//     by relying strictly on kernel-level atomic creation failure modes.
+//     Eliminates check-then-create time-of-check-to-time-of-use (TOCTOU) races by relying
+//     strictly on kernel-level atomic creation failure modes.
 //  3. Idempotent Convergence:
 //     If walPath already exists, it verifies that the existing object is a genuine directory.
 //     Pre-existing WAL segments and auxiliary files within the directory are never deleted or truncated.
@@ -49,9 +49,12 @@ func DirPath(dbPath string) string {
 //  5. Symlink Rejection:
 //     Uses os.Lstat to inspect existing paths without following symlinks. An existing symlink at walPath
 //     is strictly rejected as a non-directory to eliminate symlink redirection and traversal hazards.
-//  6. Permission Hardening:
+//  6. Descriptor-Based Permission Hardening & Inode Pinning:
 //     If the WAL directory already exists but was initialized with looser permissions (e.g. 0755 or 0777),
-//     it tightens permissions to DirMode (0700) via os.Chmod, removing group/other access rights.
+//     it avoids an unchecked pathname-based Chmod by opening the directory file descriptor,
+//     validating that the opened descriptor references the exact inode observed by Lstat (via os.SameFile),
+//     applying f.Chmod(DirMode) directly to the open handle (fchmod), and re-verifying via Lstat post-chmod.
+//     This prevents symlink-substitution attacks in the existing-directory hardening path.
 //  7. Parent Directory Enforcement:
 //     Does not blindly create arbitrary parent hierarchies. If the parent dbPath does not exist,
 //     os.Mkdir returns an error wrapping fs.ErrNotExist, preserving authoritative OS error identity.
@@ -66,7 +69,7 @@ func InitDir(dbPath string) (string, error) {
 	walPath := Dir(dbPath)
 
 	// Direct atomic creation attempt:
-	// Eliminates TOCTOU race condition by letting the OS kernel authoritatively create the directory.
+	// Eliminates check-then-create TOCTOU race condition by letting the OS kernel authoritatively create the directory.
 	err := os.Mkdir(walPath, DirMode)
 	if err == nil {
 		return walPath, nil
@@ -102,9 +105,46 @@ func InitDir(dbPath string) (string, error) {
 	}
 
 	// Existing directory: tighten permissions if group or others possess any permission bits.
+	// To prevent TOCTOU symlink-swap attacks between Lstat and Chmod, we:
+	//  1. Open the directory handle directly.
+	//  2. Use f.Stat() and os.SameFile(info, finfo) to prove that the opened descriptor
+	//     references the exact directory inode verified by os.Lstat (not a substituted symlink or file).
+	//  3. Execute f.Chmod(DirMode) directly on the open descriptor (fchmod), avoiding pathname traversal.
+	//  4. Re-verify with os.Lstat to ensure the directory was not displaced during hardening.
 	if info.Mode().Perm()&0077 != 0 {
-		if chmodErr := os.Chmod(walPath, DirMode); chmodErr != nil {
+		f, openErr := os.Open(walPath)
+		if openErr != nil {
+			return "", fmt.Errorf("wal: failed to open directory for permission hardening %s: %w", walPath, openErr)
+		}
+		defer func() {
+			_ = f.Close()
+		}()
+
+		finfo, statErr := f.Stat()
+		if statErr != nil {
+			return "", fmt.Errorf("wal: failed to stat opened directory %s: %w", walPath, statErr)
+		}
+
+		// Verify the descriptor is still a directory and references the exact same inode as info
+		if !finfo.IsDir() || !os.SameFile(info, finfo) {
+			return "", &errors.NotADirectoryError{
+				Path: walPath,
+				Mode: finfo.Mode(),
+			}
+		}
+
+		// f.Chmod executes fchmod on the file descriptor directly, never following symlinks.
+		if chmodErr := f.Chmod(DirMode); chmodErr != nil {
 			return "", fmt.Errorf("wal: failed to tighten permissions on %s: %w", walPath, chmodErr)
+		}
+
+		// Post-hardening validation: ensure walPath still points to the same inode
+		postInfo, postErr := os.Lstat(walPath)
+		if postErr != nil {
+			return "", fmt.Errorf("wal: directory displaced during hardening %s: %w", walPath, postErr)
+		}
+		if !os.SameFile(finfo, postInfo) {
+			return "", fmt.Errorf("wal: directory replaced concurrently during hardening %s: %w", walPath, errors.ErrNotADirectory)
 		}
 	}
 

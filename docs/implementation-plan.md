@@ -976,20 +976,20 @@ TOTAL: 184 Discrete, Testable Micro-Phases
   * *Changes*:
     - Extended `internal/errors` with `ErrNotADirectory` sentinel and `NotADirectoryError{Path, Mode}` typed diagnostic error.
     - Implemented `internal/wal/dir.go` with constants `DirName = "wal"`, `DirMode = 0700`, path constructors `Dir(dbPath)` and `DirPath(dbPath)`, and directory initializer `InitDir(dbPath string) (string, error)`.
-    - Enforced atomic directory creation via `os.Mkdir(walPath, DirMode)` to eliminate TOCTOU races.
+    - Enforced atomic directory creation via `os.Mkdir(walPath, DirMode)` to eliminate check-then-create TOCTOU races.
     - Implemented `os.Lstat` inspection on pre-existing paths, rejecting regular files, symlinks, and non-directory objects with `*errors.NotADirectoryError`.
-    - Added permission hardening via `os.Chmod(walPath, DirMode)` if existing directory has loose group/other permissions.
-    - Added comprehensive unit, concurrency, failure mode, and adversarial test suite in `internal/wal/dir_test.go` covering Scenarios A through Q.
+    - Hardened existing-directory permission updates: opens the directory handle directly, verifies `os.SameFile(info, finfo)` to pin the exact directory inode, executes descriptor-based `f.Chmod(DirMode)` (`fchmod`) to prevent symlink-swap traversal attacks, and re-validates inode continuity post-chmod.
+    - Added comprehensive unit, concurrency, failure mode, inode-preservation, and adversarial test suite in `internal/wal/dir_test.go` covering Scenarios A through R.
   * *Tests & Verification*:
-    - `go test -count=1 -race ./internal/wal/...`: PASS (58 suites, including 9 new directory suites)
+    - `go test -count=1 -race ./internal/wal/...`: PASS (59 suites, including 10 directory suites)
     - `go test -count=1 -race ./...`: PASS across all packages
     - `golangci-lint run ./...`: 0 issues
-    - Statement coverage: 98.5% in `internal/wal`, 100% in `internal/errors`
+    - Statement coverage: 98.7% in `internal/wal`, 100% in `internal/errors`
   * *Evidence Classification*:
-    - **Design Target**: Secure, race-free, and idempotent initialization of `<db_path>/wal/` with `0700` POSIX mode (`rwx------`), protecting database logs against group/other local access.
-    - **Theoretical Property**: Direct atomic `os.Mkdir` syscall eliminates TOCTOU races between existence checks and creation; `os.Lstat` prevents following symlinks to unintended targets; umask cannot add group/other permissions when `0700` is requested.
-    - **Measured Result**: Verified 0700 mode on fresh creation; verified permission tightening on 0777 pre-existing directories; 100% error detection on regular files, symlinks, and non-existent parents; 50 goroutines safely converged without race or data corruption; pre-existing WAL files preserved without modification.
-    - **Observed Limitation**: On non-POSIX filesystems (such as Windows NTFS without POSIX emulation), directory permission bits may not reflect standard POSIX 0700 semantics; directory initialization creates `<db_path>/wal` but does not establish storage media crash durability until log files are flushed and synced.
+    - **Design Target**: Secure, race-resistant, and idempotent initialization of `<db_path>/wal/` with `0700` POSIX mode (`rwx------`), protecting database logs against group/other local access.
+    - **Theoretical Property**: Direct atomic `os.Mkdir` syscall eliminates check-then-create TOCTOU races; `os.Lstat` detects and rejects symlinks at the WAL path; descriptor-based `fchmod` and `os.SameFile` pin the verified directory inode and prevent symlink-substitution redirection during permission hardening; umask cannot add group/other permissions when `0700` is requested.
+    - **Measured Result**: Verified 0700 mode on fresh creation; verified descriptor-based permission tightening on 0777 pre-existing directories; verified inode preservation across repeated and hardening calls; 100% error detection on regular files, symlinks, and non-existent parents; 50 goroutines safely converged without race or data corruption; pre-existing WAL files preserved without modification.
+    - **Observed Limitation**: Unprivileged local attacks are mitigated provided the parent directory `dbPath` permissions are properly restricted; a fully privileged (root/superuser) host attacker can bypass all OS permission checks; on non-POSIX filesystems (e.g. Windows), directory permission bits do not reflect POSIX 0700 semantics; directory initialization creates `<db_path>/wal` but does not establish storage media crash durability until log files are flushed and synced.
   * *Completion*: WAL directory creator and initializer verified and complete.
 * **P02-S02-M02: Synchronous WAL Appender (`Strict Sync`)**
   * *Objective*: Implement sequential file writer calling `file.Write()` followed by `fdatasync()`.

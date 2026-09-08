@@ -574,3 +574,67 @@ func TestInitDir_PreservesExistingFiles(t *testing.T) {
 		t.Errorf("wal segment 2 altered: got %q, want %q", gotSeg2, seg2Data)
 	}
 }
+
+// TestInitDir_ExistingDirectoryInodePreservation verifies Requirement 8:
+// Calling InitDir on an existing directory (both with loose 0777 and target 0700 permissions)
+// preserves the exact underlying filesystem inode (os.SameFile == true).
+// This proves that the implementation never deletes, recreates, or swaps the existing directory.
+func TestInitDir_ExistingDirectoryInodePreservation(t *testing.T) {
+	dbPath := t.TempDir()
+	walPath := filepath.Join(dbPath, wal.DirName)
+
+	// Pre-create directory with loose 0777 mode
+	if err := os.Mkdir(walPath, 0777); err != nil {
+		t.Fatalf("failed to create initial dir: %v", err)
+	}
+	_ = os.Chmod(walPath, 0777)
+
+	fiInitial, err := os.Lstat(walPath)
+	if err != nil {
+		t.Fatalf("os.Lstat failed: %v", err)
+	}
+
+	// Call InitDir: should harden to 0700 via descriptor fchmod
+	p1, err := wal.InitDir(dbPath)
+	if err != nil {
+		t.Fatalf("InitDir failed: %v", err)
+	}
+	if p1 != walPath {
+		t.Fatalf("path mismatch: got %q, want %q", p1, walPath)
+	}
+
+	fiAfterHardening, err := os.Lstat(walPath)
+	if err != nil {
+		t.Fatalf("os.Lstat failed: %v", err)
+	}
+
+	// Prove the inode was preserved across permission hardening
+	if !os.SameFile(fiInitial, fiAfterHardening) {
+		t.Fatalf("directory inode changed during permission hardening! Directory was recreated or swapped.")
+	}
+
+	if runtime.GOOS != "windows" {
+		if fiAfterHardening.Mode().Perm() != wal.DirMode {
+			t.Errorf("expected permissions %04o, got %04o", wal.DirMode, fiAfterHardening.Mode().Perm())
+		}
+	}
+
+	// Call InitDir again on already-0700 directory
+	p2, err := wal.InitDir(dbPath)
+	if err != nil {
+		t.Fatalf("second InitDir failed: %v", err)
+	}
+	if p2 != walPath {
+		t.Fatalf("path mismatch on second call: got %q, want %q", p2, walPath)
+	}
+
+	fiAfterSecondCall, err := os.Lstat(walPath)
+	if err != nil {
+		t.Fatalf("os.Lstat failed: %v", err)
+	}
+
+	// Prove the inode was preserved across idempotent call
+	if !os.SameFile(fiAfterHardening, fiAfterSecondCall) {
+		t.Fatalf("directory inode changed during idempotent call! Directory was recreated.")
+	}
+}
