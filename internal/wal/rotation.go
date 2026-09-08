@@ -118,14 +118,30 @@ func ListSegments(dbPath string) ([]uint64, error) {
 
 	var ids []uint64
 	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
 		id, err := ParseSegmentID(entry.Name())
 		if err != nil {
-			// Non-segment file in wal directory; ignore
+			// Non-segment file or unrelated subdirectory in wal directory; ignore
 			continue
 		}
+
+		fullPath := filepath.Join(walDir, entry.Name())
+		info, statErr := os.Lstat(fullPath)
+		if statErr != nil {
+			return nil, fmt.Errorf("wal: failed to inspect segment %s: %w", fullPath, statErr)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("wal: cannot open symlink %s: %w", fullPath, os.ErrInvalid)
+		}
+		if info.IsDir() {
+			return nil, &errors.NotADirectoryError{
+				Path: fullPath,
+				Mode: info.Mode(),
+			}
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("wal: path %s is not a regular file (mode: %s): %w", fullPath, info.Mode(), os.ErrInvalid)
+		}
+
 		ids = append(ids, id)
 	}
 

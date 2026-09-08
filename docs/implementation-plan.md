@@ -349,18 +349,18 @@ Every future micro-phase implementation response from Claude Code must use this 
 
 ```
 Current Major Phase           : Phase 02 — Write-Ahead Log (WAL) & Durability Subsystem
-Current Sub-Phase             : Sub-Phase 02.3 — Torn Write Handling & Log Rotation
-Current Micro-Phase           : P02-S03-M03 — WAL Recovery Coordinator & Multi-Segment Replay
+Current Sub-Phase             : Sub-Phase 02.4 — Group Commit Coalescing Pipeline
+Current Micro-Phase           : P02-S04-M01 — Group Commit Queue & Write Task Types
 Phase 01 Status               : COMPLETE (Sub-Phases 01.1 & 01.2 Complete)
 Previous Completed Phase      : Phase 01 — Core Storage Primitives & Binary Encodings
-Previous Completed Micro-Phase: P02-S03-M02 — WAL Segment Rotation & Sequencing
+Previous Completed Micro-Phase: P02-S03-M03 — WAL Recovery Coordinator & Multi-Segment Replay
 Phase 00 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Phase 01 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Blocking Issues               : None
-Tests Passing                 : `go test -race ./...` (19/19 error suites, 18/18 logger suites, 48/48 binary suites, 173/173 wal suites passing, 88.4% wal coverage, 100% binary & errors coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
-Security Review Status        : Complete & Verified (Atomic exclusive segment creation via os.O_EXCL | os.O_CREATE, collision rejection of existing files, 0600 file modes, symlink/directory rejection, foreign file non-truncation, thread-safe rotation serialization under mutex)
-Interview Knowledge Status    : Updated with segment rotation lifecycle, atomic O_EXCL collision defense, pre-write boundary accounting, oversized record policy, multi-segment numeric ordering, and engineering log
-Git Commit                    : feat(wal): [P02-S03-M02] add WAL segment rotation and sequencing
+Tests Passing                 : `go test -race ./...` (22/22 error suites, 18/18 logger suites, 48/48 binary suites, 212/212 wal suites passing, 88.9% wal coverage, 100% binary & errors coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
+Security Review Status        : Complete & Verified (Two-phase recovery with physical repair before replay, fail-closed on segment gaps/duplicates, read-only historical segment inviolability, no file mutation on middle corruption or bad CRC, symlink/directory masquerade rejection, global sequence monotonicity validation)
+Interview Knowledge Status    : Updated with multi-segment recovery orchestration, gap detection, historical vs latest segment semantics, torn-tail recovery ownership, physical repair vs logical replay stages, quiescent startup assumptions, and engineering log
+Git Commit                    : feat(wal): [P02-S03-M03] add WAL recovery coordinator and multi-segment replay
 ```
 
 ---
@@ -1054,11 +1054,15 @@ TOTAL: 184 Discrete, Testable Micro-Phases
   * *Completion*: Complete and verified across all lifecycle, boundary matrix, concurrency, and fault-injection test suites.
 
 * **P02-S03-M03: WAL Recovery Coordinator & Multi-Segment Replay**
-  * *Objective*: Coordinate multi-segment crash recovery during database startup, discovering historical WAL segments in strictly numeric order, executing torn-tail recovery on the latest active segment, verifying older sealed segments, and replaying uncommitted operations into the active MemTable.
-  * *Changes*: `internal/wal/coordinator.go` (`RecoverWAL(dbPath string) (*RecoveryReport, error)`).
-  * *Invariants*: Replay order strictly follows ascending segment ID and monotonic sequence numbers; gaps in segment IDs or middle corruptions halt startup immediately.
-  * *Tests*: Crash recovery across multi-segment directories with torn tails on the latest segment, missing segments, and out-of-order logs.
-  * *Completion*: Pending.
+  * *Objective*: Coordinate multi-segment crash recovery during database startup, discovering historical WAL segments in strictly numeric order, executing torn-tail recovery on the latest active segment, verifying older sealed segments, validating global sequence monotonicity, and replaying operations into a replay sink interface.
+  * *Changes*: `internal/wal/coordinator.go` (`RecoverWAL(dbPath string, sink ReplaySink) (RecoveryReport, error)`), `internal/wal/coordinator_test.go`, `internal/errors/errors.go` (`ErrSegmentGap`, `ErrDuplicateSegment`, `ErrSequenceOutOfOrder`, `SegmentGapError`, `DuplicateSegmentError`, `SequenceOutOfOrderError`).
+  * *Invariants*: Replay order strictly follows ascending segment ID ($1 \to 2 \to 3 \dots$); segment ID gaps or duplicates fail closed; sealed historical segments ($1..N-1$) must end at clean `io.EOF`; only latest segment ($N$) may contain a recoverable torn tail; complete CRC or middle corruptions fail closed without mutation; sequence numbers must be strictly monotonically increasing ($SeqNum_k > SeqNum_{k-1}$); replay sink failures stop replay immediately and accurately report pre-failure records.
+  * *Evidence Classification*:
+    - **Design Target**: Discover and validate all WAL segments under `<db_path>/wal/` in strictly ascending numeric order; verify historical segments in read-only mode; repair latest-segment torn tails via safe in-place truncation (`RecoverSegment`); enforce global sequence monotonicity; stream records into `ReplaySink` without full-file in-memory buffering; provide deterministic, transparent recovery report.
+    - **Theoretical Property**: Decoupling physical repair from logical replay guarantees on-disk consistency before state-machine modification. If physical truncation occurs on the latest segment and subsequent replay fails (e.g. sink error), the on-disk log remains cleanly truncated, ensuring startup recovery retry is completely idempotent. Verifying historical segments prior to mutating the latest segment guarantees that corrupt historical logs never trigger erroneous latest-segment truncation.
+    - **Measured Result**: 39 test suites passing in `coordinator_test.go`; empty WAL directory, clean single-segment, multi-segment ascending order, segment ID gap rejection, latest torn-tail truncation, earlier torn-tail fail-closed, complete CRC corruption fail-closed, middle corruption fail-closed, invalid record type rejection, sequence monotonicity and regression rejection, duplicate sequence rejection, valid DELETE and BATCH marker preservation, replay sink failure propagation, symlink and directory masquerade rejection, 10-segment streaming test with bounded memory, and adversarial multi-segment test suites passing under `-race` with 0 data races; statement coverage 88.9% in `internal/wal`; `golangci-lint` clean (0 issues).
+    - **Observed Limitation**: Replay sink is defined as an engine integration interface (`ReplaySink`); concrete in-memory MemTable replay storage is deferred to Phase 03 (`P03-S01`).
+  * *Completion*: Complete and verified across all lifecycle, boundary matrix, sequence monotonicity, fail-closed corruption, and adversarial test suites.
 
 ### Sub-Phase 02.4: Group Commit Coalescing Pipeline
 * **P02-S04-M01: Group Commit Queue & Write Task Types**

@@ -1169,21 +1169,103 @@ This section is a living record of actual engineering obstacles, debugging sessi
 - **Core Lesson**: Segment rotation is an atomic state transition across filesystem objects. Never split records across segment boundaries, evaluate thresholds pre-write, accept oversized records into empty segments to avoid write starvation, enforce atomic `O_EXCL` file creation to eliminate collision and truncation hazards, and parse segment IDs numerically to guarantee global order.
 - **Interview Relevance**: Demonstrates deep systems expertise in log-structured storage lifecycle, boundary arithmetic, concurrency synchronization during file rotation, atomic POSIX file creation, and failure-atomic resource transitions.
 
+### Entry 2026-09-08 — Phase 02: Multi-Segment Recovery Coordinator, Historical Log Inviolability, Gap Detection & Two-Phase Replay
+- **Date**: 2026-09-08
+- **Phase**: Phase 02 Sub-Phase 02.3 Micro-Phase 03 (`P02-S03-M03`)
+- **Problem**: When a database crashes and reboots, historical writes are partitioned across multiple sealed segments ($1 \dots N-1$) and one active segment ($N$). Coordinating multi-segment startup recovery introduces five critical failure hazards: (1) relying on non-deterministic directory iteration or file modification timestamps rather than canonical numeric order; (2) silently skipping over deleted or missing historical segments (e.g. observing segments 1, 2, 4 and ignoring missing segment 3); (3) erroneously truncating torn tails in historical sealed segments, concealing prior corruptions; (4) modifying filesystem state before discovering that an earlier segment is corrupt; and (5) sorting records by sequence number in memory during replay, which hides physical log ordering corruption and violates durability contracts.
+- **Initial Assumption**: Recovery could discover whatever segment files happen to exist in `wal/`, run `RecoverSegment` on every file, sort all recovered records by `SeqNum` in memory, and insert them into the database.
+- **What Was Actually True**:
+  1. **Strict Numeric Ascending Discovery**: Segments must be parsed and processed strictly by numeric ID ($1 \to 2 \to 3 \to 10$). Lexicographical string sorting (`wal_1` vs `wal_10`) or filesystem `readdir` order violates the temporal timeline of the database.
+  2. **Zero-Tolerance Gap & Duplicate Detection**: If discovered segments are $[1, 2, 4]$, the engine cannot guess what happened to segment 3 (unlinked file, silent fsck deletion, operator error). Missing segment IDs indicate catastrophic log loss, and recovery must fail closed immediately with `SegmentGapError`. Similarly, duplicate segment IDs fail with `DuplicateSegmentError`.
+  3. **Historical Segment Inviolability**: Sealed segments ($1 \dots N-1$) were finalized prior to rotation. Under normal operations, they terminate cleanly at `io.EOF`. If an earlier segment has an incomplete record or torn tail, it is NOT an in-flight crash artifact—it is an integrity violation. Historical segments must NEVER be truncated; recovery fails closed immediately.
+  4. **Two-Phase Physical Repair Before Logical Replay**:
+     - *Phase 1 (Verification & Repair)*: Sealed segments $1 \dots N-1$ are scanned in read-only mode to verify complete validity. Only when all historical segments are proven clean is the latest segment ($N$) checked and repaired via `RecoverSegment` (truncating uncommitted torn tails). Complete CRC corruption or middle corruption in segment $N$ fails closed without mutation.
+     - *Phase 2 (Logical Replay)*: Once all on-disk segments are physically consistent, records are streamed in physical log order, verified for global sequence monotonicity ($SeqNum_k > SeqNum_{k-1}$), and applied to `ReplaySink`.
+  5. **Streaming Memory Boundaries**: Recovery must never buffer all segments or records in memory. Records are streamed sequentially from one segment at a time through `WALReader`, bounding coordinator memory to the active record buffer.
+  6. **Replay Sink Decoupling**: The coordinator decouples WAL replay from the concrete in-memory index via `ReplaySink` (`Apply(Record) error`). This keeps recovery testable and modular before Phase 03 MemTable construction.
+- **How It Was Verified**:
+  1. `TestCoordinator_EmptyWALDirectory`: Clean empty WAL returns 0 records, 0 segments, and nil error.
+  2. `TestCoordinator_OneCleanSegment` & `TestCoordinator_ThreeCleanSegments`: Verified exact record replay across single and multi-segment directories.
+  3. `TestCoordinator_NumericOrdering`: Verified segments 7, 8, 9, 10 are replayed in numeric order regardless of directory order.
+  4. `TestCoordinator_MissingSegmentID_GapsRejected`: Discovered segments 1, 2, 4 fail closed with `SegmentGapError(Expected=3, Actual=4)`.
+  5. `TestCoordinator_LatestSegmentTornTail`: 7-byte torn tail in segment 2 safely truncated to valid boundary; valid prefix preserved and replayed.
+  6. `TestCoordinator_EarlierSegmentTornTail`: Torn tail in historical segment 1 fails closed without modifying segment 1 or segment 2.
+  7. `TestCoordinator_LatestSegmentCompleteCRCCorruption` & `TestCoordinator_EarlierSegmentCompleteCRCCorruption`: Complete corrupted record at EOF fails closed without truncation.
+  8. `TestCoordinator_MiddleCorruptionHistoricalSegment` & `TestCoordinator_MiddleCorruptionLatestSegment`: Middle corruption fails closed immediately without mutation.
+  9. `TestCoordinator_InvalidRecordType`: Invalid record type byte 0x99 fails closed.
+  10. `TestCoordinator_SequenceMonotonicitySuccess`: Strictly increasing sequence numbers ($5 \to 15 \to 100$) succeed.
+  11. `TestCoordinator_SequenceRegressionFailure`: Sequence regression ($20 \to 15$) fails with `SequenceOutOfOrderError`.
+  12. `TestCoordinator_DuplicateSequenceFailure`: Duplicate sequence number ($10 \to 10$) fails with `SequenceOutOfOrderError`.
+  13. `TestCoordinator_ValidDeleteReplay`: DELETE tombstones forwarded cleanly to `ReplaySink`.
+  14. `TestCoordinator_ValidBatchStartCommitPreserved`: `BATCH_START` and `BATCH_COMMIT` markers forwarded cleanly to `ReplaySink`.
+  15. `TestCoordinator_ReplaySinkFailurePropagation`: Replay sink error propagates immediately; `report.ReplayedRecords` accurately reports count applied prior to error.
+  16. `TestCoordinator_ReplayOrderAcrossMultipleSegments`: 5 segments replayed record-by-record in ascending order.
+  17. `TestCoordinator_NoReplayOfTruncatedTailBytes`: Truncated bytes are never passed to sink.
+  18. `TestCoordinator_RecoveryResultAccuracy`: All fields of `RecoveryReport` verified.
+  19. `TestCoordinator_IdempotentRecoveryAfterLatestTailTruncation`: Re-running recovery on truncated segment returns clean state with `Truncated: false`.
+  20. `TestCoordinator_SecondRecoveryReturnsCleanState`: Consecutive recovery runs return identical clean reports.
+  21. `TestCoordinator_ForeignNonSegmentFilesInWALDirectory`: Harmless non-segment files (`README.txt`, `wal_temp.tmp`) ignored.
+  22. `TestCoordinator_SymlinkSegmentRejection`: Symlinked segment file rejected with `os.ErrInvalid`.
+  23. `TestCoordinator_DirectoryAtExpectedSegmentPath`: Directory named `wal_000000000001.log` rejected with `NotADirectoryError`.
+  24. `TestCoordinator_LargeMultiSegmentStreaming`: 500 records across 10 segments streamed with bounded memory.
+  25. `TestCoordinator_DeterministicRepeatedRecovery`: Identical directory yields identical report and stream across independent runs.
+  26. `TestCoordinator_FileImmutabilityHistoricalCleanSegments`: SHA256 hashes of historical segments unchanged after latest-tail repair.
+  27. `TestCoordinator_LatestSegmentMutationOnlyWhenTornTailExists`: Clean latest segment untouched; torn latest segment truncated.
+  28. `TestCoordinator_NoMutationAnywhereOnMiddleCorruption`: Middle corruption leaves all segments unmodified.
+  29. `TestCoordinator_SequenceValidationAfterRepairedLatestTail`: Sequence validation enforced through repaired tail.
+  30. `TestCoordinator_MultipleRotationsFollowedByRecovery`: Frequent rotations under `RotatingWriter` recovered cleanly across all segments.
+  31. `TestCoordinator_Adversarial_HistoricalTornTail_WithValidLatest`: Segment 1 clean, segment 2 torn, segment 3 valid fails closed without mutating any segment.
+  32. `TestCoordinator_Adversarial_HistoricalCRC_WithValidLatest`: Segment 1 clean, segment 2 bad CRC, segment 3 valid fails closed without mutating any segment.
+  33. `TestCoordinator_Adversarial_SinkFailureAfterTruncation`: Latest segment truncated on disk, sink fails -> returns sink error with `Truncated: true`.
+- **Core Lesson**: Crash recovery is an orchestration across discrete physical logs and in-memory state machines. Never mutate files based on assumptions; inspect and verify historical sealed logs first, limit physical truncation strictly to the latest unsealed active segment, fail closed on gaps or corruptions, validate sequence monotonicity in physical log order without sorting in memory, and separate physical on-disk repair from logical replay.
+- **Interview Relevance**: Demonstrates deep mastery of database crash recovery architectures (ARIES principles, LSM log replay, fail-closed durability boundaries, idempotent truncation, TOCTOU mitigation, and streaming pipeline design).
+
 ---
 
-# 20. Questions I Personally Failed & Corrected Understandings
+# 20. Deep Systems Interview Questions & Answers: WAL Recovery & Multi-Segment Replay
 
-When studying or answering mock interview questions during the development of Lattice, any question that exposes an incomplete or incorrect understanding is logged here alongside the rigorous, verified correction.
+### 1. Why must WAL recovery process segments in strict numeric ID order?
+* **Answer**: The WAL represents the authoritative temporal timeline of state mutations committed to the database. Segment IDs ($1, 2, 3 \dots$) are allocated monotonically at runtime as earlier segments reach capacity and rotate. Processing segments out of order (such as relying on directory enumeration or file modification times) causes writes to be replayed out of causal order. An older `DELETE` could replay after a newer `PUT`, or an outdated value could overwrite the latest committed state. Numeric ordering guarantees that physical replay mirrors the exact real-time causal sequence of transactions.
 
-### Failure Entry Template
-```markdown
-### Question: <Exact Interview Question>
-- **Subsystem**: <e.g., WAL / SkipList / Raft>
-- **My Initial (Flawed) Answer**: <What I originally thought or stated>
-- **Why It Was Incomplete or Wrong**: <Technical flaw in the reasoning>
-- **The Correct, Authoritative Explanation**: <Deep, precise systems answer>
-- **Key Invariant or Concept to Remember**: <Core takeaway to avoid future slips>
-```
+### 2. Why are missing segment IDs (gaps like 1, 2, 4) dangerous, and why must recovery fail closed?
+* **Answer**: A missing segment ID in a sequence (e.g. seeing segments 1, 2, and 4, but missing 3) indicates that an entire epoch of committed log operations is absent from disk. This could happen due to silent disk corruption, filesystem corruption, improper manual file unlinking, or failed backup restoration. If recovery were to skip over segment 3 and replay segment 4, the database would apply operations based on missing intermediate state. A transaction in segment 4 updating a record created in segment 3 would fail or diverge, resulting in silent data corruption. Failing closed immediately with `SegmentGapError` prevents the engine from booting with an inconsistent state machine.
+
+### 3. Why may only the latest segment normally contain a recoverable torn tail?
+* **Answer**: During normal database operation, segment rotation is an explicit, serialized event: when segment $N-1$ reaches the configured size threshold, `RotatingWriter` finishes writing the active record, flushes buffers, executes `fdatasync`, and closes the file descriptor before creating segment $N$. Therefore, every historical segment ($1 \dots N-1$) was cleanly sealed at an exact record boundary prior to the crash. A power outage or process crash can interrupt an in-flight write *only on the currently open, active segment* ($N$). If an older segment exhibits a torn tail, it cannot be a crash artifact—it represents media bit-rot, truncation, or disk tampering after sealing. Automatically truncating an older segment would destroy valid historical data.
+
+### 4. Why must middle corruption fail closed rather than truncating or skipping?
+* **Answer**: A Write-Ahead Log is a continuous append-only stream. If corruption occurs in the middle of a log (sequence $A \to B_{corrupt} \to C$), record $B$ was fully written and flushed to disk prior to record $C$ being appended. Its corruption indicates physical storage degradation (bit-rot, sector failure, or bad blocks). If the engine truncated at $B$, all subsequent valid transactions in $C$ would be permanently erased. If the engine skipped $B$ and replayed $C$, the state machine would execute $C$ without the state updates or invariants established by $B$. The only safe response is to fail closed immediately, halt database startup, and alert the operator for disaster recovery.
+
+### 5. Why must replay follow physical WAL ordering rather than sorting records by sequence number afterward?
+* **Answer**: In a correct log-structured storage engine, the physical log order and the logical sequence number order are congruent. If an engine reads all records into memory, detects out-of-order sequence numbers, and silently sorts them by `SeqNum` before applying to the state machine, it masks physical corruption (such as disk blocks written out of order, or concurrent uncoordinated appenders writing to the same file descriptor). Physical log order is authoritative. Streaming sequentially and asserting $SeqNum_{k} > SeqNum_{k-1}$ ensures that the physical write pipeline maintained strict serializability. Any sequence inversion is caught as an integrity failure.
+
+### 6. How does startup recovery separate physical repair from logical replay?
+* **Answer**: Physical repair and logical replay have different operational scopes:
+  - **Physical Repair (Phase 1)**: Operates on filesystem descriptors. It validates historical segments in read-only mode, inspects the latest segment for torn tails, and performs physical truncation and `fdatasync` to restore the on-disk file to a clean record boundary.
+  - **Logical Replay (Phase 2)**: Operates on clean, verified physical streams. It streams records sequentially, verifies sequence monotonicity, and applies operations to the in-memory state machine (`ReplaySink`).
+  Separating these phases ensures that disk state is verified and stabilized before any in-memory index or state machine is modified.
+
+### 7. What happens if truncation succeeds on disk, but replay later fails?
+* **Answer**: Physical truncation on disk cannot be rolled back via an in-memory undo buffer. If physical truncation succeeds on the latest segment, but logical replay later encounters a failure (such as an out-of-memory error or disk failure in the replay sink), the on-disk WAL remains truncated at the last valid record boundary. This is desirable and safe: the torn, uncommitted tail bytes have been permanently removed, leaving the on-disk log in a clean, valid state. On the subsequent startup recovery attempt, the coordinator will see a clean latest segment and proceed directly to replay without re-truncating. The `RecoveryReport` accurately reports `Truncated: true` alongside the error to reflect the actual filesystem mutation.
+
+### 8. Why must WAL recovery remain streaming instead of buffering files in memory?
+* **Answer**: In production systems, WAL directories may contain tens of gigabytes of transaction logs across multiple segments prior to a checkpoint or MemTable flush. Loading entire segment files or accumulating all records into a single slice in memory would introduce unbounded memory consumption ($O(\text{total WAL bytes})$), triggering Linux OOM killer invocation during database boot. A streaming recovery architecture processes one segment descriptor at a time and iterates record by record via `WALReader`, bounding coordinator memory to $O(1)$ relative to total log size ($O(\text{max record size})$).
+
+### 9. Why should historical segments remain immutable after sealing?
+* **Answer**: In LSM storage engines, sealed historical WAL segments represent immutable archives of committed transactions. Once a segment is sealed, background processes (such as compaction, backup archiving, or replication catch-up) may inspect or read the segment concurrently with active ingestion. If recovery or normal operations were permitted to modify or rewrite historical segments, it would invalidate checksums, break replication streams, and violate the write-once durability contract. Sealed segments must remain strictly read-only until physically unlinked after MemTable flush.
+
+### 10. How does sequence-number validation detect ordering corruption during recovery?
+* **Answer**: Each record header includes a 64-bit monotonically increasing sequence number assigned by the database sequencer before writing to the WAL. During multi-segment replay, the coordinator tracks `prevSeqNum`. If an incoming record has $SeqNum \le prevSeqNum$, it reveals either a duplicate sequence number (suggesting record replay duplication or broken concurrency serialization) or a sequence regression (suggesting misplaced disk sectors or interleaved logs). By strictly requiring $SeqNum_{k} > SeqNum_{k-1}$, recovery immediately halts before corrupting the database state machine.
+
+### 11. Why is filesystem directory enumeration order not a valid source of WAL chronology?
+* **Answer**: POSIX directory enumeration (`readdir`) returns directory entries in an unspecified, filesystem-dependent hash order (e.g. ext4 directory htree order, APFS b-tree order). Directory order has no correlation with file creation time, numeric segment progression, or causal write order. Even sorting lexicographically as strings causes errors once IDs exceed single digits (e.g., `"wal_10.log"` sorts before `"wal_2.log"`). Only parsing the canonical numeric integer from the segment filename and sorting numerically guarantees a deterministic, chronological replay sequence.
+
+### 12. How does the recovery coordinator remain independent of the future MemTable?
+* **Answer**: In accordance with separation of concerns, the WAL recovery coordinator is responsible for log discovery, ordering, physical validation, and streaming. It defines a minimal `ReplaySink` interface (`Apply(Record) error`). The coordinator streams valid `Record` structs to the sink without knowing whether the sink is a concurrent SkipList, a vector index, a mock testing harness, or a diagnostic tool. This inversion of control prevents cyclic dependencies between the WAL subsystem and the MemTable subsystem, ensuring both can be tested in complete isolation.
+
+---
+
+# 21. Questions I Personally Failed & Corrected Understandings
 
 *(Entries will be appended whenever knowledge gaps are discovered)*
 

@@ -80,6 +80,18 @@ var (
 	// ErrSegmentIDOverflow indicates that incrementing a WAL segment ID would exceed
 	// the maximum 64-bit unsigned integer representation (wraparound prohibited).
 	ErrSegmentIDOverflow = stdErrors.New("segment ID overflow")
+
+	// ErrSegmentGap indicates that a numerical gap was detected in the sequence
+	// of WAL segment IDs during startup recovery.
+	ErrSegmentGap = stdErrors.New("wal segment gap detected")
+
+	// ErrDuplicateSegment indicates that multiple segment entries resolved to the
+	// same numeric segment ID during startup recovery.
+	ErrDuplicateSegment = stdErrors.New("duplicate wal segment ID detected")
+
+	// ErrSequenceOutOfOrder indicates that a WAL record's sequence number regressed
+	// or duplicated a previous sequence number, violating monotonic ordering.
+	ErrSequenceOutOfOrder = stdErrors.New("sequence number out of order")
 )
 
 // KeyTooLargeError provides structured context when a key violates maximum size limits.
@@ -283,4 +295,60 @@ func (e *NotADirectoryError) Error() string {
 // Is reports whether this error matches target sentinel ErrNotADirectory.
 func (e *NotADirectoryError) Is(target error) bool {
 	return target == ErrNotADirectory
+}
+
+// SegmentGapError provides structured context when a gap is detected in the sequence of WAL segment IDs.
+// It matches ErrSegmentGap when interrogated with errors.Is().
+type SegmentGapError struct {
+	Expected uint64
+	Actual   uint64
+}
+
+func (e *SegmentGapError) Error() string {
+	if e == nil {
+		return ErrSegmentGap.Error()
+	}
+	return fmt.Sprintf("wal segment gap detected: expected segment ID %d, got %d", e.Expected, e.Actual)
+}
+
+// Is reports whether this error matches target sentinel ErrSegmentGap.
+func (e *SegmentGapError) Is(target error) bool {
+	return target == ErrSegmentGap
+}
+
+// DuplicateSegmentError provides structured context when multiple entries resolve to the same segment ID.
+// It matches ErrDuplicateSegment when interrogated with errors.Is().
+type DuplicateSegmentError struct {
+	SegmentID uint64
+}
+
+func (e *DuplicateSegmentError) Error() string {
+	if e == nil {
+		return ErrDuplicateSegment.Error()
+	}
+	return fmt.Sprintf("duplicate wal segment ID %d detected", e.SegmentID)
+}
+
+// Is reports whether this error matches target sentinel ErrDuplicateSegment.
+func (e *DuplicateSegmentError) Is(target error) bool {
+	return target == ErrDuplicateSegment
+}
+
+// SequenceOutOfOrderError provides structured context when a WAL record violates monotonic sequence numbering.
+// It matches ErrSequenceOutOfOrder when interrogated with errors.Is().
+type SequenceOutOfOrderError struct {
+	Previous uint64
+	Current  uint64
+}
+
+func (e *SequenceOutOfOrderError) Error() string {
+	if e == nil {
+		return ErrSequenceOutOfOrder.Error()
+	}
+	return fmt.Sprintf("sequence number out of order: current %d is not greater than previous %d", e.Current, e.Previous)
+}
+
+// Is reports whether this error matches target sentinel ErrSequenceOutOfOrder.
+func (e *SequenceOutOfOrderError) Is(target error) bool {
+	return target == ErrSequenceOutOfOrder
 }

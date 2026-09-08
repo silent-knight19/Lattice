@@ -28,6 +28,9 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrInvalidOpType", errors.ErrInvalidOpType, "invalid operation type"},
 		{"ErrSeqNumOverflow", errors.ErrSeqNumOverflow, "sequence number overflow"},
 		{"ErrInternalKeyTruncated", errors.ErrInternalKeyTruncated, "internal key buffer truncated: missing trailer or user key"},
+		{"ErrSegmentGap", errors.ErrSegmentGap, "wal segment gap detected"},
+		{"ErrDuplicateSegment", errors.ErrDuplicateSegment, "duplicate wal segment ID detected"},
+		{"ErrSequenceOutOfOrder", errors.ErrSequenceOutOfOrder, "sequence number out of order"},
 	}
 
 	for _, tc := range sentinels {
@@ -63,6 +66,9 @@ func TestSentinelWrappingWithErrorsIs(t *testing.T) {
 		{"ErrInvalidOpType", errors.ErrInvalidOpType},
 		{"ErrSeqNumOverflow", errors.ErrSeqNumOverflow},
 		{"ErrInternalKeyTruncated", errors.ErrInternalKeyTruncated},
+		{"ErrSegmentGap", errors.ErrSegmentGap},
+		{"ErrDuplicateSegment", errors.ErrDuplicateSegment},
+		{"ErrSequenceOutOfOrder", errors.ErrSequenceOutOfOrder},
 	}
 
 	for _, tc := range tests {
@@ -96,6 +102,9 @@ func TestSentinelNegativeComparisons(t *testing.T) {
 		errors.ErrInvalidOpType,
 		errors.ErrSeqNumOverflow,
 		errors.ErrInternalKeyTruncated,
+		errors.ErrSegmentGap,
+		errors.ErrDuplicateSegment,
+		errors.ErrSequenceOutOfOrder,
 	}
 
 	for i, a := range allSentinels {
@@ -299,6 +308,9 @@ func TestNilReceiverTypedErrors(t *testing.T) {
 	var seq *errors.SeqNumOverflowError
 	var recType *errors.InvalidRecordTypeError
 	var recPayload *errors.InvalidRecordPayloadError
+	var sg *errors.SegmentGapError
+	var ds *errors.DuplicateSegmentError
+	var soo *errors.SequenceOutOfOrderError
 
 	// Ensure calling Error() on nil typed pointers does not panic and returns sentinel strings
 	if k.Error() != errors.ErrKeyTooLarge.Error() {
@@ -324,6 +336,15 @@ func TestNilReceiverTypedErrors(t *testing.T) {
 	}
 	if recPayload.Error() != errors.ErrInvalidRecordPayload.Error() {
 		t.Errorf("expected %q, got %q", errors.ErrInvalidRecordPayload.Error(), recPayload.Error())
+	}
+	if sg.Error() != errors.ErrSegmentGap.Error() {
+		t.Errorf("expected %q, got %q", errors.ErrSegmentGap.Error(), sg.Error())
+	}
+	if ds.Error() != errors.ErrDuplicateSegment.Error() {
+		t.Errorf("expected %q, got %q", errors.ErrDuplicateSegment.Error(), ds.Error())
+	}
+	if soo.Error() != errors.ErrSequenceOutOfOrder.Error() {
+		t.Errorf("expected %q, got %q", errors.ErrSequenceOutOfOrder.Error(), soo.Error())
 	}
 
 	// Ensure calling Is() on nil typed pointers matches corresponding sentinels
@@ -351,6 +372,15 @@ func TestNilReceiverTypedErrors(t *testing.T) {
 	if !recPayload.Is(errors.ErrInvalidRecordPayload) {
 		t.Errorf("nil *InvalidRecordPayloadError must match ErrInvalidRecordPayload via Is()")
 	}
+	if !sg.Is(errors.ErrSegmentGap) {
+		t.Errorf("nil *SegmentGapError must match ErrSegmentGap via Is()")
+	}
+	if !ds.Is(errors.ErrDuplicateSegment) {
+		t.Errorf("nil *DuplicateSegmentError must match ErrDuplicateSegment via Is()")
+	}
+	if !soo.Is(errors.ErrSequenceOutOfOrder) {
+		t.Errorf("nil *SequenceOutOfOrderError must match ErrSequenceOutOfOrder via Is()")
+	}
 }
 
 func TestInterfaceWrappedTypedNilErrors(t *testing.T) {
@@ -368,6 +398,9 @@ func TestInterfaceWrappedTypedNilErrors(t *testing.T) {
 		{"SeqNumOverflowError", (*errors.SeqNumOverflowError)(nil), errors.ErrSeqNumOverflow},
 		{"InvalidRecordTypeError", (*errors.InvalidRecordTypeError)(nil), errors.ErrInvalidRecordType},
 		{"InvalidRecordPayloadError", (*errors.InvalidRecordPayloadError)(nil), errors.ErrInvalidRecordPayload},
+		{"SegmentGapError", (*errors.SegmentGapError)(nil), errors.ErrSegmentGap},
+		{"DuplicateSegmentError", (*errors.DuplicateSegmentError)(nil), errors.ErrDuplicateSegment},
+		{"SequenceOutOfOrderError", (*errors.SequenceOutOfOrderError)(nil), errors.ErrSequenceOutOfOrder},
 	}
 
 	for _, tc := range typedNils {
@@ -737,5 +770,133 @@ func TestErrReaderClosed(t *testing.T) {
 
 	if !strings.Contains(errors.ErrReaderClosed.Error(), "wal reader is closed") {
 		t.Errorf("unexpected error message: %q", errors.ErrReaderClosed.Error())
+	}
+}
+
+func TestSegmentGapError(t *testing.T) {
+	err := &errors.SegmentGapError{
+		Expected: 3,
+		Actual:   5,
+	}
+
+	// errors.Is check
+	if !stdErrors.Is(err, errors.ErrSegmentGap) {
+		t.Errorf("SegmentGapError must match ErrSegmentGap via errors.Is")
+	}
+
+	// Negative match
+	if stdErrors.Is(err, errors.ErrKeyNotFound) {
+		t.Errorf("SegmentGapError must not match ErrKeyNotFound")
+	}
+
+	// Wrapping check
+	wrapped := fmt.Errorf("wal recovery: %w", err)
+	if !stdErrors.Is(wrapped, errors.ErrSegmentGap) {
+		t.Errorf("wrapped SegmentGapError must match ErrSegmentGap via errors.Is")
+	}
+
+	var extracted *errors.SegmentGapError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("failed to extract *SegmentGapError from wrapped chain")
+	}
+	if extracted.Expected != 3 || extracted.Actual != 5 {
+		t.Errorf("extracted mismatch: got Expected=%d, Actual=%d; want Expected=3, Actual=5", extracted.Expected, extracted.Actual)
+	}
+
+	// String check
+	msg := err.Error()
+	if !strings.Contains(msg, "expected segment ID 3, got 5") {
+		t.Errorf("unexpected error message: %q", msg)
+	}
+
+	// Typed nil safety
+	var nilErr *errors.SegmentGapError
+	if nilErr.Error() != errors.ErrSegmentGap.Error() {
+		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrSegmentGap.Error())
+	}
+}
+
+func TestDuplicateSegmentError(t *testing.T) {
+	err := &errors.DuplicateSegmentError{
+		SegmentID: 4,
+	}
+
+	// errors.Is check
+	if !stdErrors.Is(err, errors.ErrDuplicateSegment) {
+		t.Errorf("DuplicateSegmentError must match ErrDuplicateSegment via errors.Is")
+	}
+
+	// Negative match
+	if stdErrors.Is(err, errors.ErrKeyNotFound) {
+		t.Errorf("DuplicateSegmentError must not match ErrKeyNotFound")
+	}
+
+	// Wrapping check
+	wrapped := fmt.Errorf("wal recovery: %w", err)
+	if !stdErrors.Is(wrapped, errors.ErrDuplicateSegment) {
+		t.Errorf("wrapped DuplicateSegmentError must match ErrDuplicateSegment via errors.Is")
+	}
+
+	var extracted *errors.DuplicateSegmentError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("failed to extract *DuplicateSegmentError from wrapped chain")
+	}
+	if extracted.SegmentID != 4 {
+		t.Errorf("extracted mismatch: got SegmentID=%d, want 4", extracted.SegmentID)
+	}
+
+	// String check
+	msg := err.Error()
+	if !strings.Contains(msg, "duplicate wal segment ID 4 detected") {
+		t.Errorf("unexpected error message: %q", msg)
+	}
+
+	// Typed nil safety
+	var nilErr *errors.DuplicateSegmentError
+	if nilErr.Error() != errors.ErrDuplicateSegment.Error() {
+		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrDuplicateSegment.Error())
+	}
+}
+
+func TestSequenceOutOfOrderError(t *testing.T) {
+	err := &errors.SequenceOutOfOrderError{
+		Previous: 100,
+		Current:  99,
+	}
+
+	// errors.Is check
+	if !stdErrors.Is(err, errors.ErrSequenceOutOfOrder) {
+		t.Errorf("SequenceOutOfOrderError must match ErrSequenceOutOfOrder via errors.Is")
+	}
+
+	// Negative match
+	if stdErrors.Is(err, errors.ErrKeyNotFound) {
+		t.Errorf("SequenceOutOfOrderError must not match ErrKeyNotFound")
+	}
+
+	// Wrapping check
+	wrapped := fmt.Errorf("wal recovery: %w", err)
+	if !stdErrors.Is(wrapped, errors.ErrSequenceOutOfOrder) {
+		t.Errorf("wrapped SequenceOutOfOrderError must match ErrSequenceOutOfOrder via errors.Is")
+	}
+
+	var extracted *errors.SequenceOutOfOrderError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("failed to extract *SequenceOutOfOrderError from wrapped chain")
+	}
+	if extracted.Previous != 100 || extracted.Current != 99 {
+		t.Errorf("extracted mismatch: got Previous=%d, Current=%d; want Previous=100, Current=99", extracted.Previous, extracted.Current)
+	}
+
+	// String check
+	msg := err.Error()
+	if !strings.Contains(msg, "current 99 is not greater than previous 100") {
+		t.Errorf("unexpected error message: %q", msg)
+	}
+
+	// Typed nil safety
+	var nilErr *errors.SequenceOutOfOrderError
+	if nilErr.Error() != errors.ErrSequenceOutOfOrder.Error() {
+		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrSequenceOutOfOrder.Error())
 	}
 }
