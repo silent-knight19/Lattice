@@ -18,9 +18,13 @@ import (
 // storage (via fdatasync / Flush) or encountered an unrecoverable failure.
 //
 // Payload Immutability & Ownership:
-// NewWriteTask creates independent defensive copies of rec.Key and rec.Value.
-// Any subsequent mutation of the caller's key or value slice does not affect the
-// queued record. The WriteTask owns its copied payload bytes until garbage collected.
+//  1. Caller Input: NewWriteTask creates independent defensive copies of rec.Key and rec.Value.
+//     Subsequent mutations of the caller's input slices do not affect the queued record.
+//  2. Task Internal: The WriteTask owns its copied payload bytes until garbage collected.
+//  3. Public Access: Record() returns independent defensive copies of the payload bytes,
+//     ensuring external caller inspection can never mutate the task's internal state.
+//  4. Group-Commit Executor: Package-internal unexported rawRecord() provides zero-copy
+//     read-only access for high-throughput batch serialization in the future M02 executor.
 type WriteTask struct {
 	rec      Record
 	done     chan struct{}
@@ -68,12 +72,57 @@ func NewWriteTask(rec Record) (*WriteTask, error) {
 	}, nil
 }
 
-// Record returns the Record payload held by this task.
-// The returned struct contains references to the task's internally copied byte slices.
+// Record returns a defensive copy of the Record payload held by this task.
+// Any subsequent mutation of the returned Record's Key or Value byte slices
+// does not affect the task's internally owned storage.
+//
+// Thread Safety:
+// Record acquires a read lock on t.errMu, ensuring safe concurrent invocation
+// alongside Complete() and other accessors.
+// If t is nil, Record returns a zero-value Record.
 func (t *WriteTask) Record() Record {
 	if t == nil {
 		return Record{}
 	}
+
+	t.errMu.RLock()
+	defer t.errMu.RUnlock()
+
+	var keyCopy []byte
+	if len(t.rec.Key) > 0 {
+		keyCopy = make([]byte, len(t.rec.Key))
+		copy(keyCopy, t.rec.Key)
+	}
+
+	var valCopy []byte
+	if len(t.rec.Value) > 0 {
+		valCopy = make([]byte, len(t.rec.Value))
+		copy(valCopy, t.rec.Value)
+	}
+
+	return Record{
+		CRC:       t.rec.CRC,
+		Type:      t.rec.Type,
+		SeqNum:    t.rec.SeqNum,
+		Timestamp: t.rec.Timestamp,
+		Key:       keyCopy,
+		Value:     valCopy,
+	}
+}
+
+// rawRecord returns the internally owned Record without copying.
+//
+// PACKAGE-INTERNAL ONLY (M02 group-commit executor):
+// This method is strictly unexported and must only be called by the WAL
+// group commit batch executor. The caller MUST treat the returned Record's
+// Key and Value byte slices as strictly read-only to avoid corrupting task state.
+// If t is nil, rawRecord returns a zero-value Record.
+func (t *WriteTask) rawRecord() Record {
+	if t == nil {
+		return Record{}
+	}
+	t.errMu.RLock()
+	defer t.errMu.RUnlock()
 	return t.rec
 }
 

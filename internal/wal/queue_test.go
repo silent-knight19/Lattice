@@ -888,3 +888,332 @@ func TestDeterministicBehaviorUnderRepeatedRuns(t *testing.T) {
 		}
 	}
 }
+
+// 1. TestTaskRecordDoesNotExposeInternalKey
+func TestTaskRecordDoesNotExposeInternalKey(t *testing.T) {
+	key := []byte("original-key")
+	task, err := NewWriteTask(makeValidPutRecord(string(key), "val", 1))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	r := task.Record()
+	if !bytes.Equal(r.Key, key) {
+		t.Fatalf("got key %q, want %q", r.Key, key)
+	}
+
+	// Mutate returned copy
+	r.Key[0] = 'X'
+
+	// Second Record() call must observe original bytes
+	r2 := task.Record()
+	if string(r2.Key) != "original-key" {
+		t.Fatalf("internal key mutated! got %q, want %q", r2.Key, "original-key")
+	}
+}
+
+// 2. TestTaskRecordDoesNotExposeInternalValue
+func TestTaskRecordDoesNotExposeInternalValue(t *testing.T) {
+	val := []byte("original-val")
+	task, err := NewWriteTask(makeValidPutRecord("key", string(val), 1))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	r := task.Record()
+	if !bytes.Equal(r.Value, val) {
+		t.Fatalf("got val %q, want %q", r.Value, val)
+	}
+
+	// Mutate returned copy
+	r.Value[0] = 'Z'
+
+	// Second Record() call must observe original bytes
+	r2 := task.Record()
+	if string(r2.Value) != "original-val" {
+		t.Fatalf("internal value mutated! got %q, want %q", r2.Value, "original-val")
+	}
+}
+
+// 3. TestTaskRecordMetadataPreserved
+func TestTaskRecordMetadataPreserved(t *testing.T) {
+	rec := Record{
+		CRC:       0x12345678,
+		Type:      RecordTypePut,
+		SeqNum:    999,
+		Timestamp: 123456789,
+		Key:       []byte("meta-key"),
+		Value:     []byte("meta-val"),
+	}
+
+	task, err := NewWriteTask(rec)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	r := task.Record()
+	if r.CRC != rec.CRC {
+		t.Errorf("got CRC 0x%08x, want 0x%08x", r.CRC, rec.CRC)
+	}
+	if r.Type != rec.Type {
+		t.Errorf("got Type %v, want %v", r.Type, rec.Type)
+	}
+	if r.SeqNum != rec.SeqNum {
+		t.Errorf("got SeqNum %d, want %d", r.SeqNum, rec.SeqNum)
+	}
+	if r.Timestamp != rec.Timestamp {
+		t.Errorf("got Timestamp %d, want %d", r.Timestamp, rec.Timestamp)
+	}
+	if !bytes.Equal(r.Key, rec.Key) {
+		t.Errorf("got Key %q, want %q", r.Key, rec.Key)
+	}
+	if !bytes.Equal(r.Value, rec.Value) {
+		t.Errorf("got Value %q, want %q", r.Value, rec.Value)
+	}
+}
+
+// 4. TestTaskRecordNilAndEmptyPayload
+func TestTaskRecordNilAndEmptyPayload(t *testing.T) {
+	// DELETE record: key non-empty, value nil/empty
+	delTask, err := NewWriteTask(Record{
+		Type:      RecordTypeDelete,
+		Key:       []byte("del-key"),
+		SeqNum:    10,
+		Timestamp: 100,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error on DELETE: %v", err)
+	}
+	delRec := delTask.Record()
+	if string(delRec.Key) != "del-key" {
+		t.Errorf("got del key %q, want %q", delRec.Key, "del-key")
+	}
+	if len(delRec.Value) != 0 {
+		t.Errorf("expected empty value for DELETE, got %d bytes", len(delRec.Value))
+	}
+
+	// BATCH_START record: key nil, value nil
+	startTask, err := NewWriteTask(Record{
+		Type:      RecordTypeBatchStart,
+		SeqNum:    11,
+		Timestamp: 101,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error on BATCH_START: %v", err)
+	}
+	startRec := startTask.Record()
+	if len(startRec.Key) != 0 || len(startRec.Value) != 0 {
+		t.Errorf("expected empty key/val for BATCH_START, got key=%d, val=%d", len(startRec.Key), len(startRec.Value))
+	}
+
+	// BATCH_COMMIT record: key nil, value nil
+	commitTask, err := NewWriteTask(Record{
+		Type:      RecordTypeBatchCommit,
+		SeqNum:    12,
+		Timestamp: 102,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error on BATCH_COMMIT: %v", err)
+	}
+	commitRec := commitTask.Record()
+	if len(commitRec.Key) != 0 || len(commitRec.Value) != 0 {
+		t.Errorf("expected empty key/val for BATCH_COMMIT, got key=%d, val=%d", len(commitRec.Key), len(commitRec.Value))
+	}
+
+	// PUT with empty value: key non-empty, value empty
+	putEmptyValTask, err := NewWriteTask(Record{
+		Type:      RecordTypePut,
+		Key:       []byte("empty-val-key"),
+		Value:     []byte{},
+		SeqNum:    13,
+		Timestamp: 103,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error on PUT empty value: %v", err)
+	}
+	putEmptyRec := putEmptyValTask.Record()
+	if string(putEmptyRec.Key) != "empty-val-key" {
+		t.Errorf("got key %q, want %q", putEmptyRec.Key, "empty-val-key")
+	}
+	if len(putEmptyRec.Value) != 0 {
+		t.Errorf("expected empty value, got %d bytes", len(putEmptyRec.Value))
+	}
+}
+
+// 5. TestTaskRecordRepeatedIsolation
+func TestTaskRecordRepeatedIsolation(t *testing.T) {
+	task, err := NewWriteTask(makeValidPutRecord("shared-key", "shared-val", 1))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	r1 := task.Record()
+	r2 := task.Record()
+	r3 := task.Record()
+
+	// Mutate r1
+	r1.Key[0] = '1'
+	r1.Value[0] = '1'
+
+	// r2 and r3 must be unchanged
+	if string(r2.Key) != "shared-key" || string(r2.Value) != "shared-val" {
+		t.Errorf("r2 corrupted by r1 mutation: key=%q, val=%q", r2.Key, r2.Value)
+	}
+	if string(r3.Key) != "shared-key" || string(r3.Value) != "shared-val" {
+		t.Errorf("r3 corrupted by r1 mutation: key=%q, val=%q", r3.Key, r3.Value)
+	}
+
+	// Mutate r2
+	r2.Key[0] = '2'
+	r2.Value[0] = '2'
+
+	// r3 must remain unchanged
+	if string(r3.Key) != "shared-key" || string(r3.Value) != "shared-val" {
+		t.Errorf("r3 corrupted by r2 mutation: key=%q, val=%q", r3.Key, r3.Value)
+	}
+
+	// A fresh call must still have pristine data
+	rFresh := task.Record()
+	if string(rFresh.Key) != "shared-key" || string(rFresh.Value) != "shared-val" {
+		t.Errorf("task internal corrupted: key=%q, val=%q", rFresh.Key, rFresh.Value)
+	}
+}
+
+// 6. TestConcurrentRecordAccess
+func TestConcurrentRecordAccess(t *testing.T) {
+	task, err := NewWriteTask(makeValidPutRecord("concurrent-key", "concurrent-val", 500))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	const goroutines = 20
+	const iterations = 50
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for g := 0; g < goroutines; g++ {
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				r := task.Record()
+				if string(r.Key) != "concurrent-key" {
+					t.Errorf("goroutine %d iter %d saw corrupted key: %q", id, i, r.Key)
+					return
+				}
+				if string(r.Value) != "concurrent-val" {
+					t.Errorf("goroutine %d iter %d saw corrupted val: %q", id, i, r.Value)
+					return
+				}
+				// Mutate only our returned copy
+				r.Key[0] = byte('A' + (id % 26))
+				r.Value[0] = byte('0' + (i % 10))
+			}
+		}(g)
+	}
+
+	wg.Wait()
+
+	// Task must still retain original data
+	finalRec := task.Record()
+	if string(finalRec.Key) != "concurrent-key" {
+		t.Errorf("final key corrupted: got %q, want %q", finalRec.Key, "concurrent-key")
+	}
+	if string(finalRec.Value) != "concurrent-val" {
+		t.Errorf("final val corrupted: got %q, want %q", finalRec.Value, "concurrent-val")
+	}
+}
+
+// 7. TestTaskRecordMutationAgainstCompletion
+func TestTaskRecordMutationAgainstCompletion(t *testing.T) {
+	task, err := NewWriteTask(makeValidPutRecord("race-key", "race-val", 777))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Goroutine 1: repeatedly calls Record() and mutates returned slices
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			r := task.Record()
+			if string(r.Key) != "race-key" {
+				t.Errorf("iter %d corrupted key: %q", i, r.Key)
+			}
+			if len(r.Key) > 0 {
+				r.Key[0] = 'M'
+			}
+			if len(r.Value) > 0 {
+				r.Value[0] = 'V'
+			}
+		}
+	}()
+
+	// Goroutine 2: completes the task after brief churn
+	go func() {
+		defer wg.Done()
+		time.Sleep(2 * time.Millisecond)
+		_ = task.Complete(nil)
+	}()
+
+	wg.Wait()
+
+	if err := task.Wait(); err != nil {
+		t.Errorf("Wait returned unexpected error: %v", err)
+	}
+
+	finalRec := task.Record()
+	if string(finalRec.Key) != "race-key" || string(finalRec.Value) != "race-val" {
+		t.Errorf("task corrupted during concurrent complete: key=%q, val=%q", finalRec.Key, finalRec.Value)
+	}
+}
+
+// 8. TestTaskRawRecordInternalAccessor
+func TestTaskRawRecordInternalAccessor(t *testing.T) {
+	task, err := NewWriteTask(makeValidPutRecord("raw-key", "raw-val", 42))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// rawRecord returns internal storage without copy
+	raw1 := task.rawRecord()
+	raw2 := task.rawRecord()
+
+	// Proving rawRecord refers to task-owned storage:
+	// The backing array pointer of raw1.Key must match raw2.Key
+	if &raw1.Key[0] != &raw2.Key[0] {
+		t.Errorf("rawRecord must return internal storage without copying")
+	}
+	if &raw1.Value[0] != &raw2.Value[0] {
+		t.Errorf("rawRecord must return internal storage without copying")
+	}
+
+	// Record() must return independent storage:
+	pub := task.Record()
+	if &pub.Key[0] == &raw1.Key[0] {
+		t.Errorf("public Record() must NOT share backing array with rawRecord()")
+	}
+	if &pub.Value[0] == &raw1.Value[0] {
+		t.Errorf("public Record() must NOT share backing array with rawRecord()")
+	}
+
+	// Mutating public Record does not affect rawRecord
+	pub.Key[0] = 'X'
+	pub.Value[0] = 'Y'
+
+	rawAfter := task.rawRecord()
+	if string(rawAfter.Key) != "raw-key" {
+		t.Errorf("rawRecord Key corrupted by public Record mutation: got %q, want %q", rawAfter.Key, "raw-key")
+	}
+	if string(rawAfter.Value) != "raw-val" {
+		t.Errorf("rawRecord Value corrupted by public Record mutation: got %q, want %q", rawAfter.Value, "raw-val")
+	}
+
+	// Nil task safety on rawRecord
+	var nilTask *WriteTask
+	if !nilTask.rawRecord().Equal(Record{}) {
+		t.Errorf("nilTask.rawRecord() must return zero-value Record")
+	}
+}

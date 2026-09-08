@@ -357,10 +357,10 @@ Previous Completed Micro-Phase: P02-S04-M01 — Group Commit Queue & Write Task 
 Phase 00 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Phase 01 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Blocking Issues               : None
-Tests Passing                 : `go test -race ./...` (23/23 error suites, 18/18 logger suites, 48/48 binary suites, 229/229 wal test cases passing, 90.7% wal coverage, 100% binary & errors coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
-Security Review Status        : Complete & Verified (Defensive payload copying eliminates slice aliasing and caller mutations, positive capacity enforcement, bounded ring buffer prevents memory exhaustion, atomic enqueue flag prevents double-enqueue, mutex-protected idempotent completion eliminates duplicate notifications, zero-value and nil receiver safety prevents panics, graceful drain and fail-safe CloseWithError prevent hung goroutines)
-Interview Knowledge Status    : Updated with group commit task ownership, durability barrier vs enqueue/write completion, error fan-out, memory bounds, and engineering log
-Git Commit                    : feat(wal): [P02-S04-M01] add group commit queue and write task types
+Tests Passing                 : `go test -race ./...` (23/23 error suites, 18/18 logger suites, 48/48 binary suites, 237/237 wal test cases passing, 90.9% wal coverage, 100% binary & errors coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
+Security Review Status        : Complete & Verified (Sealed task payload ownership boundary with defensive copies at construction and public Record() access, unexported read-only rawRecord() for M02 executor, positive capacity enforcement, bounded ring buffer prevents memory exhaustion, atomic enqueue flag prevents double-enqueue, mutex-protected idempotent completion eliminates duplicate notifications, zero-value and nil receiver safety prevents panics, graceful drain and fail-safe CloseWithError prevent hung goroutines)
+Interview Knowledge Status    : Updated with four-tier group commit task ownership model, durability barrier vs enqueue/write completion, error fan-out, memory bounds, and engineering log
+Git Commit                    : fix(wal): [P02-S04-M01] seal task payload ownership boundary
 ```
 
 ---
@@ -1069,18 +1069,18 @@ TOTAL: 184 Discrete, Testable Micro-Phases
   * *Objective*: Define the core task data structures (`WriteTask`) and queue boundary (`WriteQueue` / `GroupCommitQueue`) for the WAL Group Commit subsystem, establishing strict durability completion semantics, defensive payload immutability, and thread-safe bounded FIFO queueing.
   * *Changes*:
     - `internal/errors/errors.go`: Added `ErrQueueClosed`, `ErrQueueFull`, `ErrQueueEmpty`, `ErrTaskAlreadyCompleted`, `ErrTaskAlreadyEnqueued`, `ErrNilTask`, `ErrInvalidQueueCapacity` sentinels, and `InvalidQueueCapacityError` structured error.
-    - `internal/wal/task.go`: Implemented `WriteTask` with defensive payload copying (`Key` and `Value`), execution error tracking, channel-based completion signaling (`done chan struct{}`), idempotent `Complete(err error)`, `Wait() error`, `WaitContext(ctx) error`, atomic `markEnqueued()` flag.
+    - `internal/wal/task.go`: Implemented `WriteTask` with four-tier payload ownership (defensive copy at `NewWriteTask`, task-owned internal storage, defensive copy at public `Record()`, package-internal unexported `rawRecord()` for M02 executor), execution error tracking, channel-based completion signaling (`done chan struct{}`), idempotent `Complete(err error)`, `Wait() error`, `WaitContext(ctx) error`, atomic `markEnqueued()` flag.
     - `internal/wal/queue.go`: Implemented `WriteQueue` (`GroupCommitQueue`) bounded ring buffer with `sync.Mutex` and condition variables (`notEmpty`, `notFull`), `DefaultQueueCapacity = 1024`, `Enqueue`, `TryEnqueue`, `Dequeue`, `TryDequeue`, graceful `Close()` draining, and immediate `CloseWithError(err)` fail-safe unblocking.
-    - `internal/wal/queue_test.go`: 17 comprehensive unit, lifecycle, concurrency, and adversarial test suites covering all 24 required scenarios.
+    - `internal/wal/queue_test.go`: 25 comprehensive unit, lifecycle, concurrency, regression, and adversarial test suites covering 33 test scenarios.
   * *Invariants*:
     - Strict durability invariant: task completion represents hardware synchronization barrier (`fdatasync`), never merely enqueue, dequeue, or page cache write.
-    - Payload immutability: defensive copy of caller key/value slices eliminates post-enqueue mutation hazards.
+    - Payload immutability: defensive copy of caller key/value slices eliminates post-enqueue mutation hazards; public `Record()` returns independent defensive copies to prevent post-inspection mutations.
     - Bounded FIFO ordering: tasks dequeued strictly in submission order; positive capacity bounds RAM accumulation.
     - Zero hung waiters: `CloseWithError(err)` guarantees every accepted task receives an explicit completion outcome on shutdown.
   * *Evidence Classification*:
-    - **Design Target**: Bounded FIFO queue (default 1,024 capacity) providing condition-variable backpressure; defensive copying of `Record` key/value payloads; channel-based synchronization barrier; idempotent completion preventing duplicate wakeups; safe uninitialized/nil receiver guards.
-    - **Theoretical Property**: Decoupling write submission from physical disk synchronization allows multiple caller goroutines to queue writes concurrently while establishing a single synchronization barrier in the downstream executor. Defensive copying at the task boundary provides mathematical isolation against caller slice aliasing without requiring external memory synchronization. Ring buffer slot clearing (`buffer[head] = nil`) guarantees garbage collection of dequeued tasks.
-    - **Measured Result**: 17 test suites passing in `queue_test.go` covering 24 scenarios; concurrent multi-producer (10 goroutines, 1,000 tasks) stress test passing cleanly under `go test -count=1 -race ./...` with 0 data races; statement coverage 90.7% in `internal/wal`; `golangci-lint` clean (0 issues); cross-compilation vet clean on Linux and Windows.
+    - **Design Target**: Bounded FIFO queue (default 1,024 capacity) providing condition-variable backpressure; defensive copying of `Record` key/value payloads at construction and public inspection; channel-based synchronization barrier; idempotent completion preventing duplicate wakeups; safe uninitialized/nil receiver guards; package-private zero-copy `rawRecord()` accessor for M02 batch runner.
+    - **Theoretical Property**: Decoupling write submission from physical disk synchronization allows multiple caller goroutines to queue writes concurrently while establishing a single synchronization barrier in the downstream executor. Defensive copying at both the construction and public accessor boundaries provides mathematical isolation against slice aliasing without requiring external memory synchronization. Ring buffer slot clearing (`buffer[head] = nil`) guarantees garbage collection of dequeued tasks.
+    - **Measured Result**: 25 test suites passing in `queue_test.go` covering 33 scenarios; concurrent multi-producer (10 goroutines, 1,000 tasks) stress test passing cleanly under `go test -count=1 -race ./...` with 0 data races; statement coverage 90.9% in `internal/wal`; `golangci-lint` clean (0 issues); cross-compilation vet clean on Linux and Windows.
     - **Observed Limitation**: Task and queue boundaries exist, but the active group-commit leader loop, cooperative batch formation, timer coalescing, and background executor worker are deferred to `P02-S04-M02`.
   * *Completion*: Complete and verified across all lifecycle, boundary matrix, concurrency, and adversarial test suites.
 * **P02-S04-M02: Group Commit Batch Runner & Cooperative fsync**
