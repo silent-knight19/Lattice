@@ -196,5 +196,20 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 14. Static Security Audit Track Implemented Ahead of Dynamic Fuzzing
+* **Limitation**: Static security audit rules (`SEC-01` & `SEC-02`) evaluate AST structures, filesystem permissions, dependency inventories, configuration settings, and plaintext secrets across source files, but do not yet execute dynamic network protocol fuzzing, concurrent deadlock fuzzing, or kernel-level fault injection.
+* **Why It Exists**: In accordance with the security roadmap hierarchy, static analysis foundations, attack surface mapping, and threat modeling (`SEC-01` & `SEC-02`) establish the audit baseline before dynamic testing tracks (`SEC-03` through `SEC-07`) are activated. Furthermore, network transport (Phase 11) and clustering consensus (Phase 13) are not yet implemented.
+* **Impact**: Static checks successfully enforce memory safety boundaries, ban `unsafe` and subprocess execution, prevent world-writable file permissions, detect hardcoded secrets, and verify bounded allocations, but dynamic protocol and race testing are deferred to future security milestones.
+* **How It Was Detected**: Security track architecture and roadmap planning.
+* **Current Mitigation**: Go concurrency race detector (`go test -race ./...`), property-based unit tests, and fail-closed error design.
+* **Future Solution**: Execute `SEC-03` (WAL & storage dynamic audit), `SEC-04` (concurrency/deadlock audit), and `SEC-05` (network protocol fuzzing) alongside production milestones.
+* **Dimensional Impact**:
+  * Correctness: **None** (Static security invariants strictly enforced).
+  * Performance: **None** (Static analysis executes out-of-band in development/CI).
+  * Scalability: **None**.
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*
+
 

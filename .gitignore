@@ -60,3 +60,6 @@ ehthumbs.db
 *.p12
 .env
 .env.*
+
+# Local Version Control / Checkpointing
+.itehaas/
