@@ -322,7 +322,7 @@ func (rw *RotatingWriter) ActiveWriter() *WALWriter {
 	return rw.active
 }
 
-// AppendSync appends record to the active segment with immediate hardware durability.
+// Append appends record to the active segment without executing an fdatasync durability barrier.
 //
 // Invariants & Operational Flow:
 //   - Thread-safe under concurrent callers.
@@ -330,10 +330,11 @@ func (rw *RotatingWriter) ActiveWriter() *WALWriter {
 //   - If record validation fails, returns the validation error without file mutation.
 //   - Evaluates rotation threshold before appending: if activeLen > 0 and
 //     activeLen + recWireSize > SegmentSize, triggers rotation to segment N+1.
-//   - Appends record to the active segment via WALWriter.AppendSync.
+//     During rotation, the old segment is closed and synced to disk.
+//   - Appends record to the active segment via WALWriter.Append.
 //   - On success, updates active segment size by the physical wire length.
-//   - On failure, queries file stat to maintain accurate size tracking and returns error.
-func (rw *RotatingWriter) AppendSync(rec Record) error {
+//   - Does NOT guarantee durability of the new record until Sync() is called.
+func (rw *RotatingWriter) Append(rec Record) error {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 
@@ -344,6 +345,30 @@ func (rw *RotatingWriter) AppendSync(rec Record) error {
 		return fmt.Errorf("wal: writer has no active segment (previous rotation failed)")
 	}
 
+	return rw.appendLocked(rec)
+}
+
+// Sync synchronizes the currently active segment file descriptor to non-volatile storage.
+//
+// Invariants:
+//   - If the writer is closed, returns errors.ErrWriterClosed.
+//   - If no segment is active, returns an error.
+//   - Thread-safe under concurrent callers.
+func (rw *RotatingWriter) Sync() error {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+
+	if rw.closed {
+		return errors.ErrWriterClosed
+	}
+	if rw.active == nil {
+		return fmt.Errorf("wal: writer has no active segment")
+	}
+
+	return rw.active.Sync()
+}
+
+func (rw *RotatingWriter) appendLocked(rec Record) error {
 	// Validate record invariants before touching disk or rotating
 	if err := rec.Validate(); err != nil {
 		return err
@@ -366,8 +391,8 @@ func (rw *RotatingWriter) AppendSync(rec Record) error {
 		}
 	}
 
-	// Append record to active segment
-	if err := rw.active.AppendSync(rec); err != nil {
+	// Append record to active segment without sync
+	if err := rw.active.Append(rec); err != nil {
 		// Update physical size tracking on error in case partial write occurred
 		if sz, szErr := rw.active.Size(); szErr == nil {
 			rw.activeLen = sz
@@ -377,6 +402,35 @@ func (rw *RotatingWriter) AppendSync(rec Record) error {
 
 	rw.activeLen += recWireSize
 	return nil
+}
+
+// AppendSync appends record to the active segment with immediate hardware durability.
+//
+// Invariants & Operational Flow:
+//   - Thread-safe under concurrent callers.
+//   - If writer is closed, returns errors.ErrWriterClosed.
+//   - If record validation fails, returns the validation error without file mutation.
+//   - Evaluates rotation threshold before appending: if activeLen > 0 and
+//     activeLen + recWireSize > SegmentSize, triggers rotation to segment N+1.
+//   - Appends record to the active segment via WALWriter.Append.
+//   - On success, updates active segment size by the physical wire length and executes Sync().
+//   - On failure, queries file stat to maintain accurate size tracking and returns error.
+func (rw *RotatingWriter) AppendSync(rec Record) error {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+
+	if rw.closed {
+		return errors.ErrWriterClosed
+	}
+	if rw.active == nil {
+		return fmt.Errorf("wal: writer has no active segment (previous rotation failed)")
+	}
+
+	if err := rw.appendLocked(rec); err != nil {
+		return err
+	}
+
+	return rw.active.Sync()
 }
 
 // Rotate explicitly seals the current active segment and transitions to segment N+1.

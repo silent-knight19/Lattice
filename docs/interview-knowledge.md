@@ -1240,6 +1240,39 @@ This section is a living record of actual engineering obstacles, debugging sessi
 - **Core Lesson**: Never confuse queue submission or memory caching with durability. In group commit, callers submit tasks to a bounded queue, but caller notification must remain firmly tied to the hardware synchronization barrier. Defensive copying at the task boundary provides mathematical safety against caller slice mutations without leaking concurrency details upstream.
 - **Interview Relevance**: Demonstrates mastery of database group-commit queuing mechanics, condition-variable backpressure, memory safety in asynchronous pipelines, zero-leak shutdown semantics, and strict durability invariant preservation.
 
+### Micro-Phase P02-S04-M02: Group Commit Batch Runner & Cooperative fsync (Completed: 2026-09-08)
+- **Problem**: Serial synchronous `fdatasync()` per write caps engine write throughput to raw flash drive IOPS (~1,000–5,000 ops/sec). High-performance storage engines require an active batch execution engine that coalesces concurrent write tasks into dense logical batches, commits them via a single physical `fdatasync()` barrier, and fans out completion status while preserving strict FIFO causality, bounded memory, zero data loss, and deterministic error handling.
+- **Architectural Solution**:
+  1. `BatchWriter` Interface & Subsystem Integration: Decouples physical append (`Append(Record) (int, error)`) from disk synchronization (`Sync() error`). Implemented by both single-segment `WALWriter` and multi-segment `RotatingWriter`.
+  2. `GroupCommitRunner`: A dedicated background event loop that continuously forms batches from `WriteQueue`, writes them to the WAL via `writer.Append()`, executes a single `writer.Sync()` barrier, and notifies task waiters.
+  3. Dual Batch Limits:
+     - Task count limit: $\le 1,024$ tasks (`MaxBatchTasks`).
+     - Byte limit: $\le 64\text{ KiB}$ wire representation (`MaxBatchBytes`), calculated via `rec.EncodedSize()`.
+     - Singleton Oversized Fallback: A record exceeding $64\text{ KiB}$ is executed as a singleton batch (1 task) rather than being permanently blocked or deadlocking the queue.
+     - Safe Subtraction Arithmetic: `recSize > maxBytes - batchBytes` prevents integer overflow on 64-bit bounds checks.
+  4. Physical Durability Contract:
+     - Execution order: Dequeue batch $\to$ Append all records $\to$ Single `Sync()` barrier $\to$ Complete all tasks with `nil`.
+     - Never complete tasks prior to the return of the `Sync()` barrier.
+     - Fail-Closed Error Fan-out: If any `Append` fails, append aborts, `Sync()` is skipped, and all tasks in the batch receive the append error. If `Sync()` fails, all tasks in the batch receive the sync error.
+  5. Segment Rotation Coordination:
+     - When `RotatingWriter.Append` triggers segment rotation, it flushes, syncs, and seals the old segment, and creates the new segment.
+     - When the batch finishes appending, `RotatingWriter.Sync()` syncs the active segment, ensuring multi-segment batches are durable across all involved files before tasks complete.
+  6. Zero-Allocation Hot Path:
+     - `GroupCommitRunner` accesses `task.rawRecord()` within the `internal/wal` package boundary, eliminating redundant memory copies during batch encoding while preserving caller slice immutability.
+  7. Lifecycle Management & Graceful Drain:
+     - Managed via `Start()`, `Stop()`, and `Wait()`. Double-start returns `ErrRunnerRunning`; start after close returns `ErrRunnerClosed`.
+     - `Stop()` closes the queue, waits for the background worker loop to exit, and drains any remaining queued tasks, completing them with `ErrRunnerClosed` to eliminate goroutine leaks and hung waiters.
+- **Key Invariants Enforced**:
+  - Amortization Invariant: Exactly one `Sync()` barrier per successful batch.
+  - Strict FIFO Execution: Batches are dequeued and written in exact caller submission order.
+  - Dual Batch Limits Invariant: Batches never exceed 1,024 tasks or 64 KiB, except for singleton oversized records.
+  - Fail-Closed Durability: Any append or sync failure fails all tasks in the batch; never acknowledge partial batch durability.
+  - Zero Goroutine Leaks: Clean termination with graceful drain under `-race`.
+- **Test Matrix & Verification**:
+  - 26 exhaustive test scenarios in `runner_test.go`: single write batch, multi-write coalescing, max batch task limit (1,024), batch byte size limit truncation (64 KiB), singleton oversized record handling, FIFO ordering preservation, single sync barrier amortization via mock seam, write failure midway abort and error fan-out, sync failure error fan-out, lifecycle start/stop clean termination, start when running returns `ErrRunnerRunning`, start after stop returns `ErrRunnerClosed`, stop drains queue with `ErrRunnerClosed`, concurrent producers stress test (50 goroutines, 500 tasks, 0 data races), stats accuracy tracking, `RotatingWriter` single batch, `RotatingWriter` rotation boundary crossing, high-volume rotation under continuous commit, nil writer/queue rejection, context cancellation during wait, rapid start-stop cycle, mixed payload sizes, zero-payload tombstones/batches, end-to-end write/rotation/recovery replay verification, and idempotent multiple `Stop` calls.
+- **Core Lesson**: Cooperative group commit is the definitive architectural bridge between in-memory concurrency and physical storage durability. By decoupling caller goroutines from the disk sync barrier, throughput scales with concurrent load. The key engineering discipline is maintaining an uncompromising physical contract: no task is completed before the physical sync returns, partial failures fail closed, and memory boundaries prevent both corruption and resource exhaustion.
+- **Interview Relevance**: Demonstrates mastery of database group-commit architectures, kernel page cache synchronization, condition variable batch formation, zero-allocation memory ownership, fail-closed disaster resilience, and cross-segment durability coordination.
+
 ---
 
 # 20. Deep Systems Interview Questions & Answers: WAL Recovery & Multi-Segment Replay
@@ -1329,12 +1362,80 @@ This section is a living record of actual engineering obstacles, debugging sessi
 
 ---
 
-# 22. Questions I Personally Failed & Corrected Understandings
+# 22. Deep Systems Interview Questions & Answers: Group Commit Batch Runner & Cooperative fsync
+
+### 1. Why must the batch runner consume the queue in strict FIFO order, and what happens if batch formation reorders tasks?
+* **Answer**: In an append-only Write-Ahead Log, physical log order dictates the authoritative causal timeline of database state transitions. Write operations on keys are causally ordered: a `DELETE` on key $K$ that follows a `PUT` on key $K$ must be appended after the `PUT`. Furthermore, 64-bit sequence numbers are assigned monotonically upon append. If the batch runner or queue reordered tasks—for instance, sorting tasks by key, prioritizing smaller payloads, or scheduling tasks out of submission order—a subsequent `PUT` could overwrite a newer `DELETE`, or a write could receive a sequence number smaller than an operation that occurred before it. During crash recovery, causal inversion causes irrecoverable state corruption. Enforcing strict FIFO dequeuing and batch insertion guarantees that causal submission order, sequence numbering, and physical persistence remain identical.
+
+### 2. What are the two batch size limits (task count and byte size), and why must both be enforced simultaneously?
+* **Answer**: Lattice enforces dual hard batch bounds: `MaxBatchTasks` (1,024 tasks) and `MaxBatchBytes` (64 KiB wire representation). Enforcing both simultaneously protects against two distinct orthogonal pathological workload profiles:
+  - **Task Count Limit (1,024)**: Protects against latency cliffs under microscopic payloads. If only a byte limit existed, tiny records (e.g. 16-byte keys/values, ~43 bytes on wire) would allow a batch to accumulate over 1,500 tasks, starving early waiting callers while the runner waits for the byte threshold to fill.
+  - **Byte Size Limit (64 KiB)**: Protects against memory spikes, I/O pauses, and disk write stalls under large payloads. If only a task count limit existed, 1,024 tasks carrying 4 KiB values would create a 4 MiB batch, resulting in sudden, multi-megabyte synchronous write bursts that stall the OS page cache.
+  Enforcing `count <= 1024` AND `bytes <= 64 KiB` bounds both maximum caller latency and maximum I/O transfer size across all conceivable key/value distributions.
+
+### 3. How does the runner handle a single task whose wire size exceeds the maximum batch byte limit (e.g. 100 KiB record vs 64 KiB limit)?
+* **Answer**: The maximum record value supported by Lattice is `binary.MaxValueLen = 4 MiB`, whereas the batch coalescing byte target is `MaxBatchBytes = 64 KiB`. If `DequeueBatch` strictly rejected any record larger than 64 KiB, any valid user record exceeding 64 KiB would either deadlock the queue indefinitely (because it can never fit into an empty 64 KiB batch) or be falsely rejected as invalid.
+Lattice solves this through the **Singleton Oversized Fallback Rule**: when forming a batch, if the queue's very first task has `rec.EncodedSize() > MaxBatchBytes`, it is dequeued and returned immediately as a dedicated singleton batch (a batch containing exactly 1 task). Batch formation halts immediately. The oversized record is appended and synced in its own discrete batch, and subsequent normal records resume multi-task coalescing. Safe subtraction arithmetic (`recSize > maxBytes - batchBytes`) guarantees that size comparisons never suffer from 64-bit integer overflow.
+
+### 4. Why must the synchronization barrier (`Sync()`) happen exactly once per batch, and what happens if a task is completed before the sync returns?
+* **Answer**: The entire economic value of group commit is amortizing the heavy latency cost of non-volatile storage synchronization (typically $0.2-1\text{ms}$ on NVMe drives, or $5-15\text{ms}$ on rotational disks) across many concurrent operations. Calling `Sync()` multiple times within a batch destroys throughput, collapsing back to synchronous write performance.
+Conversely, if any task in the batch were marked complete (`close(task.done)`) before `writer.Sync()` successfully returned—such as immediately after its individual `Append()` syscall—the calling client would receive a success notification while its data resides strictly in volatile operating system page cache memory. A host crash or power interruption at that exact instant causes an acknowledged transaction to vanish permanently from disk upon reboot, violating ACID durability and linearizability. Exactly one `Sync()` barrier must execute per batch, and task completion channels must be closed only after `Sync()` returns `nil`.
+
+### 5. If an `Append` fails midway through a batch of 10 tasks (e.g. on task 6), how are the tasks completed, and what is the state of the WAL?
+* **Answer**: If `Append()` fails midway (for instance, returning `ENOSPC` disk full or an I/O error on record 6 of 10):
+  - **Runner Execution**: The runner immediately halts the batch append loop and **skips the `Sync()` barrier entirely**.
+  - **Task Completion Fan-out**: ALL 10 tasks in the batch are immediately completed with the append error. Tasks 1–5 (whose bytes were copied to page cache) and tasks 6–10 (which were never appended) all receive the error.
+  - **WAL State**: The kernel page cache may hold un-synced dirty pages for tasks 1–5, ending in an incomplete record at EOF. Because `Sync()` was never invoked, these bytes are not durable. If the machine crashes, startup recovery will detect the un-synced/torn tail at EOF and truncate it back to the last valid durable boundary. The engine fails closed, ensuring no caller receives false durability confirmation.
+
+### 6. If `Sync()` fails after all records in a batch have been appended to the OS page cache, what is the fate of the batch and why?
+* **Answer**: If `Sync()` fails after all 10 records have been successfully written to the OS page cache:
+  - **Batch Fate**: ALL 10 tasks in the batch are completed with the `Sync()` error.
+  - **Why**: `fdatasync()` is an all-or-nothing operating system and hardware barrier. When the kernel returns an I/O error from `fdatasync()`, it cannot communicate which specific physical sectors reached persistent flash cells and which were rejected, dropped, or corrupted by the storage controller. Because all 10 records were part of the same synchronization epoch, durability cannot be established for any of them. Acknowledging any subset of tasks as committed would risk silent data loss. Failing all tasks guarantees that callers know their state transitions did not reach non-volatile media.
+
+### 7. What is the contract between `RotatingWriter.Append` and `RotatingWriter.Sync` during segment rotation midway through a batch?
+* **Answer**: When a coalesced batch contains multiple records that cross a WAL segment file size boundary:
+  - As `RotatingWriter.Append` processes record $K$, it evaluates whether the active segment exceeds `SegmentSizeBytes`. If so, it triggers an internal segment rotation:
+    1. It flushes buffered data to segment $S_N$.
+    2. It executes `fdatasync()` on segment $S_N$, making all prior records in $S_N$ durable.
+    3. It closes segment $S_N$'s file descriptor.
+    4. It creates and opens segment $S_{N+1}$, writing its file header.
+    5. It appends record $K$ and subsequent batch records into segment $S_{N+1}$.
+  - When the runner completes appending all records in the batch, it invokes `RotatingWriter.Sync()`, which executes `fdatasync()` on the newly active segment $S_{N+1}$.
+  - Result: Records written to $S_N$ are durable via rotation sync, and records written to $S_{N+1}$ are durable via batch sync. The entire batch is physically persistent across both segment files before any caller task is marked complete.
+
+### 8. Why does the runner use `rawRecord()` instead of `Record()`, and why is this safe inside the package boundary?
+* **Answer**: `WriteTask.Record()` is a public inspection method designed for external callers; it returns independent deep copies of the `Key` and `Value` byte slices to prevent callers from corrupting the task's internal state. If the runner called `Record()` on every task in the batch processing loop, it would re-allocate and copy every key and value on the performance-critical write path, generating immense garbage collection pressure and reducing write throughput.
+`WriteTask.rawRecord()` is an unexported, package-private method that returns the internally-owned `Record` directly with zero allocations. This is safe because:
+  1. Accessibility is restricted strictly to package `internal/wal`.
+  2. `GroupCommitRunner` enforces strict read-only discipline: it passes the record to `writer.Append()`, which serializes the bytes without retaining or mutating the underlying memory slices.
+  3. `NewWriteTask` already deep-copied the caller's slices at construction, ensuring no external goroutine holds a reference to the backing array memory.
+
+### 9. How does the runner guarantee clean termination without goroutine leaks or stuck tasks on `Stop()`?
+* **Answer**: `GroupCommitRunner` coordinates shutdown across three distinct components:
+  1. **Atomic Guard**: An atomic `uint32` closed flag prevents concurrent or redundant `Stop()` executions.
+  2. **Queue Termination**: `Stop()` closes the `WriteQueue`, waking any worker goroutine blocked inside condition variable `notEmpty.Wait()`.
+  3. **Loop Draining & Worker Join**: The background loop exits upon detecting queue closure, processes any currently dequeued in-flight batch, and calls `wg.Done()`. `Stop()` executes `wg.Wait()` to guarantee the worker goroutine has completely exited before proceeding.
+  4. **Fail-Safe Task Drainage**: `Stop()` drains any remaining tasks in the queue (or calls `queue.CloseWithError(ErrRunnerClosed)`), completing every pending task with `ErrRunnerClosed`.
+  This deterministic sequence guarantees that zero goroutines are leaked, no mutexes are held indefinitely, and every enqueued caller waiting on `task.Wait()` is immediately unblocked with a structured sentinel error.
+
+### 10. What is the relationship between cooperative fsync amortization, batch latency, and system throughput in group commit?
+* **Answer**:
+  - Under synchronous writes, write throughput is strictly bounded by disk sync latency: $\text{Throughput} \le 1 / T_{sync}$. If NVMe sync latency is $0.5\text{ms}$, maximum throughput is $2,000\text{ writes/sec}$, regardless of CPU core count.
+  - In group commit, concurrent caller goroutines submit tasks to `WriteQueue` while the runner is executing `Sync()` for the preceding batch.
+  - When the runner finishes the sync and returns to the queue, it dequeues all $N$ tasks accumulated during that sync interval (up to 1,024 tasks or 64 KiB).
+  - The CPU cost of appending $N$ records to the OS page cache ($T_{append} \approx 1-2\mu\text{s}$ per record) is negligible compared to disk latency ($T_{sync} \approx 500\mu\text{s}$).
+  - Thus, the total batch time is $T_{batch} \approx (N \times T_{append}) + T_{sync} \approx T_{sync}$, and effective system throughput is $N / T_{sync}$.
+  - With $N = 100$, throughput scales to $100 / 0.0005 = 200,000\text{ ops/sec}$. Individual caller latency is at most $2 \times T_{sync}$ (arriving immediately after a batch started, waiting for that batch's sync, then waiting for its own batch's sync). Group commit converts concurrent contention into a massive throughput multiplier while keeping tail latency predictably bounded.
+
+---
+
+# 23. Questions I Personally Failed & Corrected Understandings
 
 *(Entries will be appended whenever knowledge gaps are discovered)*
 
 ---
 
 *End of Technical Interview Knowledge Base — Lattice v1.0.0-KNOWLEDGE-BASE*
+
 
 

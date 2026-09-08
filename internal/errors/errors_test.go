@@ -38,6 +38,8 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrTaskAlreadyEnqueued", errors.ErrTaskAlreadyEnqueued, "wal write task already enqueued"},
 		{"ErrNilTask", errors.ErrNilTask, "wal write task cannot be nil"},
 		{"ErrInvalidQueueCapacity", errors.ErrInvalidQueueCapacity, "wal write queue capacity must be greater than zero"},
+		{"ErrRunnerRunning", errors.ErrRunnerRunning, "group commit runner is already running"},
+		{"ErrRunnerClosed", errors.ErrRunnerClosed, "group commit runner is closed"},
 	}
 
 	for _, tc := range sentinels {
@@ -83,6 +85,8 @@ func TestSentinelWrappingWithErrorsIs(t *testing.T) {
 		{"ErrTaskAlreadyEnqueued", errors.ErrTaskAlreadyEnqueued},
 		{"ErrNilTask", errors.ErrNilTask},
 		{"ErrInvalidQueueCapacity", errors.ErrInvalidQueueCapacity},
+		{"ErrRunnerRunning", errors.ErrRunnerRunning},
+		{"ErrRunnerClosed", errors.ErrRunnerClosed},
 	}
 
 	for _, tc := range tests {
@@ -126,6 +130,8 @@ func TestSentinelNegativeComparisons(t *testing.T) {
 		errors.ErrTaskAlreadyEnqueued,
 		errors.ErrNilTask,
 		errors.ErrInvalidQueueCapacity,
+		errors.ErrRunnerRunning,
+		errors.ErrRunnerClosed,
 	}
 
 	for i, a := range allSentinels {

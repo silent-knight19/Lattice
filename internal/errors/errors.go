@@ -114,6 +114,12 @@ var (
 
 	// ErrInvalidQueueCapacity indicates that a WAL write queue capacity was non-positive.
 	ErrInvalidQueueCapacity = stdErrors.New("wal write queue capacity must be greater than zero")
+
+	// ErrRunnerRunning indicates that Start was called on an already-running group commit runner.
+	ErrRunnerRunning = stdErrors.New("group commit runner is already running")
+
+	// ErrRunnerClosed indicates that an operation was attempted on a closed group commit runner.
+	ErrRunnerClosed = stdErrors.New("group commit runner is closed")
 )
 
 // KeyTooLargeError provides structured context when a key violates maximum size limits.

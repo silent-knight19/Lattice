@@ -182,17 +182,17 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
-### 13. Group Commit Queue Boundary Established Without Coalescing Runner
-* **Limitation**: `WriteTask` and `WriteQueue` define the task representation, bounded capacity, FIFO ordering, defensive payload ownership, and completion semantics for group commit, but do not yet include the active group-commit leader loop, cooperative batch coalescing, timer-based batch formation, or background execution worker.
-* **Why It Exists**: `P02-S04-M01` defines the core data structures and queue boundaries in isolation to establish deterministic task lifecycle and durability completion contracts before introducing the multi-threaded coalescing pipeline in `P02-S04-M02`.
-* **Impact**: Callers can enqueue, dequeue, and complete write tasks using `WriteQueue`, but automatic coalescing of multiple tasks into a single batch and single `fdatasync` barrier is deferred to the batch runner implementation in `P02-S04-M02`.
-* **How It Was Detected**: Architectural phase separation.
-* **Current Mitigation**: Fully verified bounded queue with condition variable backpressure, graceful drain on `Close()`, and immediate error propagation via `CloseWithError(err)` guarantees zero hung waiters.
-* **Future Solution**: `P02-S04-M02` implements `groupCommitRunner`, cooperative batch formation, and single fsync synchronization barrier across grouped tasks.
+### 13. Group Commit Batch Runner Implemented Without Linger Timeout Coalescing
+* **Limitation**: `GroupCommitRunner` executes on-demand FIFO queue draining up to 1,024 tasks or 64 KiB, but does not yet implement a configurable timer linger delay (`linger_ms`) or dynamic adaptive batch sizing based on observed queue backlog.
+* **Why It Exists**: `P02-S04-M02` implements the core batch runner, dual batch limits, single-`fdatasync` synchronization barrier, error fan-out, and graceful lifecycle management. Introducing speculative timer delays or dynamic heuristics before the baseline coalescing pipeline was verified would add non-deterministic timing jitter and latency overhead to low-concurrency workloads.
+* **Impact**: Under purely serial, single-threaded write workloads with zero queue backlog, each task is dequeued immediately and forms a singleton batch with its own `Sync()` barrier. Throughput scales naturally under concurrent load when pending writes accumulate during disk sync.
+* **How It Was Detected**: Architectural design and performance profiling of cooperative group commit pipelines.
+* **Current Mitigation**: `TryDequeueBatch` drains all currently enqueued tasks in a single lock acquisition. When the runner is blocked in `Sync()`, concurrent producers accumulate in the queue, automatically forming dense batches for the subsequent iteration without artificial timer sleeps.
+* **Future Solution**: Introduce optional microsecond-level linger timeout (`LingerTimeout`) and adaptive batch sizing during single-node engine integration (Phase 10).
 * **Dimensional Impact**:
-  * Correctness: **None** (Durability and queue lifecycle invariants strictly verified).
-  * Performance: **Expected** (Single-fsync coalescing throughput improvements deferred to M02).
-  * Scalability: **None**.
+  * Correctness: **None** (Durability and serializability strictly preserved).
+  * Performance: **Optimal under concurrency**; serial single-threaded latency bounded by raw hardware fsync speed.
+  * Scalability: **Optimal** (Amortizes up to 1,024 tasks per sync).
 
 ---
 

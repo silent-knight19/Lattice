@@ -10,6 +10,17 @@ import (
 // waiting for group commit execution, matching Architecture Spec Section 14.1.
 const DefaultQueueCapacity = 1024
 
+// Hard batch limits for group commit coalescing.
+const (
+	// MaxBatchTasks is the maximum number of WriteTasks that can be coalesced
+	// into a single logical group commit batch (1,024 tasks).
+	MaxBatchTasks = 1024
+
+	// MaxBatchBytes is the maximum encoded wire size in bytes (64 KiB) that can
+	// be coalesced into a single logical group commit batch.
+	MaxBatchBytes = 64 * 1024
+)
+
 // GroupCommitQueue is an alias for WriteQueue, aligning with storage terminology.
 type GroupCommitQueue = WriteQueue
 
@@ -195,6 +206,126 @@ func (q *WriteQueue) TryDequeue() (*WriteTask, error) {
 		q.notFull.Signal()
 	}
 	return task, nil
+}
+
+// DequeueBatch removes and returns a coalesced batch of WriteTasks from the head of the queue,
+// adhering to the hard limits of maxTasks and maxBytes.
+//
+// Batch Boundary & Coalescing Invariants:
+//   - FIFO Preservation: Tasks are dequeued in strict first-in, first-out order from the queue head.
+//   - Task Count Bound: Returns at most maxTasks tasks (clamped to MaxBatchTasks).
+//   - Encoded Wire Size Bound: Total encoded wire size of all tasks in the batch will not exceed
+//     maxBytes (clamped to MaxBatchBytes), EXCEPT for an oversized singleton batch.
+//   - Oversized Singleton Policy: If the first task at the head of the queue has an encoded wire size
+//     greater than maxBytes, it is dequeued as an individual singleton batch [task], ensuring queue
+//     forward progress without deadlock. Tasks that exceed the boundary when batch is non-empty
+//     remain at the head for the next batch.
+//   - Distinction: batch size limit (64 KiB) != maximum individual record size (4 MiB).
+//   - Blocking Behavior: Blocks until at least one task is available or the queue is closed.
+//   - Closed Queue: Returns (nil, errors.ErrQueueClosed) if the queue is closed and empty.
+//     If closed but has remaining tasks, drains available tasks up to batch limits.
+//   - Producer Wakeup: Wakes all waiting producers via notFull.Broadcast() after freeing slots.
+func (q *WriteQueue) DequeueBatch(maxTasks int, maxBytes int64) ([]*WriteTask, error) {
+	if maxTasks <= 0 || maxTasks > MaxBatchTasks {
+		maxTasks = MaxBatchTasks
+	}
+	if maxBytes <= 0 || maxBytes > MaxBatchBytes {
+		maxBytes = MaxBatchBytes
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if q.capacity <= 0 || q.buffer == nil || q.notEmpty == nil {
+		return nil, errors.ErrQueueClosed
+	}
+
+	for q.count == 0 && !q.closed {
+		q.notEmpty.Wait()
+	}
+
+	if q.count == 0 {
+		return nil, errors.ErrQueueClosed
+	}
+
+	return q.drainBatchLocked(maxTasks, maxBytes), nil
+}
+
+// TryDequeueBatch attempts to dequeue a batch of WriteTasks up to maxTasks and maxBytes without blocking.
+// If the queue is empty, it returns (nil, errors.ErrQueueEmpty).
+// If the queue is closed and empty, it returns (nil, errors.ErrQueueClosed).
+func (q *WriteQueue) TryDequeueBatch(maxTasks int, maxBytes int64) ([]*WriteTask, error) {
+	if maxTasks <= 0 || maxTasks > MaxBatchTasks {
+		maxTasks = MaxBatchTasks
+	}
+	if maxBytes <= 0 || maxBytes > MaxBatchBytes {
+		maxBytes = MaxBatchBytes
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if q.capacity <= 0 || q.buffer == nil {
+		return nil, errors.ErrQueueClosed
+	}
+
+	if q.count == 0 {
+		if q.closed {
+			return nil, errors.ErrQueueClosed
+		}
+		return nil, errors.ErrQueueEmpty
+	}
+
+	return q.drainBatchLocked(maxTasks, maxBytes), nil
+}
+
+// drainBatchLocked extracts a bounded batch from buffer while holding q.mu.
+func (q *WriteQueue) drainBatchLocked(maxTasks int, maxBytes int64) []*WriteTask {
+	batchCap := q.count
+	if batchCap > maxTasks {
+		batchCap = maxTasks
+	}
+	batch := make([]*WriteTask, 0, batchCap)
+	var batchBytes int64
+
+	for q.count > 0 && len(batch) < maxTasks {
+		task := q.buffer[q.head]
+		recSize := RecordWireSize(task.rawRecord())
+
+		if len(batch) == 0 {
+			// First task in batch
+			batch = append(batch, task)
+			q.buffer[q.head] = nil // Avoid GC reference leak
+			q.head = (q.head + 1) % q.capacity
+			q.count--
+			batchBytes += recSize
+
+			// Oversized singleton policy: if this task alone exceeds maxBytes,
+			// execute it as an oversized singleton batch and stop coalescing.
+			if recSize > maxBytes {
+				break
+			}
+		} else {
+			// Subsequent tasks: check if adding this task would exceed maxBytes.
+			// Safe arithmetic: prevent integer wrap.
+			if recSize > maxBytes-batchBytes {
+				// Next task exceeds byte boundary; leave it at head for next batch
+				break
+			}
+
+			batch = append(batch, task)
+			q.buffer[q.head] = nil // Avoid GC reference leak
+			q.head = (q.head + 1) % q.capacity
+			q.count--
+			batchBytes += recSize
+		}
+	}
+
+	if len(batch) > 0 && q.notFull != nil {
+		q.notFull.Broadcast()
+	}
+
+	return batch
 }
 
 // Close closes the queue for new writes. Future Enqueue calls will return ErrQueueClosed.

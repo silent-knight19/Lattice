@@ -262,18 +262,17 @@ func (w *WALWriter) Close() error {
 	return nil
 }
 
-// AppendSync encodes record into physical wire format, writes all bytes to disk,
-// and executes an fdatasync durability barrier before returning.
+// Append encodes record into physical wire format and writes all bytes to disk
+// without executing an fdatasync durability barrier.
 //
-// Return Contract:
-//   - Returns nil if and only if all bytes were written AND fdatasync succeeded.
+// Invariants:
 //   - If the writer is closed, returns errors.ErrWriterClosed.
 //   - If rec.Validate() fails, returns the validation error without modifying the file.
 //   - If write fails or produces a short write, returns an error.
-//   - If fdatasync fails, returns the synchronization error.
+//   - Does NOT guarantee durability on non-volatile storage until Sync() is called.
 //   - Caller's rec.Key and rec.Value slices are never mutated.
 //   - Concurrent invocations are serialized by an internal mutex to prevent record interleaving.
-func (w *WALWriter) AppendSync(rec Record) error {
+func (w *WALWriter) Append(rec Record) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -281,6 +280,28 @@ func (w *WALWriter) AppendSync(rec Record) error {
 		return errors.ErrWriterClosed
 	}
 
+	return w.appendLocked(rec)
+}
+
+// Sync executes the fdatasync durability barrier on the underlying file descriptor,
+// guaranteeing that all previously written bytes are persisted to non-volatile storage.
+//
+// Invariants:
+//   - If the writer is closed, returns errors.ErrWriterClosed.
+//   - Returns nil if fdatasync succeeds.
+//   - Thread-safe under concurrent callers.
+func (w *WALWriter) Sync() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed {
+		return errors.ErrWriterClosed
+	}
+
+	return w.syncLocked()
+}
+
+func (w *WALWriter) appendLocked(rec Record) error {
 	// Validate logical record invariants before touching disk buffers
 	if err := rec.Validate(); err != nil {
 		return err
@@ -307,12 +328,41 @@ func (w *WALWriter) AppendSync(rec Record) error {
 		}
 	}
 
+	return nil
+}
+
+func (w *WALWriter) syncLocked() error {
 	// Durability barrier: flush data to non-volatile storage
 	if syncErr := w.syncFn(w.file); syncErr != nil {
 		return fmt.Errorf("wal: sync failed: %w", syncErr)
 	}
-
 	return nil
+}
+
+// AppendSync encodes record into physical wire format, writes all bytes to disk,
+// and executes an fdatasync durability barrier before returning.
+//
+// Return Contract:
+//   - Returns nil if and only if all bytes were written AND fdatasync succeeded.
+//   - If the writer is closed, returns errors.ErrWriterClosed.
+//   - If rec.Validate() fails, returns the validation error without modifying the file.
+//   - If write fails or produces a short write, returns an error.
+//   - If fdatasync fails, returns the synchronization error.
+//   - Caller's rec.Key and rec.Value slices are never mutated.
+//   - Concurrent invocations are serialized by an internal mutex to prevent record interleaving.
+func (w *WALWriter) AppendSync(rec Record) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed {
+		return errors.ErrWriterClosed
+	}
+
+	if err := w.appendLocked(rec); err != nil {
+		return err
+	}
+
+	return w.syncLocked()
 }
 
 // setSyncFnForTesting injects a custom synchronization function for fault injection tests.
