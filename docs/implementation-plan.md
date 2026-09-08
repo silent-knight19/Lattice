@@ -349,18 +349,18 @@ Every future micro-phase implementation response from Claude Code must use this 
 
 ```
 Current Major Phase           : Phase 02 — Write-Ahead Log (WAL) & Durability Subsystem
-Current Sub-Phase             : Sub-Phase 02.1 — WAL Binary Record Layout & Serialization
-Current Micro-Phase           : P02-S01-M03 — WAL Corruption & Checksum Verification Tests
+Current Sub-Phase             : Sub-Phase 02.2 — WAL File Management & Append Operations
+Current Micro-Phase           : P02-S02-M01 — WAL File Creator & Directory Initializer
 Phase 01 Status               : COMPLETE (Sub-Phases 01.1 & 01.2 Complete)
 Previous Completed Phase      : Phase 01 — Core Storage Primitives & Binary Encodings
-Previous Completed Micro-Phase: P02-S01-M02 — WAL Full Record Serializer & Deserializer
+Previous Completed Micro-Phase: P02-S01-M03 — WAL Corruption & Checksum Verification Tests
 Phase 00 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Phase 01 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Blocking Issues               : None
-Tests Passing                 : `go test -race ./...` (16/16 error suites, 18/18 logger suites, 48/48 binary suites, 42/42 wal suites passing, 98.9% wal coverage, 100% binary & errors coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
-Security Review Status        : Complete & Verified (Stream-safe decoding; anti-DoS early allocation bounds; zero-aliasing slice ownership; hostile stream fuzzing >2.92M iterations passing with 0 crashes)
-Interview Knowledge Status    : Updated with WAL full record framing, streaming CRC coverage, reader anti-DoS validation, and memory ownership invariants
-Git Commit                    : feat(wal): [P02-S01-M02] implement full WAL record serializer and stream-safe deserializer
+Tests Passing                 : `go test -race ./...` (16/16 error suites, 18/18 logger suites, 48/48 binary suites, 49/49 wal suites passing, 99.4% wal coverage, 100% binary & errors coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
+Security Review Status        : Complete & Verified (CRC field corruption, 100% single-bit flip detection, CRC scope coverage, structural vs checksum rejection boundaries, anti-DoS bound enforcement, non-cryptographic CRC limitations documented)
+Interview Knowledge Status    : Updated with structural vs checksum validation, exhaustive bit-flip testing, non-cryptographic CRC limits, and framing error distinction
+Git Commit                    : test(wal): [P02-S01-M03] verify corruption and checksum integrity
 ```
 
 ---
@@ -947,10 +947,28 @@ TOTAL: 184 Discrete, Testable Micro-Phases
     - **Observed Limitation**: DecodeRecord allocates fresh memory slices for user key and value payloads to guarantee caller ownership without buffer aliasing.
   * *Completion*: Full record serialization, stream-safe deserialization, hostile input defenses, and test suites verified.
 * **P02-S01-M03: WAL Corruption & Checksum Verification Tests**
-  * *Objective*: Prove that corrupted bytes are intercepted.
-  * *Changes*: Test suite mutating random bytes in serialized records and verifying `ErrChecksumMismatch`.
-  * *Tests*: Single-bit flip tests across header, key, and value fields.
-  * *Completion*: 100% of bit flips detected.
+  * *Objective*: Prove that corrupted bytes are intercepted across all fields of the physical record, verify CRC32-IEEE integrity, and validate the boundary between structural format rejection and checksum rejection.
+  * *Changes*:
+    - Created `internal/wal/corruption_test.go` implementing 7 comprehensive corruption and checksum verification test suites.
+    - `TestCRCFieldCorruption`: Tested mutating each byte of the CRC field (offsets 0..3) across all 8 bit positions (32 tests). Proved that every mutation produces `ErrChecksumMismatch` carrying structured `Expected` and `Actual` CRC diagnostics.
+    - `TestCRCScopeCoverage`: Independently verified CRC32-IEEE over `RecordType || SeqNum || Timestamp || KeyLength || Key || ValueLength || Value` using `binary.Checksum`. Confirmed stored CRC equals independent CRC, proved CRC field itself is strictly excluded, and proved mutating any field in the layout alters the checksum.
+    - `TestExhaustiveSingleBitCorruption`: Deterministic exhaustive single-bit flip test across all 59 post-CRC payload bytes (472 bit flips). Proved 100% interception (419 checksum mismatches, 53 structural rejections, 0 silent accepts), and verified that bit restoration cleanly restores valid decoding.
+    - `TestStructuralVsChecksumRejectionMatrix`: Mapped and verified boundary between early structural rejections (`ErrInvalidRecordType`, `ErrValueTooLarge`, `ErrInvalidRecordPayload`) and checksum rejections (`ErrChecksumMismatch`).
+    - `TestCorruptionSemantics_ReversibilityAndCollisions`: Validated the 5 corruption semantics (mutation detected, original decodes, restoration recovers, 50 distinct random mutations do not collide into valid records, and 100-run verification determinism).
+    - `TestDeterministicRandomizedCorruption`: 1,000 deterministic seeded randomized tests across all 4 record types (PUT, DELETE, BATCH_START, BATCH_COMMIT) with variable key/value sizes; 100% intercepted.
+    - `TestCRCCollisionCaveat_TheoreticalLimits`: Documented and demonstrated difference between error detection and cryptographic integrity.
+  * *Tests & Benchmarks*:
+    - `go test -count=1 -race ./internal/wal/...`: PASS (49 suites)
+    - `go test -count=1 -race ./...`: PASS across all packages
+    - `FuzzRecordCodec`: >2.87M iterations in 5s with 0 crashes
+    - `golangci-lint run ./...`: 0 issues
+    - Code coverage: 99.4% of statements in `internal/wal`
+  * *Evidence Classification*:
+    - **Design Target**: 100% detection of bit rot, torn writes, and data corruption across WAL records without compromising structural format validation or anti-DoS bounds.
+    - **Theoretical Property**: CRC32-IEEE guarantees detection of all single-bit flips and error bursts up to polynomial bounds; random collision probability is $2^{-32} \approx 2.33 \times 10^{-10}$; CRC is an error-detecting code, not a cryptographic authentication mechanism.
+    - **Measured Result**: 472/472 exhaustive bit flips detected (419 checksum mismatches, 53 structural errors, 0 silent accepts); 32/32 CRC byte bit flips produced `ErrChecksumMismatch`; 1000/1000 randomized records intercepted; 99.4% statement coverage in `internal/wal`.
+    - **Observed Limitation**: CRC32 does not prevent intentional record tampering where an attacker recomputes the checksum; cryptographic integrity would require an HMAC or signature layer.
+  * *Completion*: WAL corruption and checksum verification suites complete and fully validated.
 
 ### Sub-Phase 02.2: WAL File Management & Append Operations
 * **P02-S02-M01: WAL File Creator & Directory Initializer**

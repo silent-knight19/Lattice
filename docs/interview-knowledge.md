@@ -270,6 +270,23 @@
   - **Partial I/O and Fragmentation Defense**: Streams must be read via `io.ReadFull`. Decoders safely process streams delivering data 1 byte at a time, arbitrary chunks, short reads returning fewer bytes than requested with nil error, and readers returning remaining data plus `io.EOF` simultaneously.
   - **Slice Ownership & Immutability**: Decoded `Key` and `Value` slices are newly allocated and strictly owned by the returned `Record`, guaranteeing zero aliasing with reader buffers or future decode calls. Encoding never mutates caller input slices.
 
+* **CRC Coverage vs. Structural Validation**:
+  - A WAL decoder must balance integrity verification against resource exhaustion (DoS) protection.
+  - Not all bit corruptions reach the CRC verification phase. If a mutation alters `RecordType` to an invalid enum (e.g. `0x00` or `0x05`), or corrupts `ValueLength` to exceed `binary.MaxValueLen` (4 MiB), the decoder immediately fails fast with a structural error (`*errors.InvalidRecordTypeError` or `*errors.ValueTooLargeError`).
+  - This early rejection is an intentional security perimeter: waiting for CRC verification before validating lengths would require allocating gigabytes of heap memory or reading gigabytes of stream data, opening catastrophic memory exhaustion vectors.
+  - Thus, **structural validation protects the machine**, while **checksum verification protects data integrity**.
+* **Exhaustive Single-Bit Corruption & Bit Restoration**:
+  - Disk bit-rot typically begins with isolated single-bit flips in magnetic or solid-state media cells.
+  - To prove detection, an exhaustive test flips each of the 8 bits across every single post-CRC byte ($4..\text{len}-1$). Every mutation must fail (either via checksum mismatch or structural error).
+  - Furthermore, flipping the bit back must cleanly restore 100% valid decoding, proving that corruption detection is deterministic and non-destructive.
+* **CRC Field Corruption Mechanics**:
+  - The 4-byte CRC field itself is explicitly excluded from the checksum calculation input.
+  - Therefore, mutating any bit in bytes 0..3 modifies the expected CRC without altering the actual computed CRC of the payload, guaranteeing an immediate, unambiguous `*errors.ChecksumMismatchError` with structured `Expected` and `Actual` fields.
+* **Why Checksum Verification Is NOT Cryptographic Authentication**:
+  - CRC32-IEEE uses the standard IEEE 802.3 polynomial (`0xEDB88320`) designed to detect accidental transmission noise, bit-rot, and torn blocks.
+  - It has a 32-bit state space ($2^{32} \approx 4.29 \times 10^9$). On completely random multi-bit noise, the theoretical probability of an undetected collision is $2^{-32} \approx 2.33 \times 10^{-10}$.
+  - Crucially, CRC32 is **non-cryptographic**. Any adversary with write access to the WAL file can modify key or value payloads and trivially recompute the matching CRC32 polynomial in nanoseconds. Tamper-proofing against hostile modification requires cryptographic MACs (HMAC-SHA256) or asymmetric digital signatures.
+
 ### Subsystem Interview Questions
 * **Basic**: Why does a database need a Write-Ahead Log?
 * **Intermediate**: What is the difference between `fsync()` and `fdatasync()`, and why does pre-allocating WAL files matter?
@@ -278,9 +295,12 @@
 * **Deep**: How does Go's bounds check elimination (BCE) pattern `_ = buf[20]` provide anti-tear guarantees during binary serialization?
 * **Deep**: How do you prevent denial-of-service memory exhaustion when streaming WAL records from an untrusted or corrupted io.Reader?
 * **Deep**: Walk me through the exact CRC coverage in Lattice's WAL records. Why is the CRC field excluded from its own checksum, and how does streaming CRC verification work without allocating contiguous buffers?
+* **Deep**: Why does a WAL decoder intercept corruptions with structural errors like `ValueTooLargeError` before performing CRC32 checksum verification?
+* **Deep**: Why is CRC32 insufficient for cryptographic tamper detection in distributed logs, and what are its mathematical error-detection guarantees versus an HMAC?
 * **Follow-up**: How do you prevent group commit queues from consuming unbounded RAM if the disk becomes completely saturated?
 * **"Did You Actually Build This?"**: How do you distinguish between an uncompleted torn write at the tail of the WAL versus a corrupted record in the middle of the file during startup recovery?
 * **"Did You Actually Build This?"**: How do you handle readers that return fewer bytes than requested without an error (short reads) or readers that return data and io.EOF in the same call?
+* **"Did You Actually Build This?"**: Walk me through how you proved your WAL checksum integrity across every field. Did you test single-bit flips, and what happens if you mutate the CRC field itself?
 
 ---
 
@@ -852,6 +872,26 @@ This section is a living record of actual engineering obstacles, debugging sessi
   4. Benchmarks on Apple M4: `AppendRecord` with reused buffer at $20.10\text{ ns/op}$ ($0\text{ allocs/op}$), `EncodeRecord` at $43.04\text{ ns/op}$ ($1\text{ alloc/op}$), and `DecodeRecord` at $91.54\text{ ns/op}$.
 - **Core Lesson**: In storage engine codecs, untrusted streams must be bounded at every step. Check limits before allocation, use streaming checksums to avoid temporary buffers, and enforce clear memory ownership to prevent aliasing bugs.
 - **Interview Relevance**: Demonstrates deep systems reasoning on streaming I/O contracts, denial-of-service memory defense, hardware-accelerated CRC updating, memory ownership semantics, and native Go fuzz testing.
+
+### Entry 2026-09-08 — Phase 02: WAL Corruption, Exhaustive Single-Bit Verification & Structural vs Checksum Boundaries
+- **Date**: 2026-09-08
+- **Phase**: Phase 02 Sub-Phase 02.1 Micro-Phase 03 (`P02-S01-M03`)
+- **Problem**: Validating WAL durability requires proving that corruptions across any field of a physical record are deterministically intercepted. However, a naive test might expect every single byte mutation to fail with `ErrChecksumMismatch`. In reality, corrupting a record type byte to `0x00` (invalid) or corrupting `ValueLength` to `4 GiB` triggers structural format errors *before* the checksum calculation is ever reached. Failing to distinguish between early structural rejection (anti-DoS perimeter) and checksum rejection (data corruption detection) obscures the security model. Furthermore, asserting that "CRC32 guarantees corruption protection" conflates error detection with cryptographic tamper resistance.
+- **Initial Assumption**: Every bit flip across the record should fail with `ErrChecksumMismatch`, and CRC32 provides comprehensive integrity guarantees.
+- **What Was Actually True**:
+  1. **Structural Rejection vs Checksum Rejection**: If a corruption produces an invalid record type (`*errors.InvalidRecordTypeError`), an oversized length (`*errors.ValueTooLargeError`), an empty key on PUT, or a non-empty value on DELETE (`*errors.InvalidRecordPayloadError`), the decoder must reject it structurally before allocating memory or reading payload bytes. This is an intentional anti-DoS design: structural validation protects the machine from resource exhaustion, while CRC32 protects validly framed data against silent corruption.
+  2. **CRC Field Exclusion Invariant**: The 4-byte CRC field at offsets 0..3 is strictly excluded from the checksum computation input. Mutating any bit in bytes 0..3 alters the stored CRC while leaving the payload's computed CRC unchanged, guaranteeing an unambiguous `*errors.ChecksumMismatchError` with expected vs actual diagnostics.
+  3. **Exhaustive Deterministic Single-Bit Testing**: Testing every bit position ($8 \times \text{post-CRC bytes}$) proves that 100% of single-bit flips are intercepted. Restoring each mutated bit confirms that decoding cleanly recovers the original record without side effects.
+  4. **Non-Cryptographic CRC Caveat**: CRC32-IEEE operates in a 32-bit state space ($2^{32} \approx 4.29 \times 10^9$) with an undetected collision probability of $\approx 2.33 \times 10^{-10}$ on random noise. However, an attacker with write access can deliberately forge matching CRC32 values for tampered data in microseconds. True tamper resistance requires cryptographic primitives (HMAC or digital signatures).
+- **How It Was Verified**:
+  1. `TestCRCFieldCorruption`: Tested 32 bit flips across offsets 0..3; all 32 returned `ErrChecksumMismatch` with exact expected/actual values.
+  2. `TestCRCScopeCoverage`: Independently computed CRC across `RecordType || SeqNum || Timestamp || KeyLen || Key || ValLen || Val` using `binary.Checksum`; confirmed match with stored CRC; proved mutating any covered field changes the checksum; proved mutating offsets 0..3 does not change the payload checksum.
+  3. `TestExhaustiveSingleBitCorruption`: Tested 472 single-bit flips across 59 payload bytes; intercepted 419 checksum mismatches and 53 structural errors with 0 silent accepts; 100% cleanly restored.
+  4. `TestStructuralVsChecksumRejectionMatrix`: Verified explicit table mapping of structural vs checksum error paths.
+  5. `TestCorruptionSemantics_ReversibilityAndCollisions`: Proved mutation detection, clean decoding, restoration recovery, absence of accidental collisions across 50 random mutations, and strict determinism across 100 consecutive runs.
+  6. `TestDeterministicRandomizedCorruption`: 1,000 seeded randomized records across all 4 types (PUT, DELETE, BATCH_START, BATCH_COMMIT); 100% intercepted.
+- **Core Lesson**: Error detection mechanisms must be layered: structural validation defends process resources, while checksums defend data integrity. Systems engineers must know exactly what each layer guarantees and never mistake cyclic redundancy codes for cryptographic authentication.
+- **Interview Relevance**: Demonstrates mastery of error-detection theory, defense-in-depth security boundaries, deterministic exhaustive verification, and the precise mathematical boundaries of CRC32.
 
 ---
 
