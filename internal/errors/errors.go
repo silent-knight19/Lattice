@@ -70,6 +70,9 @@ var (
 	// ErrNotADirectory indicates that a filesystem path expected to be a directory
 	// is a regular file, symlink, or other non-directory object.
 	ErrNotADirectory = stdErrors.New("path is not a directory")
+
+	// ErrWriterClosed indicates that an operation was attempted on a closed WAL writer.
+	ErrWriterClosed = stdErrors.New("wal writer is closed")
 )
 
 // KeyTooLargeError provides structured context when a key violates maximum size limits.

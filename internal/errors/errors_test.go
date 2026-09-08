@@ -658,3 +658,22 @@ func TestNotADirectoryError(t *testing.T) {
 		t.Errorf("empty path error string mismatch: got %q, want %q", emptyPath.Error(), errors.ErrNotADirectory.Error())
 	}
 }
+
+func TestErrWriterClosed(t *testing.T) {
+	if errors.ErrWriterClosed == nil {
+		t.Fatalf("ErrWriterClosed must not be nil")
+	}
+
+	wrapped := fmt.Errorf("wal append: %w", errors.ErrWriterClosed)
+	if !stdErrors.Is(wrapped, errors.ErrWriterClosed) {
+		t.Errorf("wrapped ErrWriterClosed must match via errors.Is")
+	}
+
+	if stdErrors.Is(errors.ErrWriterClosed, errors.ErrKeyNotFound) {
+		t.Errorf("ErrWriterClosed must not match ErrKeyNotFound")
+	}
+
+	if !strings.Contains(errors.ErrWriterClosed.Error(), "wal writer is closed") {
+		t.Errorf("unexpected error message: %q", errors.ErrWriterClosed.Error())
+	}
+}

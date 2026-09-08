@@ -314,13 +314,41 @@
 * **Idempotency & Pre-existing File Safety**:
   - Database reboots and repeated initialization calls must be non-destructive.
   - Calling `InitDir` on an already initialized WAL directory converges cleanly. Pre-existing WAL segments (`wal_*.log`) and database state files (`MANIFEST`, `CURRENT`) are never truncated, modified, or deleted. The directory inode itself is preserved without recreation.
-* **Concurrency Without Application Mutexes**:
-  - Multiple goroutines calling `InitDir` simultaneously converge safely via OS-level atomic `os.Mkdir`, `os.Lstat` inspection, and descriptor-pinned `fchmod` without requiring application-level mutex locks.
+* **"Strict Sync" Durability Contract (`WALWriter.AppendSync`)**:
+  - A database write is not committed merely because `file.Write()` accepted bytes into the operating system page cache. A kernel panic or sudden power loss immediately vaporizes uncommitted dirty pages.
+  - Lattice enforces the **Strict Sync** contract: `AppendSync(rec)` returns `nil` IF AND ONLY IF:
+    1. The complete serialized record bytes have been transferred to the operating system (`written == len(buf)`).
+    2. The hardware durability barrier (`fdatasync`) has completed without error.
+  - If a write is incomplete, or if `fdatasync` fails, `AppendSync` returns an error. It **never** returns `nil` on partial writes or synchronization failures.
+* **Three Tiers of Write Durability**:
+  1. *OS-Visible Write* (`file.Write`): Bytes reside in volatile kernel page cache (RAM). Read calls from other processes can observe the data, but power loss destroys it.
+  2. *Filesystem Synchronization* (`fdatasync`): Operating system flushes dirty page cache buffers to the storage controller command queue, satisfying the POSIX durability contract.
+  3. *Physical Media Durability*: Storage controller flushes non-volatile write cache lines to physical flash blocks/cells. True media durability depends on controller capacitor backups, drive firmware, and hardware barrier execution.
+* **`fsync()` vs `fdatasync()` Performance Optimization**:
+  - `fsync(fd)` flushes modified in-core data blocks AND all associated inode metadata (access time, modification time, file size), typically forcing two separate physical write operations to disk.
+  - `fdatasync(fd)` flushes only modified data blocks and updates metadata only if the physical file size has changed.
+  - In `Lattice`, Linux builds use `syscall.Fdatasync(int(f.Fd()))`. On non-Linux platforms (Darwin, Windows) where `fdatasync(2)` is unavailable in the kernel, it falls back to `f.Sync()`.
+* **Partial Writes, Short Writes & Torn Tails**:
+  - Disk full conditions or interrupted system calls can produce short writes (`0 < n < len(buf)`). `WALWriter` loops until all bytes are written. If a write returns 0 bytes without an error, it terminates with `io.ErrShortWrite` to prevent infinite busy loops.
+  - If a write partially succeeds and then encounters an unrecoverable disk error, the filesystem contains a partial record (torn tail).
+  - Systems Invariant: `AppendSync` does **not** attempt automatic rollback or file truncation during a failed append. Doing so during disk distress risks further corruption. Instead, cleanup of torn tail writes at EOF is strictly deferred to startup recovery (`P02-S03-M01`).
+* **Non-Destructive File Opening & Append Invariants**:
+  - WAL segment files are opened with `os.O_WRONLY | os.O_CREATE | os.O_APPEND` with `0600` (`FileMode`) permissions.
+  - `O_TRUNC` is strictly prohibited. When reopening an existing WAL segment upon process restart, `O_APPEND` positions every write to EOF, preserving all pre-existing records intact.
+* **Concurrency Model: Per-Writer Mutex Serialization**:
+  - Multiple goroutines calling `AppendSync` on the same `WALWriter` are serialized by an internal `sync.Mutex`.
+  - This ensures that record frames are strictly atomic on disk: goroutine A's record and goroutine B's record are never interleaved or torn.
+  - No global process mutex is used; concurrency protection is localized to the active segment writer. Group Commit (`P02-S04`) will later build on this to amortize `fdatasync` across concurrent callers.
 
 ### Subsystem Interview Questions
 * **Basic**: Why does a database need a Write-Ahead Log?
 * **Intermediate**: What is the difference between `fsync()` and `fdatasync()`, and why does pre-allocating WAL files matter?
 * **Intermediate**: Why is the WAL record header fixed at 21 bytes, and how does `RecordType(0x00) = Invalid` protect against torn page cache flushes?
+* **Deep**: Why isn't `file.Write()` success enough for a database WAL? What are the three tiers of write durability?
+* **Deep**: What exact contract does `AppendSync` provide, and what happens if `fdatasync()` fails after `file.Write()` succeeds?
+* **Deep**: If a write fails halfway through writing a WAL record, why doesn't `AppendSync` truncate the file immediately, and why does recovery own torn tail cleanup?
+* **Deep**: Why must concurrent WAL writes never be interleaved, and how does Lattice prevent interleaving without a global mutex?
+* **Deep**: Why is `AppendSync` deliberately simpler than later Group Commit?
 * **Deep**: Walk me through the exact concurrency flow of your Group Commit implementation. What happens if the leader goroutine panics while holding the batch?
 * **Deep**: How does Go's bounds check elimination (BCE) pattern `_ = buf[20]` provide anti-tear guarantees during binary serialization?
 * **Deep**: How do you prevent denial-of-service memory exhaustion when streaming WAL records from an untrusted or corrupted io.Reader?
@@ -951,6 +979,35 @@ This section is a living record of actual engineering obstacles, debugging sessi
   10. `TestInitDir_PreservesExistingFiles`: Proved pre-existing WAL logs and database files are 100% byte-for-byte preserved.
 - **Core Lesson**: Filesystem security begins at directory creation. Eliminate create/check races by relying on atomic kernel syscalls, inspect existing entries with `Lstat` to defeat symlink hijacking, pin inodes and use descriptor-based `fchmod` to eliminate symlink-substitution TOCTOU during permission hardening, enforce 0700 permissions to protect data confidentiality, and guarantee that re-initialization is strictly non-destructive.
 - **Interview Relevance**: Demonstrates mastery of POSIX file permissions, umask dynamics, descriptor-based filesystem operations (`fchmod`), inode pinning (`os.SameFile`), TOCTOU race mitigation, symlink security threats, and non-destructive idempotent systems design.
+
+### Entry 2026-09-08 — Phase 02: Strict Sync WAL Appender, fdatasync Durability Barrier & Non-Interleaving Concurrency
+- **Date**: 2026-09-08
+- **Phase**: Phase 02 Sub-Phase 02.2 Micro-Phase 02 (`P02-S02-M02`)
+- **Problem**: When user writes are accepted into an LSM storage engine, persisting them to disk requires physical non-volatile durability before returning success. Naively assuming `file.Write()` provides durability is a fatal flaw: `file.Write()` only copies bytes into the operating system dirty page cache (RAM). A sudden power outage or kernel panic immediately vaporizes all dirty pages, violating ACID durability. Furthermore, under high goroutine concurrency, multiple writers appending to the same file descriptor risk interleaving record fragments or corrupting record frames if not strictly synchronized.
+- **Initial Assumption**: `file.Write()` followed by `file.Sync()` on every append is sufficient, or that Go provides portable `fdatasync`.
+- **What Was Actually True**:
+  1. **Strict Sync Invariant**: `AppendSync(rec)` must return `nil` if and only if both the complete byte transfer and the hardware synchronization barrier (`fdatasync`) succeed. If `fdatasync` fails, `AppendSync` returns an error and never reports success.
+  2. **`fdatasync()` vs `fsync()` Semantics**: `fdatasync(2)` flushes only modified data blocks, omitting unchanged inode metadata updates (access/modification timestamps) and saving physical disk head seeks / NVMe write operations. On Linux, this is invoked directly via `syscall.Fdatasync(int(f.Fd()))`. On Darwin (macOS) and Windows where `fdatasync(2)` is not implemented by the kernel, the engine falls back to `f.Sync()`.
+  3. **Torn Tails Belong to Recovery, Not AppendSync**: If an append encounters a short write or write failure mid-record, `AppendSync` does not attempt to roll back or truncate the file. In-flight truncation during disk distress risks cascading corruption. Instead, cleanup of partial/torn writes at EOF is strictly delegated to startup recovery (`P02-S03-M01`).
+  4. **Per-Writer Mutex Serialization**: An internal `sync.Mutex` on `WALWriter` serializes concurrent `AppendSync` invocations. Goroutine records are appended as contiguous, non-interleaved atomic frames.
+  5. **Non-Destructive Reopening**: Segment files are opened with `os.O_WRONLY | os.O_CREATE | os.O_APPEND` with `0600` permissions. Process restarts never truncate or overwrite existing WAL segments.
+- **How It Was Verified**:
+  1. `TestWriter_FreshWALAppend`: Verified single PUT append, exact file length, and bit-for-bit replay via `DecodeRecord`.
+  2. `TestWriter_DeleteRecord` & `TestWriter_BatchMarkers`: Verified DELETE tombstones and batch markers.
+  3. `TestWriter_MultipleRecordsSequential`: Verified concatenated binary layout `encoded(A) || encoded(B) || encoded(C)`.
+  4. `TestWriter_ReopenExistingFilePreservesRecords`: Proved reopening existing segment preserves earlier records intact without truncation.
+  5. `TestWriter_InvalidRecordRejected`: Proved invalid records are rejected before touching file buffers.
+  6. `TestWriter_ShortWriteHandled`: Proved short writes loop until completion, and persistent zero-byte writes return `io.ErrShortWrite`.
+  7. `TestWriter_WriteFailureReturned`: Injected write failure via seam; verified error returned.
+  8. `TestWriter_SyncFailureReturned`: Injected `fdatasync` failure after write; verified `AppendSync` returns error and never reports success.
+  9. `TestWriter_ClosedWriter`: Verified operations on closed writer return `errors.ErrWriterClosed`.
+  10. `TestWriter_ConcurrentAppenders`: 50 concurrent goroutines appended records; verified all 50 decoded cleanly without data races, corruption, or interleaving.
+  11. `TestWriter_FilePermissions`: Verified `0600` permissions on Darwin/POSIX.
+  12. `TestWriter_DescriptorLifecycle`: 100 sequential open/append/close cycles without descriptor leaks.
+  13. `TestWriter_InputImmutability`: Proved caller's key and value memory are never modified.
+  14. `TestWriter_OneThousandRecordsReplay`: 1,000 records sequentially appended and verified.
+- **Core Lesson**: True database durability begins at the kernel barrier. Distinguish between OS page cache acceptance, filesystem data synchronization, and physical storage media durability. Never claim success on a write whose durability barrier failed, and never truncate files mid-flight during append failures.
+- **Interview Relevance**: Demonstrates mastery of database durability tiers, POSIX system calls (`write`, `fsync`, `fdatasync`), Linux vs Darwin kernel barrier behaviors, concurrency serialization without global mutexes, and the precise division of responsibility between the append path and recovery subsystem.
 
 ---
 

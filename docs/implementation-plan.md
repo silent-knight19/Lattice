@@ -350,17 +350,17 @@ Every future micro-phase implementation response from Claude Code must use this 
 ```
 Current Major Phase           : Phase 02 — Write-Ahead Log (WAL) & Durability Subsystem
 Current Sub-Phase             : Sub-Phase 02.2 — WAL File Management & Append Operations
-Current Micro-Phase           : P02-S02-M02 — Synchronous WAL Appender (`Strict Sync`)
+Current Micro-Phase           : P02-S02-M03 — Sequential WAL Reader & Log Iterator
 Phase 01 Status               : COMPLETE (Sub-Phases 01.1 & 01.2 Complete)
 Previous Completed Phase      : Phase 01 — Core Storage Primitives & Binary Encodings
-Previous Completed Micro-Phase: P02-S02-M01 — WAL File Creator & Directory Initializer
+Previous Completed Micro-Phase: P02-S02-M02 — Synchronous WAL Appender ("Strict Sync")
 Phase 00 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Phase 01 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Blocking Issues               : None
-Tests Passing                 : `go test -race ./...` (18/18 error suites, 18/18 logger suites, 48/48 binary suites, 58/58 wal suites passing, 98.5% wal coverage, 100% binary & errors coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
-Security Review Status        : Complete & Verified (Directory initialization 0700 permissions, symlink rejection, atomic TOCTOU-free creation, non-destructive idempotency, 50-goroutine concurrency safety)
-Interview Knowledge Status    : Updated with WAL directory ownership, 0700 permission enforcement, atomic TOCTOU-free creation, symlink rejection, and engineering log
-Git Commit                    : feat(wal): [P02-S02-M01] initialize secure WAL directory
+Tests Passing                 : `go test -race ./...` (19/19 error suites, 18/18 logger suites, 48/48 binary suites, 77/77 wal suites passing, 94.2% wal coverage, 100% binary & errors coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
+Security Review Status        : Complete & Verified (Strict sync durability barrier, 0600 file permissions, symlink and directory rejection, inode pinning via os.SameFile, short-write loops, concurrent non-interleaving mutex protection, caller input immutability)
+Interview Knowledge Status    : Updated with strict-sync contract, fdatasync vs fsync, sync failure semantics, short-write loop, torn-tail ownership, and engineering log
+Git Commit                    : feat(wal): [P02-S02-M02] add strict synchronous WAL appender
 ```
 
 ---
@@ -992,11 +992,35 @@ TOTAL: 184 Discrete, Testable Micro-Phases
     - **Observed Limitation**: Unprivileged local attacks are mitigated provided the parent directory `dbPath` permissions are properly restricted; a fully privileged (root/superuser) host attacker can bypass all OS permission checks; on non-POSIX filesystems (e.g. Windows), directory permission bits do not reflect POSIX 0700 semantics; directory initialization creates `<db_path>/wal` but does not establish storage media crash durability until log files are flushed and synced.
   * *Completion*: WAL directory creator and initializer verified and complete.
 * **P02-S02-M02: Synchronous WAL Appender (`Strict Sync`)**
-  * *Objective*: Implement sequential file writer calling `file.Write()` followed by `fdatasync()`.
-  * *Changes*: `WALWriter.AppendSync(rec Record) error`.
-  * *Invariants*: Method does not return until `fdatasync()` completes.
-  * *Tests*: Append 1,000 records; verify file length and verify records replay cleanly.
-  * *Completion*: Synchronous appender passing tests.
+  * *Objective*: Implement sequential file writer calling `file.Write()` followed by `fdatasync()` adhering to the Strict Sync durability contract.
+  * *Changes*:
+    - Added `ErrWriterClosed` sentinel error in `internal/errors/errors.go` and unit tests in `internal/errors/errors_test.go`.
+    - Added `internal/wal/sync_linux.go` using Linux kernel `syscall.Fdatasync(int(f.Fd()))` for zero-dependency data page synchronization without syncing unchanged inode metadata.
+    - Added `internal/wal/sync_fallback.go` falling back to `f.Sync()` on non-Linux platforms (Darwin, Windows) with documented platform limitations.
+    - Implemented `WALWriter` in `internal/wal/writer.go`:
+      - `const FileMode os.FileMode = 0600`: Restrictive POSIX mode for WAL segment files.
+      - Canonical segment naming helpers `SegmentName(id uint64) string` (`wal_%012d.log`) and `SegmentPath(dbPath string, id uint64) string`.
+      - `OpenWriter(path string) (*WALWriter, error)` and `OpenSegmentWriter(dbPath string, id uint64) (*WALWriter, error)` with `O_WRONLY | os.O_CREATE | os.O_APPEND`.
+      - Pre-open symlink/directory rejection, post-open `os.SameFile` inode pinning, and descriptor cleanup on failure paths.
+      - `(w *WALWriter) AppendSync(rec Record) error`: Validates record, serializes via `EncodeRecord`, executes write loop handling short writes, and flushes via `w.syncFn`.
+      - Strict sync contract: returns `nil` if and only if all bytes were written AND `fdatasync` succeeded; fails fast if closed or on write/sync errors.
+      - Concurrency safety: internal `sync.Mutex` serializes concurrent `AppendSync` calls, preventing record interleaving without process-global mutexes.
+      - Non-destructive reopening: reopening existing segment files appends at EOF without truncation or overwriting prior records.
+      - Preserves caller key and value byte memory immutability.
+    - Implemented comprehensive test suite in `internal/wal/writer_test.go` covering all 17 required test groups.
+  * *Tests & Verification*:
+    - `go test -count=1 -race ./internal/wal/...`: PASS (77 test suites, 0 data races)
+    - `go test -count=1 -race ./...`: PASS across all repository packages
+    - `golangci-lint run ./...`: 0 issues
+    - `GOOS=linux go vet ./...`: 0 issues (cross-compilation verified)
+    - `GOOS=windows go vet ./...`: 0 issues (cross-compilation verified)
+    - Statement coverage: 94.2% in `internal/wal`, 100% in `internal/errors`
+  * *Evidence Classification*:
+    - **Design Target**: Synchronous WAL appending where `AppendSync` guarantees that bytes leave OS buffers via `fdatasync` before returning success to callers, with zero record interleaving under concurrent calls.
+    - **Theoretical Property**: On Linux with pre-allocated segments, `syscall.Fdatasync` flushes data blocks without forcing directory/inode metadata writes; `os.O_APPEND` guarantees appending at EOF across process restarts; per-writer `sync.Mutex` guarantees serialized atomic record frames.
+    - **Measured Result**: 1,000 sequential records verified byte-for-byte with `DecodeRecord`; 50 concurrent goroutines appended without record interleaving or data races; injected sync failures deterministically returned errors without false success; short writes handled without busy looping; reopening existing segment files preserved existing records intact; file permissions verified at `0600`.
+    - **Observed Limitation**: On Darwin (macOS) and Windows, `fdatasync(2)` is not available in the kernel; synchronization falls back to `f.Sync()`, which also flushes file inode metadata. Physical media durability depends on underlying storage device controller write caches and filesystem barrier semantics. Mid-write failures may leave a partial record tail on disk; cleanup is deferred to the startup recovery subsystem.
+  * *Completion*: Synchronous appender passing all unit, concurrency, fault injection, and strict sync tests.
 * **P02-S02-M03: Sequential WAL Reader & Log Iterator**
   * *Objective*: Implement `WALReader` streaming records from disk from offset 0 to EOF.
   * *Changes*: `WALReader.Next() (Record, error)`.
