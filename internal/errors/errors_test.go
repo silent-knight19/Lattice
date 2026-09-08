@@ -297,6 +297,7 @@ func TestNilReceiverTypedErrors(t *testing.T) {
 	var op *errors.InvalidOpTypeError
 	var seq *errors.SeqNumOverflowError
 	var recType *errors.InvalidRecordTypeError
+	var recPayload *errors.InvalidRecordPayloadError
 
 	// Ensure calling Error() on nil typed pointers does not panic and returns sentinel strings
 	if k.Error() != errors.ErrKeyTooLarge.Error() {
@@ -319,6 +320,9 @@ func TestNilReceiverTypedErrors(t *testing.T) {
 	}
 	if recType.Error() != errors.ErrInvalidRecordType.Error() {
 		t.Errorf("expected %q, got %q", errors.ErrInvalidRecordType.Error(), recType.Error())
+	}
+	if recPayload.Error() != errors.ErrInvalidRecordPayload.Error() {
+		t.Errorf("expected %q, got %q", errors.ErrInvalidRecordPayload.Error(), recPayload.Error())
 	}
 
 	// Ensure calling Is() on nil typed pointers matches corresponding sentinels
@@ -343,6 +347,9 @@ func TestNilReceiverTypedErrors(t *testing.T) {
 	if !recType.Is(errors.ErrInvalidRecordType) {
 		t.Errorf("nil *InvalidRecordTypeError must match ErrInvalidRecordType via Is()")
 	}
+	if !recPayload.Is(errors.ErrInvalidRecordPayload) {
+		t.Errorf("nil *InvalidRecordPayloadError must match ErrInvalidRecordPayload via Is()")
+	}
 }
 
 func TestInterfaceWrappedTypedNilErrors(t *testing.T) {
@@ -359,6 +366,7 @@ func TestInterfaceWrappedTypedNilErrors(t *testing.T) {
 		{"InvalidOpTypeError", (*errors.InvalidOpTypeError)(nil), errors.ErrInvalidOpType},
 		{"SeqNumOverflowError", (*errors.SeqNumOverflowError)(nil), errors.ErrSeqNumOverflow},
 		{"InvalidRecordTypeError", (*errors.InvalidRecordTypeError)(nil), errors.ErrInvalidRecordType},
+		{"InvalidRecordPayloadError", (*errors.InvalidRecordPayloadError)(nil), errors.ErrInvalidRecordPayload},
 	}
 
 	for _, tc := range typedNils {
@@ -509,5 +517,71 @@ func TestInvalidRecordTypeError(t *testing.T) {
 	msg := typedErr.Error()
 	if !strings.Contains(msg, "0x99") {
 		t.Errorf("unexpected error message: %q", msg)
+	}
+}
+
+func TestInvalidRecordPayloadSentinel(t *testing.T) {
+	if errors.ErrInvalidRecordPayload == nil {
+		t.Fatalf("ErrInvalidRecordPayload must not be nil")
+	}
+
+	wrapped := fmt.Errorf("wal decode payload: %w", errors.ErrInvalidRecordPayload)
+	if !stdErrors.Is(wrapped, errors.ErrInvalidRecordPayload) {
+		t.Errorf("wrapped ErrInvalidRecordPayload must match via errors.Is")
+	}
+
+	if stdErrors.Is(errors.ErrInvalidRecordPayload, errors.ErrInvalidRecordType) {
+		t.Errorf("ErrInvalidRecordPayload must not match ErrInvalidRecordType")
+	}
+
+	if !strings.Contains(errors.ErrInvalidRecordPayload.Error(), "invalid wal record payload") {
+		t.Errorf("unexpected error message: %q", errors.ErrInvalidRecordPayload.Error())
+	}
+}
+
+func TestInvalidRecordPayloadError(t *testing.T) {
+	typedErr := &errors.InvalidRecordPayloadError{
+		Type:   0x02,
+		Reason: "delete tombstone cannot have a value payload",
+	}
+
+	// Must match sentinel via errors.Is
+	if !stdErrors.Is(typedErr, errors.ErrInvalidRecordPayload) {
+		t.Errorf("InvalidRecordPayloadError must match ErrInvalidRecordPayload via errors.Is")
+	}
+
+	// Negative match against other sentinels
+	if stdErrors.Is(typedErr, errors.ErrInvalidRecordType) {
+		t.Errorf("InvalidRecordPayloadError must not match ErrInvalidRecordType")
+	}
+
+	// Wrapped match via errors.Is
+	wrapped := fmt.Errorf("wal validate record: %w", typedErr)
+	if !stdErrors.Is(wrapped, errors.ErrInvalidRecordPayload) {
+		t.Errorf("wrapped InvalidRecordPayloadError must match ErrInvalidRecordPayload via errors.Is")
+	}
+
+	// Extraction via errors.As
+	var extracted *errors.InvalidRecordPayloadError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("errors.As failed to extract *InvalidRecordPayloadError")
+	}
+	if extracted.Type != 0x02 {
+		t.Errorf("extracted Type mismatch: got 0x%02x, expected 0x02", extracted.Type)
+	}
+	if extracted.Reason != "delete tombstone cannot have a value payload" {
+		t.Errorf("extracted Reason mismatch: got %q", extracted.Reason)
+	}
+
+	// Error string formatting with reason
+	msg := typedErr.Error()
+	if !strings.Contains(msg, "0x02") || !strings.Contains(msg, "delete tombstone cannot have a value payload") {
+		t.Errorf("unexpected error message: %q", msg)
+	}
+
+	// Error string formatting without reason
+	noReason := &errors.InvalidRecordPayloadError{Type: 0x03}
+	if !strings.Contains(noReason.Error(), "0x03") {
+		t.Errorf("unexpected error message: %q", noReason.Error())
 	}
 }

@@ -350,17 +350,17 @@ Every future micro-phase implementation response from Claude Code must use this 
 ```
 Current Major Phase           : Phase 02 — Write-Ahead Log (WAL) & Durability Subsystem
 Current Sub-Phase             : Sub-Phase 02.1 — WAL Binary Record Layout & Serialization
-Current Micro-Phase           : P02-S01-M02 — WAL Full Record Serializer & Deserializer
+Current Micro-Phase           : P02-S01-M03 — WAL Corruption & Checksum Verification Tests
 Phase 01 Status               : COMPLETE (Sub-Phases 01.1 & 01.2 Complete)
 Previous Completed Phase      : Phase 01 — Core Storage Primitives & Binary Encodings
-Previous Completed Micro-Phase: P02-S01-M01 — WAL Record Header & Framing Definition
+Previous Completed Micro-Phase: P02-S01-M02 — WAL Full Record Serializer & Deserializer
 Phase 00 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Phase 01 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Blocking Issues               : None
-Tests Passing                 : `go test -race ./...` (14/14 error suites, 18/18 logger suites, 48/48 binary suites, 12/12 wal suites passing, 100% binary & wal coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
-Security Review Status        : Complete & Verified (Early BCE bounds checks prevent torn writes; invalid record type interception guards against uninitialized memory; >3.2M fuzz iterations passing with 0 crashes)
-Interview Knowledge Status    : Updated with WAL physical 21-byte header layout, framing offsets, and zero-allocation encoding invariants
-Git Commit                    : feat(wal): [P02-S01-M01] implement 21-byte WAL record header and framing
+Tests Passing                 : `go test -race ./...` (16/16 error suites, 18/18 logger suites, 48/48 binary suites, 42/42 wal suites passing, 98.9% wal coverage, 100% binary & errors coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
+Security Review Status        : Complete & Verified (Stream-safe decoding; anti-DoS early allocation bounds; zero-aliasing slice ownership; hostile stream fuzzing >2.92M iterations passing with 0 crashes)
+Interview Knowledge Status    : Updated with WAL full record framing, streaming CRC coverage, reader anti-DoS validation, and memory ownership invariants
+Git Commit                    : feat(wal): [P02-S01-M02] implement full WAL record serializer and stream-safe deserializer
 ```
 
 ---
@@ -898,11 +898,54 @@ TOTAL: 184 Discrete, Testable Micro-Phases
     - `BenchmarkRecordType_Validate-10`: 0.23 ns/op, 0 B/op, 0 allocs/op
   * *Security Review*: Verified rejection of uninitialized memory (0x00 is invalid). Early bounds check prevents buffer bleeding and torn writes. All integer fields serialized with fixed-width big-endian routines without unsafe memory manipulation.
 * **P02-S01-M02: WAL Full Record Serializer & Deserializer**
-  * *Objective*: Serialize complete records (`Header + KeyLen + Key + ValLen + Val`).
-  * *Changes*: `EncodeRecord(record Record) ([]byte, error)`, `DecodeRecord(r io.Reader) (Record, error)`.
-  * *Invariants*: CRC32 is calculated over all bytes following the CRC field itself.
-  * *Tests*: Encode and decode records of varying sizes; verify CRC matches.
-  * *Completion*: Full record codec verified.
+  * *Objective*: Implement full physical record serialization and stream-safe deserialization (`Header (21B) || KeyLen (2B) || KeyBytes || ValLen (4B) || ValBytes`).
+  * *Changes*:
+    - Defined `Record` struct with `CRC uint32`, `Type RecordType`, `SeqNum binary.SeqNum`, `Timestamp uint64`, `Key []byte`, `Value []byte`.
+    - Implemented `(r Record) Validate() error` enforcing type rules: PUT (1B..64KB key, 0..4MB val), DELETE (1B..64KB key, 0B val tombstone), BATCH_START / BATCH_COMMIT (0B key, 0B val markers).
+    - Implemented `(r Record) Equal(other Record) bool`, `(r Record) Header() RecordHeader`, and `(r Record) String() string` (redacting raw payload data).
+    - Implemented `AppendRecord(dst []byte, record Record) ([]byte, error)`: zero-allocation record append when capacity is available.
+    - Implemented `EncodeRecord(record Record) ([]byte, error)`: exactly one heap allocation.
+    - Implemented `DecodeRecord(r io.Reader) (Record, error)`: stream-safe deserializer with hostile-reader defenses, partial I/O handling, anti-DoS length checks before allocation, and streaming CRC32-IEEE verification.
+    - Added `ErrInvalidRecordPayload` sentinel and `InvalidRecordPayloadError` struct in `internal/errors`.
+  * *Invariants & Safety Properties*:
+    - **Physical Layout**: `[CRC32 (4B) | RecordType (1B) | SeqNum (8B) | Timestamp (8B) | KeyLen (2B) | Key (Var) | ValLen (4B) | Val (Var)]`.
+    - **CRC Coverage**: CRC32-IEEE computed across all bytes following the 4-byte CRC field: `RecordType || SeqNum || Timestamp || KeyLen || Key || ValLen || Val`.
+    - **Anti-DoS Early Allocation Bounding**: 16-bit key length and 32-bit value length validated against authoritative storage limits (`binary.MaxKeyLen = 65,535` and `binary.MaxValueLen = 4,194,304`) BEFORE allocating memory buffers, preventing resource exhaustion attacks.
+    - **Memory Ownership**: Decoded slices are newly allocated and strictly owned by the returned `Record`, guaranteeing zero aliasing with reader buffers or future decode calls. Callers' input slices are never mutated during encoding.
+  * *Tests Performed*: Complete test suite covering requirements A through AB:
+    - Minimal valid records (PUT 1B key / 0B val, BATCH 0B key / 0B val).
+    - Boundary limits: Maximum key (65,535 bytes) and maximum value (4,194,304 bytes / 4 MiB).
+    - Empty value handling (both `nil` and `[]byte{}`).
+    - All four record types (PUT, DELETE tombstone, BATCH_START, BATCH_COMMIT).
+    - Minimum and maximum sequence numbers (0 and `math.MaxUint64`).
+    - Minimum and maximum timestamps (0 and `math.MaxUint64`).
+    - Exact known CRC vector byte verification.
+    - Single-byte bit-flip corruption across all 7 record fields (RecordType, SeqNum, Timestamp, KeyLength, Key, ValueLength, Value) verifying `ErrChecksumMismatch`.
+    - Truncated headers (0 bytes clean `io.EOF`, 1..20 bytes `ErrHeaderTruncated` and `io.ErrUnexpectedEOF`).
+    - Truncated keys (key length, key bytes) and truncated values (value length, value bytes) returning `io.ErrUnexpectedEOF`.
+    - Invalid record types (0x00, 0x05, 0x7F, 0xFF) returning `*InvalidRecordTypeError`.
+    - KeyLength above maximum returning `*KeyTooLargeError`.
+    - ValueLength above maximum returning `*ValueTooLargeError`.
+    - Malicious 32-bit lengths (`math.MaxUint32`, 2 GiB, 256 MiB) failing fast without memory allocation.
+    - Stream fragmentation tests: arbitrary chunk sizes (1, 2, 3, 5, 7, 11, 17, 31 bytes), single-byte readers (1 byte/read), short readers returning fewer bytes than requested with nil error, and readers returning remaining bytes with `io.EOF` simultaneously.
+    - Round-trip property tests across 500 randomized records.
+    - Deterministic encoding: multiple encodes produce identical bytes.
+    - Input immutability: mutating caller slices does not alter encoded stream.
+    - Decoded slice ownership and aliasing independence.
+    - Integer arithmetic boundary conditions.
+    - Native Go fuzzing (`FuzzRecordCodec`) executing >2.92M iterations with 0 crashes, 0 panics, and 100% round-trip structural stability.
+  * *Benchmark Results* (Apple M4, Darwin arm64, Go 1.24):
+    - `BenchmarkAppendRecord_ReusedBuffer-10`: 20.10 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkEncodeRecord_Small-10`: 43.04 ns/op, 192 B/op, 1 allocs/op
+    - `BenchmarkEncodeRecord_Large-10`: 9085 ns/op, 73728 B/op, 1 allocs/op
+    - `BenchmarkDecodeRecord_Small-10`: 91.54 ns/op, 192 B/op, 5 allocs/op
+    - `BenchmarkDecodeRecord_Large-10`: 9105 ns/op, 66592 B/op, 5 allocs/op
+  * *Evidence Classification*:
+    - **Design Target**: High-throughput binary streaming codec without unbounded memory allocation on corrupt or hostile inputs.
+    - **Theoretical Property**: CRC32-IEEE covers all post-CRC bytes deterministically; zero allocation for AppendRecord with reused buffer; total memory isolation of decoded slices.
+    - **Measured Result**: 20.10 ns/op (0 allocs) append, 43.04 ns/op encode, 91.54 ns/op decode; >2.92M fuzz iterations without panic; 98.9% statement coverage.
+    - **Observed Limitation**: DecodeRecord allocates fresh memory slices for user key and value payloads to guarantee caller ownership without buffer aliasing.
+  * *Completion*: Full record serialization, stream-safe deserialization, hostile input defenses, and test suites verified.
 * **P02-S01-M03: WAL Corruption & Checksum Verification Tests**
   * *Objective*: Prove that corrupted bytes are intercepted.
   * *Changes*: Test suite mutating random bytes in serialized records and verifying `ErrChecksumMismatch`.

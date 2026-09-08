@@ -61,6 +61,10 @@ var (
 	// ErrInvalidRecordType indicates that a WAL record type byte does not correspond
 	// to any recognized record type (PUT, DELETE, BATCH_START, BATCH_COMMIT).
 	ErrInvalidRecordType = stdErrors.New("invalid wal record type")
+
+	// ErrInvalidRecordPayload indicates that a WAL record payload does not conform to its record type
+	// (e.g. non-empty value for DELETE/tombstone, or non-empty key/value for batch markers).
+	ErrInvalidRecordPayload = stdErrors.New("invalid wal record payload")
 )
 
 // KeyTooLargeError provides structured context when a key violates maximum size limits.
@@ -199,4 +203,27 @@ func (e *InvalidRecordTypeError) Error() string {
 // Is reports whether this error matches target sentinel ErrInvalidRecordType.
 func (e *InvalidRecordTypeError) Is(target error) bool {
 	return target == ErrInvalidRecordType
+}
+
+// InvalidRecordPayloadError provides structured context when a WAL record payload
+// violates constraints for its record type.
+// It matches ErrInvalidRecordPayload when interrogated with errors.Is().
+type InvalidRecordPayloadError struct {
+	Type   byte
+	Reason string
+}
+
+func (e *InvalidRecordPayloadError) Error() string {
+	if e == nil {
+		return ErrInvalidRecordPayload.Error()
+	}
+	if e.Reason != "" {
+		return fmt.Sprintf("invalid wal record payload for type 0x%02x: %s", e.Type, e.Reason)
+	}
+	return fmt.Sprintf("invalid wal record payload for type 0x%02x", e.Type)
+}
+
+// Is reports whether this error matches target sentinel ErrInvalidRecordPayload.
+func (e *InvalidRecordPayloadError) Is(target error) bool {
+	return target == ErrInvalidRecordPayload
 }

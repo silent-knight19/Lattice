@@ -261,6 +261,14 @@
   - **Early Bounds Check (`_ = buf[20]`)**: In `EncodeHeader`, the 21st byte is read at entry. If the caller provides an undersized slice (`len < 21`), Go's runtime panics immediately *before* writing any bytes, preventing partial or torn writes to memory buffers.
   - **Uninitialized Memory Defense**: `RecordType(0x00)` is explicitly `RecordTypeInvalid`. In pre-allocated WAL files or uninitialized disk blocks (zeroed pages), an unwritten block presents a type byte of `0x00`. Decoders fail-fast with `*errors.InvalidRecordTypeError` rather than misinterpreting zeroed blocks as a valid `PUT` operation.
   - **Big-Endian Portability**: All multi-byte integers are serialized with strict network byte order (Big-Endian), ensuring binary WAL log segments can be transported and replayed across mixed-endian CPU architectures (ARM64, x86_64, RISC-V) without bit-shifting discrepancies.
+* **Full Physical Record Framing & CRC Coverage**:
+  - Full record layout: `[CRC32 (4B) | RecordType (1B) | SeqNum (8B) | Timestamp (8B) | KeyLength (2B) | KeyBytes (Var) | ValueLength (4B) | ValueBytes (Var)]`.
+  - **Authoritative CRC Scope**: CRC32-IEEE is calculated across ALL bytes following the 4-byte CRC field: `RecordType || SeqNum || Timestamp || KeyLength || KeyBytes || ValueLength || ValueBytes`. The 4 CRC bytes themselves are excluded from calculation.
+  - **Streaming Zero-Allocation CRC Replay**: In `DecodeRecord`, CRC is verified on-the-fly across read chunks using `crc32.Update(crc, crc32.IEEETable, chunk)` without allocating temporary contiguous buffers.
+* **Stream-Safety & Hostile Reader Anti-DoS Invariants**:
+  - **Early Allocation Bounding**: The decoder treats `io.Reader` streams as potentially hostile. Before executing `make([]byte, length)`, `keyLen` is checked against `binary.MaxKeyLen = 65,535` and `valLen` against `binary.MaxValueLen = 4,194,304` (4 MiB). Malicious length fields (e.g. `math.MaxUint32` 4 GiB) are rejected immediately with `*errors.ValueTooLargeError` without allocating heap memory or panicking from OOM.
+  - **Partial I/O and Fragmentation Defense**: Streams must be read via `io.ReadFull`. Decoders safely process streams delivering data 1 byte at a time, arbitrary chunks, short reads returning fewer bytes than requested with nil error, and readers returning remaining data plus `io.EOF` simultaneously.
+  - **Slice Ownership & Immutability**: Decoded `Key` and `Value` slices are newly allocated and strictly owned by the returned `Record`, guaranteeing zero aliasing with reader buffers or future decode calls. Encoding never mutates caller input slices.
 
 ### Subsystem Interview Questions
 * **Basic**: Why does a database need a Write-Ahead Log?
@@ -268,10 +276,14 @@
 * **Intermediate**: Why is the WAL record header fixed at 21 bytes, and how does `RecordType(0x00) = Invalid` protect against torn page cache flushes?
 * **Deep**: Walk me through the exact concurrency flow of your Group Commit implementation. What happens if the leader goroutine panics while holding the batch?
 * **Deep**: How does Go's bounds check elimination (BCE) pattern `_ = buf[20]` provide anti-tear guarantees during binary serialization?
+* **Deep**: How do you prevent denial-of-service memory exhaustion when streaming WAL records from an untrusted or corrupted io.Reader?
+* **Deep**: Walk me through the exact CRC coverage in Lattice's WAL records. Why is the CRC field excluded from its own checksum, and how does streaming CRC verification work without allocating contiguous buffers?
 * **Follow-up**: How do you prevent group commit queues from consuming unbounded RAM if the disk becomes completely saturated?
 * **"Did You Actually Build This?"**: How do you distinguish between an uncompleted torn write at the tail of the WAL versus a corrupted record in the middle of the file during startup recovery?
+* **"Did You Actually Build This?"**: How do you handle readers that return fewer bytes than requested without an error (short reads) or readers that return data and io.EOF in the same call?
 
 ---
+
 
 # 3. In-Memory MemTable & Concurrent SkipList
 
@@ -822,6 +834,24 @@ This section is a living record of actual engineering obstacles, debugging sessi
   3. Benchmarks on Apple M4: `EncodeHeader` at $0.99\text{ ns/op}$, `DecodeHeader` at $1.48\text{ ns/op}$, `AppendHeader` at $1.36\text{ ns/op}$, all with $0\text{ allocs/op}$.
 - **Core Lesson**: In binary serialization, correctness begins at the framing boundary. Defensive zero-tear invariants in userland memory mirrors crash durability on disk: an operation either commits completely or fails without side-effects.
 - **Interview Relevance**: Demonstrates deep understanding of Go compiler bounds check elimination (BCE), binary memory safety invariants, zero-allocation serialization, and disk preallocation failure modes.
+
+### Entry 2026-09-08 — Phase 02: Full WAL Record Serialization, Hostile Reader Anti-DoS & Streaming CRC Verification
+- **Date**: 2026-09-08
+- **Phase**: Phase 02 Sub-Phase 02.1 Micro-Phase 02 (`P02-S01-M02`)
+- **Problem**: Deserializing variable-length binary records from an `io.Reader` introduces serious security and correctness hazards. If a corrupted or malicious WAL stream presents a 32-bit length field like `0xFFFFFFFF` (4 GiB), a naive decoder calling `make([]byte, valLen)` immediately triggers an out-of-memory crash or severe allocation latency, causing denial-of-service. Additionally, network and disk readers can fragment writes (returning single bytes or short reads), and reusing scratch buffers across decode iterations risks memory aliasing where subsequent reads overwrite data currently referenced by active MemTables.
+- **Initial Assumption**: Reading records by allocating buffers based on decoded length headers and verifying CRC on contiguous buffers after all bytes have arrived.
+- **What Was Actually True**:
+  1. **Anti-DoS Early Allocation Bounding**: Decoders must validate key length against `binary.MaxKeyLen = 65,535` and value length against `binary.MaxValueLen = 4,194,304` (4 MiB) *prior* to executing any memory allocation. Malicious lengths fail fast with structured errors (`*errors.ValueTooLargeError`), completely neutralizing allocation-based resource exhaustion attacks.
+  2. **Streaming Zero-Allocation CRC32-IEEE**: Rather than allocating a contiguous slice for the entire record to calculate CRC, `DecodeRecord` streams bytes into discrete field buffers and updates CRC incrementally using `crc32.Update(crc, crc32.IEEETable, chunk)`. This calculates the exact hardware-accelerated CRC across all post-CRC bytes (`RecordType || SeqNum || Timestamp || KeyLength || Key || ValueLength || Value`) with zero heap allocations for the checksum calculation.
+  3. **Stream-Safe Read Loop**: Standard Go `io.Reader` contracts permit returning fewer bytes than requested without error, or returning data alongside `io.EOF`. Using `io.ReadFull` across all header and payload stages guarantees that partial chunks, single-byte readers, and fragmented streams are assembled deterministically. A clean `io.EOF` is emitted if and only if the stream ends cleanly at byte offset 0 of a record header.
+  4. **Strict Memory Ownership**: Decoded `Key` and `Value` slices are newly allocated and strictly owned by the returned `Record`. They never alias internal decode scratchpads, guaranteeing memory safety when passed to concurrent MemTable writers. Conversely, `EncodeRecord` uses `copy()` and never mutates caller-owned memory.
+- **How It Was Verified**:
+  1. Exhaustive test suite covering requirements A through AB: minimal records, max key (65KB), max value (4MB), empty values, all 4 record types, min/max SeqNum/Timestamp, exact CRC manual byte vectors, single-byte bit flips across all 7 fields, truncations, invalid types, and malicious 4 GiB length fields.
+  2. Stream safety tests with 1-byte readers, arbitrary chunk readers (1, 2, 3, 5, 7, 11, 17, 31 bytes), short readers with nil error, and simultaneous data + EOF readers.
+  3. Native Go fuzzing (`FuzzRecordCodec`) executing >2.92M iterations with 0 crashes, 0 panics, and 100% round-trip structural stability.
+  4. Benchmarks on Apple M4: `AppendRecord` with reused buffer at $20.10\text{ ns/op}$ ($0\text{ allocs/op}$), `EncodeRecord` at $43.04\text{ ns/op}$ ($1\text{ alloc/op}$), and `DecodeRecord` at $91.54\text{ ns/op}$.
+- **Core Lesson**: In storage engine codecs, untrusted streams must be bounded at every step. Check limits before allocation, use streaming checksums to avoid temporary buffers, and enforce clear memory ownership to prevent aliasing bugs.
+- **Interview Relevance**: Demonstrates deep systems reasoning on streaming I/O contracts, denial-of-service memory defense, hardware-accelerated CRC updating, memory ownership semantics, and native Go fuzz testing.
 
 ---
 
