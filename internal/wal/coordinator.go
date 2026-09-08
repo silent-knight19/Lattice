@@ -117,16 +117,8 @@ func RecoverWAL(dbPath string, sink ReplaySink) (RecoveryReport, error) {
 	}
 
 	// Step 3: Validate segment ID continuity (no duplicates, no gaps)
-	for i := 1; i < len(ids); i++ {
-		if ids[i] == ids[i-1] {
-			return RecoveryReport{}, &errors.DuplicateSegmentError{SegmentID: ids[i]}
-		}
-		if ids[i] != ids[i-1]+1 {
-			return RecoveryReport{}, &errors.SegmentGapError{
-				Expected: ids[i-1] + 1,
-				Actual:   ids[i],
-			}
-		}
+	if err := ValidateSegmentContinuity(ids); err != nil {
+		return RecoveryReport{}, err
 	}
 
 	report := RecoveryReport{
@@ -263,4 +255,20 @@ func RecoverWAL(dbPath string, sink ReplaySink) (RecoveryReport, error) {
 	}
 
 	return report, nil
+}
+
+// ValidateSegmentContinuity validates that a sorted slice of segment IDs has no duplicates and no gaps.
+func ValidateSegmentContinuity(ids []uint64) error {
+	for i := 1; i < len(ids); i++ {
+		if ids[i] == ids[i-1] {
+			return &errors.DuplicateSegmentError{SegmentID: ids[i]}
+		}
+		if ids[i] != ids[i-1]+1 {
+			return &errors.SegmentGapError{
+				Expected: ids[i-1] + 1,
+				Actual:   ids[i],
+			}
+		}
+	}
+	return nil
 }

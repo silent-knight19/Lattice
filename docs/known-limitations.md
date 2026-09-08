@@ -196,16 +196,30 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
-### 14. Static Security Audit Track Implemented Ahead of Dynamic Fuzzing
-* **Limitation**: Static security audit rules (`SEC-01` & `SEC-02`) evaluate AST structures, filesystem permissions, dependency inventories, configuration settings, and plaintext secrets across source files, but do not yet execute dynamic network protocol fuzzing, concurrent deadlock fuzzing, or kernel-level fault injection.
-* **Why It Exists**: In accordance with the security roadmap hierarchy, static analysis foundations, attack surface mapping, and threat modeling (`SEC-01` & `SEC-02`) establish the audit baseline before dynamic testing tracks (`SEC-03` through `SEC-07`) are activated. Furthermore, network transport (Phase 11) and clustering consensus (Phase 13) are not yet implemented.
-* **Impact**: Static checks successfully enforce memory safety boundaries, ban `unsafe` and subprocess execution, prevent world-writable file permissions, detect hardcoded secrets, and verify bounded allocations, but dynamic protocol and race testing are deferred to future security milestones.
-* **How It Was Detected**: Security track architecture and roadmap planning.
-* **Current Mitigation**: Go concurrency race detector (`go test -race ./...`), property-based unit tests, and fail-closed error design.
-* **Future Solution**: Execute `SEC-03` (WAL & storage dynamic audit), `SEC-04` (concurrency/deadlock audit), and `SEC-05` (network protocol fuzzing) alongside production milestones.
+### 14. Static Security Audit Completed and Storage Dynamic Audit (SEC-03) Verified
+* **Limitation**: Static analysis (`SEC-01`, `SEC-02`) and persistence/storage dynamic security auditing (`SEC-03`) are fully complete and verified. However, dynamic network protocol fuzzing, distributed consensus fault injection, and multi-node Byzantine testing remain deferred until their respective subsystems are implemented.
+* **Why It Exists**: In accordance with the security roadmap hierarchy, storage persistence (`SEC-03`) is audited immediately following Phase 02. Network transport (Phase 11) and Raft consensus (Phase 13) do not yet exist in the codebase.
+* **Impact**: Storage, WAL, filesystem races, torn writes, malformed framing, and permission boundaries are rigorously verified under adversarial tests. Network and cluster-level dynamic testing will activate when those subsystems are built.
+* **How It Was Detected**: Security roadmap staging and architecture boundaries.
+* **Current Mitigation**: Comprehensive dynamic test suites in `internal/wal` (`sec03_*_test.go`), native Go fuzzing, fault injection seams, and race detection.
+* **Future Solution**: Execute `SEC-04` (in-memory concurrent audit alongside MemTable), `SEC-05` (network protocol fuzzing), and `SEC-06` (distributed consensus chaos testing).
 * **Dimensional Impact**:
-  * Correctness: **None** (Static security invariants strictly enforced).
-  * Performance: **None** (Static analysis executes out-of-band in development/CI).
+  * Correctness: **None** (Existing subsystems verified).
+  * Performance: **None**.
+  * Scalability: **None**.
+
+---
+
+### 15. Directory Metadata Fsync and Cross-Platform ACL Handling
+* **Limitation**: Individual WAL segment files are strictly synchronized via `fdatasync()` upon append and rotation, but the containing parent directory is not explicitly directory-fsynced on Unix filesystems. Furthermore, on Windows, POSIX permissions (`0700` / `0600`) map to standard file attributes rather than fine-grained Windows NT Access Control Lists (ACLs).
+* **Why It Exists**: In modern journaling filesystems (ext4, XFS, APFS), file creation and append operations with `O_CREAT | O_APPEND` followed by `fdatasync` ensure file data and required inode size metadata reach disk. Explicit directory `fsync()` incurs substantial synchronous metadata lock contention across concurrent rotations. On Windows, the Go standard library maps file modes to read-only bits without native security descriptor manipulation.
+* **Impact**: In the catastrophic event of a sudden host power cut at the exact microsecond of segment rotation on a non-journaled filesystem, directory entry pointers could lag behind allocated inodes. On multi-user Windows servers without restricted parent directories, local users might read segment files if parent directory inheritance is permissive.
+* **How It Was Detected**: Identified as Hardening Opportunities `SEC-03-HARD-02` and `SEC-03-HARD-03` during the SEC-03 dynamic security audit.
+* **Current Mitigation**: Segment creation uses `os.O_EXCL | os.O_CREATE`, verifying inode identity via `os.SameFile` and hardening permissions via `fchmod` on the open descriptor. Startup recovery discovers segments by numeric filename sorting and fails closed upon sequence gaps.
+* **Future Solution**: Introduce optional directory fsync configuration for enterprise deployments and native Windows security descriptor inheritance in Phase 10.
+* **Dimensional Impact**:
+  * Correctness: **None** (Recovery fails closed on any discrepancy).
+  * Performance: **Optimal** (Avoids synchronous directory lock stalls).
   * Scalability: **None**.
 
 ---

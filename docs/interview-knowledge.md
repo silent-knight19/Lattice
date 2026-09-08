@@ -1488,7 +1488,80 @@ Conversely, if any task in the batch were marked complete (`close(task.done)`) b
 
 ---
 
-# 24. Questions I Personally Failed & Corrected Understandings
+# 24. Deep Systems Interview Questions & Answers: Storage, Filesystem & Persistence Dynamic Auditing
+
+### 1. Why filesystem validation can still be vulnerable to TOCTOU.
+* **Answer**: Time-of-Check to Time-of-Use (TOCTOU) vulnerabilities arise whenever an application performs an inspection on a filesystem pathname (e.g. checking permissions, verifying it is not a symlink, or confirming a file does not exist) and subsequently performs an action using that same pathname (e.g. `os.OpenFile`, `os.Chmod`, or `os.Create`). Because the check and the use are separate system calls, the operating system kernel may preempt the process between the two operations. During this time window, a concurrent local process can displace the validated directory or file, substituting a symbolic link pointing to a sensitive external target (such as `/etc/shadow` or a database configuration file). The subsequent operation then follows the attacker's symlink, executing unauthorized reads, writes, or permission changes. Pathname validation alone is never an atomic security boundary.
+
+### 2. Why inode identity checks mitigate but do not automatically solve every filesystem race.
+* **Answer**: Inode identity pinning (verifying `os.SameFile(finfo, postInfo)` where `finfo` is obtained via `f.Stat()` on an open file descriptor and `postInfo` via `os.Lstat(path)`) verifies that the path string on disk still points to the exact same device and inode that the process currently holds open. This mitigates simple post-open substitutions where an attacker tries to displace a file immediately after opening. However, it does not automatically solve every filesystem race:
+  1. An attacker can swap the path before the initial open, causing the application to open the malicious target in the first place.
+  2. On filesystems where inode numbers are aggressively recycled (e.g. rapid unlink/create cycles), an attacker can theoretically re-acquire the same inode number.
+  3. Intermediate parent directory components can still be renamed or manipulated.
+  True atomic safety requires operating exclusively on file descriptors (`openat`, `fstat`, `fchmod`, `unlinkat`) rather than traversing path strings repeatedly.
+
+### 3. Why symlink attacks matter for local databases.
+* **Answer**: Embedded and local databases (such as RocksDB, SQLite, or Lattice) operate with the privileges of the host process running them. In shared or multi-tenant hosting environments, local unprivileged users may share disk partitions or temp directories with the database process. If the database blindly opens, rotates, or creates segment files without verifying symlink attributes (`os.O_NOFOLLOW` or `os.Lstat`), an unprivileged attacker can pre-create symlinks in the database directory pointing to sensitive system files. When the database initializes or rotates a WAL segment, it opens or truncates the attacker's target, allowing unauthorized data corruption, arbitrary file overwrites, or privilege escalation.
+
+### 4. Why malformed persistent data must be treated as attacker-controlled input.
+* **Answer**: Developers often assume that because data on disk was written by their own database engine, it is inherently trusted. In reality, on-disk persistence files are vulnerable to storage controller firmware bugs, bit-rot, torn tail writes from host crashes, and direct tampering by anyone with local access or backup access. If the recovery parser trusts persistent records without strict bounds checking (e.g. allocating memory based on raw declared lengths or executing unverified record types), malformed records can trigger buffer overflows, uncontrolled allocations causing out-of-memory crashes (DoS), or arbitrary state corruption. Treating persistent data as untrusted, hostile input is mandatory for resilience.
+
+### 5. Why CRC detects corruption but is not an authentication mechanism.
+* **Answer**: Cyclic Redundancy Checks (e.g. CRC32C or CRC64) are linear algebraic checksums specifically designed to detect accidental transmission errors, bit-flips, and random hardware corruption with high probability and minimal computational overhead. However, CRC is **not cryptographically secure**: it has no secret key and is completely malleable. An adversary who can modify data on disk can effortlessly recompute the valid CRC for any forged payload and overwrite the CRC header bytes. CRC guarantees integrity against accidental faults, but provides zero authenticity or non-repudiation against an active, malicious adversary. Cryptographic MACs (like HMAC-SHA256) are required for tamper-proofing.
+
+### 6. Why latest-tail recovery is fundamentally different from historical corruption.
+* **Answer**: During an ungraceful host crash or sudden power loss, the operating system kernel page cache may be interrupted midway through writing the most recent transaction to the active WAL segment. This leaves an incomplete, uncommitted "torn tail" at the exact end of the latest segment file ($S_N$). Truncating this torn tail back to the last complete, verified record boundary is safe and necessary because the interrupted transaction was never acknowledged to the client as durable.
+Conversely, historical sealed segments ($S_1 \dots S_{N-1}$) were closed and synced long before the crash. Any corruption in a historical segment cannot be a crash torn tail; it indicates physical bit-rot, disk sector failure, or malicious tampering with committed transactions. Truncating or skipping records in historical segments would silently erase committed state and cause catastrophic data divergence. Historical corruption must fail closed immediately.
+
+### 7. Why partial writes create ambiguous durability boundaries.
+* **Answer**: When a database initiates a multi-byte write (e.g. appending a 4 KiB record), the underlying hardware storage media writes data in physical sector or flash page units (typically 512 bytes or 4,096 bytes). If a crash or power failure occurs mid-write:
+  - Some sectors may reach persistent media while others do not.
+  - The file length in the filesystem metadata may or may not have been updated.
+  - A client might have experienced a timeout without knowing if the write succeeded.
+  This creates an ambiguous durability boundary where userland cannot determine whether the transaction was committed. Strict database protocols resolve this by declaring that a transaction is only committed if a complete, valid record frame with a verified checksum exists on disk and has survived a successful synchronization barrier.
+
+### 8. Why a failed fsync cannot safely imply which individual records persisted.
+* **Answer**: The `fsync` or `fdatasync` system call flushes all dirty kernel page cache buffers associated with an open file descriptor down to physical media. When the kernel or storage controller returns an I/O error (`EIO`), it does not return an offset or byte count indicating partial progress; it is an all-or-nothing status. Some dirty blocks may have made it to flash memory, while others were rejected due to controller timeout or bad blocks. Because the exact boundary between persisted and lost pages is unknown to userland, the engine cannot safely assume any individual record in that sync epoch is durable. The database must fail all concurrent tasks in the batch and mark the segment as potentially degraded.
+
+### 9. Why bounded allocation is a security property.
+* **Answer**: In garbage-collected runtimes like Go, memory is finite, and allocating more memory than available physical RAM causes the operating system Out-Of-Memory (OOM) killer to terminate the database process immediately with `SIGKILL`. If an input parser reads a length field directly from disk or network and executes `make([]byte, declaredLen)` without checking against an architectural ceiling, an attacker can supply a 4-byte value claiming $2\text{ GB}$ or $4\text{ GB}$. A single malformed record immediately triggers catastrophic OOM termination. Enforcing strict bounds (`len <= MaxKeyLen`, `len <= MaxValueLen`) before allocating memory is a critical availability security control.
+
+### 10. Why recovery must fail closed.
+* **Answer**: When crash recovery encounters unexpected corruption, missing segment files, or sequence number anomalies, it faces two architectural choices:
+  1. **Fail Open (Permissive)**: Skip the corrupted bytes, ignore missing segments, and start the database engine anyway.
+  2. **Fail Closed (Defensive)**: Halt startup immediately with a fatal diagnostic error, leaving the disk in an unaltered state.
+  Failing open risks catastrophic silent data loss: foreign keys break, deleted records resurrect, and client applications read inconsistent, partially truncated state without warning. Failing closed ensures operators can restore from authoritative backups or run forensic tools before corrupted data infects dependent downstream systems.
+
+### 11. Why sequence monotonicity matters for database integrity.
+* **Answer**: The Write-Ahead Log represents the definitive total order of mutations in the database. Every record carries a strictly monotonically increasing 64-bit sequence number ($SeqNum_k > SeqNum_{k-1}$). Monotonicity ensures that:
+  - Updates and deletes always execute in the exact causal order they were submitted.
+  - MVCC visibility engines can determine whether a snapshot can read a specific record version.
+  - Replay engines can detect duplicate records, replayed log segments, or out-of-order sector writes.
+  A sequence regression during recovery indicates that physical chronology has diverged from logical causality, which would corrupt the state machine if replayed.
+
+### 12. How segment rotation interacts with crash recovery.
+* **Answer**: Segment rotation bounds individual WAL file sizes by closing segment $N$ when it exceeds a configured byte threshold and opening segment $N+1$. This creates clear durability and recovery boundaries:
+  1. During rotation, segment $N$ is fully synced via `fdatasync()` and closed before segment $N+1$ accepts new writes.
+  2. If a crash occurs immediately before, during, or after rotation, the recovery coordinator discovers all segments by enumerating filenames (`wal_000000000001.log` $\dots$), sorting numerically, and verifying continuity.
+  3. If a segment gap exists (e.g. 1, 2, 4), recovery halts immediately.
+  4. Only the latest segment ($N+1$) can undergo torn-tail repair; segment $N$ is historical and must be pristine.
+
+### 13. Why test seams are useful in storage security testing.
+* **Answer**: Testing how a storage engine handles catastrophic hardware failures (e.g. `ENOSPC` disk full, `EIO` drive failure, torn writes, or power loss mid-sync) is notoriously difficult on real hardware without damaging drives or requiring root filesystem emulation. Test seams—such as package-internal function pointers (`w.syncFn`, `w.writeFn`) or mock `BatchWriter` interfaces—allow tests to inject deterministic, millisecond-accurate simulated faults directly into the execution path without touching real host storage or altering production release binaries. This enables exhaustive verification of error fan-out, fail-closed handling, and recovery invariants in standard CI environments.
+
+### 14. Difference between simulated crash testing and real power-failure testing.
+* **Answer**:
+  - **Simulated Crash Testing**: Uses software seams, process `kill -9`, or byte truncation on disk to verify that recovery algorithms handle incomplete records and torn tails correctly under POSIX assumptions. It tests the software's recovery logic.
+  - **Real Power-Failure Testing**: Cuts electrical power to actual server hardware during sustained write load. It exercises physical drive controller firmware, volatile disk write-back caches, barrier commands (`FLUSH CACHE`), and operating system journal consistency. Hardware can suffer from drive-level reordering, un-flushed volatile SRAM, or silent sector corruption that pure software simulations cannot replicate. Simulated testing is necessary for unit validation; power-cut testing is necessary for hardware qualification.
+
+### 15. How to distinguish security weakness from a normal storage error.
+* **Answer**: In storage engineering, hardware errors (like a bad disk block, disk full, or network timeout) are normal operational conditions that systems must routinely handle.
+  - **Normal Storage Error**: The subsystem detects the failure, halts or reports the error, preserves data integrity, and fails closed without granting false assurances or corrupting existing state.
+  - **Security Weakness / Vulnerability**: The subsystem behaves unsafely in response to corruption or failure—for instance, silently ignoring missing records, confirming a write as durable when `fdatasync` actually failed, panicking into an unhandled OOM loop, or allowing an attacker to overwrite foreign files via symlink manipulation. The difference is not whether an error occurred, but whether the system failed safely and preserved its core invariants.
+
+---
+
+# 25. Questions I Personally Failed & Corrected Understandings
 
 *(Entries will be appended whenever knowledge gaps are discovered)*
 
