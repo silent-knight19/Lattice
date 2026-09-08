@@ -24,7 +24,9 @@ type RecoveryResult struct {
 	RecoveredOffset int64
 
 	// Truncated reports whether physical truncation was performed on the file.
-	// False if the segment ended at a clean record boundary or was empty.
+	// Accurately reflects whether physical file mutation occurred, even if subsequent
+	// synchronization or post-condition verification returns an error.
+	// False if the segment ended at a clean record boundary, was empty, or truncation failed.
 	Truncated bool
 }
 
@@ -180,41 +182,39 @@ func recoverSegmentWithSeams(
 		return res, fmt.Errorf("wal: failed to truncate torn tail at offset %d in %s: %w", validOffset, cleanPath, err)
 	}
 
+	// Physical truncation has succeeded on disk. From this point onward,
+	// Truncated must remain true to accurately reflect that physical file mutation occurred,
+	// even if subsequent synchronization or post-condition verification returns an error.
+	res.Truncated = true
+
 	// Synchronize file data and inode metadata to stable storage
 	if err := syncFn(f); err != nil {
-		res.Truncated = false
 		return res, fmt.Errorf("wal: failed to sync truncated file %s: %w", cleanPath, err)
 	}
 
 	// Invariant 9: Post-condition verification - verify file size
 	postStat, err := f.Stat()
 	if err != nil {
-		res.Truncated = false
 		return res, fmt.Errorf("wal: failed to stat truncated file %s: %w", cleanPath, err)
 	}
 	if postStat.Size() != validOffset {
-		res.Truncated = false
 		return res, fmt.Errorf("wal: post-truncation file size %d does not match expected valid offset %d", postStat.Size(), validOffset)
 	}
 
 	// Invariant 9: Post-condition verification - rewind and verify valid records to EOF
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		res.Truncated = false
 		return res, fmt.Errorf("wal: failed to rewind file %s for post-truncation verification: %w", cleanPath, err)
 	}
 
 	for i := 0; i < validCount; i++ {
 		if _, err := DecodeRecord(f); err != nil {
-			res.Truncated = false
 			return res, fmt.Errorf("wal: post-truncation verification failed at record %d: %w", i, err)
 		}
 	}
 
 	if _, err := DecodeRecord(f); !stdErrors.Is(err, io.EOF) {
-		res.Truncated = false
 		return res, fmt.Errorf("wal: post-truncation verification expected io.EOF after record %d, got: %w", validCount, err)
 	}
 
-	res.Truncated = true
 	return res, nil
 }

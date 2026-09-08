@@ -1038,11 +1038,13 @@ func TestRecovery_TruncateFailureSeam(t *testing.T) {
 }
 
 // 31. TEST SEAMS: sync failure injected
+// Truncate succeeds, but sync fails -> Truncated must be true (mutation occurred),
+// error must be returned, and physical file size must confirm truncation actually occurred.
 func TestRecovery_SyncFailureSeam(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "wal_000000000001.log")
 	rec := makeValidRecord(1, "k1", "v1")
-	appendRecordToFile(t, path, rec)
+	validLen := appendRecordToFile(t, path, rec)
 
 	// Append torn tail
 	appendBytesToFile(t, path, []byte{0x01, 0x02})
@@ -1062,8 +1064,17 @@ func TestRecovery_SyncFailureSeam(t *testing.T) {
 	if !stdErrors.Is(err, injectedErr) {
 		t.Errorf("expected injected error, got: %v", err)
 	}
-	if res.Truncated {
-		t.Errorf("expected Truncated=false on sync failure, got true")
+	if !res.Truncated {
+		t.Errorf("expected Truncated=true because physical truncation occurred before sync failed, got false")
+	}
+
+	// Verify physical file size confirms truncation actually occurred on disk
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		t.Fatalf("Stat failed: %v", statErr)
+	}
+	if info.Size() != int64(validLen) {
+		t.Errorf("expected physical file size %d confirming truncation, got %d", validLen, info.Size())
 	}
 }
 
@@ -1087,5 +1098,35 @@ func TestRecovery_RecoverSegmentByID(t *testing.T) {
 	}
 	if !res.Truncated || res.ValidRecords != 1 || res.RecoveredOffset != int64(validLen) {
 		t.Errorf("unexpected result: %+v", res)
+	}
+}
+
+// 33. TEST SEAMS: post-truncation verification failure
+// Truncate succeeds, sync succeeds, but post-truncation size verification fails (e.g. file size mismatch)
+// -> Truncated must remain true, error must be non-nil.
+func TestRecovery_PostTruncationVerificationFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wal_000000000001.log")
+	rec := makeValidRecord(1, "k1", "v1")
+	appendRecordToFile(t, path, rec)
+
+	// Append torn tail
+	appendBytesToFile(t, path, []byte{0x01, 0x02})
+
+	// Truncate function pretends to succeed (returns nil) without actually truncating the file,
+	// causing postStat.Size() != validOffset to fail during post-condition verification.
+	noOpTruncate := func(f *os.File, size int64) error {
+		return nil
+	}
+	normalSync := func(f *os.File) error {
+		return f.Sync()
+	}
+
+	res, err := wal.RecoverSegmentWithSeamsForTesting(path, normalSync, noOpTruncate)
+	if err == nil {
+		t.Fatalf("expected error from post-truncation verification failure, got nil")
+	}
+	if !res.Truncated {
+		t.Errorf("expected Truncated=true because Truncate succeeded before verification failed, got false")
 	}
 }
