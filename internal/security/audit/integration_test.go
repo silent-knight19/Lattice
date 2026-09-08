@@ -47,27 +47,33 @@ func TestAudit_FullRepositoryScanAndReportGeneration(t *testing.T) {
 		t.Errorf("expected %d rules to run, got %d", expectedRulesCount, len(auditRep.RulesRun))
 	}
 
-	// Verify reports directory exists
-	secDocsDir := filepath.Join(repoRoot, "docs", "security")
-	if err := os.MkdirAll(secDocsDir, 0755); err != nil {
-		t.Fatalf("failed to create docs/security: %v", err)
-	}
-
-	// Generate Markdown report
+	// Test generating Markdown report
 	mdContent := report.GenerateMarkdown(auditRep)
-	mdPath := filepath.Join(secDocsDir, "security-audit-report.md")
-	if err := os.WriteFile(mdPath, []byte(mdContent), 0644); err != nil {
-		t.Fatalf("failed to write security-audit-report.md: %v", err)
+	if len(mdContent) == 0 {
+		t.Errorf("expected non-empty markdown report")
 	}
 
-	// Generate JSON report
+	// Test generating JSON report
 	jsonData, err := report.GenerateJSON(auditRep)
-	if err != nil {
+	if err != nil || len(jsonData) == 0 {
 		t.Fatalf("failed to generate JSON report: %v", err)
 	}
-	jsonPath := filepath.Join(secDocsDir, "security-audit-report.json")
-	if err := os.WriteFile(jsonPath, jsonData, 0644); err != nil {
-		t.Fatalf("failed to write security-audit-report.json: %v", err)
+
+	// Write to temporary directory to verify file I/O without dirtying repository working tree
+	testOutDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(testOutDir, "security-audit-report.md"), []byte(mdContent), 0644); err != nil {
+		t.Fatalf("failed to write test markdown report: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(testOutDir, "security-audit-report.json"), jsonData, 0644); err != nil {
+		t.Fatalf("failed to write test JSON report: %v", err)
+	}
+
+	// If explicitly requested via environment variable, update tracked documentation reports
+	if os.Getenv("LATTICE_UPDATE_SECURITY_REPORT") == "1" {
+		secDocsDir := filepath.Join(repoRoot, "docs", "security")
+		_ = os.MkdirAll(secDocsDir, 0755)
+		_ = os.WriteFile(filepath.Join(secDocsDir, "security-audit-report.md"), []byte(mdContent), 0644)
+		_ = os.WriteFile(filepath.Join(secDocsDir, "security-audit-report.json"), jsonData, 0644)
 	}
 
 	t.Logf("Audit complete: %d active findings, %d suppressed, %d errors across %d files.",
