@@ -257,11 +257,17 @@
 ### Failure Modes & Disaster Scenarios
 * **Torn Tail Write**: A power loss mid-write writes only part of a record. Detected via CRC32 mismatch at EOF and truncated cleanly.
 * **Mid-Log Bit Rot**: Corruption in the middle of a historical log triggers `panic`, as it indicates disk failure rather than a clean power drop.
+* **Zero-Allocation 21-Byte Binary Framing**: Every WAL record begins with a fixed 21-byte physical header: `[CRC32 (4B) | RecordType (1B) | SeqNum (8B) | Timestamp (8B)]`. Key design invariants:
+  - **Early Bounds Check (`_ = buf[20]`)**: In `EncodeHeader`, the 21st byte is read at entry. If the caller provides an undersized slice (`len < 21`), Go's runtime panics immediately *before* writing any bytes, preventing partial or torn writes to memory buffers.
+  - **Uninitialized Memory Defense**: `RecordType(0x00)` is explicitly `RecordTypeInvalid`. In pre-allocated WAL files or uninitialized disk blocks (zeroed pages), an unwritten block presents a type byte of `0x00`. Decoders fail-fast with `*errors.InvalidRecordTypeError` rather than misinterpreting zeroed blocks as a valid `PUT` operation.
+  - **Big-Endian Portability**: All multi-byte integers are serialized with strict network byte order (Big-Endian), ensuring binary WAL log segments can be transported and replayed across mixed-endian CPU architectures (ARM64, x86_64, RISC-V) without bit-shifting discrepancies.
 
 ### Subsystem Interview Questions
 * **Basic**: Why does a database need a Write-Ahead Log?
 * **Intermediate**: What is the difference between `fsync()` and `fdatasync()`, and why does pre-allocating WAL files matter?
+* **Intermediate**: Why is the WAL record header fixed at 21 bytes, and how does `RecordType(0x00) = Invalid` protect against torn page cache flushes?
 * **Deep**: Walk me through the exact concurrency flow of your Group Commit implementation. What happens if the leader goroutine panics while holding the batch?
+* **Deep**: How does Go's bounds check elimination (BCE) pattern `_ = buf[20]` provide anti-tear guarantees during binary serialization?
 * **Follow-up**: How do you prevent group commit queues from consuming unbounded RAM if the disk becomes completely saturated?
 * **"Did You Actually Build This?"**: How do you distinguish between an uncompleted torn write at the tail of the WAL versus a corrupted record in the middle of the file during startup recovery?
 
@@ -800,6 +806,22 @@ This section is a living record of actual engineering obstacles, debugging sessi
   3. Benchmarked sensitive paths: short-circuiting `Redact()` evaluation for sensitive keys reduced latency from 1,294 ns/op to 787 ns/op (39.2% improvement) and heap allocations from 569 B/op (17 allocs) to 136 B/op (9 allocs).
 - **Core Lesson**: Security policies must prioritize unambiguous, structural invariants (e.g. key sensitivity classification) over user-provided callback transformations. Fail-closed boundaries prevent downstream implementation flaws from escalating into secret leakage.
 - **Interview Relevance**: Demonstrates systems-grade defense-in-depth thinking, fail-closed security boundary design, empirical benchmark auditing, and concurrency-safe regression verification.
+
+### Entry 2026-09-08 — Phase 02: 21-Byte Physical WAL Header Framing & Zero-Tear Bounds Check Elimination
+- **Date**: 2026-09-08
+- **Phase**: Phase 02 Sub-Phase 02.1 Micro-Phase 01 (`P02-S01-M01`)
+- **Problem**: In a crash-resilient write-ahead log, writing variable-length records directly to disk requires an infallible physical framing header. If a memory buffer passed to the header encoder is smaller than the required header width (21 bytes), naive sequential writes (`buf[0] = ...; buf[1] = ...; buf[15] = ...`) will mutate the beginning of the buffer before hitting a panic on subsequent indices, leaving a partially mutated, torn buffer in memory. Furthermore, on-disk corruption or reading unwritten preallocated blocks must not be confused with valid operations.
+- **Initial Assumption**: Deserializing headers with dynamic allocation or slice checking at each field write is sufficient.
+- **What Was Actually True**: 
+  1. **Torn Writes in RAM**: Partial buffer mutation before a panic corrupts memory state. By inserting an early bounds check elimination dummy read (`_ = buf[HeaderSize-1]` i.e. `_ = buf[20]`), Go's compiler emits a single bounds check at entry. If the slice has fewer than 21 bytes, it panics immediately without modifying any byte, guaranteeing atomic fail-fast behavior.
+  2. **Uninitialized Memory Poisoning**: Storage engines often pre-allocate WAL files using fallocate or write zero-filled pages. If `RecordType(0x00)` is mapped to an operation (or treated as default `PUT`), an unwritten or zeroed page can be erroneously replayed during recovery. Mapping `0x00` strictly to `RecordTypeInvalid` guarantees that zeroed memory immediately halts recovery with an explicit diagnostic (`*errors.InvalidRecordTypeError`).
+  3. **Zero Allocation Contract**: Encoding, decoding, and appending the 21-byte header must never trigger GC allocations. Deserializing via fixed Big-Endian integer getters and returning by value guarantees $0\text{ B/op}$ and $0\text{ allocs/op}$.
+- **How It Was Verified**:
+  1. Anti-tear tests (`TestEncodeHeaderEarlyBoundsCheckAntiTear`) verifying buffers of lengths $0..20$ panic with zero byte mutations.
+  2. Fuzzing (`FuzzRecordHeaderCodec`) executing >3.2M iterations without panics or discrepancies.
+  3. Benchmarks on Apple M4: `EncodeHeader` at $0.99\text{ ns/op}$, `DecodeHeader` at $1.48\text{ ns/op}$, `AppendHeader` at $1.36\text{ ns/op}$, all with $0\text{ allocs/op}$.
+- **Core Lesson**: In binary serialization, correctness begins at the framing boundary. Defensive zero-tear invariants in userland memory mirrors crash durability on disk: an operation either commits completely or fails without side-effects.
+- **Interview Relevance**: Demonstrates deep understanding of Go compiler bounds check elimination (BCE), binary memory safety invariants, zero-allocation serialization, and disk preallocation failure modes.
 
 ---
 

@@ -53,6 +53,14 @@ var (
 	// ErrInternalKeyTruncated indicates that an encoded internal key byte sequence
 	// is shorter than the minimum required size (user key + 9-byte sequence/op trailer).
 	ErrInternalKeyTruncated = stdErrors.New("internal key buffer truncated: missing trailer or user key")
+
+	// ErrHeaderTruncated indicates that a buffer provided to decode a WAL record header
+	// is shorter than the required 21 bytes.
+	ErrHeaderTruncated = stdErrors.New("wal record header truncated: buffer smaller than 21 bytes")
+
+	// ErrInvalidRecordType indicates that a WAL record type byte does not correspond
+	// to any recognized record type (PUT, DELETE, BATCH_START, BATCH_COMMIT).
+	ErrInvalidRecordType = stdErrors.New("invalid wal record type")
 )
 
 // KeyTooLargeError provides structured context when a key violates maximum size limits.
@@ -173,4 +181,22 @@ func (e *SeqNumOverflowError) Error() string {
 // Is reports whether this error matches target sentinel ErrSeqNumOverflow.
 func (e *SeqNumOverflowError) Is(target error) bool {
 	return target == ErrSeqNumOverflow
+}
+
+// InvalidRecordTypeError provides structured context when an unrecognized WAL record type byte is encountered.
+// It matches ErrInvalidRecordType when interrogated with errors.Is().
+type InvalidRecordTypeError struct {
+	Type byte
+}
+
+func (e *InvalidRecordTypeError) Error() string {
+	if e == nil {
+		return ErrInvalidRecordType.Error()
+	}
+	return fmt.Sprintf("invalid wal record type: 0x%02x", e.Type)
+}
+
+// Is reports whether this error matches target sentinel ErrInvalidRecordType.
+func (e *InvalidRecordTypeError) Is(target error) bool {
+	return target == ErrInvalidRecordType
 }

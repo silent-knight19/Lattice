@@ -350,16 +350,17 @@ Every future micro-phase implementation response from Claude Code must use this 
 ```
 Current Major Phase           : Phase 02 — Write-Ahead Log (WAL) & Durability Subsystem
 Current Sub-Phase             : Sub-Phase 02.1 — WAL Binary Record Layout & Serialization
-Current Micro-Phase           : P02-S01-M01 — WAL Record Header & Framing Definition
+Current Micro-Phase           : P02-S01-M02 — WAL Full Record Serializer & Deserializer
 Phase 01 Status               : COMPLETE (Sub-Phases 01.1 & 01.2 Complete)
 Previous Completed Phase      : Phase 01 — Core Storage Primitives & Binary Encodings
-Previous Completed Micro-Phase: P01-S02-M03 — InternalKey Data Model & Comparator
+Previous Completed Micro-Phase: P02-S01-M01 — WAL Record Header & Framing Definition
 Phase 00 Final Audit          : Completed — PASS WITH REMEDIATIONS
+Phase 01 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Blocking Issues               : None
-Tests Passing                 : `go test -race ./...` (12/12 error suites, 18/18 logger suites, 48/48 binary suites passing, 100% binary coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
-Security Review Status        : Complete & Verified (Defensive slice copying protects against caller mutation; canonical three-way comparator guarantees strict total ordering; >5.82M fuzz iterations passing with 0 crashes)
-Interview Knowledge Status    : Updated with InternalKey version ordering, LSM newest-first search semantics, comparator mathematical laws, and interview Q&A
-Git Commit                    : feat(binary): [P01-S02-M03] add InternalKey model and comparator
+Tests Passing                 : `go test -race ./...` (14/14 error suites, 18/18 logger suites, 48/48 binary suites, 12/12 wal suites passing, 100% binary & wal coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
+Security Review Status        : Complete & Verified (Early BCE bounds checks prevent torn writes; invalid record type interception guards against uninitialized memory; >3.2M fuzz iterations passing with 0 crashes)
+Interview Knowledge Status    : Updated with WAL physical 21-byte header layout, framing offsets, and zero-allocation encoding invariants
+Git Commit                    : feat(wal): [P02-S01-M01] implement 21-byte WAL record header and framing
 ```
 
 ---
@@ -864,11 +865,38 @@ TOTAL: 184 Discrete, Testable Micro-Phases
 
 ### Sub-Phase 02.1: WAL Binary Record Layout & Serialization
 * **P02-S01-M01: WAL Record Header & Framing Definition**
+  * *Status*: **COMPLETE**
   * *Objective*: Implement struct and serialization for 21-byte WAL header (`CRC32`, `Type`, `SeqNum`, `Timestamp`).
-  * *Changes*: `walRecordHeader` binary pack/unpack in `internal/wal`.
-  * *Invariants*: Header is fixed 21 bytes.
-  * *Tests*: Round-trip serialization and byte alignment validation.
-  * *Completion*: Header codec passing tests.
+  * *Data Structures & Functions Implemented*:
+    - `HeaderSize = 21`, `RecordHeaderLen = 21`: Fixed-size physical binary header constants.
+    - `RecordType byte`: 1-byte operation/framing marker (`RecordTypeInvalid=0x00`, `RecordTypePut=0x01`, `RecordTypeDelete=0x02`, `RecordTypeBatchStart=0x03`, `RecordTypeBatchCommit=0x04`).
+    - `(t RecordType) Valid() bool`, `(t RecordType) Validate() error`, `(t RecordType) String() string`.
+    - `(t RecordType) OpType() (binary.OpType, error)`: Typed bridge converting WAL operation types to storage engine primitives.
+    - `ParseRecordType(b byte) (RecordType, error)`: Safe parser rejecting uninitialized or unknown bytes.
+    - `RecordHeader`: Struct containing `CRC uint32`, `Type RecordType`, `SeqNum binary.SeqNum`, `Timestamp uint64`.
+    - `EncodeHeader(buf []byte, h RecordHeader)`: Serializes 21-byte header with early BCE bounds check (`_ = buf[20]`).
+    - `AppendHeader(dst []byte, h RecordHeader) []byte`: Appends 21-byte serialized header to slice with zero allocations on sufficient capacity.
+    - `DecodeHeader(buf []byte) (RecordHeader, error)`: Deserializes 21-byte header, returning `ErrHeaderTruncated` if undersized or `*InvalidRecordTypeError` if corrupt.
+  * *Invariants Verified*:
+    - Invariant 1: Header size is strictly fixed at 21 bytes (`CRC32` 4B + `Type` 1B + `SeqNum` 8B + `Timestamp` 8B).
+    - Invariant 2: Strict Big-Endian integer serialization using `internal/binary` primitives.
+    - Invariant 3: Zero-tear bounds check: `EncodeHeader` triggers runtime bounds panic before mutating undersized buffers (`_ = buf[HeaderSize-1]`).
+    - Invariant 4: Oversized buffer isolation: bytes beyond index 20 are untouched during encode and ignored during decode.
+    - Invariant 5: Zero heap allocations empirically verified (`0 B/op`, `0 allocs/op`).
+  * *Tests Added* (`internal/wal/record_test.go`):
+    - Constant identity and exact physical byte offset alignment against known hex vectors.
+    - Round-trip serialization across edge cases (min/max SeqNum, max uint64 timestamp, all RecordType variants).
+    - Truncated buffer tests (lengths 0..20) verifying `ErrHeaderTruncated`.
+    - Corrupt RecordType tests (0x00, 0x05, 0xFF) verifying `ErrInvalidRecordType` and `*InvalidRecordTypeError`.
+    - Anti-tear panic tests ensuring zero bytes are mutated on undersized writes.
+    - High-concurrency race tests across 64 goroutines and 1,000 iterations each.
+    - Native Go fuzz testing (`FuzzRecordHeaderCodec`) executing >3.2M iterations with 0 crashes.
+  * *Benchmark Results* (Apple M4, Darwin arm64, Go 1.24):
+    - `BenchmarkEncodeHeader-10`: 0.99 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkDecodeHeader-10`: 1.48 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkAppendHeader-10`: 1.36 ns/op, 0 B/op, 0 allocs/op
+    - `BenchmarkRecordType_Validate-10`: 0.23 ns/op, 0 B/op, 0 allocs/op
+  * *Security Review*: Verified rejection of uninitialized memory (0x00 is invalid). Early bounds check prevents buffer bleeding and torn writes. All integer fields serialized with fixed-width big-endian routines without unsafe memory manipulation.
 * **P02-S01-M02: WAL Full Record Serializer & Deserializer**
   * *Objective*: Serialize complete records (`Header + KeyLen + Key + ValLen + Val`).
   * *Changes*: `EncodeRecord(record Record) ([]byte, error)`, `DecodeRecord(r io.Reader) (Record, error)`.

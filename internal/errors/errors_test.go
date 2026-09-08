@@ -296,6 +296,7 @@ func TestNilReceiverTypedErrors(t *testing.T) {
 	var tw *errors.TornWriteError
 	var op *errors.InvalidOpTypeError
 	var seq *errors.SeqNumOverflowError
+	var recType *errors.InvalidRecordTypeError
 
 	// Ensure calling Error() on nil typed pointers does not panic and returns sentinel strings
 	if k.Error() != errors.ErrKeyTooLarge.Error() {
@@ -315,6 +316,9 @@ func TestNilReceiverTypedErrors(t *testing.T) {
 	}
 	if seq.Error() != errors.ErrSeqNumOverflow.Error() {
 		t.Errorf("expected %q, got %q", errors.ErrSeqNumOverflow.Error(), seq.Error())
+	}
+	if recType.Error() != errors.ErrInvalidRecordType.Error() {
+		t.Errorf("expected %q, got %q", errors.ErrInvalidRecordType.Error(), recType.Error())
 	}
 
 	// Ensure calling Is() on nil typed pointers matches corresponding sentinels
@@ -336,6 +340,9 @@ func TestNilReceiverTypedErrors(t *testing.T) {
 	if !seq.Is(errors.ErrSeqNumOverflow) {
 		t.Errorf("nil *SeqNumOverflowError must match ErrSeqNumOverflow via Is()")
 	}
+	if !recType.Is(errors.ErrInvalidRecordType) {
+		t.Errorf("nil *InvalidRecordTypeError must match ErrInvalidRecordType via Is()")
+	}
 }
 
 func TestInterfaceWrappedTypedNilErrors(t *testing.T) {
@@ -351,6 +358,7 @@ func TestInterfaceWrappedTypedNilErrors(t *testing.T) {
 		{"TornWriteError", (*errors.TornWriteError)(nil), errors.ErrTornWrite},
 		{"InvalidOpTypeError", (*errors.InvalidOpTypeError)(nil), errors.ErrInvalidOpType},
 		{"SeqNumOverflowError", (*errors.SeqNumOverflowError)(nil), errors.ErrSeqNumOverflow},
+		{"InvalidRecordTypeError", (*errors.InvalidRecordTypeError)(nil), errors.ErrInvalidRecordType},
 	}
 
 	for _, tc := range typedNils {
@@ -444,6 +452,62 @@ func TestSeqNumOverflowError(t *testing.T) {
 	// Error string formatting
 	msg := typedErr.Error()
 	if !strings.Contains(msg, "18446744073709551615") {
+		t.Errorf("unexpected error message: %q", msg)
+	}
+}
+
+func TestHeaderTruncatedSentinel(t *testing.T) {
+	if errors.ErrHeaderTruncated == nil {
+		t.Fatalf("ErrHeaderTruncated must not be nil")
+	}
+
+	wrapped := fmt.Errorf("wal decode header: %w", errors.ErrHeaderTruncated)
+	if !stdErrors.Is(wrapped, errors.ErrHeaderTruncated) {
+		t.Errorf("wrapped ErrHeaderTruncated must match via errors.Is")
+	}
+
+	if stdErrors.Is(errors.ErrHeaderTruncated, errors.ErrInternalKeyTruncated) {
+		t.Errorf("ErrHeaderTruncated must not match ErrInternalKeyTruncated")
+	}
+
+	if !strings.Contains(errors.ErrHeaderTruncated.Error(), "header truncated") {
+		t.Errorf("unexpected error message: %q", errors.ErrHeaderTruncated.Error())
+	}
+}
+
+func TestInvalidRecordTypeError(t *testing.T) {
+	typedErr := &errors.InvalidRecordTypeError{
+		Type: 0x99,
+	}
+
+	// Must match sentinel via errors.Is
+	if !stdErrors.Is(typedErr, errors.ErrInvalidRecordType) {
+		t.Errorf("InvalidRecordTypeError must match ErrInvalidRecordType via errors.Is")
+	}
+
+	// Negative match against other sentinels
+	if stdErrors.Is(typedErr, errors.ErrInvalidOpType) {
+		t.Errorf("InvalidRecordTypeError must not match ErrInvalidOpType")
+	}
+
+	// Wrapped match via errors.Is
+	wrapped := fmt.Errorf("wal decode header: %w", typedErr)
+	if !stdErrors.Is(wrapped, errors.ErrInvalidRecordType) {
+		t.Errorf("wrapped InvalidRecordTypeError must match ErrInvalidRecordType via errors.Is")
+	}
+
+	// Extraction via errors.As
+	var extracted *errors.InvalidRecordTypeError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("errors.As failed to extract *InvalidRecordTypeError")
+	}
+	if extracted.Type != 0x99 {
+		t.Errorf("extracted Type mismatch: got 0x%02x, expected 0x99", extracted.Type)
+	}
+
+	// Error string formatting
+	msg := typedErr.Error()
+	if !strings.Contains(msg, "0x99") {
 		t.Errorf("unexpected error message: %q", msg)
 	}
 }
