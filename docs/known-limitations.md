@@ -156,4 +156,18 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 11. Single-Segment Recovery Assumes Quiescent Segment Access
+* **Limitation**: `RecoverSegment` assumes the target WAL segment file is quiescent and not being concurrently appended to by an active `WALWriter`.
+* **Why It Exists**: `P02-S03-M01` implements single-segment torn-tail detection and in-place truncation. Concurrent writes during recovery could cause race conditions where in-flight writes are misidentified as torn tails or truncated during append.
+* **Impact**: Recovery must be executed during startup prior to writer initialization, or against an inactive/sealed segment.
+* **How It Was Detected**: Recovery concurrency and lifecycle modeling.
+* **Current Mitigation**: Documented architectural invariant; engine startup sequence executes segment recovery before active writers are spawned.
+* **Future Solution**: Sub-Phase 02.3 M02/M03 segment rotation and engine startup coordinator manage writer lifecycle and ensure segment quiescence before recovery execution.
+* **Dimensional Impact**:
+  * Correctness: **High if violated** (Caller must guarantee segment quiescence during recovery).
+  * Performance: **Optimal** (No locking overhead during offline recovery).
+  * Scalability: **None**.
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*

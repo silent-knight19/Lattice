@@ -366,7 +366,19 @@
 * **Reader Concurrency Ownership**:
   - `WALReader` is intentionally **NOT safe for concurrent use**.
   - A sequential log reader represents a forward-only traversal state. If concurrent goroutines invoked `Next()` simultaneously, read chunks would interleave, destroying stream framing and corrupting offset accounting.
-  - Lattice enforces a single-consumer model per reader: recovery or replication creates dedicated sequential readers.
+* **Torn-Tail Detection vs. Middle Corruption Invariant**:
+  - In a Write-Ahead Log, incomplete records at EOF are natural crash artifacts: a power outage or kernel panic can interrupt a `write(2)` syscall while bytes are in flight, leaving a partial record (1..20 header bytes, partial key/val lengths or payloads). Because the append was never acknowledged as synchronized (`Strict Sync` invariant), safely discarding this uncommitted suffix during startup recovery restores the log to the last durable transaction.
+  - In contrast, corruption in the middle of a log (or a complete record with a bad CRC / invalid type byte) cannot be attributed to an interrupted append. It indicates storage media degradation (bit rot), hardware controller bugs, or hostile tampering. Skipping or repairing middle corruption would violate database linearizability, introduce sequence gaps, and replay corrupted state. The recovery primitive must fail closed.
+* **Why a Complete Corrupt Record at EOF is NOT a Torn Tail**:
+  - If a file contains a complete record whose bytes match declared lengths, but fails CRC32 verification, it is NOT an incomplete write. The disk subsystem stored all requested bytes, but the data itself is corrupted. Automatically truncating complete corrupted records at EOF would risk destroying acknowledged user transactions that suffered bit-rot. Recovery must halt and report `ErrChecksumMismatch`.
+* **Verified Open Descriptor Truncation vs. Path Reopening**:
+  - Safe recovery requires opening the file descriptor once in `os.O_RDWR` mode, verifying the inode via `os.SameFile`, scanning the records through that descriptor, and truncating that exact descriptor via `f.Truncate(validOffset)`. Reopening the path after scanning introduces a TOCTOU file-swap vulnerability where an attacker or concurrent process replaces the target file between scan and truncate.
+* **Why `O_TRUNC` is Strictly Prohibited During Recovery Initialization**:
+  - `os.O_TRUNC` zeroes the file immediately upon opening, destroying all historical records before any scan can take place. Recovery must open with `os.O_RDWR` without `O_TRUNC` or `O_CREATE`.
+* **Post-Condition Verification (Invariant 9)**:
+  - Truncation is not complete merely because `f.Truncate()` returned nil. The recovery engine flushes metadata via `f.Sync()`, confirms the physical size matches the expected valid offset via `f.Stat()`, rewinds the descriptor, and verifies that all valid records decode cleanly to `io.EOF`.
+* **Quiescent Segment Assumption & Concurrency Boundaries**:
+  - Recovery assumes the segment is quiescent (no concurrent writers). Running recovery concurrently with an active writer would cause race conditions between appending and truncating.
 
 ### Subsystem Interview Questions
 * **Basic**: Why does a database need a Write-Ahead Log?
@@ -394,12 +406,20 @@
 * **Deep**: How do `DecodeRecord` and `WALReader` divide responsibilities between framing decoding and file lifecycle management?
 * **Deep**: What are the concurrency ownership semantics of `WALReader`, and why is `Next()` intentionally not thread-safe?
 * **Deep**: How does the deterministic offset and error reporting of `WALReader` prepare the database engine for startup crash recovery?
+* **Deep**: Why can a torn WAL tail at EOF be safely truncated, but corruption in the middle of the log cannot?
+* **Deep**: Why is a complete record with a bad CRC at EOF NOT treated as an automatically recoverable torn tail?
+* **Deep**: Why does Lattice perform recovery through a verified open file descriptor rather than scanning with a reader and reopening the path for truncation?
+* **Deep**: Why is `os.O_TRUNC` strictly prohibited when opening a WAL segment for recovery?
+* **Deep**: What does Invariant 9 ("Success Means Post-Condition Verified") require after `f.Truncate()` executes?
+* **Deep**: What happens if `f.Truncate()` succeeds but the subsequent `f.Sync()` fails during recovery?
+* **Deep**: What concurrency assumptions does `RecoverSegment` make regarding active `WALWriter` instances?
 * **Follow-up**: How do you prevent group commit queues from consuming unbounded RAM if the disk becomes completely saturated?
 * **"Did You Actually Build This?"**: How do you distinguish between an uncompleted torn write at the tail of the WAL versus a corrupted record in the middle of the file during startup recovery?
 * **"Did You Actually Build This?"**: How do you handle readers that return fewer bytes than requested without an error (short reads) or readers that return data and io.EOF in the same call?
 * **"Did You Actually Build This?"**: Walk me through how you proved your WAL checksum integrity across every field. Did you test single-bit flips, and what happens if you mutate the CRC field itself?
 * **"Did You Actually Build This?"**: What happens if two goroutines call WAL directory initialization at the exact same millisecond when the directory does not yet exist? Does it require a mutex?
 * **"Did You Actually Build This?"**: When reading a WAL file, what happens to the reader's offset if a record has a checksum mismatch? Does the offset advance past the corrupted record?
+* **"Did You Actually Build This?"**: If a WAL segment ends with 7 bytes of an incomplete header, how does recovery identify the truncation boundary and verify that the remaining prefix is readable?
 
 ---
 
@@ -1077,9 +1097,39 @@ This section is a living record of actual engineering obstacles, debugging sessi
   15. `TestReader_OffsetAccounting`: Proved cumulative encoded lengths exactly equal final reader offset without drift.
   16. `TestReader_LargeRecordStream`: 1,000 sequential records decoded in order with final offset equal to file size.
   17. `TestReader_TornTailIsolation`: Verified partial record at EOF does not mutate or truncate the underlying file.
-  18. `TestReader_MiddleCorruptionIsolation`: Verified middle corruption leaves the file intact.
 - **Core Lesson**: A log reader is a sensor and classifier, not an actuator. Decouple stream reading from disaster recovery decisions, preserve error identities strictly, advance positions only upon complete validation, and track exact byte offsets to empower higher-level recovery subsystems.
 - **Interview Relevance**: Demonstrates mastery of streaming binary deserialization, failure classification (clean EOF vs torn tail vs middle corruption), non-destructive reader design, descriptor security and inode pinning, memory-bounded I/O, and clean separation between log consumption and crash recovery.
+
+### Entry 2026-09-08 — Phase 02: Safe Torn-Tail Truncation, Descriptor-Based Inode Pinning & Middle Corruption Fail-Closed Boundary
+- **Date**: 2026-09-08
+- **Phase**: Phase 02 Sub-Phase 02.3 Micro-Phase 01 (`P02-S03-M01`)
+- **Problem**: When a database crashes or loses power mid-append, an incomplete record (torn tail) remains at the physical end of the WAL file. During startup recovery, the engine must safely truncate this uncommitted suffix back to the last valid record boundary. However, naive recovery implementations suffer from four major hazards: (1) misclassifying middle bit-rot as a torn tail and deleting valid history; (2) automatically truncating complete records that happen to have bad CRCs at EOF, risking loss of committed transactions; (3) reopening the file by pathname after scanning, opening a dangerous TOCTOU file-swap window; and (4) assuming `Truncate()` success without verifying that the truncated prefix remains readable.
+- **Initial Assumption**: `RecoverSegment` could scan using `WALReader`, close it, and then call `os.Truncate(path, offset)`.
+- **What Was Actually True**:
+  1. **Single Verified Descriptor Mutation**: Reopening by pathname after scanning introduces a TOCTOU race where an external process or attacker can replace the file with another inode or symlink. `RecoverSegment` opens the descriptor once in `os.O_RDWR` mode, pins the inode using `os.SameFile`, scans records sequentially through the open descriptor, truncates that same descriptor via `f.Truncate(validOffset)`, flushes via `f.Sync()`, and verifies post-conditions before closing.
+  2. **Torn Tails vs. Complete Corrupt Records**: Truncation is permissible ONLY when the file terminates before a record could be fully read (`ErrHeaderTruncated` or `io.ErrUnexpectedEOF`). If all bytes of a record are present on disk but the record fails CRC32 verification or contains an invalid type byte, the record is NOT an incomplete append. It is corrupted data, and recovery must fail closed without file mutation.
+  3. **Middle Corruption Fails Closed**: If corruption occurs anywhere prior to EOF (in sequence $A \to B \to C$), recovery halts immediately on $B$, refuses to truncate, and never scans forward to $C$, preventing out-of-order replay or state divergence.
+  4. **Post-Condition Verification (Invariant 9)**: `RecoverSegment` does not return `nil` merely because `f.Truncate()` succeeded. It executes `f.Sync()`, verifies via `f.Stat()` that `file.Size() == validOffset`, rewinds to offset 0, and verifies that all valid records decode cleanly and terminate at `io.EOF`.
+  5. **Clean EOF Immutability**: Clean files ending at exact record boundaries (or 0-byte files) are never mutated or synchronized (`Truncated: false`).
+- **How It Was Verified**:
+  1. `TestRecovery_EmptyFile`: 0-byte file returns clean success with 0 valid records, 0 offset, and `Truncated: false`.
+  2. `TestRecovery_OneValidRecord` & `TestRecovery_ManyValidRecords`: Preserves all valid records byte-for-byte with `Truncated: false`.
+  3. `TestRecovery_CleanEOFAfterMaxSizedRecord`: Max key (65 KB) and max value (1 MB) verified without false torn-tail classification.
+  4. `TestRecovery_OneByteTail`: 1 extra byte at EOF cleanly truncated to valid boundary.
+  5. `TestRecovery_EveryHeaderPrefixLength1To20`: Exhaustively verified header prefixes 1..20 bytes; all cleanly truncated to valid prefix.
+  6. `TestRecovery_TruncatedKey`, `TestRecovery_TruncatedValue`, `TestRecovery_TruncatedKeyLengthField`, `TestRecovery_TruncatedValueLengthField`: Verified truncation across all record framing components.
+  7. `TestRecovery_CompleteChecksumCorruptedRecordAtEOF`: Complete record with bad CRC at EOF returns `ErrChecksumMismatch` and leaves file untouched.
+  8. `TestRecovery_CompleteInvalidRecordTypeAtEOF`: Complete header with bad type at EOF returns `ErrInvalidRecordType` and leaves file untouched.
+  9. `TestRecovery_MiddleChecksumCorruption` & `TestRecovery_MiddleStructuralCorruption`: Verified fail-closed halt without file mutation.
+  10. `TestRecovery_ValidPrefixImmutability`: Proved SHA256 of valid prefix remains 100% identical before and after recovery.
+  11. `TestRecovery_TruncationSizeExactness`: Proved file size matches valid offset exactly.
+  12. `TestRecovery_RecoveryIdempotence` & `TestRecovery_CleanFileIdempotence`: Verified repeatable idempotent executions.
+  13. `TestRecovery_ReadabilityAfterRecovery`: Verified all recovered records stream cleanly to `io.EOF` via `WALReader`.
+  14. `TestRecovery_LargePrefix`: 500 records + torn tail truncated back to 500 records with exact size match.
+  15. `TestRecovery_RandomizedTailLengths`: 20 deterministic seeded iterations with random truncation points verified.
+  16. `TestRecovery_TruncateFailureSeam` & `TestRecovery_SyncFailureSeam`: Injected faults verified to fail safely without false success.
+- **Core Lesson**: Crash recovery is an irreversible physical filesystem mutation. Never truncate based on pathname after scanning; pin inodes on an open descriptor, strictly distinguish incomplete writes at EOF from complete corrupted records, verify post-conditions by reading back the truncated log, and fail closed on any middle corruption.
+- **Interview Relevance**: Demonstrates mastery of database crash recovery, physical log truncation, TOCTOU mitigation during file mutation, descriptor-based inode pinning, post-condition verification theory, and the precise failure boundaries between partial writes and data corruption.
 
 ---
 

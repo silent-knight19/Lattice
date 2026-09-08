@@ -350,17 +350,17 @@ Every future micro-phase implementation response from Claude Code must use this 
 ```
 Current Major Phase           : Phase 02 — Write-Ahead Log (WAL) & Durability Subsystem
 Current Sub-Phase             : Sub-Phase 02.3 — Torn Write Handling & Log Rotation
-Current Micro-Phase           : P02-S03-M01 — Torn Tail Write Detection & Safe Truncation
+Current Micro-Phase           : P02-S03-M02 — WAL Segment Rotation & Pre-allocation
 Phase 01 Status               : COMPLETE (Sub-Phases 01.1 & 01.2 Complete)
 Previous Completed Phase      : Phase 01 — Core Storage Primitives & Binary Encodings
-Previous Completed Micro-Phase: P02-S02-M03 — Sequential WAL Reader & Log Iterator
+Previous Completed Micro-Phase: P02-S03-M01 — Torn Tail Write Detection & Safe Truncation
 Phase 00 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Phase 01 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Blocking Issues               : None
-Tests Passing                 : `go test -race ./...` (19/19 error suites, 18/18 logger suites, 48/48 binary suites, 105/105 wal suites passing, 91.8% wal coverage, 100% binary & errors coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
-Security Review Status        : Complete & Verified (Read-only O_RDONLY enforcement, no file mutation/truncation, symlink rejection via os.Lstat, inode pinning via os.SameFile, directory/non-regular file rejection, memory bounded streaming, clean EOF vs torn tail distinction, checksum mismatch preservation)
-Interview Knowledge Status    : Updated with clean EOF vs torn tail, middle corruption vs tail truncation, reader-decoder separation of concerns, offset accounting, single-consumer concurrency model, recovery boundary, and engineering log
-Git Commit                    : feat(wal): [P02-S02-M03] add sequential WAL reader and iterator
+Tests Passing                 : `go test -race ./...` (19/19 error suites, 18/18 logger suites, 48/48 binary suites, 138/138 wal suites passing, 89.7% wal coverage, 100% binary & errors coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
+Security Review Status        : Complete & Verified (Single-descriptor in-place truncation, O_RDWR without O_CREATE/O_TRUNC, inode pinning via os.SameFile, symlink and directory rejection, post-condition verification via rewind and replay, middle corruption fail-closed, complete corrupt record at EOF fail-closed)
+Interview Knowledge Status    : Updated with torn-tail vs middle corruption, complete corrupt records vs partial writes, verified open descriptor truncation vs path reopening, post-condition verification, and engineering log
+Git Commit                    : feat(wal): [P02-S03-M01] add torn-tail recovery and safe truncation
 ```
 
 ---
@@ -1034,11 +1034,15 @@ TOTAL: 184 Discrete, Testable Micro-Phases
 
 ### Sub-Phase 02.3: Torn Write Handling & Log Rotation
 * **P02-S03-M01: Torn Tail Write Detection & Safe Truncation**
-  * *Objective*: Implement recovery logic that detects partial writes at the end of the file and truncates them.
-  * *Changes*: `WALReader.RecoverAndTruncate() error`.
-  * *Invariants*: Mid-log corruption returns fatal error; EOF partial write truncates cleanly.
-  * *Tests*: Append partial record bytes to EOF; verify reader truncates and recovers preceding valid records.
-  * *Completion*: Torn write test passing.
+  * *Objective*: Implement the WAL recovery primitive that detects incomplete/torn records at the end of a segment and safely truncates the segment in-place to the last valid record boundary.
+  * *Changes*: `internal/wal/recovery.go` implementing `RecoveryResult`, `RecoverSegment()`, `RecoverSegmentByID()`, and `recoverSegmentWithSeams()`; `internal/wal/export_test.go` exposing test seams; `internal/wal/recovery_test.go` implementing 33 comprehensive test suites.
+  * *Invariants*: Quiescent segment assumption (target segment is not actively being written to); valid prefix preservation (all complete valid records are preserved); clean EOF requires no mutation (`Truncated: false`); complete corrupt records (checksum mismatch or invalid type) fail closed without truncation; middle corruption fails closed without skipping; truncation size exactness; single-descriptor in-place mutation and inode pinning via `os.SameFile`; post-condition verified before return (size check + rewind replay to `io.EOF`).
+  * *Evidence*:
+    - **Design Target**: Deterministic torn-tail recovery primitive that classifies EOF partial writes, truncates only the uncommitted tail, and refuses to silently repair or skip middle corruption.
+    - **Theoretical Property**: If every record in prefix $P$ is complete and checksum-valid, and the record at $P$ is incomplete due to premature EOF (`ErrHeaderTruncated` or `io.ErrUnexpectedEOF`), truncating the physical file to $\text{len}(P)$ and flushing via `f.Sync()` leaves the file containing exactly $P$ terminating at clean `io.EOF`.
+    - **Measured Result**: 33 test suites passing; 0-byte file preserved; 1..20 byte headers truncated back; partial key/value lengths/payloads truncated back; complete bad CRC at EOF rejected without truncation; complete invalid type at EOF rejected without truncation; middle corruption halted without truncation; valid prefix SHA256 immutability proved; 500-record prefix with torn tail cleanly truncated; randomized seeded truncation tests verified; 0 data races; `golangci-lint` clean (0 issues).
+    - **Observed Limitation**: Recovery assumes the target segment is quiescent (not concurrently appended to by a `WALWriter`); multi-segment recovery is deferred to engine startup orchestration (`P02-S03-M03`).
+  * *Completion*: Complete and verified across all unit, corruption, boundary matrix, and lifecycle test suites.
 * **P02-S03-M02: WAL Segment Rotation & Pre-allocation**
   * *Objective*: Rotate WAL file when size exceeds 64MB; pre-allocate via `fallocate()`.
   * *Changes*: `WALWriter.Rotate() (*WALSegment, error)`.
