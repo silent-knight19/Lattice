@@ -1220,6 +1220,25 @@ This section is a living record of actual engineering obstacles, debugging sessi
 - **Core Lesson**: Crash recovery is an orchestration across discrete physical logs and in-memory state machines. Never mutate files based on assumptions; inspect and verify historical sealed logs first, limit physical truncation strictly to the latest unsealed active segment, fail closed on gaps or corruptions, validate sequence monotonicity in physical log order without sorting in memory, and separate physical on-disk repair from logical replay.
 - **Interview Relevance**: Demonstrates deep mastery of database crash recovery architectures (ARIES principles, LSM log replay, fail-closed durability boundaries, idempotent truncation, TOCTOU mitigation, and streaming pipeline design).
 
+### Micro-Phase P02-S04-M01: Group Commit Queue & Write Task Types (Completed: 2026-09-08)
+- **Problem**: In high-throughput storage engines, executing an independent `fdatasync()` per write limits throughput to hardware flash IOPS (~1,000–5,000 IOPS). Group commit coalesces writes from concurrent callers into a single batch, synchronizing them with a single `fdatasync()`. However, before introducing the leader election or background execution loop, the engine requires a formal task representation and queue boundary that preserves strict durability semantics, protects against slice aliasing, provides bounded memory backpressure, and guarantees deterministic lifecycle transitions.
+- **Architectural Solution**:
+  1. `WriteTask`: Represents a single caller's write. Holds a defensively copied `Record` (independent `Key` and `Value` byte slices), an atomic `enqueued` flag, a completion channel (`done chan struct{}`), and an error field protected by `sync.RWMutex`.
+  2. Strict Durability Invariant: A task is NOT complete when enqueued or written to page cache; it is complete ONLY when the physical WAL segment synchronizes to non-volatile storage. Waiters block on `task.Wait()` or `task.WaitContext(ctx)`.
+  3. `WriteQueue` (`GroupCommitQueue`): A bounded circular ring buffer with positive capacity (`DefaultQueueCapacity = 1024`), guarded by `sync.Mutex` and dual condition variables (`notEmpty`, `notFull`). Provides blocking `Enqueue`/`Dequeue` and non-blocking `TryEnqueue`/`TryDequeue`.
+  4. Graceful & Fail-Safe Shutdown: `Close()` allows existing queued tasks to be drained by consumers while rejecting new writes with `ErrQueueClosed`. `CloseWithError(err)` terminates immediately, draining all queued tasks and completing each waiter with `err`, eliminating goroutine leakage and hung waiters.
+  5. Idempotent Completion: `task.Complete(err)` closes `done` exactly once; subsequent invocations return `ErrTaskAlreadyCompleted` without overwriting the original durability error.
+- **Key Invariants Enforced**:
+  - Durability Barrier: Task completion strictly corresponds to the post-sync barrier.
+  - Payload Immutability: Mutating caller slices after `NewWriteTask` has zero effect on the task.
+  - FIFO Ordering: Queued writes are dequeued in strict submission order.
+  - Exactly-Once Enqueue & Dequeue: An enqueued task cannot be re-enqueued; ring buffer slots are zeroed on dequeue to prevent GC leaks.
+  - Bounded Memory: Queue rejects non-positive capacities and applies backpressure when full.
+- **Test Matrix & Verification**:
+  - 17 test suites covering 24 scenarios: task creation, multiple tasks, record validity, payload immutability against caller mutation, success completion, failure completion with exact error preservation, second completion rejection, FIFO ordering, empty queue non-blocking/blocking behavior, bounded capacity backpressure and overflow, enqueue after close, graceful queue drain, `CloseWithError` no-task-starvation, concurrent multi-producers with backpressure, concurrent producers and consumer under `-race`, concurrent close and enqueue race, large payload (4 MiB boundary) and 4 MiB+1 rejection, zero/nil payloads (DELETE tombstones, BATCH markers), invalid record rejection at task creation, sequence metadata preservation, deterministic repeated runs, adversarial zero-value tasks/queues, and `WaitContext` cancellation.
+- **Core Lesson**: Never confuse queue submission or memory caching with durability. In group commit, callers submit tasks to a bounded queue, but caller notification must remain firmly tied to the hardware synchronization barrier. Defensive copying at the task boundary provides mathematical safety against caller slice mutations without leaking concurrency details upstream.
+- **Interview Relevance**: Demonstrates mastery of database group-commit queuing mechanics, condition-variable backpressure, memory safety in asynchronous pipelines, zero-leak shutdown semantics, and strict durability invariant preservation.
+
 ---
 
 # 20. Deep Systems Interview Questions & Answers: WAL Recovery & Multi-Segment Replay
@@ -1265,11 +1284,56 @@ This section is a living record of actual engineering obstacles, debugging sessi
 
 ---
 
-# 21. Questions I Personally Failed & Corrected Understandings
+# 21. Deep Systems Interview Questions & Answers: Group Commit Queue & Write Task Types
+
+### 1. Why does group commit require an explicit task abstraction rather than callers directly calling `AppendSync`?
+* **Answer**: In a synchronous WAL architecture, each caller thread drives the write pipeline directly from start to finish: serializing the record, executing the `write()` syscall, calling `fdatasync()`, and returning the error. In group commit, the caller yields execution of physical I/O to a cooperative group leader or background executor. Because physical I/O is decoupled from caller execution, the write request must be reified into a heap-allocated `WriteTask` carrying the record payload, an atomic lifecycle marker, an error storage field, and a synchronization primitive (`chan struct{}`). The caller blocks on the task's completion channel, allowing the group leader to aggregate tens or hundreds of queued tasks and persist them in a single physical I/O operation.
+
+### 2. Why is enqueueing a task fundamentally not equivalent to durability?
+* **Answer**: Enqueueing merely appends a pointer to an in-memory data structure residing in the process's heap. If power is interrupted or the process panics while the task is queued, the data in RAM is instantaneously lost. ACID durability mandates that an acknowledged write survive subsequent host failure. Acknowledging a write upon enqueue converts the database into an asynchronous cache with zero crash-durability guarantees. Durability is achieved only when the underlying file descriptor executes `fdatasync()` and the physical storage device commits the bytes to non-volatile flash or magnetic cells.
+
+### 3. Why can a single `fsync` or `fdatasync` cover multiple independent writes?
+* **Answer**: The operating system kernel manages filesystem data via block layers and page caches. Multiple sequential `write()` or `pwrite()` system calls populate contiguous pages in the kernel page cache and update the inode size in memory. When `fdatasync()` is invoked on that file descriptor, the kernel flushes all modified dirty pages associated with the file down to the drive controller and commands the drive to flush its volatile hardware cache. Because `fdatasync` operates at the file descriptor level and commits all pending dirty pages, a single barrier physically flushes every record appended prior to that barrier. This amortizes the high latency cost of disk synchronization across all tasks in the coalesced batch.
+
+### 4. Why must the completion signal be tied to the durability barrier rather than the write syscall?
+* **Answer**: The `write()` system call only transfers bytes from userland memory across the kernel boundary into kernel page cache memory. If the process or OS crashes immediately after `write()`, dirty pages in the page cache that have not been written to physical media are lost. If client notification occurred after `write()`, clients would observe commits that disappear upon recovery, violating linearizability and durability. Tying the completion channel closure (`close(task.done)`) directly to the return of `fdatasync()` guarantees that clients receive success only after physical persistence is assured.
+
+### 5. Why does a sync failure necessarily affect the entire durability group?
+* **Answer**: `fdatasync()` is an all-or-nothing hardware barrier. If `fdatasync()` returns an I/O error (e.g. `EIO`, disk write timeout, bad sector, hardware controller reset), the filesystem cannot determine which specific dirty pages, if any, reached non-volatile storage. Because all records in the batch were queued and appended in the same synchronization epoch, the durability barrier failed for the entire group. Selectively acknowledging some tasks as durable while failing others would corrupt state machine consistency. Every task in the batch must receive the failure error.
+
+### 6. Why does queue backpressure matter for database memory safety?
+* **Answer**: Under sustained peak ingestion loads, client producer goroutines can generate write requests thousands of times faster than physical NVMe hardware can sync them. If the queue were unbounded, pending `WriteTask` instances—each holding key and value byte slices (up to 4 MiB each)—would accumulate indefinitely in RAM, triggering catastrophic memory exhaustion and process termination by the OS OOM killer. A bounded queue (`DefaultQueueCapacity = 1024`) enforces backpressure: when the buffer is full, producers block on condition variables (`notFull.Wait()`) or receive `ErrQueueFull`, naturally pacing the rate of incoming writes to physical disk throughput.
+
+### 7. Why does payload ownership matter for asynchronous writes, and how does defensive copying protect it?
+* **Answer**: In Go, `[]byte` slices are non-owning reference headers containing a pointer to backing array memory. In synchronous writes, the caller's slice is serialized before `AppendSync` returns, preventing concurrent mutations. In group commit, the task sits in a queue while the caller continues execution or waits. If the task merely held a pointer to the caller's slice, the caller could mutate the slice bytes before the group leader serializes them, resulting in corrupted records, CRC mismatches, or security vulnerabilities. `NewWriteTask` allocates independent byte slices and deep-copies `Key` and `Value`, creating an immutable ownership boundary that guarantees data integrity regardless of caller mutations.
+
+### 8. Why must the group commit queue preserve strict FIFO ordering?
+* **Answer**: The Write-Ahead Log is the authoritative chronological timeline of database mutations. Writes are inherently causal: updating a key or writing a tombstone `DELETE` must occur after earlier operations on that key. Reordering queued tasks by key, size, or priority would cause physical append order to diverge from submission order, leading to causal inversion upon crash recovery (e.g. an older `PUT` overwriting a newer `DELETE`). Dequeuing tasks in strict FIFO order guarantees that physical log sequence mirrors submission causality and preserves monotonic sequence numbering.
+
+### 9. What does shutdown mean for accepted but incomplete tasks?
+* **Answer**: During engine shutdown, every accepted task must reach a deterministic completion outcome to avoid permanently hanging client goroutines.
+- **Graceful Shutdown (`Close`)**: The queue rejects new writes with `ErrQueueClosed`, but allows the group commit consumer to drain all currently queued tasks, append them to the WAL, execute a final `fdatasync`, and complete the tasks with success.
+- **Abrupt Shutdown (`CloseWithError`)**: If an unrecoverable disk error or panic occurs, `CloseWithError(err)` terminates the queue, drains all queued tasks, and immediately completes every waiter with `err`. No task is left stranded waiting on an unclosed channel.
+
+### 10. Why does group commit complicate error fan-out compared to synchronous writes?
+* **Answer**: In synchronous writes, error handling is 1:1: the single caller receives whatever error was returned by `write()` or `fdatasync()`. In group commit, a single failure (e.g. disk write failure, torn write, or sync failure) governs an entire batch of $N$ distinct callers. The executor must fan out the exact failure to all $N$ tasks in the durability group. Furthermore, if a caller canceled its wait via `WaitContext(ctx)`, the task itself remains in the batch and must still be completed by the executor without panicking or creating race conditions.
+
+### 11. What is the fundamental difference between write completion and durable completion?
+* **Answer**: 
+- **Write Completion**: Occurs when bytes are copied into the operating system page cache via the `write()` system call. The data is safe against userland process crashes, but vulnerable to operating system kernel panics, power failures, or hardware resets.
+- **Durable Completion**: Occurs when the kernel has flushed all dirty pages to the physical storage device, the disk controller has flushed its internal volatile cache, and the hardware reports completion via `fdatasync()`. The data is guaranteed to survive complete system power failure. Group commit completion MUST signify durable completion.
+
+### 12. Why must the existing `AppendSync` contract remain intact underneath the future group commit layer?
+* **Answer**: `AppendSync` is the bedrock atomic primitive of the WAL: it guarantees valid framing, Big-Endian encoding, CRC32-IEEE checksum computation, chunked short-write loops, and synchronous `fdatasync()` durability. The group commit executor (`P02-S04-M02`) does not bypass or replace these durability invariants; it builds atop the exact same record serialization and synchronization mechanics. Furthermore, single-threaded diagnostic tools, recovery utilities, and low-latency single-write operations rely directly on `AppendSync`. The group commit queue is an orchestration layer above physical durability, not a compromise of it.
+
+---
+
+# 22. Questions I Personally Failed & Corrected Understandings
 
 *(Entries will be appended whenever knowledge gaps are discovered)*
 
 ---
 
 *End of Technical Interview Knowledge Base — Lattice v1.0.0-KNOWLEDGE-BASE*
+
 

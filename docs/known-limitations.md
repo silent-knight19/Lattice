@@ -182,4 +182,19 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 13. Group Commit Queue Boundary Established Without Coalescing Runner
+* **Limitation**: `WriteTask` and `WriteQueue` define the task representation, bounded capacity, FIFO ordering, defensive payload ownership, and completion semantics for group commit, but do not yet include the active group-commit leader loop, cooperative batch coalescing, timer-based batch formation, or background execution worker.
+* **Why It Exists**: `P02-S04-M01` defines the core data structures and queue boundaries in isolation to establish deterministic task lifecycle and durability completion contracts before introducing the multi-threaded coalescing pipeline in `P02-S04-M02`.
+* **Impact**: Callers can enqueue, dequeue, and complete write tasks using `WriteQueue`, but automatic coalescing of multiple tasks into a single batch and single `fdatasync` barrier is deferred to the batch runner implementation in `P02-S04-M02`.
+* **How It Was Detected**: Architectural phase separation.
+* **Current Mitigation**: Fully verified bounded queue with condition variable backpressure, graceful drain on `Close()`, and immediate error propagation via `CloseWithError(err)` guarantees zero hung waiters.
+* **Future Solution**: `P02-S04-M02` implements `groupCommitRunner`, cooperative batch formation, and single fsync synchronization barrier across grouped tasks.
+* **Dimensional Impact**:
+  * Correctness: **None** (Durability and queue lifecycle invariants strictly verified).
+  * Performance: **Expected** (Single-fsync coalescing throughput improvements deferred to M02).
+  * Scalability: **None**.
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*
+

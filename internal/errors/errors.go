@@ -92,6 +92,28 @@ var (
 	// ErrSequenceOutOfOrder indicates that a WAL record's sequence number regressed
 	// or duplicated a previous sequence number, violating monotonic ordering.
 	ErrSequenceOutOfOrder = stdErrors.New("sequence number out of order")
+
+	// ErrQueueClosed indicates that an enqueue or dequeue operation was attempted
+	// on a closed WAL write queue.
+	ErrQueueClosed = stdErrors.New("wal write queue is closed")
+
+	// ErrQueueFull indicates that a non-blocking enqueue was attempted on a full WAL write queue.
+	ErrQueueFull = stdErrors.New("wal write queue is full")
+
+	// ErrQueueEmpty indicates that a non-blocking dequeue was attempted on an empty WAL write queue.
+	ErrQueueEmpty = stdErrors.New("wal write queue is empty")
+
+	// ErrTaskAlreadyCompleted indicates that a write task was completed more than once.
+	ErrTaskAlreadyCompleted = stdErrors.New("wal write task already completed")
+
+	// ErrTaskAlreadyEnqueued indicates that a write task was enqueued more than once.
+	ErrTaskAlreadyEnqueued = stdErrors.New("wal write task already enqueued")
+
+	// ErrNilTask indicates that a nil write task was passed to an enqueue operation.
+	ErrNilTask = stdErrors.New("wal write task cannot be nil")
+
+	// ErrInvalidQueueCapacity indicates that a WAL write queue capacity was non-positive.
+	ErrInvalidQueueCapacity = stdErrors.New("wal write queue capacity must be greater than zero")
 )
 
 // KeyTooLargeError provides structured context when a key violates maximum size limits.
@@ -351,4 +373,22 @@ func (e *SequenceOutOfOrderError) Error() string {
 // Is reports whether this error matches target sentinel ErrSequenceOutOfOrder.
 func (e *SequenceOutOfOrderError) Is(target error) bool {
 	return target == ErrSequenceOutOfOrder
+}
+
+// InvalidQueueCapacityError provides structured context when a queue is initialized with a non-positive capacity.
+// It matches ErrInvalidQueueCapacity when interrogated with errors.Is().
+type InvalidQueueCapacityError struct {
+	Capacity int
+}
+
+func (e *InvalidQueueCapacityError) Error() string {
+	if e == nil {
+		return ErrInvalidQueueCapacity.Error()
+	}
+	return fmt.Sprintf("invalid wal write queue capacity %d: must be greater than zero", e.Capacity)
+}
+
+// Is reports whether this error matches target sentinel ErrInvalidQueueCapacity.
+func (e *InvalidQueueCapacityError) Is(target error) bool {
+	return target == ErrInvalidQueueCapacity
 }

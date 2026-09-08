@@ -31,6 +31,13 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrSegmentGap", errors.ErrSegmentGap, "wal segment gap detected"},
 		{"ErrDuplicateSegment", errors.ErrDuplicateSegment, "duplicate wal segment ID detected"},
 		{"ErrSequenceOutOfOrder", errors.ErrSequenceOutOfOrder, "sequence number out of order"},
+		{"ErrQueueClosed", errors.ErrQueueClosed, "wal write queue is closed"},
+		{"ErrQueueFull", errors.ErrQueueFull, "wal write queue is full"},
+		{"ErrQueueEmpty", errors.ErrQueueEmpty, "wal write queue is empty"},
+		{"ErrTaskAlreadyCompleted", errors.ErrTaskAlreadyCompleted, "wal write task already completed"},
+		{"ErrTaskAlreadyEnqueued", errors.ErrTaskAlreadyEnqueued, "wal write task already enqueued"},
+		{"ErrNilTask", errors.ErrNilTask, "wal write task cannot be nil"},
+		{"ErrInvalidQueueCapacity", errors.ErrInvalidQueueCapacity, "wal write queue capacity must be greater than zero"},
 	}
 
 	for _, tc := range sentinels {
@@ -69,6 +76,13 @@ func TestSentinelWrappingWithErrorsIs(t *testing.T) {
 		{"ErrSegmentGap", errors.ErrSegmentGap},
 		{"ErrDuplicateSegment", errors.ErrDuplicateSegment},
 		{"ErrSequenceOutOfOrder", errors.ErrSequenceOutOfOrder},
+		{"ErrQueueClosed", errors.ErrQueueClosed},
+		{"ErrQueueFull", errors.ErrQueueFull},
+		{"ErrQueueEmpty", errors.ErrQueueEmpty},
+		{"ErrTaskAlreadyCompleted", errors.ErrTaskAlreadyCompleted},
+		{"ErrTaskAlreadyEnqueued", errors.ErrTaskAlreadyEnqueued},
+		{"ErrNilTask", errors.ErrNilTask},
+		{"ErrInvalidQueueCapacity", errors.ErrInvalidQueueCapacity},
 	}
 
 	for _, tc := range tests {
@@ -105,6 +119,13 @@ func TestSentinelNegativeComparisons(t *testing.T) {
 		errors.ErrSegmentGap,
 		errors.ErrDuplicateSegment,
 		errors.ErrSequenceOutOfOrder,
+		errors.ErrQueueClosed,
+		errors.ErrQueueFull,
+		errors.ErrQueueEmpty,
+		errors.ErrTaskAlreadyCompleted,
+		errors.ErrTaskAlreadyEnqueued,
+		errors.ErrNilTask,
+		errors.ErrInvalidQueueCapacity,
 	}
 
 	for i, a := range allSentinels {
@@ -898,5 +919,47 @@ func TestSequenceOutOfOrderError(t *testing.T) {
 	var nilErr *errors.SequenceOutOfOrderError
 	if nilErr.Error() != errors.ErrSequenceOutOfOrder.Error() {
 		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrSequenceOutOfOrder.Error())
+	}
+}
+
+func TestInvalidQueueCapacityError(t *testing.T) {
+	err := &errors.InvalidQueueCapacityError{
+		Capacity: -1,
+	}
+
+	// errors.Is check
+	if !stdErrors.Is(err, errors.ErrInvalidQueueCapacity) {
+		t.Errorf("InvalidQueueCapacityError must match ErrInvalidQueueCapacity via errors.Is")
+	}
+
+	// Negative match
+	if stdErrors.Is(err, errors.ErrKeyNotFound) {
+		t.Errorf("InvalidQueueCapacityError must not match ErrKeyNotFound")
+	}
+
+	// Wrapping check
+	wrapped := fmt.Errorf("queue init: %w", err)
+	if !stdErrors.Is(wrapped, errors.ErrInvalidQueueCapacity) {
+		t.Errorf("wrapped InvalidQueueCapacityError must match ErrInvalidQueueCapacity via errors.Is")
+	}
+
+	var extracted *errors.InvalidQueueCapacityError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("failed to extract *InvalidQueueCapacityError from wrapped chain")
+	}
+	if extracted.Capacity != -1 {
+		t.Errorf("extracted mismatch: got Capacity=%d; want Capacity=-1", extracted.Capacity)
+	}
+
+	// String check
+	msg := err.Error()
+	if !strings.Contains(msg, "invalid wal write queue capacity -1: must be greater than zero") {
+		t.Errorf("unexpected error message: %q", msg)
+	}
+
+	// Typed nil safety
+	var nilErr *errors.InvalidQueueCapacityError
+	if nilErr.Error() != errors.ErrInvalidQueueCapacity.Error() {
+		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrInvalidQueueCapacity.Error())
 	}
 }
