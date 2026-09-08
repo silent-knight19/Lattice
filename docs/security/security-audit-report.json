@@ -1,0 +1,49 @@
+{
+  "audit_version": "1.0.0-LATTICE-SEC",
+  "commit": "4330dae2961992823aaa6ceeda474fe109adfae3",
+  "timestamp": "2026-09-08T09:08:02.68802Z",
+  "root_dir": "/Users/sachinkumarsingh/Projectss/Lattice",
+  "rules_run": [
+    "SECURITY-001",
+    "SECURITY-002",
+    "SECURITY-004",
+    "SECURITY-008",
+    "SECURITY-009",
+    "SECURITY-010",
+    "SECURITY-011",
+    "SECURITY-012",
+    "SECURITY-CFG-001",
+    "SECURITY-DEP-001"
+  ],
+  "findings": [
+    {
+      "id": "FIND-SECURITY-DEP-001-d05ae8a0",
+      "rule_id": "SECURITY-DEP-001",
+      "title": "Dependency inventory complete; external advisory enrichment deferred",
+      "severity": "INFORMATIONAL",
+      "classification": "DESIGN TARGET",
+      "component": "SupplyChain",
+      "file": "go.mod",
+      "line": 1,
+      "description": "Go toolchain: 1.22.0. Direct dependencies: 0. Indirect dependencies: 0. No third-party runtime dependencies currently linked.",
+      "preconditions": "Production build pipeline.",
+      "attack_path": "Supply-chain compromise through third-party dependencies.",
+      "impact": "Current dependency footprint is zero external runtime packages; blast radius is strictly bounded.",
+      "evidence": "Zero third-party runtime dependencies in go.mod (hermetic pure-Go build).",
+      "reproduction": "Inspect go.mod.",
+      "recommendation": "Maintain minimal third-party dependencies. Audit external modules before introducing to go.mod.",
+      "status": "VERIFIED"
+    }
+  ],
+  "suppressed": null,
+  "errors": null,
+  "counts": {
+    "critical": 0,
+    "high": 0,
+    "informational": 1,
+    "low": 0,
+    "medium": 0,
+    "suppressed_findings": 0,
+    "total_findings": 1
+  }
+}

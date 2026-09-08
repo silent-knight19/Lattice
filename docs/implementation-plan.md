@@ -358,12 +358,35 @@ Previous Completed Micro-Phase: P02-S04-M02 — Group Commit Batch Runner & Coop
 Next Planned Phase            : Phase 03 — In-Memory MemTable & Concurrent SkipList (P03-S01-M01)
 Phase 00 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Phase 01 Final Audit          : Completed — PASS WITH REMEDIATIONS
+Security Audit Track State    : Active
+  - SEC-01 — Security Audit Foundations & Attack-Surface Inventory (COMPLETE)
+  - SEC-02 — Static Security Audit & Dependency/Secret/Configuration Analysis (COMPLETE)
+  - SEC-03 through SEC-09 (DEFERRED / PLANNED)
 Blocking Issues               : None
-Tests Passing                 : `go test -race ./...` (23/23 error suites, 18/18 logger suites, 48/48 binary suites, 287/287 wal test cases passing, 90.3% wal coverage, 100% binary & errors coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
-Security Review Status        : Complete & Verified (Dual hard batch bounds <=1,024 tasks and <=64 KiB prevent memory and latency spikes; singleton oversized fallback prevents queue deadlock; strict post-sync barrier prevents premature caller notification; fail-closed error fanout prevents partial commit acknowledgment; package-private rawRecord() preserves slice immutability without allocations; clean shutdown via Close/Wait/drain prevents goroutine leaks and hung waiters)
-Interview Knowledge Status    : Updated with M02 micro-phase summary and Section 22 containing 10 deep systems interview questions and answers on group commit batch running, cooperative fsync amortization, dual batch limits, rotation coordination, and error fan-out
+Tests Passing                 : `go test -race ./...` (23/23 error suites, 18/18 logger suites, 48/48 binary suites, 287/287 wal test cases passing, internal/security suites passing, 0 race conditions), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
+Security Review Status        : Complete & Verified (SEC-01 foundations established, attack surface cataloged, threat model defined; SEC-02 AST rules, secret scanning, dependency inventory, config analysis verified with 0 execution errors and 0 false positives)
+Interview Knowledge Status    : Updated with Section 23 containing 15 deep systems security interview questions and answers on SAST vs dynamic testing, AST reliability, secret masking, trust boundaries, deterministic CI findings, and auditable suppressions
 Git Commit                    : feat(wal): [P02-S04-M02] add group commit batch runner
 ```
+
+---
+
+# 16.1 Continuous Security Track Roadmap
+
+In parallel with the feature development roadmap (Phase 00–21), Lattice maintains a dedicated, non-disruptive Continuous Security Audit Track:
+
+| Security Milestone | Scope & Objectives | Status |
+| :--- | :--- | :--- |
+| **SEC-01** | **Security Audit Foundations & Attack-Surface Inventory**: Trust boundaries, attack surface catalog, 12-vector threat model, security invariants register, security audit data model, baseline audit report. | **COMPLETE** |
+| **SEC-02** | **Static Security Audit & Dependency/Secret/Config Analysis**: Go AST analyzers (`SECURITY-001` through `SECURITY-012`), conservative secret scanner (`SECURITY-008`), supply-chain dependency analyzer (`SECURITY-DEP-001`), configuration auditor (`SECURITY-CFG-001`), auditable suppressions, automated markdown/JSON reporting. | **COMPLETE** |
+| **SEC-03** | **WAL / Filesystem / Storage Security Audit**: Dynamic filesystem fault injection, torn write fuzzing, descriptor permission verification. | Planned |
+| **SEC-04** | **Concurrency / Race / Deadlock / Resource Exhaustion Audit**: Dynamic race fuzzing, queue backpressure stress, deadlock detection under extreme contention. | Planned |
+| **SEC-05** | **Network / Protocol / Parser / Fuzz Security Audit**: Wire protocol frame fuzzing, Slowloris defenses, payload ceiling enforcement (post-Phase 11). | Planned |
+| **SEC-06** | **Authentication / Authorization / Security Boundary Audit**: Mutual TLS (mTLS), cluster node identity verification, RBAC permissions (post-Phase 14). | Planned |
+| **SEC-07** | **Corruption / Fault Injection / Adversarial Recovery Audit**: Random bit-rot mutation testing, split-brain consensus recovery, crash-during-flush validation. | Planned |
+| **SEC-08** | **Security Regression Suite / CI Security Gates**: Automated PR blocking on new security findings, deterministic finding tracking. | Planned |
+| **SEC-09** | **Final Penetration-Style Audit / Release Security Certification**: End-to-end red team assessment, cryptographic verification, formal release sign-off. | Planned |
+
 
 ---
 
