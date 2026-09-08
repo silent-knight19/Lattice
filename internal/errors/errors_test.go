@@ -3,6 +3,7 @@ package errors_test
 import (
 	stdErrors "errors"
 	"fmt"
+	"io/fs"
 	"strings"
 	"testing"
 
@@ -583,5 +584,77 @@ func TestInvalidRecordPayloadError(t *testing.T) {
 	noReason := &errors.InvalidRecordPayloadError{Type: 0x03}
 	if !strings.Contains(noReason.Error(), "0x03") {
 		t.Errorf("unexpected error message: %q", noReason.Error())
+	}
+}
+
+func TestNotADirectorySentinel(t *testing.T) {
+	if errors.ErrNotADirectory == nil {
+		t.Fatalf("ErrNotADirectory must not be nil")
+	}
+
+	wrapped := fmt.Errorf("wal init dir: %w", errors.ErrNotADirectory)
+	if !stdErrors.Is(wrapped, errors.ErrNotADirectory) {
+		t.Errorf("wrapped ErrNotADirectory must match via errors.Is")
+	}
+
+	if stdErrors.Is(errors.ErrNotADirectory, errors.ErrKeyNotFound) {
+		t.Errorf("ErrNotADirectory must not match ErrKeyNotFound")
+	}
+
+	if !strings.Contains(errors.ErrNotADirectory.Error(), "path is not a directory") {
+		t.Errorf("unexpected error message: %q", errors.ErrNotADirectory.Error())
+	}
+}
+
+func TestNotADirectoryError(t *testing.T) {
+	typedErr := &errors.NotADirectoryError{
+		Path: "/var/lib/lattice/wal",
+		Mode: 0644,
+	}
+
+	// Must match sentinel via errors.Is
+	if !stdErrors.Is(typedErr, errors.ErrNotADirectory) {
+		t.Errorf("NotADirectoryError must match ErrNotADirectory via errors.Is")
+	}
+
+	// Negative match against other sentinels
+	if stdErrors.Is(typedErr, errors.ErrKeyNotFound) {
+		t.Errorf("NotADirectoryError must not match ErrKeyNotFound")
+	}
+
+	// Wrapped match via errors.Is
+	wrapped := fmt.Errorf("wal dir setup: %w", typedErr)
+	if !stdErrors.Is(wrapped, errors.ErrNotADirectory) {
+		t.Errorf("wrapped NotADirectoryError must match ErrNotADirectory via errors.Is")
+	}
+
+	// Extraction via errors.As
+	var extracted *errors.NotADirectoryError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("errors.As failed to extract *NotADirectoryError")
+	}
+	if extracted.Path != "/var/lib/lattice/wal" {
+		t.Errorf("extracted Path mismatch: got %q, expected /var/lib/lattice/wal", extracted.Path)
+	}
+	if extracted.Mode != 0644 {
+		t.Errorf("extracted Mode mismatch: got %v, expected 0644", extracted.Mode)
+	}
+
+	// Error string formatting with path and mode
+	msg := typedErr.Error()
+	if !strings.Contains(msg, "/var/lib/lattice/wal") || !strings.Contains(msg, "not a directory") {
+		t.Errorf("unexpected error message: %q", msg)
+	}
+
+	// Typed nil safety
+	var nilTyped *errors.NotADirectoryError
+	if nilTyped.Error() != errors.ErrNotADirectory.Error() {
+		t.Errorf("typed nil error string mismatch: got %q, want %q", nilTyped.Error(), errors.ErrNotADirectory.Error())
+	}
+
+	// Empty path fallback
+	emptyPath := &errors.NotADirectoryError{Mode: fs.ModeSymlink}
+	if emptyPath.Error() != errors.ErrNotADirectory.Error() {
+		t.Errorf("empty path error string mismatch: got %q, want %q", emptyPath.Error(), errors.ErrNotADirectory.Error())
 	}
 }

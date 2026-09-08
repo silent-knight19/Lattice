@@ -3,6 +3,7 @@ package errors
 import (
 	stdErrors "errors"
 	"fmt"
+	"io/fs"
 )
 
 // Sentinel errors representing fundamental domain failure conditions in Lattice.
@@ -65,6 +66,10 @@ var (
 	// ErrInvalidRecordPayload indicates that a WAL record payload does not conform to its record type
 	// (e.g. non-empty value for DELETE/tombstone, or non-empty key/value for batch markers).
 	ErrInvalidRecordPayload = stdErrors.New("invalid wal record payload")
+
+	// ErrNotADirectory indicates that a filesystem path expected to be a directory
+	// is a regular file, symlink, or other non-directory object.
+	ErrNotADirectory = stdErrors.New("path is not a directory")
 )
 
 // KeyTooLargeError provides structured context when a key violates maximum size limits.
@@ -226,4 +231,27 @@ func (e *InvalidRecordPayloadError) Error() string {
 // Is reports whether this error matches target sentinel ErrInvalidRecordPayload.
 func (e *InvalidRecordPayloadError) Is(target error) bool {
 	return target == ErrInvalidRecordPayload
+}
+
+// NotADirectoryError provides structured context when an expected directory path
+// is a regular file, symlink, or other non-directory object.
+// It matches ErrNotADirectory when interrogated with errors.Is().
+type NotADirectoryError struct {
+	Path string
+	Mode fs.FileMode
+}
+
+func (e *NotADirectoryError) Error() string {
+	if e == nil {
+		return ErrNotADirectory.Error()
+	}
+	if e.Path != "" {
+		return fmt.Sprintf("path %q is not a directory (mode: %s)", e.Path, e.Mode)
+	}
+	return ErrNotADirectory.Error()
+}
+
+// Is reports whether this error matches target sentinel ErrNotADirectory.
+func (e *NotADirectoryError) Is(target error) bool {
+	return target == ErrNotADirectory
 }

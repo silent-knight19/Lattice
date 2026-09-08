@@ -350,17 +350,17 @@ Every future micro-phase implementation response from Claude Code must use this 
 ```
 Current Major Phase           : Phase 02 — Write-Ahead Log (WAL) & Durability Subsystem
 Current Sub-Phase             : Sub-Phase 02.2 — WAL File Management & Append Operations
-Current Micro-Phase           : P02-S02-M01 — WAL File Creator & Directory Initializer
+Current Micro-Phase           : P02-S02-M02 — Synchronous WAL Appender (`Strict Sync`)
 Phase 01 Status               : COMPLETE (Sub-Phases 01.1 & 01.2 Complete)
 Previous Completed Phase      : Phase 01 — Core Storage Primitives & Binary Encodings
-Previous Completed Micro-Phase: P02-S01-M03 — WAL Corruption & Checksum Verification Tests
+Previous Completed Micro-Phase: P02-S02-M01 — WAL File Creator & Directory Initializer
 Phase 00 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Phase 01 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Blocking Issues               : None
-Tests Passing                 : `go test -race ./...` (16/16 error suites, 18/18 logger suites, 48/48 binary suites, 49/49 wal suites passing, 99.4% wal coverage, 100% binary & errors coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
-Security Review Status        : Complete & Verified (CRC field corruption, 100% single-bit flip detection, CRC scope coverage, structural vs checksum rejection boundaries, anti-DoS bound enforcement, non-cryptographic CRC limitations documented)
-Interview Knowledge Status    : Updated with structural vs checksum validation, exhaustive bit-flip testing, non-cryptographic CRC limits, and framing error distinction
-Git Commit                    : test(wal): [P02-S01-M03] verify corruption and checksum integrity
+Tests Passing                 : `go test -race ./...` (18/18 error suites, 18/18 logger suites, 48/48 binary suites, 58/58 wal suites passing, 98.5% wal coverage, 100% binary & errors coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
+Security Review Status        : Complete & Verified (Directory initialization 0700 permissions, symlink rejection, atomic TOCTOU-free creation, non-destructive idempotency, 50-goroutine concurrency safety)
+Interview Knowledge Status    : Updated with WAL directory ownership, 0700 permission enforcement, atomic TOCTOU-free creation, symlink rejection, and engineering log
+Git Commit                    : feat(wal): [P02-S02-M01] initialize secure WAL directory
 ```
 
 ---
@@ -972,10 +972,25 @@ TOTAL: 184 Discrete, Testable Micro-Phases
 
 ### Sub-Phase 02.2: WAL File Management & Append Operations
 * **P02-S02-M01: WAL File Creator & Directory Initializer**
-  * *Objective*: Safely initialize `<db_path>/wal/` directory with `0700` permissions.
-  * *Security*: Strict POSIX permissions prevent other local users from reading WAL data.
-  * *Tests*: Verify directory creation and permission bits on filesystem.
-  * *Completion*: Directory management verified.
+  * *Objective*: Safely initialize `<db_path>/wal/` directory with restrictive `0700` POSIX permissions, preventing unauthorized local access, avoiding TOCTOU races, rejecting symlinks, and maintaining idempotent convergence.
+  * *Changes*:
+    - Extended `internal/errors` with `ErrNotADirectory` sentinel and `NotADirectoryError{Path, Mode}` typed diagnostic error.
+    - Implemented `internal/wal/dir.go` with constants `DirName = "wal"`, `DirMode = 0700`, path constructors `Dir(dbPath)` and `DirPath(dbPath)`, and directory initializer `InitDir(dbPath string) (string, error)`.
+    - Enforced atomic directory creation via `os.Mkdir(walPath, DirMode)` to eliminate TOCTOU races.
+    - Implemented `os.Lstat` inspection on pre-existing paths, rejecting regular files, symlinks, and non-directory objects with `*errors.NotADirectoryError`.
+    - Added permission hardening via `os.Chmod(walPath, DirMode)` if existing directory has loose group/other permissions.
+    - Added comprehensive unit, concurrency, failure mode, and adversarial test suite in `internal/wal/dir_test.go` covering Scenarios A through Q.
+  * *Tests & Verification*:
+    - `go test -count=1 -race ./internal/wal/...`: PASS (58 suites, including 9 new directory suites)
+    - `go test -count=1 -race ./...`: PASS across all packages
+    - `golangci-lint run ./...`: 0 issues
+    - Statement coverage: 98.5% in `internal/wal`, 100% in `internal/errors`
+  * *Evidence Classification*:
+    - **Design Target**: Secure, race-free, and idempotent initialization of `<db_path>/wal/` with `0700` POSIX mode (`rwx------`), protecting database logs against group/other local access.
+    - **Theoretical Property**: Direct atomic `os.Mkdir` syscall eliminates TOCTOU races between existence checks and creation; `os.Lstat` prevents following symlinks to unintended targets; umask cannot add group/other permissions when `0700` is requested.
+    - **Measured Result**: Verified 0700 mode on fresh creation; verified permission tightening on 0777 pre-existing directories; 100% error detection on regular files, symlinks, and non-existent parents; 50 goroutines safely converged without race or data corruption; pre-existing WAL files preserved without modification.
+    - **Observed Limitation**: On non-POSIX filesystems (such as Windows NTFS without POSIX emulation), directory permission bits may not reflect standard POSIX 0700 semantics; directory initialization creates `<db_path>/wal` but does not establish storage media crash durability until log files are flushed and synced.
+  * *Completion*: WAL directory creator and initializer verified and complete.
 * **P02-S02-M02: Synchronous WAL Appender (`Strict Sync`)**
   * *Objective*: Implement sequential file writer calling `file.Write()` followed by `fdatasync()`.
   * *Changes*: `WALWriter.AppendSync(rec Record) error`.
