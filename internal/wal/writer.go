@@ -139,9 +139,101 @@ func OpenSegmentWriter(dbPath string, id uint64) (*WALWriter, error) {
 	return OpenWriter(SegmentPath(dbPath, id))
 }
 
+// CreateWriter creates a new WAL segment file at the specified filesystem path
+// with exclusive creation semantics (os.O_EXCL | os.O_CREATE) and 0600 permissions.
+//
+// Invariants & Security Guarantees:
+//   - If a file, directory, or symlink already exists at the target path, creation
+//     aborts immediately with an error wrapping os.ErrExist.
+//   - Existing file contents are never truncated, overwritten, or modified.
+//   - Rejects symbolic links, directories, and non-regular objects.
+//   - Pins the opened file descriptor to the disk inode via os.SameFile.
+func CreateWriter(path string) (*WALWriter, error) {
+	if path == "" {
+		return nil, fmt.Errorf("%w: path cannot be empty", os.ErrInvalid)
+	}
+
+	cleanPath := filepath.Clean(path)
+
+	// Pre-creation inspection: reject existing paths immediately before open attempt
+	if info, err := os.Lstat(cleanPath); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("wal: cannot create segment over existing symlink %s: %w", cleanPath, os.ErrInvalid)
+		}
+		if info.IsDir() {
+			return nil, &errors.NotADirectoryError{
+				Path: cleanPath,
+				Mode: info.Mode(),
+			}
+		}
+		return nil, fmt.Errorf("wal: segment file %s already exists: %w", cleanPath, os.ErrExist)
+	}
+
+	// Atomic exclusive creation: kernel guarantees fail-fast if file exists concurrently
+	flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL | os.O_APPEND
+	f, err := os.OpenFile(cleanPath, flags, FileMode)
+	if err != nil {
+		return nil, fmt.Errorf("wal: failed to create segment file %s: %w", cleanPath, err)
+	}
+
+	// Verify the opened file descriptor references a genuine regular file
+	finfo, statErr := f.Stat()
+	if statErr != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("wal: failed to stat created file %s: %w", cleanPath, statErr)
+	}
+	if !finfo.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, fmt.Errorf("wal: path %s is not a regular file (mode: %s): %w", cleanPath, finfo.Mode(), os.ErrInvalid)
+	}
+
+	// Post-create verification: prove the open file descriptor matches the inode on disk
+	postInfo, lstatErr := os.Lstat(cleanPath)
+	if lstatErr != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("wal: failed to lstat created file %s: %w", cleanPath, lstatErr)
+	}
+	if !os.SameFile(finfo, postInfo) {
+		_ = f.Close()
+		return nil, fmt.Errorf("wal: file %s was replaced during create: %w", cleanPath, os.ErrInvalid)
+	}
+
+	w := &WALWriter{
+		file:    f,
+		path:    cleanPath,
+		syncFn:  fdatasync,
+		writeFn: func(file *os.File, p []byte) (int, error) { return file.Write(p) },
+	}
+
+	return w, nil
+}
+
+// CreateSegmentWriter creates a new WAL segment file under dbPath using its 12-digit segment ID.
+// The segment path is constructed as <db_path>/wal/wal_<000000000001>.log.
+// Fails with os.ErrExist if the segment file already exists.
+func CreateSegmentWriter(dbPath string, id uint64) (*WALWriter, error) {
+	return CreateWriter(SegmentPath(dbPath, id))
+}
+
 // Path returns the canonical filesystem path of the active WAL segment file.
 func (w *WALWriter) Path() string {
 	return w.path
+}
+
+// Size returns the current physical byte length of the segment file.
+func (w *WALWriter) Size() (int64, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed {
+		return 0, errors.ErrWriterClosed
+	}
+
+	info, err := w.file.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("wal: stat file %s: %w", w.path, err)
+	}
+	return info.Size(), nil
 }
 
 // Close flushes data, executes the durability barrier, and closes the underlying file descriptor.

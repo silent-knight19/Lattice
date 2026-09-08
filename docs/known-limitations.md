@@ -168,6 +168,18 @@ This document tracks all **genuine architectural and operational limitations** o
   * Performance: **Optimal** (No locking overhead during offline recovery).
   * Scalability: **None**.
 
+### 12. Multi-Segment Startup Recovery Replay Deferred to P02-S03-M03
+* **Limitation**: `RotatingWriter` manages runtime log rotation, monotonic sequencing, and boundary enforcement during database operation. It does not orchestrate full database crash recovery replay across historical segments into an in-memory MemTable upon system restart.
+* **Why It Exists**: In accordance with the micro-phase hierarchy, runtime log rotation (`P02-S03-M02`) is decoupled from database startup orchestration (`P02-S03-M03`).
+* **Impact**: Callers can open and append to existing WAL directories with automatic continuation, but replaying transactions from historical segments into memory requires manual iteration via `ListSegments` and `WALReader` until the recovery coordinator is built.
+* **How It Was Detected**: Architectural boundary analysis.
+* **Current Mitigation**: `ListSegments` guarantees strict numeric discovery ($1 < 2 < 3 \dots$) and `WALReader` independently iterates any sealed segment to `io.EOF`.
+* **Future Solution**: Sub-Phase 02.3 M03 introduces the startup recovery coordinator (`RecoverWAL`) to automate multi-segment verification, torn-tail truncation of the active segment, and MemTable replay.
+* **Dimensional Impact**:
+  * Correctness: **None** (Runtime rotation invariants fully preserved).
+  * Performance: **Optimal** (Zero startup overhead during standalone write execution).
+  * Scalability: **None**.
+
 ---
 
 *End of Known Limitations — To be updated continuously throughout implementation.*

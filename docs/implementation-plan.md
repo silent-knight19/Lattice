@@ -350,17 +350,17 @@ Every future micro-phase implementation response from Claude Code must use this 
 ```
 Current Major Phase           : Phase 02 — Write-Ahead Log (WAL) & Durability Subsystem
 Current Sub-Phase             : Sub-Phase 02.3 — Torn Write Handling & Log Rotation
-Current Micro-Phase           : P02-S03-M02 — WAL Segment Rotation & Pre-allocation
+Current Micro-Phase           : P02-S03-M03 — WAL Recovery Coordinator & Multi-Segment Replay
 Phase 01 Status               : COMPLETE (Sub-Phases 01.1 & 01.2 Complete)
 Previous Completed Phase      : Phase 01 — Core Storage Primitives & Binary Encodings
-Previous Completed Micro-Phase: P02-S03-M01 — Torn Tail Write Detection & Safe Truncation
+Previous Completed Micro-Phase: P02-S03-M02 — WAL Segment Rotation & Sequencing
 Phase 00 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Phase 01 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Blocking Issues               : None
-Tests Passing                 : `go test -race ./...` (19/19 error suites, 18/18 logger suites, 48/48 binary suites, 138/138 wal suites passing, 89.7% wal coverage, 100% binary & errors coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
-Security Review Status        : Complete & Verified (Single-descriptor in-place truncation, O_RDWR without O_CREATE/O_TRUNC, inode pinning via os.SameFile, symlink and directory rejection, post-condition verification via rewind and replay, middle corruption fail-closed, complete corrupt record at EOF fail-closed)
-Interview Knowledge Status    : Updated with torn-tail vs middle corruption, complete corrupt records vs partial writes, verified open descriptor truncation vs path reopening, post-condition verification, and engineering log
-Git Commit                    : feat(wal): [P02-S03-M01] add torn-tail recovery and safe truncation
+Tests Passing                 : `go test -race ./...` (19/19 error suites, 18/18 logger suites, 48/48 binary suites, 173/173 wal suites passing, 88.4% wal coverage, 100% binary & errors coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
+Security Review Status        : Complete & Verified (Atomic exclusive segment creation via os.O_EXCL | os.O_CREATE, collision rejection of existing files, 0600 file modes, symlink/directory rejection, foreign file non-truncation, thread-safe rotation serialization under mutex)
+Interview Knowledge Status    : Updated with segment rotation lifecycle, atomic O_EXCL collision defense, pre-write boundary accounting, oversized record policy, multi-segment numeric ordering, and engineering log
+Git Commit                    : feat(wal): [P02-S03-M02] add WAL segment rotation and sequencing
 ```
 
 ---
@@ -1043,11 +1043,22 @@ TOTAL: 184 Discrete, Testable Micro-Phases
     - **Measured Result**: 33 test suites passing; 0-byte file preserved; 1..20 byte headers truncated back; partial key/value lengths/payloads truncated back; complete bad CRC at EOF rejected without truncation; complete invalid type at EOF rejected without truncation; middle corruption halted without truncation; valid prefix SHA256 immutability proved; 500-record prefix with torn tail cleanly truncated; randomized seeded truncation tests verified; 0 data races; `golangci-lint` clean (0 issues).
     - **Observed Limitation**: Recovery assumes the target segment is quiescent (not concurrently appended to by a `WALWriter`); multi-segment recovery is deferred to engine startup orchestration (`P02-S03-M03`).
   * *Completion*: Complete and verified across all unit, corruption, boundary matrix, and lifecycle test suites.
-* **P02-S03-M02: WAL Segment Rotation & Pre-allocation**
-  * *Objective*: Rotate WAL file when size exceeds 64MB; pre-allocate via `fallocate()`.
-  * *Changes*: `WALWriter.Rotate() (*WALSegment, error)`.
-  * *Tests*: Append records exceeding 64MB; verify new segment `wal_000000000002.log` created.
-  * *Completion*: Segment rotation verified.
+* **P02-S03-M02: WAL Segment Rotation & Sequencing**
+  * *Objective*: Introduce deterministic WAL segment rotation and sequencing (`RotatingWriter` / `WAL`), enforcing strict monotonic segment IDs (`wal_%012d.log`), single active writer ownership, pre-write boundary evaluation, oversized record handling, atomic creation (`os.O_EXCL`), and multi-segment numeric ordering.
+  * *Changes*: `internal/wal/rotation.go` (`RotatingWriter`, `WAL`, `Options`, `OpenRotatingWriter`, `Open`, `RecordWireSize`, `ParseSegmentID`, `ListSegments`), `internal/wal/writer.go` (`CreateWriter`, `CreateSegmentWriter`, `Size`).
+  * *Evidence*:
+    - **Design Target**: Exactly one active writable segment at a time for the logical WAL writer; rotation triggers automatically before appending any record that would exceed configured segment size (default 64MB); segment IDs increment monotonically ($N \to N+1$); older segments remain closed and independently readable without modification; existing foreign files are never overwritten or truncated on rotation collision.
+    - **Theoretical Property**: If every record is encoded with exact wire length $R$, evaluating $S > 0 \land S + R > M$ before writing guarantees no record is fragmented across segment boundaries. If $S = 0$ (empty segment), accepting an oversized record ($R > M$) prevents deadlock while ensuring all subsequent appends trigger rotation immediately. Creating segments with `os.O_EXCL | os.O_CREATE` guarantees kernel-level atomic fail-fast if a target file already exists, eliminating TOCTOU collision hazards.
+    - **Measured Result**: 34 test suites passing in `rotation_test.go`; exact boundary threshold ($S + R == M$), one byte under ($S + R == M - 1$), and one byte over ($S + R == M + 1$) verified; atomic collision rejection with foreign file non-truncation verified; oversized record in empty segment verified; multi-segment continuous byte sequence verified; 10 concurrent goroutines performing concurrent appends and rotations under `-race` passing with 0 data races; `golangci-lint` clean (0 issues).
+    - **Observed Limitation**: Multi-segment startup recovery orchestration (discovering active segment, reconciling uncommitted tail writes across multiple historical segments, and replaying records into MemTable on database boot) is deferred to `P02-S03-M03`.
+  * *Completion*: Complete and verified across all lifecycle, boundary matrix, concurrency, and fault-injection test suites.
+
+* **P02-S03-M03: WAL Recovery Coordinator & Multi-Segment Replay**
+  * *Objective*: Coordinate multi-segment crash recovery during database startup, discovering historical WAL segments in strictly numeric order, executing torn-tail recovery on the latest active segment, verifying older sealed segments, and replaying uncommitted operations into the active MemTable.
+  * *Changes*: `internal/wal/coordinator.go` (`RecoverWAL(dbPath string) (*RecoveryReport, error)`).
+  * *Invariants*: Replay order strictly follows ascending segment ID and monotonic sequence numbers; gaps in segment IDs or middle corruptions halt startup immediately.
+  * *Tests*: Crash recovery across multi-segment directories with torn tails on the latest segment, missing segments, and out-of-order logs.
+  * *Completion*: Pending.
 
 ### Sub-Phase 02.4: Group Commit Coalescing Pipeline
 * **P02-S04-M01: Group Commit Queue & Write Task Types**

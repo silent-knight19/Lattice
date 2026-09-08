@@ -1131,6 +1131,44 @@ This section is a living record of actual engineering obstacles, debugging sessi
 - **Core Lesson**: Crash recovery is an irreversible physical filesystem mutation. Never truncate based on pathname after scanning; pin inodes on an open descriptor, strictly distinguish incomplete writes at EOF from complete corrupted records, verify post-conditions by reading back the truncated log, and fail closed on any middle corruption.
 - **Interview Relevance**: Demonstrates mastery of database crash recovery, physical log truncation, TOCTOU mitigation during file mutation, descriptor-based inode pinning, post-condition verification theory, and the precise failure boundaries between partial writes and data corruption.
 
+### Entry 2026-09-08 — Phase 02: Deterministic WAL Segment Rotation, Atomic O_EXCL Collision Defense, Boundary Accounting & Multi-Segment Sequencing
+- **Date**: 2026-09-08
+- **Phase**: Phase 02 Sub-Phase 02.3 Micro-Phase 02 (`P02-S03-M02`)
+- **Problem**: Storage engines must bound individual log file sizes to facilitate timely reclamation, compaction, and archiving. Moving from a single segment to an ordered sequence of segments introduces critical lifecycle challenges: (1) managing writer ownership so no records are written to a closed segment or interleaved across multiple active descriptors; (2) detecting segment overflow before appending records so no individual record is fragmented across files; (3) handling records larger than the configured segment threshold without infinite rotation deadlocks; (4) preventing concurrent goroutines from racing to create the same next segment; (5) guaranteeing that existing segment files or foreign files are never overwritten or truncated during rotation; and (6) ensuring multi-segment ordering relies on strict numeric parsing rather than fragile directory iteration or lexicographic sorting.
+- **Initial Assumption**: `RotatingWriter` could simply check `file.Size() >= threshold`, call `active.Close()`, and open `wal_%012d.log` with `os.O_CREATE`.
+- **What Was Actually True**:
+  1. **Single Logical Writer Ownership**: The `RotatingWriter` exclusively owns the active `*WALWriter`. All append operations are serialized through an internal mutex, ensuring that exactly one active writable segment exists at a time and no caller can write to a previous segment after rotation begins.
+  2. **Pre-Write Boundary Evaluation**: Rotation must occur *before* appending an oversized write, not after. Evaluating `activeLen > 0 && activeLen + recWireSize > SegmentSize` ensures that records never cross segment boundaries. On an exact fit ($S + R == M$), the record remains in the current segment, and the subsequent append triggers rotation.
+  3. **Oversized Record Policy**: If an incoming record exceeds `SegmentSize` while the active segment is empty ($S == 0$), the record must be accepted into that segment (provided it conforms to maximum key/value limits). Rejecting or rotating would cause an infinite rotation loop or total write starvation. Once written, any subsequent append sees $S > M$ and immediately rotates.
+  4. **Atomic Segment Creation & Collision Defense (`O_EXCL`)**: New segments are created using `os.O_WRONLY | os.O_CREATE | os.O_EXCL | os.O_APPEND`. If a file already exists at the target path (e.g. from an uncoordinated external process or crash residue), `os.OpenFile` fails fast with `os.ErrExist` at the kernel level. The existing file is never opened, truncated, or overwritten.
+  5. **Explicit Numeric ID Parsing & Ordering**: Segment discovery (`ListSegments`) extracts and parses the 12-digit numeric integer via `strconv.ParseUint` and sorts numerically ($1 < 2 < 9 < 10$). Lexicographical sorting would break if naming formats evolve.
+  6. **Independent Readability & Recovery**: Sealing and closing previous segments leaves them immutable, terminated at clean `io.EOF`, and independently readable by `WALReader` and recoverable by `RecoverSegment`.
+- **How It Was Verified**:
+  1. `TestRotation_InitialSegmentCreation`: Fresh WAL starts at segment 1 with 0 bytes and 0600 mode.
+  2. `TestRotation_AppendMultipleRecordsWithoutRotation`: Multiple records stay in segment 1 when below threshold.
+  3. `TestRotation_AtExactThreshold` & `TestRotation_ExactByteFitMatrix`: Verified exact fit ($S+R == M$), one byte under ($S+R == M-1$), and one byte over ($S+R == M+1$).
+  4. `TestRotation_OldSegmentRemainsIntact`: Proved SHA256 of old segment bytes remains 100% identical before and after rotation.
+  5. `TestRotation_NewSegmentStartsEmpty`: Proved new segment starts at 0 bytes before pending record append.
+  6. `TestRotation_SubsequentAppendGoesOnlyToNewSegment`: Proved subsequent records route strictly to the new segment.
+  7. `TestRotation_SegmentIDsIncrementCorrectly`: Verified monotonic progression $1 \to 2 \to 3 \dots$.
+  8. `TestRotation_NoIDReuse`: Proved no segment ID is ever reused across rotations.
+  9. `TestRotation_ExistingNextSegmentFileCollisionRejected` & `TestRotation_ExistingUnrelatedFileNeverTruncated`: Pre-existing file at next segment path rejects rotation with `os.ErrExist`; content is untouched.
+  10. `TestRotation_CreationFailurePropagated` & `TestRotation_PermissionFailurePropagated`: Verified safe error handling on injected disk errors and read-only directory permissions (`chmod 0500`).
+  11. `TestRotation_BothOldAndNewSegmentsReadableIndependently`: Both segments read cleanly to `io.EOF` via `WALReader`.
+  12. `TestRotation_RecordNeverSplitAcrossSegments`: All records verified physically atomic and whole within individual files.
+  13. `TestRotation_OversizedRecordBehavior`: Verified oversized record accepted into empty segment and triggers rotation on next append.
+  14. `TestRotation_WithEmptyActiveSegment`: Explicit `Rotate()` on empty segment seals 0-byte file and opens $N+1$.
+  15. `TestRotation_StateAfterWriterClose`: Closed writer returns `errors.ErrWriterClosed` on `AppendSync` and `Rotate`.
+  16. `TestRotation_RepeatedRotationAttemptsBehaveDeterministically`: Monotonic progression over consecutive manual rotations.
+  17. `TestRotation_ConcurrentAppendRotationStressRace`: 10 goroutines appending 250 records across frequent rotations; 0 data races under `-race`, all records decoded cleanly.
+  18. `TestRotation_ConcurrentCallersCannotBothCreateSameNextSegment`: Proved concurrent rotation calls serialize and maintain strictly unique IDs.
+  19. `TestRotation_SymlinkTargetRejection`: Proved pre-existing symlink target is never written or followed.
+  20. `TestRotation_FailureAfterOldSegmentCloseLeavesDeterministicState`: Proved failed creation marks writer inactive and allows retry recovery.
+  21. `TestRotation_LargeNumberOfSequentialRotations`: 50 consecutive rotations verified sequentially.
+  22. `TestRotation_ByteLevelContinuousSequence`: 30 records written across multiple segments decoded back in exact order, field-for-field, with 0 lost and 0 duplicated records.
+- **Core Lesson**: Segment rotation is an atomic state transition across filesystem objects. Never split records across segment boundaries, evaluate thresholds pre-write, accept oversized records into empty segments to avoid write starvation, enforce atomic `O_EXCL` file creation to eliminate collision and truncation hazards, and parse segment IDs numerically to guarantee global order.
+- **Interview Relevance**: Demonstrates deep systems expertise in log-structured storage lifecycle, boundary arithmetic, concurrency synchronization during file rotation, atomic POSIX file creation, and failure-atomic resource transitions.
+
 ---
 
 # 20. Questions I Personally Failed & Corrected Understandings

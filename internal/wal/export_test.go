@@ -20,3 +20,10 @@ func RecoverSegmentWithSeamsForTesting(
 ) (RecoveryResult, error) {
 	return recoverSegmentWithSeams(path, syncFn, truncateFn)
 }
+
+// SetCreateWriterFnForTesting exports createWriterFn seam injection on RotatingWriter.
+func (rw *RotatingWriter) SetCreateWriterFnForTesting(fn func(path string) (*WALWriter, error)) {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	rw.createWriterFn = fn
+}
