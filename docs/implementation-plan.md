@@ -349,18 +349,18 @@ Every future micro-phase implementation response from Claude Code must use this 
 
 ```
 Current Major Phase           : Phase 02 — Write-Ahead Log (WAL) & Durability Subsystem
-Current Sub-Phase             : Sub-Phase 02.2 — WAL File Management & Append Operations
-Current Micro-Phase           : P02-S02-M03 — Sequential WAL Reader & Log Iterator
+Current Sub-Phase             : Sub-Phase 02.3 — Torn Write Handling & Log Rotation
+Current Micro-Phase           : P02-S03-M01 — Torn Tail Write Detection & Safe Truncation
 Phase 01 Status               : COMPLETE (Sub-Phases 01.1 & 01.2 Complete)
 Previous Completed Phase      : Phase 01 — Core Storage Primitives & Binary Encodings
-Previous Completed Micro-Phase: P02-S02-M02 — Synchronous WAL Appender ("Strict Sync")
+Previous Completed Micro-Phase: P02-S02-M03 — Sequential WAL Reader & Log Iterator
 Phase 00 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Phase 01 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Blocking Issues               : None
-Tests Passing                 : `go test -race ./...` (19/19 error suites, 18/18 logger suites, 48/48 binary suites, 77/77 wal suites passing, 94.2% wal coverage, 100% binary & errors coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
-Security Review Status        : Complete & Verified (Strict sync durability barrier, 0600 file permissions, symlink and directory rejection, inode pinning via os.SameFile, short-write loops, concurrent non-interleaving mutex protection, caller input immutability)
-Interview Knowledge Status    : Updated with strict-sync contract, fdatasync vs fsync, sync failure semantics, short-write loop, torn-tail ownership, and engineering log
-Git Commit                    : feat(wal): [P02-S02-M02] add strict synchronous WAL appender
+Tests Passing                 : `go test -race ./...` (19/19 error suites, 18/18 logger suites, 48/48 binary suites, 105/105 wal suites passing, 91.8% wal coverage, 100% binary & errors coverage), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed
+Security Review Status        : Complete & Verified (Read-only O_RDONLY enforcement, no file mutation/truncation, symlink rejection via os.Lstat, inode pinning via os.SameFile, directory/non-regular file rejection, memory bounded streaming, clean EOF vs torn tail distinction, checksum mismatch preservation)
+Interview Knowledge Status    : Updated with clean EOF vs torn tail, middle corruption vs tail truncation, reader-decoder separation of concerns, offset accounting, single-consumer concurrency model, recovery boundary, and engineering log
+Git Commit                    : feat(wal): [P02-S02-M03] add sequential WAL reader and iterator
 ```
 
 ---
@@ -1022,10 +1022,15 @@ TOTAL: 184 Discrete, Testable Micro-Phases
     - **Observed Limitation**: On Darwin (macOS) and Windows, `fdatasync(2)` is not available in the kernel; synchronization falls back to `f.Sync()`, which also flushes file inode metadata. Physical media durability depends on underlying storage device controller write caches and filesystem barrier semantics. Mid-write failures may leave a partial record tail on disk; cleanup is deferred to the startup recovery subsystem.
   * *Completion*: Synchronous appender passing all unit, concurrency, fault injection, and strict sync tests.
 * **P02-S02-M03: Sequential WAL Reader & Log Iterator**
-  * *Objective*: Implement `WALReader` streaming records from disk from offset 0 to EOF.
-  * *Changes*: `WALReader.Next() (Record, error)`.
-  * *Tests*: Read back sequential log; verify sequence number monotonicity.
-  * *Completion*: Reader verified against multi-record log.
+  * *Objective*: Implement `WALReader` streaming records sequentially from disk from offset 0 to clean EOF.
+  * *Changes*: `internal/wal/reader.go` implementing `WALReader`, `OpenReader()`, `OpenSegmentReader()`, `Path()`, `Offset()`, `Close()`, and `Next() (Record, error)`; `internal/errors/errors.go` adding `ErrReaderClosed`.
+  * *Invariants*: Forward-only deterministic iteration without full-file buffering; strict read-only operation (opened with `os.O_RDONLY`, never modifies or truncates the file); symlink rejection via `os.Lstat` and inode pinning via `os.SameFile`; `Offset()` starts at 0, advances only on successful record consumption by exact physical wire length (`MinRecordSize + len(key) + len(val)`); clean EOF returns `io.EOF`; partial/torn records at EOF return truncation errors (`ErrHeaderTruncated`, `io.ErrUnexpectedEOF`); corrupted records return checksum/structural errors (`ErrChecksumMismatch`, `ErrInvalidRecordType`); never skips or repairs corrupted entries; single-consumer model (not safe for concurrent use); idempotent `Close()`.
+  * *Evidence*:
+    - **Design Target**: Forward-only, streaming sequential reader verifying checksums and framing boundaries without loading entire WAL files into memory.
+    - **Theoretical Property**: If every successful `Next()` consumes exactly one valid record, cumulative reader offset equals the sum of consumed physical record sizes (`MinRecordSize + len(key) + len(val)`), and stops cleanly at `io.EOF` or freezes at the exact byte offset of the first invalid/truncated byte.
+    - **Measured Result**: 22 required test groups passed; 1,000 sequential records read with cumulative offset exactly equal to file size; clean EOF distinguished from torn tails (1..20 byte truncated headers, partial keys, partial values); middle corruption intercepted deterministically without skipping; read-only verification proved file size and SHA256 checksum remain identical before and after reading; `go test -count=1 -race ./...` clean; 91.8% statement coverage in `internal/wal`; `golangci-lint` clean (0 issues).
+    - **Observed Limitation**: Reader classifies and stops on errors; it does not repair corruption or truncate torn tails. Truncation and recovery decisions belong strictly to Sub-Phase 02.3 (`P02-S03-M01`). Reader is not safe for concurrent `Next()` calls.
+  * *Completion*: Complete and verified across all unit, corruption, torn-tail, offset accounting, and lifecycle test suites.
 
 ### Sub-Phase 02.3: Torn Write Handling & Log Rotation
 * **P02-S03-M01: Torn Tail Write Detection & Safe Truncation**

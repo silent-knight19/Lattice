@@ -338,7 +338,35 @@
 * **Concurrency Model: Per-Writer Mutex Serialization**:
   - Multiple goroutines calling `AppendSync` on the same `WALWriter` are serialized by an internal `sync.Mutex`.
   - This ensures that record frames are strictly atomic on disk: goroutine A's record and goroutine B's record are never interleaved or torn.
-  - No global process mutex is used; concurrency protection is localized to the active segment writer. Group Commit (`P02-S04`) will later build on this to amortize `fdatasync` across concurrent callers.
+* **WAL Reader Architecture & Streaming Separation of Concerns**:
+  - `DecodeRecord(io.Reader)` is a pure stream codec: it reads byte chunks, verifies fixed-header framing, computes streaming CRC32-IEEE checksums, guards against unbounded allocations, and builds `Record` structs.
+  - `WALReader` is a lifecycle and sequential position manager: it opens WAL files securely (strictly `os.O_RDONLY`), rejects symlinks via `os.Lstat`, pins inodes via `os.SameFile`, verifies file regularity, tracks cumulative byte offsets, manages descriptor closing, and presents a forward-only `Next() (Record, error)` iterator.
+  - This clean separation allows `DecodeRecord` to remain testable against synthetic byte buffers and chunked network streams, while `WALReader` focuses on physical segment files and offset tracking.
+* **Clean EOF vs. Torn Tail Classification**:
+  - Clean EOF occurs when the file boundary aligns *exactly* with the end of a valid, fully decoded record (or in a fresh 0-byte segment). When `io.ReadFull` is called for the 21-byte header at EOF, exactly 0 bytes are read and `io.EOF` is returned immediately. `WALReader.Next()` cleanly preserves `io.EOF`.
+  - A torn tail occurs when the file terminates in the middle of a record: 1..20 bytes of a header, truncated key length, partial key bytes, truncated value length, or partial value bytes. In these cases, `io.ReadFull` returns fewer bytes than requested before encountering EOF, producing `*errors.HeaderTruncatedError` or `io.ErrUnexpectedEOF`.
+  - Distinguishing clean EOF from a torn tail is essential: clean EOF signals successful log completion, whereas a torn tail signals an incomplete in-flight transaction during crash/power-loss.
+* **Middle Corruption vs. Tail Truncation**:
+  - In a sequence of records $A \to B \to C$, if record $B$ fails checksum validation (`*errors.ChecksumMismatchError`) or structural validation (`*errors.InvalidRecordTypeError`), `WALReader` halts immediately and propagates the error.
+  - The reader MUST NOT silently skip $B$ and attempt to read $C$. In an append-only WAL, sequence numbers and operations are strictly serialized. Skipping an operation would allow downstream state machines to execute out-of-order or miss dependent state transitions, violating linearizability and database consistency.
+  - Halting deterministically ensures corrupted data is never silently replayed into the MemTable.
+* **The Recovery Boundary & Non-Destructive Read-Only Contract**:
+  - `WALReader` is strictly a *reader and classifier*, NOT a recovery or repair engine.
+  - The reader MUST NOT mutate the WAL file, truncate torn tails, or repair corrupted records. It opens segment files exclusively with `os.O_RDONLY`.
+  - Truncation is an irreversible, destructive filesystem mutation. Deciding whether to truncate an uncompleted transaction at EOF, crash-halt, or alert an operator is strictly the responsibility of the startup recovery subsystem (`P02-S03-M01`).
+* **Deterministic Record Offset Accounting**:
+  - `WALReader` maintains a logical byte offset (`Offset() int64`).
+  - At initialization: `offset = 0`.
+  - Upon each successful `Next()` call: `offset` advances by the exact physical wire length consumed: `int64(wal.MinRecordSize + len(rec.Key) + len(rec.Value))`.
+  - On ANY error (clean `io.EOF`, header truncation, unexpected EOF, checksum mismatch): `offset` freezes at the start of the unconsumed record.
+  - This eliminates duplicate parsing passes: higher-level recovery immediately knows the exact byte offset where the valid log ended and where truncation or forensics must begin.
+* **Streaming Memory Bounds vs. Full-File Buffering**:
+  - A WAL segment can reach 64 MiB or larger. Loading an entire segment into memory before iterating causes massive heap spikes and GC pauses.
+  - `WALReader` streams records on-the-fly from the underlying file descriptor. Heap allocations are strictly bounded to the currently active record's key and value slices (`binary.MaxKeyLen = 64` KiB, `binary.MaxValueLen = 4` MiB), keeping memory footprint constant ($O(1)$ with respect to segment file size).
+* **Reader Concurrency Ownership**:
+  - `WALReader` is intentionally **NOT safe for concurrent use**.
+  - A sequential log reader represents a forward-only traversal state. If concurrent goroutines invoked `Next()` simultaneously, read chunks would interleave, destroying stream framing and corrupting offset accounting.
+  - Lattice enforces a single-consumer model per reader: recovery or replication creates dedicated sequential readers.
 
 ### Subsystem Interview Questions
 * **Basic**: Why does a database need a Write-Ahead Log?
@@ -358,11 +386,20 @@
 * **Deep**: How does Lattice avoid Time-of-Check to Time-of-Use (TOCTOU) race conditions when initializing the WAL directory?
 * **Deep**: Why does Lattice use `os.Lstat` instead of `os.Stat` when inspecting an existing WAL path, and what security threat does this mitigate?
 * **Deep**: In the existing-directory permission hardening path, why is pathname-based `os.Chmod` vulnerable to TOCTOU, and how does Lattice mitigate it using descriptor-based `fchmod` and `os.SameFile`?
+* **Deep**: Why does clean EOF differ from a torn tail during WAL replay, and how does `WALReader` distinguish them?
+* **Deep**: If record B is corrupted in the middle of a WAL segment ($A \to B \to C$), why must `WALReader` halt rather than skipping B to read C?
+* **Deep**: Why is `WALReader` strictly read-only, and why must the reader NOT truncate or repair corrupted records?
+* **Deep**: How does `WALReader` compute physical record byte offsets without parsing the record format twice?
+* **Deep**: Why shouldn't a sequential WAL reader buffer the entire segment file into memory, and how are memory allocations bounded?
+* **Deep**: How do `DecodeRecord` and `WALReader` divide responsibilities between framing decoding and file lifecycle management?
+* **Deep**: What are the concurrency ownership semantics of `WALReader`, and why is `Next()` intentionally not thread-safe?
+* **Deep**: How does the deterministic offset and error reporting of `WALReader` prepare the database engine for startup crash recovery?
 * **Follow-up**: How do you prevent group commit queues from consuming unbounded RAM if the disk becomes completely saturated?
 * **"Did You Actually Build This?"**: How do you distinguish between an uncompleted torn write at the tail of the WAL versus a corrupted record in the middle of the file during startup recovery?
 * **"Did You Actually Build This?"**: How do you handle readers that return fewer bytes than requested without an error (short reads) or readers that return data and io.EOF in the same call?
 * **"Did You Actually Build This?"**: Walk me through how you proved your WAL checksum integrity across every field. Did you test single-bit flips, and what happens if you mutate the CRC field itself?
 * **"Did You Actually Build This?"**: What happens if two goroutines call WAL directory initialization at the exact same millisecond when the directory does not yet exist? Does it require a mutex?
+* **"Did You Actually Build This?"**: When reading a WAL file, what happens to the reader's offset if a record has a checksum mismatch? Does the offset advance past the corrupted record?
 
 ---
 
@@ -1008,6 +1045,41 @@ This section is a living record of actual engineering obstacles, debugging sessi
   14. `TestWriter_OneThousandRecordsReplay`: 1,000 records sequentially appended and verified.
 - **Core Lesson**: True database durability begins at the kernel barrier. Distinguish between OS page cache acceptance, filesystem data synchronization, and physical storage media durability. Never claim success on a write whose durability barrier failed, and never truncate files mid-flight during append failures.
 - **Interview Relevance**: Demonstrates mastery of database durability tiers, POSIX system calls (`write`, `fsync`, `fdatasync`), Linux vs Darwin kernel barrier behaviors, concurrency serialization without global mutexes, and the precise division of responsibility between the append path and recovery subsystem.
+
+### Entry 2026-09-08 — Phase 02: Sequential WAL Reader, Deterministic Offset Tracking, Clean EOF vs Torn-Tail Classification & Read-Only Separation of Concerns
+- **Date**: 2026-09-08
+- **Phase**: Phase 02 Sub-Phase 02.2 Micro-Phase 03 (`P02-S02-M03`)
+- **Problem**: In an LSM database, crash recovery and replica catch-up require streaming persisted WAL records sequentially from disk. A naive reader might buffer the entire file into memory (inducing OOM), blur the distinction between a clean end-of-file and an incomplete torn tail from a crash, attempt to repair or truncate the log mid-iteration, or skip past corrupted records. Furthermore, without deterministic physical offset tracking, higher-level recovery cannot know where valid data ended and where truncation must occur.
+- **Initial Assumption**: `WALReader` should decide whether to truncate torn records at EOF, or could simply call `os.Open()` and use `io.ReadAll()`.
+- **What Was Actually True**:
+  1. **Strict Read-Only Separation of Concerns**: `WALReader` is strictly a *reader and classifier*. It opens files exclusively with `os.O_RDONLY`. It never truncates, repairs, or mutates the underlying file. Destructive recovery actions (like truncating torn tails) belong strictly to the recovery subsystem (`P02-S03-M01`).
+  2. **Clean EOF vs Torn Tail Invariant**: Clean EOF occurs when the file ends exactly at a record boundary (or is a 0-byte file), returning `io.EOF`. If the file ends mid-record (partial header, partial key, or partial value), it returns `*errors.HeaderTruncatedError` or `io.ErrUnexpectedEOF`. Distinguishing these allows recovery to cleanly finish versus truncating incomplete crash artifacts.
+  3. **Middle Corruption Stops Immediately**: If a record in the middle of the log fails checksum verification (`*errors.ChecksumMismatchError`) or structural validation (`*errors.InvalidRecordTypeError`), the reader halts immediately and preserves the error. It never skips forward to later records, preventing the replay of dependent operations over corrupted state.
+  4. **Exact Physical Offset Tracking**: `Offset()` starts at 0 and advances only after successful record consumption by `int64(wal.MinRecordSize + len(rec.Key) + len(rec.Value))`. On any error, it freezes at the exact byte boundary of the unconsumed record, providing recovery with the exact truncation point without a second parsing pass.
+  5. **Constant Streaming Memory Footprint**: Records are decoded on-the-fly directly from the open file descriptor. Heap allocations are strictly bounded to the active record's key and value slices (`binary.MaxKeyLen = 64` KiB, `binary.MaxValueLen = 4` MiB), maintaining $O(1)$ memory usage relative to the segment file size.
+  6. **Security Perimeter**: Symlinks are rejected via `os.Lstat`, directories and non-regular files are rejected, and the file descriptor is pinned via `os.SameFile` post-open.
+  7. **Single-Consumer Concurrency Model**: `WALReader` is explicitly not safe for concurrent `Next()` calls. Concurrent iteration would interleave chunk reads and corrupt stream framing.
+- **How It Was Verified**:
+  1. `TestReader_EmptyWAL`: Verified 0-byte file immediately returns `io.EOF` with `Offset() == 0`.
+  2. `TestReader_SingleRecord` & `TestReader_MultipleRecords`: Verified exact sequential record contents and exact byte-for-byte offset advancement.
+  3. `TestReader_AllRecordTypes`: Verified PUT, DELETE, BATCH_START, and BATCH_COMMIT.
+  4. `TestReader_MaxRecordSize`: Verified records at maximum valid key (65,535 B) and value (4 MiB) boundaries.
+  5. `TestReader_CleanEOF`: Verified exact boundary returns `io.EOF`, not `io.ErrUnexpectedEOF`.
+  6. `TestReader_TruncatedHeader`, `TestReader_TruncatedKey`, `TestReader_TruncatedValue`: Verified partial records at EOF return specific truncation errors.
+  7. `TestReader_ChecksumCorruption`: Verified mutated payload returns `*errors.ChecksumMismatchError`.
+  8. `TestReader_MiddleCorruption`: Verified in $A \to \text{corrupted } B \to C$, reader returns $A$, halts on $B$, and never returns $C$.
+  9. `TestReader_InvalidRecordType` & `TestReader_OversizedLength`: Verified structural error propagation and memory defense without unbounded allocation.
+  10. `TestReader_WrongFileType` & `TestReader_MissingFile`: Verified directory and non-existent file handling.
+  11. `TestReader_CloseIdempotency`: Verified idempotent `Close()` and subsequent `Next()` returning `errors.ErrReaderClosed`.
+  12. `TestReader_ReopenReread`: Verified separate readers return identical records.
+  13. `TestReader_DoesNotModifyFile`: Proved file size and SHA256 checksum remain 100% identical before and after reading.
+  14. `TestReader_RecordOwnership`: Proved returned slices do not alias internal reader buffers.
+  15. `TestReader_OffsetAccounting`: Proved cumulative encoded lengths exactly equal final reader offset without drift.
+  16. `TestReader_LargeRecordStream`: 1,000 sequential records decoded in order with final offset equal to file size.
+  17. `TestReader_TornTailIsolation`: Verified partial record at EOF does not mutate or truncate the underlying file.
+  18. `TestReader_MiddleCorruptionIsolation`: Verified middle corruption leaves the file intact.
+- **Core Lesson**: A log reader is a sensor and classifier, not an actuator. Decouple stream reading from disaster recovery decisions, preserve error identities strictly, advance positions only upon complete validation, and track exact byte offsets to empower higher-level recovery subsystems.
+- **Interview Relevance**: Demonstrates mastery of streaming binary deserialization, failure classification (clean EOF vs torn tail vs middle corruption), non-destructive reader design, descriptor security and inode pinning, memory-bounded I/O, and clean separation between log consumption and crash recovery.
 
 ---
 

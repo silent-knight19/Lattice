@@ -677,3 +677,22 @@ func TestErrWriterClosed(t *testing.T) {
 		t.Errorf("unexpected error message: %q", errors.ErrWriterClosed.Error())
 	}
 }
+
+func TestErrReaderClosed(t *testing.T) {
+	if errors.ErrReaderClosed == nil {
+		t.Fatalf("ErrReaderClosed must not be nil")
+	}
+
+	wrapped := fmt.Errorf("wal read: %w", errors.ErrReaderClosed)
+	if !stdErrors.Is(wrapped, errors.ErrReaderClosed) {
+		t.Errorf("wrapped ErrReaderClosed must match via errors.Is")
+	}
+
+	if stdErrors.Is(errors.ErrReaderClosed, errors.ErrKeyNotFound) {
+		t.Errorf("ErrReaderClosed must not match ErrKeyNotFound")
+	}
+
+	if !strings.Contains(errors.ErrReaderClosed.Error(), "wal reader is closed") {
+		t.Errorf("unexpected error message: %q", errors.ErrReaderClosed.Error())
+	}
+}

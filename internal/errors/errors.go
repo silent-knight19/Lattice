@@ -73,6 +73,9 @@ var (
 
 	// ErrWriterClosed indicates that an operation was attempted on a closed WAL writer.
 	ErrWriterClosed = stdErrors.New("wal writer is closed")
+
+	// ErrReaderClosed indicates that an operation was attempted on a closed WAL reader.
+	ErrReaderClosed = stdErrors.New("wal reader is closed")
 )
 
 // KeyTooLargeError provides structured context when a key violates maximum size limits.
