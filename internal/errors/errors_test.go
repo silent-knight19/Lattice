@@ -40,6 +40,8 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrInvalidQueueCapacity", errors.ErrInvalidQueueCapacity, "wal write queue capacity must be greater than zero"},
 		{"ErrRunnerRunning", errors.ErrRunnerRunning, "group commit runner is already running"},
 		{"ErrRunnerClosed", errors.ErrRunnerClosed, "group commit runner is closed"},
+		{"ErrInvalidSkipListHeight", errors.ErrInvalidSkipListHeight, "invalid skiplist node height"},
+		{"ErrInvalidSkipListLevel", errors.ErrInvalidSkipListLevel, "invalid skiplist level"},
 	}
 
 	for _, tc := range sentinels {
@@ -87,6 +89,8 @@ func TestSentinelWrappingWithErrorsIs(t *testing.T) {
 		{"ErrInvalidQueueCapacity", errors.ErrInvalidQueueCapacity},
 		{"ErrRunnerRunning", errors.ErrRunnerRunning},
 		{"ErrRunnerClosed", errors.ErrRunnerClosed},
+		{"ErrInvalidSkipListHeight", errors.ErrInvalidSkipListHeight},
+		{"ErrInvalidSkipListLevel", errors.ErrInvalidSkipListLevel},
 	}
 
 	for _, tc := range tests {
@@ -967,5 +971,92 @@ func TestInvalidQueueCapacityError(t *testing.T) {
 	var nilErr *errors.InvalidQueueCapacityError
 	if nilErr.Error() != errors.ErrInvalidQueueCapacity.Error() {
 		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrInvalidQueueCapacity.Error())
+	}
+}
+
+func TestInvalidSkipListHeightError(t *testing.T) {
+	err := &errors.InvalidSkipListHeightError{
+		Height:    0,
+		MinHeight: 1,
+		MaxHeight: 16,
+	}
+
+	// errors.Is check
+	if !stdErrors.Is(err, errors.ErrInvalidSkipListHeight) {
+		t.Errorf("InvalidSkipListHeightError must match ErrInvalidSkipListHeight via errors.Is")
+	}
+
+	// Negative match
+	if stdErrors.Is(err, errors.ErrKeyNotFound) {
+		t.Errorf("InvalidSkipListHeightError must not match ErrKeyNotFound")
+	}
+
+	// Wrapping check
+	wrapped := fmt.Errorf("node allocation: %w", err)
+	if !stdErrors.Is(wrapped, errors.ErrInvalidSkipListHeight) {
+		t.Errorf("wrapped InvalidSkipListHeightError must match ErrInvalidSkipListHeight via errors.Is")
+	}
+
+	var extracted *errors.InvalidSkipListHeightError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("failed to extract *InvalidSkipListHeightError from wrapped chain")
+	}
+	if extracted.Height != 0 || extracted.MinHeight != 1 || extracted.MaxHeight != 16 {
+		t.Errorf("extracted mismatch: got %+v", extracted)
+	}
+
+	// String check
+	msg := err.Error()
+	if !strings.Contains(msg, "invalid skiplist node height 0: must be between 1 and 16") {
+		t.Errorf("unexpected error message: %q", msg)
+	}
+
+	// Typed nil safety
+	var nilErr *errors.InvalidSkipListHeightError
+	if nilErr.Error() != errors.ErrInvalidSkipListHeight.Error() {
+		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrInvalidSkipListHeight.Error())
+	}
+}
+
+func TestInvalidSkipListLevelError(t *testing.T) {
+	err := &errors.InvalidSkipListLevelError{
+		Level:    16,
+		MaxLevel: 15,
+	}
+
+	// errors.Is check
+	if !stdErrors.Is(err, errors.ErrInvalidSkipListLevel) {
+		t.Errorf("InvalidSkipListLevelError must match ErrInvalidSkipListLevel via errors.Is")
+	}
+
+	// Negative match
+	if stdErrors.Is(err, errors.ErrKeyNotFound) {
+		t.Errorf("InvalidSkipListLevelError must not match ErrKeyNotFound")
+	}
+
+	// Wrapping check
+	wrapped := fmt.Errorf("forward traversal: %w", err)
+	if !stdErrors.Is(wrapped, errors.ErrInvalidSkipListLevel) {
+		t.Errorf("wrapped InvalidSkipListLevelError must match ErrInvalidSkipListLevel via errors.Is")
+	}
+
+	var extracted *errors.InvalidSkipListLevelError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("failed to extract *InvalidSkipListLevelError from wrapped chain")
+	}
+	if extracted.Level != 16 || extracted.MaxLevel != 15 {
+		t.Errorf("extracted mismatch: got %+v", extracted)
+	}
+
+	// String check
+	msg := err.Error()
+	if !strings.Contains(msg, "invalid skiplist level 16: must be between 0 and 15") {
+		t.Errorf("unexpected error message: %q", msg)
+	}
+
+	// Typed nil safety
+	var nilErr *errors.InvalidSkipListLevelError
+	if nilErr.Error() != errors.ErrInvalidSkipListLevel.Error() {
+		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrInvalidSkipListLevel.Error())
 	}
 }

@@ -120,6 +120,14 @@ var (
 
 	// ErrRunnerClosed indicates that an operation was attempted on a closed group commit runner.
 	ErrRunnerClosed = stdErrors.New("group commit runner is closed")
+
+	// ErrInvalidSkipListHeight indicates that a requested SkipList node height violates
+	// the architectural bounds [MinHeight, MaxHeight].
+	ErrInvalidSkipListHeight = stdErrors.New("invalid skiplist node height")
+
+	// ErrInvalidSkipListLevel indicates that a requested SkipList level index violates
+	// the bounds [0, height-1] for a node.
+	ErrInvalidSkipListLevel = stdErrors.New("invalid skiplist level")
 )
 
 // KeyTooLargeError provides structured context when a key violates maximum size limits.
@@ -397,4 +405,43 @@ func (e *InvalidQueueCapacityError) Error() string {
 // Is reports whether this error matches target sentinel ErrInvalidQueueCapacity.
 func (e *InvalidQueueCapacityError) Is(target error) bool {
 	return target == ErrInvalidQueueCapacity
+}
+
+// InvalidSkipListHeightError provides structured context when a SkipList node height violates bounds.
+// It matches ErrInvalidSkipListHeight when interrogated with errors.Is().
+type InvalidSkipListHeightError struct {
+	Height    int
+	MinHeight int
+	MaxHeight int
+}
+
+func (e *InvalidSkipListHeightError) Error() string {
+	if e == nil {
+		return ErrInvalidSkipListHeight.Error()
+	}
+	return fmt.Sprintf("invalid skiplist node height %d: must be between %d and %d", e.Height, e.MinHeight, e.MaxHeight)
+}
+
+// Is reports whether this error matches target sentinel ErrInvalidSkipListHeight.
+func (e *InvalidSkipListHeightError) Is(target error) bool {
+	return target == ErrInvalidSkipListHeight
+}
+
+// InvalidSkipListLevelError provides structured context when accessing a SkipList forward level outside bounds.
+// It matches ErrInvalidSkipListLevel when interrogated with errors.Is().
+type InvalidSkipListLevelError struct {
+	Level    int
+	MaxLevel int
+}
+
+func (e *InvalidSkipListLevelError) Error() string {
+	if e == nil {
+		return ErrInvalidSkipListLevel.Error()
+	}
+	return fmt.Sprintf("invalid skiplist level %d: must be between 0 and %d", e.Level, e.MaxLevel)
+}
+
+// Is reports whether this error matches target sentinel ErrInvalidSkipListLevel.
+func (e *InvalidSkipListLevelError) Is(target error) bool {
+	return target == ErrInvalidSkipListLevel
 }
