@@ -1,6 +1,10 @@
 package memtable
 
-import "github.com/silent-knight19/lattice/internal/binary"
+import (
+	"sync/atomic"
+
+	"github.com/silent-knight19/lattice/internal/binary"
+)
 
 // Exported type aliases, methods, and functions for black-box testing from external packages.
 
@@ -90,4 +94,30 @@ func (s *SkipList) WriterLockForTesting() {
 
 func (s *SkipList) WriterUnlockForTesting() {
 	s.mu.Unlock()
+}
+
+func (s *SkipList) SetByteSizeForTesting(val uint64) {
+	s.byteSize.Store(val)
+}
+
+func NodeMemoryBytesForTesting(keyLen, valueLen, height int) uint64 {
+	return nodeMemoryBytes(keyLen, valueLen, height)
+}
+
+func ValueMemoryBytesForTesting(valueLen int) uint64 {
+	return valueMemoryBytes(valueLen)
+}
+
+var (
+	NodeStructSizeForTesting      = NodeStructSize
+	NodeValueStructSizeForTesting = NodeValueStructSize
+	PointerSizeForTesting         = PointerSize
+)
+
+func SafeAddUint64ForTesting(counter *atomic.Uint64, delta uint64) {
+	safeAddUint64(counter, delta)
+}
+
+func SafeSubUint64ForTesting(counter *atomic.Uint64, delta uint64) {
+	safeSubUint64(counter, delta)
 }

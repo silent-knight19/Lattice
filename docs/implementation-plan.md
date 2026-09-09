@@ -350,13 +350,13 @@ Every future micro-phase implementation response from Claude Code must use this 
 ```
 Current Major Phase           : Phase 03 — In-Memory MemTable & Concurrent SkipList
 Current Sub-Phase             : Sub-Phase 03.2 — Concurrent Traversal & Memory Accounting
-Current Micro-Phase           : P03-S02-M01 — Lock-Free Read Traversal via Atomic Pointer Reads (COMPLETE)
+Current Micro-Phase           : P03-S02-M02 — Exact Byte-Level Memory Accounting (COMPLETE)
 Phase 01 Status               : COMPLETE (Sub-Phases 01.1 & 01.2 Complete)
 Phase 02 Status               : COMPLETE (Sub-Phases 02.1, 02.2, 02.3, 02.4 Complete)
-Phase 03 Status               : IN PROGRESS (Sub-Phase 03.1 Complete; Sub-Phase 03.2 M01 complete)
+Phase 03 Status               : IN PROGRESS (Sub-Phases 03.1 & 03.2 Complete)
 Previous Completed Phase      : Phase 02 — Write-Ahead Log (WAL) & Durability Subsystem
-Previous Completed Micro-Phase: P03-S02-M01 — Lock-Free Read Traversal via Atomic Pointer Reads
-Next Planned Phase            : Phase 03 — In-Memory MemTable & Concurrent SkipList (P03-S02-M02)
+Previous Completed Micro-Phase: P03-S02-M02 — Exact Byte-Level Memory Accounting
+Next Planned Phase            : Phase 03 — In-Memory MemTable & Concurrent SkipList (P03-S03-M01)
 Phase 00 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Phase 01 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Security Audit Track State    : Active
@@ -1183,11 +1183,21 @@ TOTAL: 184 Discrete, Testable Micro-Phases
   * *Observed Limitation*: Write mutations remain serialized under `s.mu.Lock()`; concurrent multi-writer lock-free insertions are intentionally not implemented. Exact byte-level memory tracking (`MemTable.ByteSize()`) is deferred to `P03-S02-M02`.
   * *Completion*: Complete and verified.
 * **P03-S02-M02: Exact Byte-Level Memory Accounting**
-  * *Objective*: Track exact heap consumption of keys, values, node structs, and pointer arrays.
-  * *Changes*: `MemTable.ByteSize() uint64`.
-  * *Invariants*: `ByteSize()` updated atomically on each insertion.
-  * *Tests*: Insert known sizes; verify reported `ByteSize()` matches expected memory overhead within 1%.
-  * *Completion*: Memory accounting verified.
+  * *Objective*: Track exact heap consumption of keys, values, node structs, and forward pointer arrays.
+  * *Changes*: `internal/memtable/size.go` (`NodeStructSize`, `NodeValueStructSize`, `PointerSize`, `nodeMemoryBytes`, `valueMemoryBytes`, `safeAddUint64`, `safeSubUint64`), `internal/memtable/skiplist.go` (`SkipList.ByteSize() uint64`, `byteSize atomic.Uint64`, atomic accounting on fresh insert and duplicate replacement), `internal/memtable/export_test.go`, `internal/memtable/size_test.go`.
+  * *Invariants*:
+    - P03-S02-M02-SEC-INV-01: `ByteSize` never wraps due to unchecked addition (saturates safely at `math.MaxUint64`).
+    - P03-S02-M02-SEC-INV-02: `ByteSize` never underflows due to subtraction (saturates safely at 0).
+    - P03-S02-M02-SEC-INV-03: Failed insertion does not change `ByteSize` (failure atomicity).
+    - P03-S02-M02-SEC-INV-04: Exact duplicate insertion does not change node count (`Len()`).
+    - P03-S02-M02-SEC-INV-05: Exact duplicate replacement changes `ByteSize` strictly by the defined ownership delta ($\Delta = \text{newValBytes} - \text{oldValBytes}$).
+    - P03-S02-M02-SEC-INV-06: `ByteSize()` is race-free under concurrent observation.
+    - P03-S02-M02-SEC-INV-07: Every live owned allocation represented by the accounting model is counted exactly once.
+    - P03-S02-M02-SEC-INV-08: No temporary test-only memory is included in production `ByteSize`.
+  * *Theoretical Property*: `ByteSize()` is $O(1)$ time, zero heap allocations, safe for concurrent reader observation via `atomic.Uint64`. Accounting derives deterministically from struct layout (`unsafe.Sizeof`) and owned slice capacities, completely decoupled from non-deterministic `runtime.MemStats`.
+  * *Measured Result*: Exact equality verified against an independent test oracle across deterministic cases (Heights 1..16, Keys 1..65,535B, Values 0..65,536B); incremental additive deltas ($A, B, C$) confirmed; duplicate delta updates (grow, shrink, shrink to 0, grow from 0) verified; 1 writer + 16 readers executing continuous mutations and `ByteSize()` observation under `go test -race` with 0 data races; 92.7% statement coverage in `internal/memtable`; `golangci-lint run ./...` clean (0 issues); `go vet` clean across Darwin, Linux, and Windows.
+  * *Observed Limitation*: `ByteSize()` tracks Lattice-owned in-memory object heap allocations under the project's explicit accounting model; it intentionally excludes Go runtime allocator metadata, GC write barrier structures, allocator size-class slack, and OS-level process RSS.
+  * *Completion*: Complete and verified.
 
 ### Sub-Phase 03.3: MemTable Iteration & Immutable Transition
 * **P03-S03-M01: Forward Iterator Implementation**

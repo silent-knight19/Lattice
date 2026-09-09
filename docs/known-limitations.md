@@ -238,13 +238,13 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
-### 17. Single Serialized Writer Model & Deferred MemTable Memory Accounting
-* **Limitation**: In `P03-S02-M01`, lock-free reader traversal (`SearchConcurrent`) and bottom-up atomic publication are fully implemented and verified. However, write mutations remain strictly serialized under an exclusive mutex (`s.mu.Lock()`). Concurrent multi-writer lock-free insertions are intentionally not implemented. Furthermore, exact byte-level memory tracking (`MemTable.ByteSize()`) is deferred to `P03-S02-M02`.
+### 17. Single Serialized Writer Model & Verified Lock-Free Reader Architecture
+* **Limitation**: In `P03-S02-M01` and `P03-S02-M02`, lock-free reader traversal (`SearchConcurrent`), exact byte-level memory tracking (`ByteSize()`), and bottom-up atomic publication are fully implemented and verified. However, write mutations remain strictly serialized under an exclusive mutex (`s.mu.Lock()`). Concurrent multi-writer lock-free insertions are intentionally not implemented.
 * **Why It Exists**: In modern LSM storage engines (e.g. LevelDB, RocksDB, Pebble), multiple concurrent writers incur extreme CAS retry overhead and complex split/splice lock-free protocols that provide minimal throughput benefit over serialized append-oriented MemTables fed by a WAL Group Commit pipeline. Serializing structural SkipList mutations under a mutex while keeping readers 100% lock-free represents the optimal production engineering balance.
 * **Impact**: Total ingestion rate into a single active MemTable is bounded by single-core pointer splicing throughput (~2-5 million writes/sec in memory). Multiple concurrent readers scale linearly across CPU cores without mutex contention.
 * **How It Was Detected**: Architectural design established in Phase 03 Roadmap and ADR-003.
 * **Current Mitigation**: Serialized writer mutex guarantees structural failure atomicity and zero CAS retry storms; lock-free readers execute without acquiring locks.
-* **Future Solution**: Exact memory accounting will be implemented in `P03-S02-M02`; MemTable freezing and multi-version iterators in Sub-Phase 03.3.
+* **Future Solution**: MemTable freezing and multi-version forward iterators will be implemented in Sub-Phase 03.3.
 * **Dimensional Impact**:
   * Correctness: **None** (Linearizability and race freedom strictly preserved).
   * Performance: **Optimal** (Readers never stall on writers; writers avoid CAS loops).
@@ -252,6 +252,21 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 18. Lattice-Owned Object Accounting Boundary vs Go Runtime Allocator Metadata and Process RSS
+* **Limitation**: `ByteSize()` deterministically tracks heap memory directly attributable to Lattice-owned objects (`skipListNode` struct headers, cloned `UserKey` backing arrays, variable-height forward pointer towers, `nodeValue` containers, and value backing arrays). It deliberately does not track Go runtime allocator internal metadata (`mheap`, `mcentral`, `mspan`), size-class rounding slack (e.g. a 72-byte struct allocated from Go's 80-byte size class), GC write barrier state, goroutine stacks, runtime heap fragmentation, or operating system Resident Set Size (RSS).
+* **Why It Exists**: `ByteSize()` must be deterministic, reproducible, arithmetic-safe, and independent of Go runtime GC cycles, allocator cache flushes, or operating system page management. Using `runtime.MemStats.HeapAlloc` would make byte accounting non-deterministic, noisy across unrelated goroutines, and unsuited for predictable MemTable flush threshold decisions.
+* **Impact**: Total physical process resident memory (`RSS`) reported by OS tools (e.g., `ps`, `top`) will exceed `ByteSize()` due to runtime overhead, garbage collector retention curves, and OS page alignment.
+* **How It Was Detected**: P03-S02-M02 memory accounting architectural specification.
+* **Current Mitigation**: The accounting model explicitly derives bounds from `unsafe.Sizeof` and allocated slice capacities, ensuring exact equality against independent mathematical models and predictable flushing triggers.
+* **Future Solution**: Phase 10 engine metrics will export both logical `ByteSize()` and physical OS RSS (`runtime.MemStats.Sys`, `HeapInuse`) for operational telemetry.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Deterministic, testable, and failure-atomic).
+  * Performance: **Optimal** ($O(1)$ atomic counter load with zero allocations).
+  * Scalability: **Optimal**.
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*
+
 
 

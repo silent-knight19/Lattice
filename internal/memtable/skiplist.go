@@ -36,11 +36,12 @@ import (
 //     3. OpType DESC (DELETE/Tombstone sorts before PUT for identical seqNum)
 //   - Traversal along forward pointers terminates at nil without cycles.
 type SkipList struct {
-	mu     sync.RWMutex
-	head   *skipListNode
-	height atomic.Int32
-	rnd    *HeightGenerator
-	count  atomic.Int64
+	mu       sync.RWMutex
+	head     *skipListNode
+	height   atomic.Int32
+	rnd      *HeightGenerator
+	count    atomic.Int64
+	byteSize atomic.Uint64
 }
 
 // NewSkipList creates a new SkipList backed by the default
@@ -66,6 +67,7 @@ func NewSkipListWithGenerator(rnd *HeightGenerator) *SkipList {
 	}
 	sl.height.Store(MinHeight)
 	sl.count.Store(0)
+	sl.byteSize.Store(0)
 	return sl
 }
 
@@ -77,6 +79,27 @@ func (s *SkipList) Height() int {
 // Len returns the total number of distinct entries currently stored in the SkipList.
 func (s *SkipList) Len() int {
 	return int(s.count.Load())
+}
+
+// ByteSize returns the exact heap bytes directly owned by user-record structures
+// (nodes, key backing arrays, forward pointer towers, value containers, and value backing arrays)
+// currently stored in the SkipList.
+//
+// Memory Accounting Model (P03-S02-M02):
+//   - Model A (User-Record Owned Storage): ByteSize starts at 0 for an empty SkipList.
+//   - Each inserted entry accounts for:
+//     NodeStructSize (72B on 64-bit) + len(UserKey) + height * PointerSize (8B on 64-bit)
+//   - (if valueLen > 0: NodeValueStructSize (24B) + len(value))
+//   - Exact duplicate InternalKey updates adjust ByteSize strictly by the value container/payload delta.
+//   - Sentinel node infrastructure is excluded from user-record ByteSize.
+//   - Excludes Go runtime allocator metadata, GC structures, and fragmentation.
+//
+// Guarantees:
+//   - Complexity: O(1) time, 0 allocations.
+//   - Concurrency: Thread-safe for concurrent readers and serialized writers via atomic.Uint64 load.
+//   - Invariant: Updated atomically on insertion and duplicate replacement.
+func (s *SkipList) ByteSize() uint64 {
+	return s.byteSize.Load()
 }
 
 // IsEmpty reports whether the SkipList contains zero user entries.
@@ -110,7 +133,7 @@ func (s *SkipList) Insert(key binary.InternalKey, value []byte) error {
 }
 
 // insertInternal executes predecessor search and splices the new node.
-// If forcedHeight > 0, forcedHeight is used instead of generating a random height (used by test seams).
+// If forcedHeight != 0, forcedHeight is used instead of generating a random height (used by test seams).
 func (s *SkipList) insertInternal(key binary.InternalKey, value []byte, forcedHeight int) error {
 	// 1. Boundary validation prior to acquiring locks or mutating structure
 	if err := binary.ValidateKey(key.UserKey); err != nil {
@@ -125,7 +148,7 @@ func (s *SkipList) insertInternal(key binary.InternalKey, value []byte, forcedHe
 
 	// 2. Determine node tower height
 	nodeHeight := forcedHeight
-	if nodeHeight <= 0 {
+	if nodeHeight == 0 {
 		nodeHeight = s.rnd.RandomHeight()
 	}
 	if nodeHeight < MinHeight || nodeHeight > MaxHeight {
@@ -141,6 +164,7 @@ func (s *SkipList) insertInternal(key binary.InternalKey, value []byte, forcedHe
 	if err != nil {
 		return err
 	}
+	entryBytes := nodeMemoryBytes(len(key.UserKey), len(value), nodeHeight)
 
 	// 4. Acquire exclusive writer mutation lock
 	s.mu.Lock()
@@ -164,6 +188,13 @@ func (s *SkipList) insertInternal(key binary.InternalKey, value []byte, forcedHe
 	candidate := curr.forward[0].Load()
 	if candidate != nil && binary.CompareInternalKey(candidate.key, key) == 0 {
 		// Exact duplicate (UserKey, SeqNum, OpType): atomically replace value container
+		oldVal := candidate.value.Load()
+		oldValBytes := uint64(0)
+		if oldVal != nil {
+			oldValBytes = valueMemoryBytes(len(oldVal.data))
+		}
+		newValBytes := valueMemoryBytes(len(value))
+
 		var newVal *nodeValue
 		if len(value) > 0 {
 			valCopy := make([]byte, len(value))
@@ -171,6 +202,13 @@ func (s *SkipList) insertInternal(key binary.InternalKey, value []byte, forcedHe
 			newVal = &nodeValue{data: valCopy}
 		}
 		candidate.value.Store(newVal)
+
+		// Adjust ByteSize by the delta between new and old value container/payload allocations
+		if newValBytes > oldValBytes {
+			safeAddUint64(&s.byteSize, newValBytes-oldValBytes)
+		} else if newValBytes < oldValBytes {
+			safeSubUint64(&s.byteSize, oldValBytes-newValBytes)
+		}
 		return nil
 	}
 
@@ -199,6 +237,7 @@ func (s *SkipList) insertInternal(key binary.InternalKey, value []byte, forcedHe
 	}
 
 	s.count.Add(1)
+	safeAddUint64(&s.byteSize, entryBytes)
 	return nil
 }
 
