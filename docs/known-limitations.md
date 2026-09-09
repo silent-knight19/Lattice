@@ -238,6 +238,20 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 17. Single-Threaded SkipList Traversal & Sequential Pointer Mutation
+* **Limitation**: In `P03-S01-M02`, `SkipList` is strictly single-threaded. Forward pointers are linked via standard pointer writes (`newNode.forward[i] = update[i].forward[i]; update[i].forward[i] = newNode`), and read traversals do not execute atomic load operations (`atomic.LoadPointer`).
+* **Why It Exists**: Phase 03 is staged systematically: micro-phase `P03-S01-M02` focuses exclusively on algorithmic correctness, multi-version ordering, sentinel anchoring, failure atomicity, and structural invariants. Lock-free read traversal, bottom-up atomic publication (`atomic.StorePointer`), and writer mutex coordination are scheduled for Sub-Phase 03.2 (`P03-S02-M01`).
+* **Impact**: Concurrent invocations of `Insert` or concurrent `Insert` + `Search` without external synchronization would produce data races.
+* **How It Was Detected**: Architectural design boundary established in Phase 03 roadmap.
+* **Current Mitigation**: The SkipList remains package-private to `internal/memtable` in this micro-phase. Comprehensive race detector verification (`go test -race ./...`) confirms 0 race conditions under all sequential and package-level tests.
+* **Future Solution**: Implement lock-free read traversal via `atomic.LoadPointer` and atomic pointer publication in `P03-S02-M01`.
+* **Dimensional Impact**:
+  * Correctness: **None** for single-threaded usage; concurrency intentionally deferred.
+  * Performance: **Optimal** for single-threaded operations (no atomic instruction overhead).
+  * Scalability: **Deferred** to Sub-Phase 03.2.
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*
 
 

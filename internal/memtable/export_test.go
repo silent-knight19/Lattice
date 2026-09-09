@@ -41,3 +41,45 @@ func (n *skipListNode) SetForwardForTesting(level int, next *skipListNode) error
 func RandomHeightForTesting() int {
 	return randomHeight()
 }
+
+func (s *SkipList) InsertWithHeightForTesting(key binary.InternalKey, value []byte, height int) error {
+	return s.insertInternal(key, value, height)
+}
+
+func (s *SkipList) ValidateStructureForTesting() error {
+	return s.validateStructure()
+}
+
+func (s *SkipList) SearchNodeForTesting(userKey []byte) *skipListNode {
+	return s.searchNode(userKey)
+}
+
+func (s *SkipList) HeadForTesting() *skipListNode {
+	return s.head
+}
+
+func (s *SkipList) NodeCountAtLevelForTesting(level int) int {
+	if level < 0 || level >= MaxHeight {
+		return 0
+	}
+	count := 0
+	curr := s.head.forward[level]
+	for curr != nil {
+		count++
+		curr = curr.forward[level]
+	}
+	return count
+}
+
+func (s *SkipList) NodesAtLevelForTesting(level int) []*skipListNode {
+	if level < 0 || level >= MaxHeight {
+		return nil
+	}
+	var nodes []*skipListNode
+	curr := s.head.forward[level]
+	for curr != nil {
+		nodes = append(nodes, curr)
+		curr = curr.forward[level]
+	}
+	return nodes
+}

@@ -1777,6 +1777,142 @@ Conversely, historical sealed segments ($S_1 \dots S_{N-1}$) were closed and syn
 
 ---
 
+# 28. Deep Systems Interview Questions & Answers: Single-Threaded SkipList Insertion & Lookup (P03-S01-M02)
+
+### 1. How did you locate the predecessor of an inserted SkipList node?
+* **Question**: In your SkipList implementation, walk me through the exact algorithm for locating the predecessor nodes when inserting a new key.
+* **Answer**:
+  - Traversal begins at the head sentinel node (`s.head`) at the current active maximum list height minus one (`i = s.height - 1`).
+  - At each level $i$, the algorithm scans horizontally along forward pointers:
+    ```go
+    for curr.forward[i] != nil && binary.CompareInternalKey(curr.forward[i].key, key) < 0 {
+        curr = curr.forward[i]
+    }
+    update[i] = curr
+    ```
+  - While the candidate next node sorts strictly before the target `key` according to canonical `CompareInternalKey`, traversal advances `curr = curr.forward[i]`.
+  - As soon as `curr.forward[i]` is `nil` or sorts greater than or equal to `key`, horizontal scanning at level $i$ halts. The pointer `curr` at that exact position is recorded as the predecessor for level $i$: `update[i] = curr`.
+  - The loop drops down one level ($i-1$) and repeats horizontal scanning starting from `curr`. This preserves the structural invariants of the express lanes: nodes skipped at higher levels are never re-evaluated at lower levels, maintaining $O(\log N)$ expected comparisons.
+
+### 2. Why do you maintain an update array?
+* **Question**: Why does the SkipList insertion algorithm require an `update` array of size `MaxHeight`? What would break if you only tracked the predecessor at level 0?
+* **Answer**:
+  - In a SkipList, a newly inserted node of height $H$ participates in multiple independent linked lists: Level 0, Level 1, $\dots$, Level $H-1$.
+  - Splicing the new node into the data structure requires updating the forward pointer of the predecessor node at *every single level* from 0 to $H-1$:
+    ```go
+    for i := 0; i < nodeHeight; i++ {
+        newNode.forward[i] = update[i].forward[i]
+        update[i].forward[i] = newNode
+    }
+    ```
+  - SkipList forward pointers are strictly unidirectional (singly-linked). There are no backward or downward pointers from level 0 back to higher levels. If the algorithm only tracked the predecessor at level 0, it would be impossible to determine which nodes at levels $1 \dots H-1$ point to the insertion point without re-scanning the entire SkipList from `head` for each individual level.
+  - Sizing the array statically as `var update [MaxHeight]*skipListNode` (16 pointers = 128 bytes on stack) eliminates heap allocation during insertion, bounding stack memory to $O(1)$ and enabling zero-allocation predecessor recording.
+
+### 3. Why must all levels preserve the same global InternalKey ordering?
+* **Question**: Why is it mandatory that every level in the SkipList enforces the identical `binary.CompareInternalKey` ordering rule, rather than using a simplified comparator at upper levels?
+* **Answer**:
+  - The correctness of SkipList search relies on the property that each upper level is a strict sub-sequence of the level below it:
+    $$L_k \subseteq L_{k-1} \subseteq \dots \subseteq L_0$$
+  - If upper levels used a different comparison rule (e.g. comparing only `UserKey` while ignoring `SeqNum` or `OpType`), an upper level might skip past nodes that should have sorted after the target key under full `InternalKey` ordering. Once traversal drops down to a lower level, it can only search forwards; it can never back up.
+  - A divergence in ordering rules between levels causes the search path to bypass valid target keys, causing point lookups to return false negatives (`ErrKeyNotFound`) or stale revisions. A single globally consistent comparator across all levels guarantees monotonic search intervals: if $A < B$ at level $L$, then $A$ precedes $B$ at all levels where both appear.
+
+### 4. Why does SeqNum sort descending in the SkipList?
+* **Question**: Why does `binary.CompareInternalKey` sort `SeqNum` in descending order ($a.\text{SeqNum} > b.\text{SeqNum} \implies -1$), and how does this property benefit LSM-tree read operations?
+* **Answer**:
+  - In an LSM-tree, mutations to a key are append-only. When a key is updated or deleted multiple times, each write receives a monotonically increasing 64-bit sequence number.
+  - By ordering keys first by `UserKey` ascending and second by `SeqNum` descending:
+    1. All versions of a given `UserKey` form a contiguous cluster at level 0.
+    2. Within that cluster, the newest revision (highest sequence number) appears as the very first element.
+  - When performing a point lookup `Search(UserKey)` or initializing a range iterator, the search algorithm lands directly on the newest revision. The engine inspects the first matching node, evaluates its value or tombstone status, and terminates immediately in $O(1)$ steps without having to scan past older revisions.
+
+### 5. How does a lookup by UserKey locate the newest version?
+* **Question**: Point lookup is invoked with `Search(userKey []byte)`, not a full `InternalKey`. How does traversal locate the newest version without knowing its sequence number in advance?
+* **Answer**:
+  - During express-lane traversal from level `s.height - 1` down to level 0:
+    ```go
+    for curr.forward[i] != nil && bytes.Compare(curr.forward[i].key.UserKey, userKey) < 0 {
+        curr = curr.forward[i]
+    }
+    ```
+  - Crucially, the horizontal scan condition is strictly `< 0` (less than).
+  - Traversal advances `curr` only as long as `curr.forward[i].key.UserKey` is strictly less than the target `userKey`.
+  - As soon as `curr.forward[i]` has `UserKey >= userKey`, the loop halts and drops down. Thus, `curr` never advances into or past any node with `UserKey == userKey`.
+  - At level 0, `curr` is the last node strictly before `userKey`. Therefore, `candidate := curr.forward[0]` is guaranteed to be the *first* node in the entire SkipList with `UserKey >= userKey`.
+  - If `bytes.Equal(candidate.key.UserKey, userKey)` is true, `candidate` is the first version of that user key. Because versions sort by `SeqNum DESC`, the first version is mathematically guaranteed to be the newest revision.
+
+### 6. What happens when multiple versions of a key exist?
+* **Question**: If a user key has 5 distinct revisions (e.g. seq 10, 20, 30, 40, 50), what does the physical SkipList contain, and what does `Search` return?
+* **Answer**:
+  - **Physical State**: All 5 versions physically exist as independent `skipListNode` instances in the SkipList. Because their `InternalKey`s differ in `SeqNum`, each is a distinct ordered entity.
+  - **Level 0 Layout**: At level 0, they appear consecutively in descending sequence order:
+    $$\text{seq } 50 \longrightarrow \text{seq } 40 \longrightarrow \text{seq } 30 \longrightarrow \text{seq } 20 \longrightarrow \text{seq } 10$$
+  - **Point Lookup Result**: `Search(userKey)` locates the first node (`seq 50`). If `seq 50` is an `OpTypePut`, it returns its value. If `seq 50` is an `OpTypeDelete` (tombstone), it returns `ErrKeyNotFound`. The older versions (seq 40, 30, etc.) are masked by the newest version, exactly fulfilling LSM multi-version concurrency control (MVCC) semantics.
+
+### 7. How do you prevent cycles during insertion?
+* **Question**: How does your insertion implementation mathematically guarantee that no pointer cycle can ever be introduced into the SkipList?
+* **Answer**:
+  - Cycle prevention is guaranteed by three structural invariants:
+    1. **Predecessor Invariant**: `update[i]` is chosen such that `update[i].key < newNode.key`.
+    2. **Successor Invariant**: `update[i].forward[i]` satisfies `newNode.key <= update[i].forward[i].key` (or is `nil`).
+    3. **Splicing Order**:
+       ```go
+       newNode.forward[i] = update[i].forward[i]
+       update[i].forward[i] = newNode
+       ```
+    - `newNode` copies the predecessor's forward pointer *before* the predecessor is redirected to `newNode`.
+    - Because `update[i].key < newNode.key < update[i].forward[i].key`, the forward pointers strictly follow the transitive strict weak ordering of `binary.CompareInternalKey`.
+    - A cycle requires a path from $X$ back to $X$, which would require $X < \dots < X$, violating the irreflexive property of the strict ordering ($X \not< X$).
+  - Invariant tests `P03-S01-M02-INV-03` explicitly traverse every level tracking visited nodes in a hash set to mathematically confirm acyclicity.
+
+### 8. Why is failed insertion required to be atomic from the structure's perspective?
+* **Question**: Why does `Insert` enforce failure atomicity, and what would happen if validation failed midway through pointer splicing?
+* **Answer**:
+  - If validation occurred after partial pointer splicing, a failure (e.g. invalid operation type or oversized value) would leave `newNode` linked into some levels (e.g. Level 0 and Level 1) while absent from higher levels, or leave `update[i].forward[i]` pointing to a half-initialized node.
+  - A partially inserted node corrupts structural invariants:
+    - Level reachability (`INV-04` and `INV-05`) is broken.
+    - Readers encountering the partially initialized node could read unvalidated or nil memory.
+    - Subsequent insertions could splice around dangling pointers.
+  - **Lattice Implementation**: Validation executes completely in Step 1 (`ValidateKey`, `OpType.Validate`, `ValidateValue`). Then `newSkipListNode` allocates and defensively clones buffers in Step 3. Only after the node is 100% constructed and validated does Step 7 splice forward pointers. If any error occurs before Step 7, zero pointers in the SkipList have been touched, leaving the data structure completely pristine.
+
+### 9. How does the sentinel simplify insertion?
+* **Question**: How does initializing the SkipList with a head sentinel of height `MaxHeight` eliminate edge cases during insertion?
+* **Answer**:
+  - Without a sentinel, inserting a key smaller than all existing keys would require updating a `root` or `head` variable, requiring special-case branching (`if head == nil`, `if newKey < head.key`).
+  - With a sentinel allocated at `MaxHeight` (16):
+    - Traversal always starts from a non-nil node (`s.head`), eliminating null checks for the list header.
+    - The sentinel has no key and conceptually sorts before all possible keys ($-\infty$). Thus, even if a new key is smaller than all existing user keys, its predecessor is simply `s.head`.
+    - The splicing loop `update[i].forward[i] = newNode` works identically whether inserting at the very beginning of the list, in the middle, or at the end. Zero special-case branches exist in the splicing logic.
+
+### 10. Why is sequential pointer mutation acceptable in M02 but not future concurrent traversal?
+* **Question**: In M02, pointers are updated sequentially (`newNode.forward[i] = update[i].forward[i]`). Why is this acceptable now, and why must concurrent traversal (M01 of Sub-Phase 03.2) change this?
+* **Answer**:
+  - In single-threaded execution (M02), there is only one goroutine executing. No reader can observe the data structure in an intermediate state while pointers are being spliced.
+  - In concurrent execution with lock-free readers:
+    - If a writer updates `update[i].forward[i] = newNode` without memory barriers, a compiler or out-of-order CPU core can reorder instructions such that the predecessor points to `newNode` *before* `newNode.forward[i]` has been written to RAM. A concurrent reader following the predecessor would dereference a garbage or nil forward pointer.
+    - Furthermore, writers must link pointers bottom-up (Level 0 first, up to Level $H-1$) using release semantics (`atomic.StorePointer`), while readers must read pointers using acquire semantics (`atomic.LoadPointer`). M02 deliberately keeps pointers sequential to isolate baseline correctness before adding atomic memory model complexity.
+
+### 11. Why must caller-owned key/value buffers be isolated from stored nodes?
+* **Question**: Explain the memory aliasing vulnerability that occurs if caller key and value buffers are stored directly in SkipList nodes without defensive copying.
+* **Answer**:
+  - In Go, a slice `[]byte` is a 24-byte struct containing `{ptr *byte, len int, cap int}`. Storing the caller's slice directly shares the underlying backing array with the caller.
+  - If an external caller modifies its local byte buffer after calling `Insert(key, value)`:
+    - The stored `UserKey` inside the SkipList would change in-place. Because the SkipList's forward pointers were established based on the *original* key's sort order, mutating the key corrupts the sorted ordering invariant (`INV-01`). The node now occupies the wrong sorted position, causing binary search and SkipList traversal to fail.
+    - Mutating the stored `Value` causes data corruption where readers observe modified payload data that was never committed through WAL or transactional logging.
+  - Defensive copying in `newSkipListNode` (`key.Clone()` and `copy(make([]byte, len(v)), v)`) guarantees that nodes own their memory independently, enforcing security invariant `SEC-MEM-INV-01`.
+
+### 12. What invariant proves that every node appears on all levels below its own height?
+* **Question**: Explain invariant `P03-S01-M02-INV-05`. Why must a node of height $H$ be present at every level $0 \dots H-1$, and what invariant test confirms this?
+* **Answer**:
+  - In a standard 1D SkipList, a node represents a single physical tower with $H$ forward pointers. If a node appeared at level 3 but was omitted at level 2, a search that stepped onto that node at level 3 and dropped down to level 2 would find itself in an inconsistent state where the current node does not exist on level 2.
+  - `P03-S01-M02-INV-05` asserts:
+    $$\forall \text{node } n, \quad n \in L_k \iff 0 \le k < n.\text{height}$$
+  - In `internal/memtable/skiplist_invariants_test.go` (`TestSkipList_Invariant_05_LevelSpan`), the test enumerates all nodes at level 0. For each node, it inspects every level from 0 to `MaxHeight-1`:
+    - For $k < n.\text{height}$, the test asserts $n$ is reachable from `head` at level $k$.
+    - For $k \ge n.\text{height}$, the test asserts $n$ is NOT present at level $k$.
+  - This mathematically proves that tower splicing is gapless and height-bounded.
+
+---
+
 # 26. Questions I Personally Failed & Corrected Understandings
 
 *(Entries will be appended whenever knowledge gaps are discovered)*
