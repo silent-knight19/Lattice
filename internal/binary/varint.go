@@ -99,3 +99,23 @@ func GetVarint64(buf []byte) (uint64, int, error) {
 	// Reached end of slice while continuation bit was still set.
 	return 0, 0, errors.ErrVarintTruncated
 }
+
+// GetVarint64Canonical decodes a uint64 from buf using unsigned 7-bit variable-length encoding,
+// strictly enforcing canonical minimal-byte representations.
+//
+// In addition to standard GetVarint64 validation:
+//   - Rejects non-canonical (overlong) encodings with errors.ErrVarintNonCanonical
+//     where a value was encoded using more bytes than mathematically required
+//     (e.g., [0x80, 0x00] for 0, or [0x81, 0x00] for 1).
+//   - Safe against parser ambiguity and cryptographic malleability attacks.
+//   - Zero heap allocations.
+func GetVarint64Canonical(buf []byte) (uint64, int, error) {
+	val, n, err := GetVarint64(buf)
+	if err != nil {
+		return 0, 0, err
+	}
+	if VarintLen(val) != n {
+		return 0, 0, errors.ErrVarintNonCanonical
+	}
+	return val, n, nil
+}

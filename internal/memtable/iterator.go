@@ -39,7 +39,11 @@ type Iterator struct {
 // The iterator starts unpositioned (Valid() == false).
 // Callers may either advance using Next() (which moves to the first element)
 // or position explicitly using Seek() or SeekToFirst().
+// Returns nil if s is nil.
 func (s *SkipList) NewIterator() *Iterator {
+	if s == nil {
+		return nil
+	}
 	return &Iterator{
 		sl:    s,
 		curr:  nil,
@@ -49,6 +53,9 @@ func (s *SkipList) NewIterator() *Iterator {
 
 // Valid reports whether the iterator is currently positioned at a valid SkipList entry.
 func (it *Iterator) Valid() bool {
+	if it == nil {
+		return false
+	}
 	return it.state == statePositioned && it.curr != nil
 }
 
@@ -60,6 +67,9 @@ func (it *Iterator) Valid() bool {
 //   - If positioned, Next() advances to the next entry along Level 0.
 //   - If already exhausted (at EOF), Next() is a safe no-op returning false.
 func (it *Iterator) Next() bool {
+	if it == nil {
+		return false
+	}
 	switch it.state {
 	case stateUnpositioned:
 		if it.sl == nil {
@@ -133,6 +143,9 @@ func (it *Iterator) Value() []byte {
 // Complexity:
 // Expected O(log N) comparisons and pointer loads using the multi-level express-lane hierarchy.
 func (it *Iterator) Seek(userKey []byte) error {
+	if it == nil {
+		return errors.ErrNilReceiver
+	}
 	if it.sl == nil {
 		it.curr = nil
 		it.state = stateExhausted
@@ -174,6 +187,9 @@ func (it *Iterator) Seek(userKey []byte) error {
 // SeekToFirst positions the iterator at the first entry in the SkipList.
 // If the SkipList is empty, the iterator is exhausted (Valid() == false).
 func (it *Iterator) SeekToFirst() {
+	if it == nil {
+		return
+	}
 	if it.sl == nil {
 		it.curr = nil
 		it.state = stateExhausted
@@ -191,6 +207,9 @@ func (it *Iterator) SeekToFirst() {
 // to target according to canonical binary.CompareInternalKey ordering.
 // If target.UserKey or target.OpType is invalid, the iterator is invalidated and an error is returned.
 func (it *Iterator) SeekInternalKey(target binary.InternalKey) error {
+	if it == nil {
+		return errors.ErrNilReceiver
+	}
 	if it.sl == nil {
 		it.curr = nil
 		it.state = stateExhausted
@@ -237,6 +256,9 @@ func (it *Iterator) SeekInternalKey(target binary.InternalKey) error {
 // Close invalidates the iterator and releases references to internal SkipList nodes.
 // Calling Close multiple times is safe and idempotent.
 func (it *Iterator) Close() {
+	if it == nil {
+		return
+	}
 	it.curr = nil
 	it.sl = nil
 	it.state = stateExhausted

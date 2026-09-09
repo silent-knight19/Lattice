@@ -25,6 +25,7 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrCompactionRunning", errors.ErrCompactionRunning, "compaction already in progress"},
 		{"ErrVarintOverflow", errors.ErrVarintOverflow, "varint exceeds maximum 64-bit integer size"},
 		{"ErrVarintTruncated", errors.ErrVarintTruncated, "varint buffer truncated or incomplete"},
+		{"ErrVarintNonCanonical", errors.ErrVarintNonCanonical, "non-canonical varint encoding"},
 		{"ErrInvalidOpType", errors.ErrInvalidOpType, "invalid operation type"},
 		{"ErrSeqNumOverflow", errors.ErrSeqNumOverflow, "sequence number overflow"},
 		{"ErrInternalKeyTruncated", errors.ErrInternalKeyTruncated, "internal key buffer truncated: missing trailer or user key"},
@@ -44,6 +45,7 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrInvalidSkipListLevel", errors.ErrInvalidSkipListLevel, "invalid skiplist level"},
 		{"ErrMemTableFrozen", errors.ErrMemTableFrozen, "memtable is frozen"},
 		{"ErrIteratorClosed", errors.ErrIteratorClosed, "iterator is closed"},
+		{"ErrNilReceiver", errors.ErrNilReceiver, "nil receiver pointer"},
 	}
 
 	for _, tc := range sentinels {
@@ -76,6 +78,7 @@ func TestSentinelWrappingWithErrorsIs(t *testing.T) {
 		{"ErrCompactionRunning", errors.ErrCompactionRunning},
 		{"ErrVarintOverflow", errors.ErrVarintOverflow},
 		{"ErrVarintTruncated", errors.ErrVarintTruncated},
+		{"ErrVarintNonCanonical", errors.ErrVarintNonCanonical},
 		{"ErrInvalidOpType", errors.ErrInvalidOpType},
 		{"ErrSeqNumOverflow", errors.ErrSeqNumOverflow},
 		{"ErrInternalKeyTruncated", errors.ErrInternalKeyTruncated},
@@ -95,6 +98,7 @@ func TestSentinelWrappingWithErrorsIs(t *testing.T) {
 		{"ErrInvalidSkipListLevel", errors.ErrInvalidSkipListLevel},
 		{"ErrMemTableFrozen", errors.ErrMemTableFrozen},
 		{"ErrIteratorClosed", errors.ErrIteratorClosed},
+		{"ErrNilReceiver", errors.ErrNilReceiver},
 	}
 
 	for _, tc := range tests {
@@ -125,6 +129,7 @@ func TestSentinelNegativeComparisons(t *testing.T) {
 		errors.ErrCompactionRunning,
 		errors.ErrVarintOverflow,
 		errors.ErrVarintTruncated,
+		errors.ErrVarintNonCanonical,
 		errors.ErrInvalidOpType,
 		errors.ErrSeqNumOverflow,
 		errors.ErrInternalKeyTruncated,
@@ -140,6 +145,11 @@ func TestSentinelNegativeComparisons(t *testing.T) {
 		errors.ErrInvalidQueueCapacity,
 		errors.ErrRunnerRunning,
 		errors.ErrRunnerClosed,
+		errors.ErrInvalidSkipListHeight,
+		errors.ErrInvalidSkipListLevel,
+		errors.ErrMemTableFrozen,
+		errors.ErrIteratorClosed,
+		errors.ErrNilReceiver,
 	}
 
 	for i, a := range allSentinels {

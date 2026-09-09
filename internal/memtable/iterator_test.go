@@ -830,3 +830,29 @@ func TestInvariant_P03_S03_M01_INV_06_RaceFreeConcurrency(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestIterator_NilReceiverSafety(t *testing.T) {
+	var it *memtable.Iterator
+
+	if it.Valid() {
+		t.Errorf("expected Valid() false for nil iterator")
+	}
+	if it.Next() {
+		t.Errorf("expected Next() false for nil iterator")
+	}
+	if it.Key().UserKey != nil {
+		t.Errorf("expected zero-value InternalKey for nil iterator")
+	}
+	if it.Value() != nil {
+		t.Errorf("expected nil Value for nil iterator")
+	}
+	if err := it.Seek([]byte("k")); !stdErrors.Is(err, errors.ErrNilReceiver) {
+		t.Errorf("expected ErrNilReceiver on Seek, got: %v", err)
+	}
+	if err := it.SeekInternalKey(binary.InternalKey{}); !stdErrors.Is(err, errors.ErrNilReceiver) {
+		t.Errorf("expected ErrNilReceiver on SeekInternalKey, got: %v", err)
+	}
+	// SeekToFirst and Close must not panic
+	it.SeekToFirst()
+	it.Close()
+}

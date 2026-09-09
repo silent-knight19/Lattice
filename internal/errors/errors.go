@@ -43,6 +43,10 @@ var (
 	// a varint before encountering a terminating byte.
 	ErrVarintTruncated = stdErrors.New("varint buffer truncated or incomplete")
 
+	// ErrVarintNonCanonical indicates that a varint byte sequence uses a non-minimal
+	// overlong encoding that is prohibited under strict canonical decoding contracts.
+	ErrVarintNonCanonical = stdErrors.New("non-canonical varint encoding")
+
 	// ErrInvalidOpType indicates that an operation type byte does not correspond
 	// to any recognized database operation (only PUT and DELETE/TOMBSTONE are valid).
 	ErrInvalidOpType = stdErrors.New("invalid operation type")
@@ -135,6 +139,9 @@ var (
 
 	// ErrIteratorClosed indicates that an operation was attempted on a closed iterator.
 	ErrIteratorClosed = stdErrors.New("iterator is closed")
+
+	// ErrNilReceiver indicates that a method was invoked on a nil pointer receiver.
+	ErrNilReceiver = stdErrors.New("nil receiver pointer")
 )
 
 // KeyTooLargeError provides structured context when a key violates maximum size limits.

@@ -14,6 +14,13 @@ const DirName = "wal"
 // DirMode defines the restrictive POSIX directory permission mode (0700) for the WAL directory:
 // owner: read + write + execute (rwx); group: none (---); others: none (---).
 // This guarantees that other local system users cannot read, list, or tamper with WAL log files.
+//
+// Cross-Platform Security Note (SEC-P03-HARD-04):
+// On Windows/NTFS filesystems, POSIX permission bits map to generic file attribute flags and do not
+// create UNIX-style user/group ACL isolation. On Windows environments, WAL directories inherit
+// NTFS Discretionary Access Control Lists (DACLs) from the parent dbPath container. Administrators
+// deploying Lattice in multi-user Windows environments must ensure dbPath itself is restricted to the
+// service account identity.
 const DirMode os.FileMode = 0700
 
 // Dir returns the platform-aware path to the WAL directory inside dbPath.

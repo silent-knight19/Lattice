@@ -145,6 +145,25 @@ func TestInternalKey_CloneStringEqual(t *testing.T) {
 		t.Errorf("unexpected binary string output: %q", binStr)
 	}
 
+	// 2b. Privacy-safe Redact and RedactedString representations
+	secretKey := binary.InternalKey{
+		UserKey: []byte("very-secret-password-12345"),
+		SeqNum:  99,
+		OpType:  binary.OpTypePut,
+	}
+	redactedStr := secretKey.RedactedString()
+	if strings.Contains(redactedStr, "very-secret-password-12345") {
+		t.Errorf("RedactedString leaked secret user key: %q", redactedStr)
+	}
+	if !strings.Contains(redactedStr, "len=26") || !strings.Contains(redactedStr, "seq=99") || !strings.Contains(redactedStr, "op=PUT") {
+		t.Errorf("unexpected RedactedString output: %q", redactedStr)
+	}
+
+	redactVal, ok := secretKey.Redact().(binary.InternalKeyLogView)
+	if !ok || redactVal.UserKeyLen != 26 || redactVal.SeqNum != 99 || redactVal.OpType != binary.OpTypePut {
+		t.Errorf("unexpected Redact() struct view: %+v", secretKey.Redact())
+	}
+
 	// 3. Equal and Compare receiver
 	k2 := binary.InternalKey{
 		UserKey: []byte("test-key"),

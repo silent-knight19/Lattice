@@ -644,3 +644,59 @@ func TestSkipList_SentinelNeverParticipates(t *testing.T) {
 		t.Errorf("expected validation error searching nil key, got %v (err: %v)", got, err)
 	}
 }
+
+func TestSkipList_NilReceiverSafety(t *testing.T) {
+	var sl *memtable.SkipList
+
+	if sl.Height() != 0 {
+		t.Errorf("expected Height 0 for nil SkipList, got %d", sl.Height())
+	}
+	if sl.Len() != 0 {
+		t.Errorf("expected Len 0 for nil SkipList, got %d", sl.Len())
+	}
+	if sl.ByteSize() != 0 {
+		t.Errorf("expected ByteSize 0 for nil SkipList, got %d", sl.ByteSize())
+	}
+	if !sl.IsEmpty() {
+		t.Errorf("expected IsEmpty true for nil SkipList")
+	}
+	if sl.IsFrozen() {
+		t.Errorf("expected IsFrozen false for nil SkipList")
+	}
+	if sl.Freeze() {
+		t.Errorf("expected Freeze false for nil SkipList")
+	}
+
+	ik, _ := binary.NewInternalKey([]byte("k"), 1, binary.OpTypePut)
+	if err := sl.Insert(ik, []byte("v")); !stdErrors.Is(err, errors.ErrNilReceiver) {
+		t.Errorf("expected ErrNilReceiver on Insert, got: %v", err)
+	}
+
+	val, err := sl.Search([]byte("k"))
+	if val != nil || !stdErrors.Is(err, errors.ErrNilReceiver) {
+		t.Errorf("expected ErrNilReceiver on Search, got val=%v, err=%v", val, err)
+	}
+
+	val, err = sl.SearchConcurrent([]byte("k"))
+	if val != nil || !stdErrors.Is(err, errors.ErrNilReceiver) {
+		t.Errorf("expected ErrNilReceiver on SearchConcurrent, got val=%v, err=%v", val, err)
+	}
+
+	if it := sl.NewIterator(); it != nil {
+		t.Errorf("expected nil iterator for nil SkipList, got: %v", it)
+	}
+}
+
+func TestSkipList_DuplicateUpdateAllocationEfficiency(t *testing.T) {
+	sl := memtable.NewSkipList()
+	ik, _ := binary.NewInternalKey([]byte("dedup-key"), 100, binary.OpTypePut)
+	_ = sl.Insert(ik, []byte("initial-val"))
+
+	// Exact duplicate update: should only allocate value copy + nodeValue container, not a skipListNode tower
+	allocs := testing.AllocsPerRun(100, func() {
+		_ = sl.Insert(ik, []byte("updated-val"))
+	})
+	if allocs > 3 {
+		t.Errorf("expected <= 3 allocations on duplicate update, got %f", allocs)
+	}
+}

@@ -416,6 +416,45 @@ func TestNonCanonicalVarintPolicy(t *testing.T) {
 	}
 }
 
+func TestGetVarint64Canonical(t *testing.T) {
+	// 1. Canonical inputs must pass
+	canonicalVals := []uint64{0, 1, 127, 128, 255, 300, 16384, 1<<31 - 1, 1<<63 - 1, math.MaxUint64}
+	buf := make([]byte, 10)
+	for _, v := range canonicalVals {
+		n := binary.PutVarint64(buf, v)
+		decoded, readN, err := binary.GetVarint64Canonical(buf[:n])
+		if err != nil {
+			t.Fatalf("GetVarint64Canonical failed on canonical input %d: %v", v, err)
+		}
+		if decoded != v || readN != n {
+			t.Fatalf("mismatch: decoded=%d, readN=%d, want v=%d, n=%d", decoded, readN, v, n)
+		}
+	}
+
+	// 2. Non-canonical overlong inputs must be rejected with ErrVarintNonCanonical
+	nonCanonicalInputs := [][]byte{
+		{0x80, 0x00},             // overlong 0
+		{0x81, 0x00},             // overlong 1
+		{0xFF, 0x00},             // overlong 127
+		{0x80, 0x80, 0x00},       // 3-byte overlong 0
+		{0x80, 0x80, 0x80, 0x00}, // 4-byte overlong 0
+		{0x80, 0x81, 0x00},       // 3-byte overlong 128
+	}
+
+	for _, input := range nonCanonicalInputs {
+		val, n, err := binary.GetVarint64Canonical(input)
+		if !stdErrors.Is(err, errors.ErrVarintNonCanonical) {
+			t.Fatalf("expected ErrVarintNonCanonical for %x, got val=%d, n=%d, err=%v", input, val, n, err)
+		}
+	}
+
+	// 3. Truncated inputs must return ErrVarintTruncated
+	_, _, err := binary.GetVarint64Canonical([]byte{0x80})
+	if !stdErrors.Is(err, errors.ErrVarintTruncated) {
+		t.Fatalf("expected ErrVarintTruncated for truncated input, got: %v", err)
+	}
+}
+
 // ============================================================================
 // 8. Property-Based Randomized Differential Testing
 // ============================================================================

@@ -5,10 +5,10 @@ import (
 	stdErrors "errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"sync"
 	"sync/atomic"
 	"testing"
-	"unsafe"
 
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
@@ -43,7 +43,7 @@ func independentOracleEntryBytes(keyLen, valLen, height int) uint64 {
 // TestByteSize_PlatformLayoutSanity verifies that the compile-time struct sizes on the
 // running platform match the architectural constants.
 func TestByteSize_PlatformLayoutSanity(t *testing.T) {
-	if unsafe.Sizeof(uintptr(0)) != 8 {
+	if bits.UintSize != 64 {
 		t.Skip("Skipping 64-bit layout assertions on non-64-bit platform")
 	}
 

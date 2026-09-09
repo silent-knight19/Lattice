@@ -75,11 +75,17 @@ func NewSkipListWithGenerator(rnd *HeightGenerator) *SkipList {
 
 // Height returns the current active maximum tower height among inserted nodes (1 <= height <= MaxHeight).
 func (s *SkipList) Height() int {
+	if s == nil {
+		return 0
+	}
 	return int(s.height.Load())
 }
 
 // Len returns the total number of distinct entries currently stored in the SkipList.
 func (s *SkipList) Len() int {
+	if s == nil {
+		return 0
+	}
 	return int(s.count.Load())
 }
 
@@ -101,11 +107,17 @@ func (s *SkipList) Len() int {
 //   - Concurrency: Thread-safe for concurrent readers and serialized writers via atomic.Uint64 load.
 //   - Invariant: Updated atomically on insertion and duplicate replacement.
 func (s *SkipList) ByteSize() uint64 {
+	if s == nil {
+		return 0
+	}
 	return s.byteSize.Load()
 }
 
 // IsEmpty reports whether the SkipList contains zero user entries.
 func (s *SkipList) IsEmpty() bool {
+	if s == nil {
+		return true
+	}
 	return s.count.Load() == 0
 }
 
@@ -123,6 +135,9 @@ func (s *SkipList) IsEmpty() bool {
 //     and values are permanently immutable. Exact duplicate updates cannot swap value containers.
 //   - Zero Copy / In-Place: Freezing is an O(1) state transition with zero node copying.
 func (s *SkipList) Freeze() bool {
+	if s == nil {
+		return false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -136,6 +151,9 @@ func (s *SkipList) Freeze() bool {
 // IsFrozen reports whether the SkipList has transitioned to the permanently read-only FROZEN state.
 // This check is lock-free and safe for concurrent execution.
 func (s *SkipList) IsFrozen() bool {
+	if s == nil {
+		return false
+	}
 	return s.frozen.Load()
 }
 
@@ -161,12 +179,18 @@ func (s *SkipList) IsFrozen() bool {
 //   - Defensive copies of UserKey and Value are created during node allocation.
 //   - Callers mutating external slices after Insert will not corrupt internal state.
 func (s *SkipList) Insert(key binary.InternalKey, value []byte) error {
+	if s == nil {
+		return errors.ErrNilReceiver
+	}
 	return s.insertInternal(key, value, 0)
 }
 
 // insertInternal executes predecessor search and splices the new node.
 // If forcedHeight != 0, forcedHeight is used instead of generating a random height (used by test seams).
 func (s *SkipList) insertInternal(key binary.InternalKey, value []byte, forcedHeight int) error {
+	if s == nil {
+		return errors.ErrNilReceiver
+	}
 	// 0. Fast-path check for frozen state before any validation or allocation
 	if s.frozen.Load() {
 		return errors.ErrMemTableFrozen
@@ -183,36 +207,16 @@ func (s *SkipList) insertInternal(key binary.InternalKey, value []byte, forcedHe
 		return err
 	}
 
-	// 2. Determine node tower height
-	nodeHeight := forcedHeight
-	if nodeHeight == 0 {
-		nodeHeight = s.rnd.RandomHeight()
-	}
-	if nodeHeight < MinHeight || nodeHeight > MaxHeight {
-		return &errors.InvalidSkipListHeightError{
-			Height:    nodeHeight,
-			MinHeight: MinHeight,
-			MaxHeight: MaxHeight,
-		}
-	}
-
-	// 3. Pre-allocate and fully initialize the node in private writer memory before taking the lock
-	newNode, err := newSkipListNode(key, value, nodeHeight)
-	if err != nil {
-		return err
-	}
-	entryBytes := nodeMemoryBytes(len(key.UserKey), len(value), nodeHeight)
-
-	// 4. Acquire exclusive writer mutation lock
+	// 2. Acquire exclusive writer mutation lock
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 4b. Strict linearization check: if Freeze() won the lock while we were preparing newNode, abort.
+	// 2b. Strict linearization check: if Freeze() won the lock while we were validating, abort.
 	if s.frozen.Load() {
 		return errors.ErrMemTableFrozen
 	}
 
-	// 5. Predecessor search: locate the insertion position at each level
+	// 3. Predecessor search: locate the insertion position at each level
 	var update [MaxHeight]*skipListNode
 	curr := s.head
 	currentHeight := int(s.height.Load())
@@ -226,7 +230,7 @@ func (s *SkipList) insertInternal(key binary.InternalKey, value []byte, forcedHe
 		update[i] = curr
 	}
 
-	// 6. Check for exact duplicate InternalKey at level 0
+	// 4. Check for exact duplicate InternalKey at level 0
 	candidate := curr.forward[0].Load()
 	if candidate != nil && binary.CompareInternalKey(candidate.key, key) == 0 {
 		// Exact duplicate (UserKey, SeqNum, OpType): atomically replace value container
@@ -253,6 +257,26 @@ func (s *SkipList) insertInternal(key binary.InternalKey, value []byte, forcedHe
 		}
 		return nil
 	}
+
+	// 5. Determine node tower height (deferred until after duplicate check to eliminate allocation churn: SEC-P03-HARD-02)
+	nodeHeight := forcedHeight
+	if nodeHeight == 0 {
+		nodeHeight = s.rnd.RandomHeight()
+	}
+	if nodeHeight < MinHeight || nodeHeight > MaxHeight {
+		return &errors.InvalidSkipListHeightError{
+			Height:    nodeHeight,
+			MinHeight: MinHeight,
+			MaxHeight: MaxHeight,
+		}
+	}
+
+	// 6. Allocate and fully initialize the new node in writer memory
+	newNode, err := newSkipListNode(key, value, nodeHeight)
+	if err != nil {
+		return err
+	}
+	entryBytes := nodeMemoryBytes(len(key.UserKey), len(value), nodeHeight)
 
 	// 7. If new node's height exceeds current list height, initialize update pointers for new levels
 	if nodeHeight > currentHeight {
@@ -292,6 +316,9 @@ func (s *SkipList) insertInternal(key binary.InternalKey, value []byte, forcedHe
 //   - If the newest matching revision is an OpTypeDelete (tombstone): returns (nil, errors.ErrKeyNotFound).
 //   - If the newest matching revision is an OpTypePut: returns (defensiveCopy, nil).
 func (s *SkipList) Search(userKey []byte) ([]byte, error) {
+	if s == nil {
+		return nil, errors.ErrNilReceiver
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.SearchConcurrent(userKey)
@@ -315,6 +342,9 @@ func (s *SkipList) Search(userKey []byte) ([]byte, error) {
 //   - Expected O(log N) comparisons using the express-lane forward pointer hierarchy.
 //   - Traversal state allocates zero heap memory; returning a non-nil value creates one defensive copy.
 func (s *SkipList) SearchConcurrent(userKey []byte) ([]byte, error) {
+	if s == nil {
+		return nil, errors.ErrNilReceiver
+	}
 	if err := binary.ValidateKey(userKey); err != nil {
 		return nil, err
 	}

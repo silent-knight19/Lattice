@@ -66,8 +66,39 @@ func (k InternalKey) Clone() InternalKey {
 
 // String returns a human-readable representation of the InternalKey with the user key
 // formatted using Go-quoted string syntax to safely represent binary or arbitrary bytes.
+// For production logging where user keys may contain sensitive data, use Redact() or RedactedString().
 func (k InternalKey) String() string {
 	return fmt.Sprintf("InternalKey(%q, seq=%s, op=%s)", k.UserKey, k.SeqNum.String(), k.OpType.String())
+}
+
+// InternalKeyLogView is the privacy-safe structured representation of an InternalKey
+// produced by Redact() when logging internal keys in structured log handlers.
+type InternalKeyLogView struct {
+	UserKeyLen int
+	SeqNum     SeqNum
+	OpType     OpType
+}
+
+func (v InternalKeyLogView) String() string {
+	return fmt.Sprintf("InternalKey(len=%d, seq=%s, op=%s)", v.UserKeyLen, v.SeqNum.String(), v.OpType.String())
+}
+
+// Redact implements logger.Redactable, returning a safe, privacy-preserving structured
+// representation of the InternalKey where the UserKey length is reported rather than exposing
+// raw user bytes. This prevents sensitive credentials, session tokens, or PII embedded in
+// user keys from being exposed in structured logging output.
+func (k InternalKey) Redact() any {
+	return InternalKeyLogView{
+		UserKeyLen: len(k.UserKey),
+		SeqNum:     k.SeqNum,
+		OpType:     k.OpType,
+	}
+}
+
+// RedactedString returns a privacy-safe representation of the InternalKey where the UserKey
+// payload is omitted and represented strictly by its length.
+func (k InternalKey) RedactedString() string {
+	return fmt.Sprintf("InternalKey(len=%d, seq=%s, op=%s)", len(k.UserKey), k.SeqNum.String(), k.OpType.String())
 }
 
 // Equal reports whether k and other sort equivalently under CompareInternalKey.

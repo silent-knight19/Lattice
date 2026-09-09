@@ -2,31 +2,34 @@ package memtable
 
 import (
 	"math"
+	"math/bits"
 	"sync/atomic"
-	"unsafe"
 )
 
-// Layout constants derived directly from struct definitions via unsafe.Sizeof.
-// These constants are platform-adaptive across 64-bit and 32-bit architectures.
-var (
+// Layout constants derived directly from struct definitions.
+// These constants are platform-adaptive across 64-bit and 32-bit architectures
+// and declared as immutable constants to prevent accidental or adversarial modification (SEC-P03-HARD-01).
+const (
+	wordSize = bits.UintSize / 8
+
 	// NodeStructSize is the heap byte size of a skipListNode struct header.
 	// On 64-bit platforms:
 	//   key binary.InternalKey (40 bytes: UserKey []byte 24B + SeqNum 8B + OpType 1B + padding 7B)
 	//   value atomic.Pointer[nodeValue] (8 bytes)
 	//   forward []atomic.Pointer[skipListNode] (24 bytes slice header)
-	// Total = 72 bytes.
-	NodeStructSize = uint64(unsafe.Sizeof(skipListNode{}))
+	// Total = 72 bytes (40 bytes on 32-bit platforms).
+	NodeStructSize = uint64(40 + (wordSize-4)*8)
 
 	// NodeValueStructSize is the heap byte size of a nodeValue struct container.
 	// On 64-bit platforms:
 	//   data []byte (24 bytes slice header)
-	// Total = 24 bytes.
-	NodeValueStructSize = uint64(unsafe.Sizeof(nodeValue{}))
+	// Total = 24 bytes (12 bytes on 32-bit platforms).
+	NodeValueStructSize = uint64(3 * wordSize)
 
 	// PointerSize is the byte size of a single forward pointer element
 	// (atomic.Pointer[skipListNode]) in the variable-height tower backing array.
-	// On 64-bit platforms: 8 bytes.
-	PointerSize = uint64(unsafe.Sizeof(atomic.Pointer[skipListNode]{}))
+	// On 64-bit platforms: 8 bytes (4 bytes on 32-bit platforms).
+	PointerSize = uint64(wordSize)
 )
 
 // nodeMemoryBytes computes the exact heap bytes directly owned by a newly allocated skipListNode,
