@@ -349,14 +349,14 @@ Every future micro-phase implementation response from Claude Code must use this 
 
 ```
 Current Major Phase           : Phase 03 — In-Memory MemTable & Concurrent SkipList
-Current Sub-Phase             : Sub-Phase 03.2 — Concurrent Traversal & Memory Accounting
-Current Micro-Phase           : P03-S02-M02 — Exact Byte-Level Memory Accounting (COMPLETE)
+Current Sub-Phase             : Sub-Phase 03.3 — MemTable Iteration & Immutable Transition
+Current Micro-Phase           : P03-S03-M01 — Forward Iterator Implementation (COMPLETE)
 Phase 01 Status               : COMPLETE (Sub-Phases 01.1 & 01.2 Complete)
 Phase 02 Status               : COMPLETE (Sub-Phases 02.1, 02.2, 02.3, 02.4 Complete)
-Phase 03 Status               : IN PROGRESS (Sub-Phases 03.1 & 03.2 Complete)
+Phase 03 Status               : IN PROGRESS (Sub-Phases 03.1 & 03.2 Complete; Sub-Phase 03.3 In Progress)
 Previous Completed Phase      : Phase 02 — Write-Ahead Log (WAL) & Durability Subsystem
-Previous Completed Micro-Phase: P03-S02-M02 — Exact Byte-Level Memory Accounting
-Next Planned Phase            : Phase 03 — In-Memory MemTable & Concurrent SkipList (P03-S03-M01)
+Previous Completed Micro-Phase: P03-S03-M01 — Forward Iterator Implementation
+Next Planned Phase            : Phase 03 — In-Memory MemTable & Concurrent SkipList (P03-S03-M02)
 Phase 00 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Phase 01 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Security Audit Track State    : Active
@@ -369,8 +369,8 @@ Security Audit Track State    : Active
 Blocking Issues               : None
 Tests Passing                 : `go test -race ./...` (All test suites passing, 0 race conditions), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed, Linux & Windows cross-platform verified
 Security Review Status        : Complete & Verified (SEC-01 foundations established; SEC-02 static audit verified; SEC-03 dynamic persistence audit completed; SEC-04 in-memory engine audit completed across buffer mutation immutability, canonical multi-version comparison, memory limits, and fuzzing with 0 confirmed vulnerabilities)
-Interview Knowledge Status    : Updated with Sections 24, 25, and 26 containing deep systems security interview questions and answers across persistence, concurrency, and in-memory engine design
-Git Commit                    : feat(security): [SEC-04] audit in-memory concurrent engine security
+Interview Knowledge Status    : Updated with Sections 24, 25, 26, 27, and 28 containing deep systems interview questions and answers across persistence, concurrency, node memory layout, and lock-free forward iterators
+Git Commit                    : feat(memtable): [P03-S03-M01] implement forward iterator
 ```
 
 ---
@@ -1201,10 +1201,25 @@ TOTAL: 184 Discrete, Testable Micro-Phases
 
 ### Sub-Phase 03.3: MemTable Iteration & Immutable Transition
 * **P03-S03-M01: Forward Iterator Implementation**
-  * *Objective*: Implement `Iterator` interface (`Seek`, `Next`, `Valid`, `Key`, `Value`).
-  * *Invariants*: Iterator yields records in ascending internal key order.
-  * *Tests*: Iterate through populated MemTable; assert lexicographical monotonicity.
-  * *Completion*: Iterator verified.
+  * *Objective*: Implement lock-free forward iterator (`Iterator`) over the SkipList's Level-0 canonical physical ordering supporting `Seek`, `SeekToFirst`, `SeekInternalKey`, `Next`, `Valid`, `Key`, `Value`, and `Close`.
+  * *Invariants*:
+    - `P03-S03-M01-INV-01`: For a static SkipList, repeated `Next()` traverses exactly the Level-0 sequence once from head to tail.
+    - `P03-S03-M01-INV-02`: Keys returned by successive valid iterator positions are strictly non-decreasing according to canonical `CompareInternalKey`.
+    - `P03-S03-M01-INV-03`: Iterator traversal terminates at `nil` and is guaranteed to be acyclic.
+    - `P03-S03-M01-INV-04`: `Seek(target)` returns the first position satisfying `UserKey >= target`; for multi-version keys, it strictly lands on the newest revision.
+    - `P03-S03-M01-INV-05`: `Key()` and `Value()` return defensive copies, strictly preventing caller mutation from corrupting engine memory.
+    - `P03-S03-M01-INV-06`: Concurrent iteration and insertion is 100% race-free under the supported weakly-consistent live iterator model.
+  * *Theoretical Property*: Traversal requires zero mutex locks and zero allocations per `Next()`. `Seek(userKey)` leverages express lanes to achieve expected $O(\log N)$ descent from active height down to Level 0. Physical sequence exposes tombstones (`OpTypeDelete` with `Value() == nil`) and historical versions to support LSM SSTable flushing and compaction.
+  * *Measured Result*:
+    - `BenchmarkIterator_SequentialScan_1000Keys`: 2,393 ns/op (~2.39 ns/node), 0 B/op, 0 allocs/op.
+    - `BenchmarkIterator_SequentialScan_10000Keys`: 35,967 ns/op (~3.60 ns/node), 0 B/op, 0 allocs/op.
+    - `BenchmarkIterator_Seek_Random_1000Keys`: 58.84 ns/op, 0 B/op, 0 allocs/op.
+    - `BenchmarkIterator_Seek_Random_10000Keys`: 129.3 ns/op, 0 B/op, 0 allocs/op.
+    - `BenchmarkIterator_Next_PerStep`: 3.002 ns/op, 0 B/op, 0 allocs/op.
+    - Fuzz testing (`FuzzIterator`): >1,360,000 iterations executed with 0 failures.
+    - Race detector (`go test -race ./internal/memtable`): PASSED (0 data races).
+  * *Observed Limitation*: The iterator is a live, weakly-consistent iterator over a mutable SkipList, not a point-in-time snapshot iterator. Insertions ahead of the iterator's cursor are observed; insertions behind are not. Snapshot isolation will be introduced via `MemTable.Freeze()` (`P03-S03-M02`) and MVCC sequence number filtering.
+  * *Completion*: Complete and verified.
 * **P03-S03-M02: Atomic MemTable Freeze & Immutable Transition**
   * *Objective*: Transition active MemTable to read-only `ImmutableMemTable`.
   * *Changes*: `MemTable.Freeze()`, insert attempts on frozen table return `ErrMemTableFrozen`.

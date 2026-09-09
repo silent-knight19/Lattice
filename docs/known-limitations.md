@@ -264,6 +264,18 @@ This document tracks all **genuine architectural and operational limitations** o
   * Performance: **Optimal** ($O(1)$ atomic counter load with zero allocations).
   * Scalability: **Optimal**.
 
+### 19. Weakly-Consistent Live SkipList Iterator Traversal vs Snapshot Isolation
+* **Limitation**: The SkipList forward iterator (`Iterator`, introduced in `P03-S03-M01`) operates directly over the live, mutable SkipList via lock-free atomic pointer reads along Level 0. It is a weakly-consistent live iterator, not a point-in-time snapshot iterator.
+* **Why It Exists**: SkipList Level-0 links are updated concurrently by serialized writers. Providing true multi-version snapshot isolation at the iterator level requires either freezing the MemTable (`P03-S03-M02`) or maintaining an active snapshot sequence number barrier with MVCC record visibility filtering. Before MemTable freeze transitions exist, the physical SkipList iterator reflects live mutations.
+* **Impact**: An iterator traversing while concurrent writers append nodes will observe newly inserted nodes if they fall ahead of the iterator's current position (`UserKey >= current.UserKey`). Nodes inserted behind the iterator's current position will not be observed. Historical revisions and tombstones (`OpTypeDelete`) are physically yielded in canonical internal order (`UserKey ASC`, `SeqNum DESC`, `OpType DESC`) rather than logically filtered.
+* **How It Was Detected**: Design specification and semantic definition in `P03-S03-M01`.
+* **Current Mitigation**: The iterator contract is explicitly documented as live and weakly consistent. Traversal is 100% race-free under `go test -race` due to atomic pointer loads. Defensive copying (`Key()` and `Value()`) guarantees callers cannot corrupt internal memory.
+* **Future Solution**: In `P03-S03-M02`, `MemTable.Freeze()` will transition active MemTables to read-only immutable tables, providing static snapshot guarantees. In Phase 06/10, engine-level snapshot iterators will bind a read sequence number to mask uncommitted or future versions.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Guarantees monotonicity, acyclicity, and memory isolation without false claims of snapshot isolation).
+  * Performance: **Optimal** (Zero locks acquired during iteration; sub-3ns Next step).
+  * Scalability: **Optimal** (Arbitrary concurrent iterators scale linearly across CPU cores).
+
 ---
 
 *End of Known Limitations — To be updated continuously throughout implementation.*

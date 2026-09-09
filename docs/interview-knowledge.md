@@ -36,6 +36,7 @@
 25. [Twelve Deep Systems Security Questions on In-Memory Concurrent Engine & SkipList Subsystems](#25-twelve-deep-systems-security-questions-on-in-memory-concurrent-engine--skiplist-subsystems)
 26. [Questions I Personally Failed & Corrected Understandings](#26-questions-i-personally-failed--corrected-understandings)
 27. [Deep Systems Interview Questions & Answers: SkipList Node Memory Representation & Geometric Randomizer (P03-S01-M01)](#27-deep-systems-interview-questions--answers-skiplist-node-memory-representation--geometric-randomizer-p03-s01-m01)
+28. [Deep Systems Interview Questions & Answers: Forward Iterator, Express-Lane Seek, & Weak Consistency (P03-S03-M01)](#28-deep-systems-interview-questions--answers-forward-iterator-express-lane-seek--weak-consistency-p03-s03-m01)
 
 ---
 
@@ -2077,6 +2078,76 @@ Conversely, historical sealed segments ($S_1 \dots S_{N-1}$) were closed and syn
 # 26. Questions I Personally Failed & Corrected Understandings
 
 *(Entries will be appended whenever knowledge gaps are discovered)*
+
+# 28. Deep Systems Interview Questions & Answers: Forward Iterator, Express-Lane Seek, & Weak Consistency (P03-S03-M01)
+
+### 1. How does the SkipList forward iterator navigate through records?
+* **Question**: How does `Iterator.Next()` traverse records, and what synchronization is required?
+* **Answer**:
+  - The SkipList maintains Level 0 as the single canonical total ordering of all stored records.
+  - `Next()` simply loads the forward pointer at Level 0: `it.curr = it.curr.forward[0].Load()`.
+  - Because forward towers are immutable once published, and the pointer load is atomic (`atomic.Pointer[skipListNode].Load()`), this traversal requires **zero mutex locks**, zero CAS loops, and zero memory allocations.
+  - Benchmarks confirm `Next()` executes in ~3.0 nanoseconds per node with 0 heap allocations.
+
+### 2. Why does `Seek(userKey)` use upper levels instead of scanning from the head?
+* **Question**: Why not just scan Level 0 from head during `Seek(userKey)`? What is the algorithmic benefit of the express lanes?
+* **Answer**:
+  - Scanning Level 0 from head is $O(N)$ linear search. In a SkipList with 100,000 nodes, this requires up to 100,000 pointer dereferences.
+  - `Seek(userKey)` starts from the dynamically maintained active height ($h = \text{height.Load()}$) and descends layer by layer:
+    - At level $i$, while `next != nil && bytes.Compare(next.key.UserKey, userKey) < 0`, it advances horizontally (`curr = next`).
+    - When `next.key.UserKey >= userKey` or `next == nil`, it drops down one level ($i-1$).
+    - At Level 0, `curr.forward[0].Load()` points directly to the first candidate node satisfying $\text{UserKey} \ge \text{userKey}$.
+  - This reduces Seek complexity from $O(N)$ to expected $O(\log N)$ steps (~58 ns for 1,000 keys, ~129 ns for 10,000 keys in benchmarks).
+
+### 3. In a multi-version SkipList, why is `Seek(userKey)` guaranteed to land on the newest revision?
+* **Question**: When multiple revisions of the same UserKey exist (with different SeqNums), how does `Seek(userKey)` guarantee it lands on the newest revision first?
+* **Answer**:
+  - InternalKey canonical ordering is:
+    1. `UserKey` ascending
+    2. `SeqNum` descending
+    3. `OpType` descending
+  - During `Seek`, the iterator moves forward as long as `next.key.UserKey < userKey`.
+  - The moment it stops and drops to Level 0, the very next node is the first node where `UserKey >= userKey`.
+  - If `UserKey == userKey`, the first node encountered is the one with the *highest* `SeqNum` (newest revision) because sequence numbers sort in descending order.
+  - Subsequent calls to `Next()` will then visit older revisions of that same UserKey in descending chronological order before moving to the next UserKey.
+
+### 4. Why does the iterator physically yield tombstones (`OpTypeDelete`) instead of filtering them?
+* **Question**: In database iterators, callers usually expect only live keys. Why does `Iterator` yield tombstone entries with `Value() == nil`?
+* **Answer**:
+  - The SkipList iterator is the **physical Level-0 storage iterator**.
+  - In an LSM-tree engine, the MemTable iterator is consumed by two primary subsystems:
+    1. **SSTable Flush Worker**: When flushing an active or immutable MemTable to an L0 SSTable, tombstones *must* be physically written to the SSTable so that older versions in lower levels ($L_1 \dots L_k$) can be shadowed and purged during compaction! If the MemTable iterator filtered tombstones, deletes would vanish and resurrect deleted data from disk!
+    2. **Compaction K-Way Merger**: Compaction mergers need raw physical records (including sequence numbers and tombstones) to compute correct purge horizons.
+  - Logical masking (filtering deleted records and shadowing older revisions for client point-in-time reads) is the responsibility of the upper-layer Engine/DB iterator (Phase 10), which applies snapshot sequence number visibility.
+
+### 5. What are the memory ownership guarantees of `Key()` and `Value()`?
+* **Question**: Why does `Key()` call `key.Clone()` and `Value()` call `getValue()`, rather than returning raw internal slices?
+* **Answer**:
+  - In Go, byte slices (`[]byte`) are mutable reference headers (`Data`, `Len`, `Cap`). If an iterator returned a direct reference to `node.key.UserKey` or `node.value.Load().data`, any caller modifying the slice in-place (e.g. `val[0] = 0x00`) would silently corrupt the SkipList's internal index ordering or data payload.
+  - This violates security invariant `SEC-MEM-INV-01` (Memory Isolation).
+  - To prevent caller mutation from corrupting engine memory, `Key()` returns an `InternalKey` with a cloned `UserKey` slice, and `Value()` returns a defensively copied slice from the immutable `nodeValue` container.
+
+### 6. What is the concurrency and consistency model of this iterator?
+* **Question**: Is this a snapshot iterator? What happens if a writer inserts keys while an iterator is actively traversing?
+* **Answer**:
+  - It is a **weakly-consistent live iterator**, NOT a point-in-time snapshot iterator.
+  - Because it operates directly over the live mutable SkipList via lock-free atomic pointer reads:
+    - Insertions ahead of the iterator's current position will be observed.
+    - Insertions behind the iterator's current position will not be observed.
+    - Traversal is guaranteed to be **acyclic**, **monotonic**, and **race-free** (`go test -race` passes cleanly).
+    - If a writer performs an exact-duplicate key update, `nodeValue` is atomically swapped; an iterator calling `Value()` at that instant reads either the old or new value atomically, never a torn buffer.
+  - Point-in-time snapshot isolation requires freezing the MemTable (`P03-S03-M02`) or filtering by snapshot sequence number (Phase 06/10).
+
+### 7. Why is snapshot iteration harder than forward traversal in a concurrent SkipList?
+* **Question**: Why can't we easily give snapshot isolation to a live SkipList iterator without freezing?
+* **Answer**:
+  - In a live SkipList, writers continuously append new nodes.
+  - To provide snapshot isolation at sequence number $S_{\text{snap}}$:
+    1. The iterator must ignore any node where `node.key.SeqNum > S_snap`.
+    2. For any key with multiple revisions, the iterator must find the latest revision with `SeqNum <= S_snap` and skip all older revisions of that key.
+    3. If the newest visible revision is a tombstone (`OpTypeDelete`), the iterator must skip the key entirely and advance to the next user key.
+    4. Seek operations must not just land on `UserKey >= target`, but must find the latest version $\le S_{\text{snap}}$, requiring complex multi-version lookahead.
+  - Freezing the MemTable (`P03-S03-M02`) freezes the entire list, converting it into a static immutable structure where snapshot isolation is trivial.
 
 ---
 
