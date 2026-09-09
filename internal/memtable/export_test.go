@@ -100,6 +100,12 @@ func (s *SkipList) SetByteSizeForTesting(val uint64) {
 	s.byteSize.Store(val)
 }
 
+func (s *SkipList) UnfreezeForTesting() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.frozen.Store(false)
+}
+
 func NodeMemoryBytesForTesting(keyLen, valueLen, height int) uint64 {
 	return nodeMemoryBytes(keyLen, valueLen, height)
 }

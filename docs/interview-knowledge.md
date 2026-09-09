@@ -37,6 +37,7 @@
 26. [Questions I Personally Failed & Corrected Understandings](#26-questions-i-personally-failed--corrected-understandings)
 27. [Deep Systems Interview Questions & Answers: SkipList Node Memory Representation & Geometric Randomizer (P03-S01-M01)](#27-deep-systems-interview-questions--answers-skiplist-node-memory-representation--geometric-randomizer-p03-s01-m01)
 28. [Deep Systems Interview Questions & Answers: Forward Iterator, Express-Lane Seek, & Weak Consistency (P03-S03-M01)](#28-deep-systems-interview-questions--answers-forward-iterator-express-lane-seek--weak-consistency-p03-s03-m01)
+29. [Deep Systems Interview Questions & Answers: Atomic MemTable Freeze, Linearization Points, & In-Place Immutability (P03-S03-M02)](#29-deep-systems-interview-questions--answers-atomic-memtable-freeze-linearization-points--in-place-immutability-p03-s03-m02)
 
 ---
 
@@ -2148,6 +2149,53 @@ Conversely, historical sealed segments ($S_1 \dots S_{N-1}$) were closed and syn
     3. If the newest visible revision is a tombstone (`OpTypeDelete`), the iterator must skip the key entirely and advance to the next user key.
     4. Seek operations must not just land on `UserKey >= target`, but must find the latest version $\le S_{\text{snap}}$, requiring complex multi-version lookahead.
   - Freezing the MemTable (`P03-S03-M02`) freezes the entire list, converting it into a static immutable structure where snapshot isolation is trivial.
+
+# 29. Deep Systems Interview Questions & Answers: Atomic MemTable Freeze, Linearization Points, & In-Place Immutability (P03-S03-M02)
+
+### 1. Why do LSM-tree storage engines require an atomic freeze transition?
+* **Question**: Why does an LSM engine transition active MemTables to immutable/frozen tables rather than flushing directly from the active MemTable?
+* **Answer**:
+  - In high-throughput LSM engines, write traffic cannot stall while a 64MB MemTable is serialized and flushed to an L0 SSTable on disk (which can take 100ms to several seconds depending on I/O load).
+  - The engine performs an instantaneous, atomic transition: the active MemTable is marked `FROZEN`, and a fresh `ACTIVE` MemTable is swapped in to receive new client writes immediately.
+  - The frozen MemTable is handed off to a background flush worker thread. Because the frozen table is guaranteed to be 100% immutable, the flusher can iterate and stream records to disk with zero locks and zero risk of concurrent mutations corrupting SSTable block construction.
+
+### 2. How is the linearization boundary established between racing Inserts and Freeze?
+* **Question**: How do we prevent a Time-of-Check to Time-of-Use (TOCTOU) race between concurrent writers calling `Insert()` and a flusher thread calling `Freeze()`?
+* **Answer**:
+  - `Freeze()` acquires the serialized writer mutex (`s.mu.Lock()`).
+  - Inside `insertInternal()`, the check for `s.frozen.Load()` is evaluated **under `s.mu.Lock()`**.
+  - Because writer mutations and `Freeze()` share mutual exclusion on `s.mu`:
+    - **Case A**: If `Insert` acquires `s.mu` first, it finishes splicing the node and updating byteSize/count. When `Freeze` subsequently acquires `s.mu`, that entry is 100% guaranteed to be included in the frozen structure.
+    - **Case B**: If `Freeze` acquires `s.mu` first, it stores `s.frozen = true`. When `Insert` subsequently acquires `s.mu`, it detects `s.frozen == true` and immediately aborts, returning `errors.ErrMemTableFrozen` with zero mutations.
+  - Mutual exclusion on `s.mu` makes the linearization point strictly deterministic, eliminating any intermediate or torn states.
+
+### 3. Why is in-place freezing preferred over allocating a new immutable structure?
+* **Question**: Why does Lattice freeze the SkipList in place rather than creating a deep copy of all nodes into a dedicated read-only struct?
+* **Answer**:
+  - **Zero CPU & Allocation Overhead ($O(1)$)**: A deep copy of 100,000 nodes would require allocating hundreds of thousands of heap objects, burning megabytes of RAM and triggering GC pressure right before an I/O flush. In-place `Freeze()` simply sets an atomic boolean flag under the writer mutex, executing in ~12 nanoseconds with 0 heap allocations regardless of whether the table contains 1K, 10K, or 100K entries.
+  - **Zero Disruption to Existing Readers**: Lock-free readers (`SearchConcurrent`) and existing iterators continue traversing the exact same pointer nodes without pause or cache invalidation.
+
+### 4. Why must exact duplicate InternalKey updates be rejected after Freeze?
+* **Question**: In Phase 03.1/03.2, exact duplicate InternalKey updates (`CompareInternalKey == 0`) do not insert a new node, but atomically replace the `nodeValue` container. Why must this also be rejected after Freeze?
+* **Answer**:
+  - If duplicate updates were permitted post-freeze, a background flusher reading `node.getValue()` could observe a value that was updated *after* the flush began, corrupting WAL-to-MemTable recovery horizons.
+  - Furthermore, replacing `nodeValue` alters `s.byteSize`. A frozen MemTable's size must remain strictly invariant.
+  - By placing the `s.frozen.Load()` check before predecessor search and before duplicate checking, all post-freeze mutation attempts—whether new keys, duplicates, or tombstones—are strictly rejected.
+
+### 5. What is the difference between structural immutability and MVCC snapshot isolation?
+* **Question**: Does calling `Freeze()` provide full MVCC snapshot isolation to database clients?
+* **Answer**:
+  - No. `Freeze()` provides **structural immutability** (the SkipList cannot be modified).
+  - However, the physical SkipList still contains all historical sequence numbers and tombstones (`OpTypeDelete`).
+  - Full MVCC snapshot isolation requires sequence-number visibility filtering (masking records with `SeqNum > S_snapshot`) and tombstone shadowing. This filtering is the responsibility of higher-layer engine snapshot iterators (Phase 10), not the raw physical MemTable.
+
+### 6. Why should `Iterator.Close()` release the underlying SkipList pointer?
+* **Question**: Why was `Iterator.Close()` updated in `P03-S03-M02` to clear `it.sl = nil`?
+* **Answer**:
+  - In Go, a struct pointer retains the referenced heap object from garbage collection.
+  - If a caller creates an iterator over a MemTable, iterates, and calls `Close()`, but retains the `*Iterator` reference in a long-lived struct or connection pool:
+    - If `it.sl` were retained, the entire MemTable (potentially 64MB of nodes) cannot be garbage collected even after the table has been flushed to disk and dereferenced by the engine!
+    - Setting `it.sl = nil` in `Close()` severs the reference to the SkipList, allowing the entire MemTable heap to be promptly reclaimed by the Go runtime GC.
 
 ---
 

@@ -276,6 +276,18 @@ This document tracks all **genuine architectural and operational limitations** o
   * Performance: **Optimal** (Zero locks acquired during iteration; sub-3ns Next step).
   * Scalability: **Optimal** (Arbitrary concurrent iterators scale linearly across CPU cores).
 
+### 20. Structural In-Place Immutability vs Full MVCC Point-In-Time Snapshot Isolation
+* **Limitation**: `SkipList.Freeze()` (introduced in `P03-S03-M02`) provides permanent *structural immutability* for the in-memory MemTable, but does not provide logical MVCC snapshot isolation (such as point-in-time sequence-number visibility filtering or tombstone masking).
+* **Why It Exists**: In an LSM-tree architecture, the frozen MemTable is the exact physical unit passed to background SSTable flusher workers and compaction mergers. Flusher workers strictly require physical visibility of all sequence revisions and tombstones (`OpTypeDelete`) so deletions and overwrites are persisted to L0 SSTables. Logical filtering at the MemTable tier would break LSM compaction dynamics.
+* **Impact**: Iterating over a frozen MemTable (`it := frozenSL.NewIterator()`) yields a static, immutable view of all physical records stored up to the `Freeze()` linearization point. However, multiple revisions of the same UserKey and raw tombstones remain visible until upper-layer engine snapshot iterators (Phase 10) apply MVCC sequence masking.
+* **How It Was Detected**: Architectural specification in `P03-S03-M02`.
+* **Current Mitigation**: The separation of concerns is explicitly maintained: `Freeze()` guarantees structural and value immutability (zero post-freeze mutations, failure-atomic rejection returning `ErrMemTableFrozen`).
+* **Future Solution**: Phase 06/10 will implement `DB.NewSnapshot()` and `SnapshotIterator`, which bind a read sequence number $S_{\text{read}}$ to mask newer revisions and tombstones.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (LSM flusher contracts strictly preserved).
+  * Performance: **Optimal** ($O(1)$ in-place transition with zero data copying).
+  * Scalability: **Optimal**.
+
 ---
 
 *End of Known Limitations — To be updated continuously throughout implementation.*

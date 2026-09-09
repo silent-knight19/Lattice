@@ -42,6 +42,8 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrRunnerClosed", errors.ErrRunnerClosed, "group commit runner is closed"},
 		{"ErrInvalidSkipListHeight", errors.ErrInvalidSkipListHeight, "invalid skiplist node height"},
 		{"ErrInvalidSkipListLevel", errors.ErrInvalidSkipListLevel, "invalid skiplist level"},
+		{"ErrMemTableFrozen", errors.ErrMemTableFrozen, "memtable is frozen"},
+		{"ErrIteratorClosed", errors.ErrIteratorClosed, "iterator is closed"},
 	}
 
 	for _, tc := range sentinels {
@@ -91,6 +93,8 @@ func TestSentinelWrappingWithErrorsIs(t *testing.T) {
 		{"ErrRunnerClosed", errors.ErrRunnerClosed},
 		{"ErrInvalidSkipListHeight", errors.ErrInvalidSkipListHeight},
 		{"ErrInvalidSkipListLevel", errors.ErrInvalidSkipListLevel},
+		{"ErrMemTableFrozen", errors.ErrMemTableFrozen},
+		{"ErrIteratorClosed", errors.ErrIteratorClosed},
 	}
 
 	for _, tc := range tests {

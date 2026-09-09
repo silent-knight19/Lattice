@@ -4,6 +4,7 @@ import (
 	"bytes"
 
 	"github.com/silent-knight19/lattice/internal/binary"
+	"github.com/silent-knight19/lattice/internal/errors"
 )
 
 type iteratorState byte
@@ -61,6 +62,10 @@ func (it *Iterator) Valid() bool {
 func (it *Iterator) Next() bool {
 	switch it.state {
 	case stateUnpositioned:
+		if it.sl == nil {
+			it.state = stateExhausted
+			return false
+		}
 		it.curr = it.sl.head.forward[0].Load()
 		if it.curr != nil {
 			it.state = statePositioned
@@ -128,6 +133,11 @@ func (it *Iterator) Value() []byte {
 // Complexity:
 // Expected O(log N) comparisons and pointer loads using the multi-level express-lane hierarchy.
 func (it *Iterator) Seek(userKey []byte) error {
+	if it.sl == nil {
+		it.curr = nil
+		it.state = stateExhausted
+		return errors.ErrIteratorClosed
+	}
 	if err := binary.ValidateKey(userKey); err != nil {
 		it.curr = nil
 		it.state = stateExhausted
@@ -164,6 +174,11 @@ func (it *Iterator) Seek(userKey []byte) error {
 // SeekToFirst positions the iterator at the first entry in the SkipList.
 // If the SkipList is empty, the iterator is exhausted (Valid() == false).
 func (it *Iterator) SeekToFirst() {
+	if it.sl == nil {
+		it.curr = nil
+		it.state = stateExhausted
+		return
+	}
 	it.curr = it.sl.head.forward[0].Load()
 	if it.curr != nil {
 		it.state = statePositioned
@@ -176,6 +191,11 @@ func (it *Iterator) SeekToFirst() {
 // to target according to canonical binary.CompareInternalKey ordering.
 // If target.UserKey or target.OpType is invalid, the iterator is invalidated and an error is returned.
 func (it *Iterator) SeekInternalKey(target binary.InternalKey) error {
+	if it.sl == nil {
+		it.curr = nil
+		it.state = stateExhausted
+		return errors.ErrIteratorClosed
+	}
 	if err := binary.ValidateKey(target.UserKey); err != nil {
 		it.curr = nil
 		it.state = stateExhausted
@@ -218,5 +238,6 @@ func (it *Iterator) SeekInternalKey(target binary.InternalKey) error {
 // Calling Close multiple times is safe and idempotent.
 func (it *Iterator) Close() {
 	it.curr = nil
+	it.sl = nil
 	it.state = stateExhausted
 }

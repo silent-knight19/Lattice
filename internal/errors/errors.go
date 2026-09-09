@@ -128,6 +128,13 @@ var (
 	// ErrInvalidSkipListLevel indicates that a requested SkipList level index violates
 	// the bounds [0, height-1] for a node.
 	ErrInvalidSkipListLevel = stdErrors.New("invalid skiplist level")
+
+	// ErrMemTableFrozen indicates that an operation attempting mutation was rejected
+	// because the MemTable/SkipList is permanently frozen (read-only).
+	ErrMemTableFrozen = stdErrors.New("memtable is frozen")
+
+	// ErrIteratorClosed indicates that an operation was attempted on a closed iterator.
+	ErrIteratorClosed = stdErrors.New("iterator is closed")
 )
 
 // KeyTooLargeError provides structured context when a key violates maximum size limits.

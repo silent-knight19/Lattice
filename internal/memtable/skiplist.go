@@ -42,6 +42,7 @@ type SkipList struct {
 	rnd      *HeightGenerator
 	count    atomic.Int64
 	byteSize atomic.Uint64
+	frozen   atomic.Bool
 }
 
 // NewSkipList creates a new SkipList backed by the default
@@ -68,6 +69,7 @@ func NewSkipListWithGenerator(rnd *HeightGenerator) *SkipList {
 	sl.height.Store(MinHeight)
 	sl.count.Store(0)
 	sl.byteSize.Store(0)
+	sl.frozen.Store(false)
 	return sl
 }
 
@@ -107,6 +109,36 @@ func (s *SkipList) IsEmpty() bool {
 	return s.count.Load() == 0
 }
 
+// Freeze permanently transitions the SkipList from ACTIVE to FROZEN.
+//
+// Concurrency & Linearization Semantics (P03-S03-M02-INV-01..05):
+//   - Exclusive Writer Synchronization: Freeze acquires s.mu.Lock(), ensuring
+//     it synchronizes with the serialized writer path.
+//   - Deterministic Linearization Boundary: Any concurrent Insert that acquired s.mu.Lock()
+//     before Freeze will complete and be included in the frozen structure. Any concurrent Insert
+//     that arrives at s.mu.Lock() after Freeze will observe s.frozen == true and return ErrMemTableFrozen.
+//   - Idempotence: Multiple sequential or concurrent Freeze invocations are safe.
+//     Returns true if this call performed the transition; returns false if already frozen.
+//   - Structural Immutability: Once frozen, all node keys, forward towers, heights, counts,
+//     and values are permanently immutable. Exact duplicate updates cannot swap value containers.
+//   - Zero Copy / In-Place: Freezing is an O(1) state transition with zero node copying.
+func (s *SkipList) Freeze() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.frozen.Load() {
+		return false
+	}
+	s.frozen.Store(true)
+	return true
+}
+
+// IsFrozen reports whether the SkipList has transitioned to the permanently read-only FROZEN state.
+// This check is lock-free and safe for concurrent execution.
+func (s *SkipList) IsFrozen() bool {
+	return s.frozen.Load()
+}
+
 // Insert inserts an InternalKey-value entry into the SkipList in canonical sorted order.
 //
 // Concurrency & Synchronization:
@@ -135,6 +167,11 @@ func (s *SkipList) Insert(key binary.InternalKey, value []byte) error {
 // insertInternal executes predecessor search and splices the new node.
 // If forcedHeight != 0, forcedHeight is used instead of generating a random height (used by test seams).
 func (s *SkipList) insertInternal(key binary.InternalKey, value []byte, forcedHeight int) error {
+	// 0. Fast-path check for frozen state before any validation or allocation
+	if s.frozen.Load() {
+		return errors.ErrMemTableFrozen
+	}
+
 	// 1. Boundary validation prior to acquiring locks or mutating structure
 	if err := binary.ValidateKey(key.UserKey); err != nil {
 		return err
@@ -169,6 +206,11 @@ func (s *SkipList) insertInternal(key binary.InternalKey, value []byte, forcedHe
 	// 4. Acquire exclusive writer mutation lock
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// 4b. Strict linearization check: if Freeze() won the lock while we were preparing newNode, abort.
+	if s.frozen.Load() {
+		return errors.ErrMemTableFrozen
+	}
 
 	// 5. Predecessor search: locate the insertion position at each level
 	var update [MaxHeight]*skipListNode
