@@ -1,6 +1,8 @@
 package memtable
 
 import (
+	"sync/atomic"
+
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
 )
@@ -24,24 +26,26 @@ const (
 	DefaultPromotionProbability = 0.25
 )
 
+// nodeValue wraps a byte slice in an immutable container to enable lock-free atomic value
+// publishing and race-free reads under concurrent SearchConcurrent invocations.
+type nodeValue struct {
+	data []byte
+}
+
 // skipListNode represents an individual multi-level entry in the SkipList.
 //
 // Ownership & Immutability Model:
 //   - key: Owned, defensively cloned binary.InternalKey. External callers cannot
 //     mutate internal key state via slice aliasing (enforcing SEC-MEM-INV-01).
-//   - value: Owned, defensively copied byte slice (nil or empty for tombstones/deletions).
+//   - value: Atomic pointer to an immutable nodeValue container holding a defensively
+//     copied byte slice (nil or empty for tombstones/deletions).
 //   - forward: Private pointer tower sized exactly to the node's declared height.
-//     Nodes allocate only the pointers necessary for their height (1 <= height <= MaxHeight).
-//
-// Concurrency Model Preparation:
-//   - In this micro-phase (P03-S01-M01), pointer storage is represented as []*skipListNode.
-//   - Future micro-phases introduce atomic pointer reads (atomic.LoadPointer) for lock-free
-//     traversal without mutexes, and atomic pointer publication (atomic.StorePointer)
-//     splicing pointers bottom-up (Level 0 to Level H-1).
+//     Each forward pointer is an atomic.Pointer[skipListNode], permitting lock-free reader
+//     traversal without mutexes while ensuring safe atomic publication by the serialized writer.
 type skipListNode struct {
 	key     binary.InternalKey
-	value   []byte
-	forward []*skipListNode
+	value   atomic.Pointer[nodeValue]
+	forward []atomic.Pointer[skipListNode]
 }
 
 // newSkipListNode creates and initializes a new skipListNode with the given key, value, and tower height.
@@ -72,17 +76,18 @@ func newSkipListNode(key binary.InternalKey, value []byte, height int) (*skipLis
 		return nil, err
 	}
 
-	var valCopy []byte
-	if len(value) > 0 {
-		valCopy = make([]byte, len(value))
-		copy(valCopy, value)
+	n := &skipListNode{
+		key:     key.Clone(),
+		forward: make([]atomic.Pointer[skipListNode], height),
 	}
 
-	return &skipListNode{
-		key:     key.Clone(),
-		value:   valCopy,
-		forward: make([]*skipListNode, height),
-	}, nil
+	if len(value) > 0 {
+		valCopy := make([]byte, len(value))
+		copy(valCopy, value)
+		n.value.Store(&nodeValue{data: valCopy})
+	}
+
+	return n, nil
 }
 
 // newSentinelNode creates a head sentinel node with the given height and no key/value.
@@ -96,7 +101,7 @@ func newSentinelNode(height int) (*skipListNode, error) {
 		}
 	}
 	return &skipListNode{
-		forward: make([]*skipListNode, height),
+		forward: make([]atomic.Pointer[skipListNode], height),
 	}, nil
 }
 
@@ -114,10 +119,10 @@ func (n *skipListNode) forwardAt(level int) (*skipListNode, error) {
 			MaxLevel: len(n.forward) - 1,
 		}
 	}
-	return n.forward[level], nil
+	return n.forward[level].Load(), nil
 }
 
-// setForward sets the forward pointer at the specified 0-indexed level.
+// setForward sets the forward pointer at the specified 0-indexed level using atomic store.
 // Returns an *errors.InvalidSkipListLevelError if level is outside [0, height()-1].
 func (n *skipListNode) setForward(level int, next *skipListNode) error {
 	if level < 0 || level >= len(n.forward) {
@@ -126,7 +131,7 @@ func (n *skipListNode) setForward(level int, next *skipListNode) error {
 			MaxLevel: len(n.forward) - 1,
 		}
 	}
-	n.forward[level] = next
+	n.forward[level].Store(next)
 	return nil
 }
 
@@ -138,15 +143,20 @@ func (n *skipListNode) getKey() binary.InternalKey {
 // getValue returns a defensive copy of the node's value slice.
 // Returns nil if the node stores a nil value (e.g. tombstone).
 func (n *skipListNode) getValue() []byte {
-	if n.value == nil {
+	v := n.value.Load()
+	if v == nil || v.data == nil {
 		return nil
 	}
-	valCopy := make([]byte, len(n.value))
-	copy(valCopy, n.value)
+	valCopy := make([]byte, len(v.data))
+	copy(valCopy, v.data)
 	return valCopy
 }
 
 // rawValue returns the internal value slice directly for internal, non-escaping read operations.
 func (n *skipListNode) rawValue() []byte {
-	return n.value
+	v := n.value.Load()
+	if v == nil {
+		return nil
+	}
+	return v.data
 }

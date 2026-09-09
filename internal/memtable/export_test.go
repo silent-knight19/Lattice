@@ -63,10 +63,10 @@ func (s *SkipList) NodeCountAtLevelForTesting(level int) int {
 		return 0
 	}
 	count := 0
-	curr := s.head.forward[level]
+	curr := s.head.forward[level].Load()
 	for curr != nil {
 		count++
-		curr = curr.forward[level]
+		curr = curr.forward[level].Load()
 	}
 	return count
 }
@@ -76,10 +76,18 @@ func (s *SkipList) NodesAtLevelForTesting(level int) []*skipListNode {
 		return nil
 	}
 	var nodes []*skipListNode
-	curr := s.head.forward[level]
+	curr := s.head.forward[level].Load()
 	for curr != nil {
 		nodes = append(nodes, curr)
-		curr = curr.forward[level]
+		curr = curr.forward[level].Load()
 	}
 	return nodes
+}
+
+func (s *SkipList) WriterLockForTesting() {
+	s.mu.Lock()
+}
+
+func (s *SkipList) WriterUnlockForTesting() {
+	s.mu.Unlock()
 }

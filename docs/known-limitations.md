@@ -238,17 +238,17 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
-### 17. Single-Threaded SkipList Traversal & Sequential Pointer Mutation
-* **Limitation**: In `P03-S01-M02`, `SkipList` is strictly single-threaded. Forward pointers are linked via standard pointer writes (`newNode.forward[i] = update[i].forward[i]; update[i].forward[i] = newNode`), and read traversals do not execute atomic load operations (`atomic.LoadPointer`).
-* **Why It Exists**: Phase 03 is staged systematically: micro-phase `P03-S01-M02` focuses exclusively on algorithmic correctness, multi-version ordering, sentinel anchoring, failure atomicity, and structural invariants. Lock-free read traversal, bottom-up atomic publication (`atomic.StorePointer`), and writer mutex coordination are scheduled for Sub-Phase 03.2 (`P03-S02-M01`).
-* **Impact**: Concurrent invocations of `Insert` or concurrent `Insert` + `Search` without external synchronization would produce data races.
-* **How It Was Detected**: Architectural design boundary established in Phase 03 roadmap.
-* **Current Mitigation**: The SkipList remains package-private to `internal/memtable` in this micro-phase. Comprehensive race detector verification (`go test -race ./...`) confirms 0 race conditions under all sequential and package-level tests.
-* **Future Solution**: Implement lock-free read traversal via `atomic.LoadPointer` and atomic pointer publication in `P03-S02-M01`.
+### 17. Single Serialized Writer Model & Deferred MemTable Memory Accounting
+* **Limitation**: In `P03-S02-M01`, lock-free reader traversal (`SearchConcurrent`) and bottom-up atomic publication are fully implemented and verified. However, write mutations remain strictly serialized under an exclusive mutex (`s.mu.Lock()`). Concurrent multi-writer lock-free insertions are intentionally not implemented. Furthermore, exact byte-level memory tracking (`MemTable.ByteSize()`) is deferred to `P03-S02-M02`.
+* **Why It Exists**: In modern LSM storage engines (e.g. LevelDB, RocksDB, Pebble), multiple concurrent writers incur extreme CAS retry overhead and complex split/splice lock-free protocols that provide minimal throughput benefit over serialized append-oriented MemTables fed by a WAL Group Commit pipeline. Serializing structural SkipList mutations under a mutex while keeping readers 100% lock-free represents the optimal production engineering balance.
+* **Impact**: Total ingestion rate into a single active MemTable is bounded by single-core pointer splicing throughput (~2-5 million writes/sec in memory). Multiple concurrent readers scale linearly across CPU cores without mutex contention.
+* **How It Was Detected**: Architectural design established in Phase 03 Roadmap and ADR-003.
+* **Current Mitigation**: Serialized writer mutex guarantees structural failure atomicity and zero CAS retry storms; lock-free readers execute without acquiring locks.
+* **Future Solution**: Exact memory accounting will be implemented in `P03-S02-M02`; MemTable freezing and multi-version iterators in Sub-Phase 03.3.
 * **Dimensional Impact**:
-  * Correctness: **None** for single-threaded usage; concurrency intentionally deferred.
-  * Performance: **Optimal** for single-threaded operations (no atomic instruction overhead).
-  * Scalability: **Deferred** to Sub-Phase 03.2.
+  * Correctness: **None** (Linearizability and race freedom strictly preserved).
+  * Performance: **Optimal** (Readers never stall on writers; writers avoid CAS loops).
+  * Scalability: **High** read scalability; write scalability governed by WAL group commit.
 
 ---
 

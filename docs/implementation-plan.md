@@ -349,14 +349,14 @@ Every future micro-phase implementation response from Claude Code must use this 
 
 ```
 Current Major Phase           : Phase 03 — In-Memory MemTable & Concurrent SkipList
-Current Sub-Phase             : Sub-Phase 03.1 — SkipList Node & Level Generation
-Current Micro-Phase           : P03-S01-M02 — Single-Threaded SkipList Insertion & Lookup (COMPLETE)
+Current Sub-Phase             : Sub-Phase 03.2 — Concurrent Traversal & Memory Accounting
+Current Micro-Phase           : P03-S02-M01 — Lock-Free Read Traversal via Atomic Pointer Reads (COMPLETE)
 Phase 01 Status               : COMPLETE (Sub-Phases 01.1 & 01.2 Complete)
 Phase 02 Status               : COMPLETE (Sub-Phases 02.1, 02.2, 02.3, 02.4 Complete)
-Phase 03 Status               : IN PROGRESS (Sub-Phase 03.1 Complete: M01, M02 complete)
+Phase 03 Status               : IN PROGRESS (Sub-Phase 03.1 Complete; Sub-Phase 03.2 M01 complete)
 Previous Completed Phase      : Phase 02 — Write-Ahead Log (WAL) & Durability Subsystem
-Previous Completed Micro-Phase: P03-S01-M02 — Single-Threaded SkipList Insertion & Lookup
-Next Planned Phase            : Phase 03 — In-Memory MemTable & Concurrent SkipList (P03-S02-M01)
+Previous Completed Micro-Phase: P03-S02-M01 — Lock-Free Read Traversal via Atomic Pointer Reads
+Next Planned Phase            : Phase 03 — In-Memory MemTable & Concurrent SkipList (P03-S02-M02)
 Phase 00 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Phase 01 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Security Audit Track State    : Active
@@ -1166,11 +1166,22 @@ TOTAL: 184 Discrete, Testable Micro-Phases
 
 ### Sub-Phase 03.2: Concurrent Traversal & Memory Accounting
 * **P03-S02-M01: Lock-Free Read Traversal via Atomic Pointer Reads**
-  * *Objective*: Use `atomic.LoadPointer` for traversing forward pointers, allowing readers to search without mutexes.
-  * *Changes*: `SearchConcurrent(key []byte) (Value, bool)`.
-  * *Invariants*: Readers never block writers; writers lock exclusively during pointer splicing.
-  * *Tests*: 16 reader goroutines + 1 writer goroutine running simultaneously under `go test -race`.
-  * *Completion*: Concurrent reads verified race-free.
+  * *Objective*: Implement lock-free concurrent read traversal (`SearchConcurrent(userKey []byte) ([]byte, error)`) across forward pointer express lanes via `atomic.Pointer[skipListNode]`, accompanied by exclusive writer synchronization (`sync.RWMutex`), atomic active-height observation (`atomic.Int32`), and bottom-up publication.
+  * *Invariants*:
+    - P03-S02-M01-INV-01: Every reader-visible forward-pointer load is atomic (`atomic.Pointer.Load`).
+    - P03-S02-M01-INV-02: A published node is fully initialized before becoming reader-visible.
+    - P03-S02-M01-INV-03: Published immutable node fields are never mutated non-atomically after publication; duplicate updates atomically swap value container.
+    - P03-S02-M01-INV-04: Concurrent readers never require the writer mutation lock for forward traversal.
+    - P03-S02-M01-INV-05: Concurrent active-height observation is race-free.
+    - P03-S02-M01-INV-06: Concurrent reader traversal cannot observe a partially initialized node.
+    - P03-S02-M01-INV-07: Concurrent insertion preserves canonical ordering across all levels.
+    - P03-S02-M01-INV-08: Concurrent searches return only valid logical states (either valid old or valid new).
+    - P03-S02-M01-INV-09: Concurrent traversal never creates or follows cycles.
+    - P03-S02-M01-INV-10: After writer completion, `Search` and `SearchConcurrent` are semantically equivalent.
+  * *Theoretical Property*: Reader point lookup requires expected $O(\log N)$ atomic pointer loads and zero locks on the writer mutation mutex. Traversal state allocates zero heap memory.
+  * *Measured Result*: 16 reader goroutines + 1 writer goroutine concurrently executing 3,000 multi-version mutations and continuous point lookups under `go test -race` with 0 data races, verified against an independent concurrent test oracle; active-height growth ($1 \to 2 \to 8 \to 16$) verified race-free; 352,967 concurrent fuzz iterations completed in 3.0s (117,652 execs/sec) with 0 panics; 91.5% statement coverage in `internal/memtable`; `golangci-lint run ./...` clean (0 issues); `go vet` clean across Darwin, Linux, and Windows.
+  * *Observed Limitation*: Write mutations remain serialized under `s.mu.Lock()`; concurrent multi-writer lock-free insertions are intentionally not implemented. Exact byte-level memory tracking (`MemTable.ByteSize()`) is deferred to `P03-S02-M02`.
+  * *Completion*: Complete and verified.
 * **P03-S02-M02: Exact Byte-Level Memory Accounting**
   * *Objective*: Track exact heap consumption of keys, values, node structs, and pointer arrays.
   * *Changes*: `MemTable.ByteSize() uint64`.
