@@ -2608,5 +2608,70 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
+# 34. Deep Systems Interview Questions & Answers: SSTable Sequential File Writer Architecture (P04-S03-M01)
+
+### 1. How does `TableWriter` guarantee crash consistency and atomicity during SSTable file construction?
+* **Question**: In an LSM-tree storage engine, an SSTable file may take hundreds of milliseconds to stream to disk. If a process crash (`SIGKILL`) or power failure occurs midway through writing, how does Lattice ensure that partial, torn, or corrupt SSTables never become visible to readers or corrupt database state?
+* **Answer**:
+  - **Staging File Protocol (`.sst.tmp`)**: `TableWriter` never writes directly to the final target filename `000001.sst`. Instead, it creates and streams exclusively to a temporary staging file `000001.sst.tmp`.
+  - **Durability Barrier (`fdatasync` / `Sync`)**: After all data blocks, the meta-index block, the index block, and the 48-byte footer are emitted, the writer calls `file.Sync()`. This forces the kernel page cache and storage controller write caches to flush all dirty data blocks to non-volatile physical storage before proceeding.
+  - **Atomic Publication (`os.Rename`)**: Only after `Sync()` returns successfully does the writer close the file descriptor and execute POSIX `os.Rename(tmpPath, dstPath)`. On POSIX filesystems, directory entry replacement is atomic at the kernel inode level; readers inspecting directory state either observe the previous state or the completely written, valid SSTable, never an incomplete file.
+  - **Directory Sync Barrier**: Following the rename, `TableWriter` opens the containing parent directory and calls `dir.Sync()`. This guarantees that the directory entry metadata itself is durably committed to disk, preventing filesystem journaling rollback upon sudden power loss.
+  - **Failure Cleanup**: If any error occurs during block emission, index creation, or syncing, or if `Close()` is called before `Finish()`, `TableWriter` immediately closes the descriptor and unlinks the `.tmp` staging file (`os.Remove`), preventing temporary file accumulation.
+
+### 2. Why must index metadata and the footer be written strictly after all data blocks?
+* **Question**: Why does the SSTable format place the Index Block and Footer at the physical tail of the file rather than at the beginning (file offset 0)?
+* **Answer**:
+  - **Single-Pass Sequential Streaming ($O(1)$ Memory Overhead)**: In a write-heavy LSM-tree flush or compaction, data blocks are generated sequentially from an iterator. Because data blocks utilize prefix compression with variable-length varint headers, their exact serialized sizes cannot be predicted in advance. Placing the index at the beginning would require pre-computing all block offsets and sizes, necessitating either holding the entire multi-megabyte SSTable in RAM or executing a two-pass write with expensive disk seeks (`lseek`/`WriteAt`).
+  - **Append-Only Construction**: By placing data blocks first, the writer can stream 4KB blocks sequentially to disk in an append-only pipeline. As each block is emitted, its exact physical offset and size are known and immediately recorded in the in-memory `IndexBuilder`.
+  - **Anchoring the Footer at `file_size - 48`**: The 48-byte footer contains handles to the meta-index and index blocks. Because the index block's offset and size are only finalized after all data blocks are written, the footer can only be computed and written as the final 48 bytes of the file. Readers locate the footer in $O(1)$ time via `Seek(file_size - 48)`.
+
+### 3. How does `TableWriter` perform exact BlockHandle offset accounting?
+* **Question**: How does `TableWriter` track physical file offsets for each `BlockHandle`, and how does it prevent offset drift from short writes?
+* **Answer**:
+  - **Deterministic Offset Counter**: The writer maintains an explicit internal byte counter `w.offset uint64` initialized to 0.
+  - **Short-Write Defensive Loop (`writeAll`)**: Disk writes via `os.File.Write()` may write fewer bytes than requested (e.g. under heavy kernel memory pressure or signal interruptions). `TableWriter` executes a strict loop:
+    ```go
+    written := 0
+    for written < len(p) {
+        n, err := w.writeFn(w.file, p[written:])
+        written += n
+        if err != nil { return err }
+        if n == 0 && written < len(p) { return errors.New("short write") }
+    }
+    w.offset += uint64(written)
+    ```
+  - **Handle Construction**: For each completed data block:
+    `handle := BlockHandle{Offset: blockOffset, Size: uint64(len(blockBytes))}`.
+    Because `blockOffset` is recorded *prior* to `writeAll` and `w.offset` is updated strictly by the verified bytes written, `Offset + Size` corresponds with 100% mathematical fidelity to the physical byte span on disk.
+  - **Contiguity Invariant**: Block $i+1$ starts at `block_i.Offset + block_i.Size`. There are zero gaps, alignment paddings, or phantom bytes between adjacent blocks.
+
+### 4. What is the role of the MetaIndex block in Phase 04, and how is forward compatibility maintained?
+* **Question**: Phase 05 introduces Bloom filter blocks. Why does Phase 04 `TableWriter` write an 8-byte MetaIndex block, and how does it ensure forward and backward compatibility?
+* **Answer**:
+  - **The Non-Zero Handle Size Constraint**: `Footer.Validate()` strictly enforces that `MetaIndexHandle.Size > 0`. If `TableWriter` wrote a 0-byte meta-index or a 0-size handle, the footer would be rejected as corrupt (`ErrInvalidBlockHandle`).
+  - **Valid Empty Block Serialization**: `TableWriter` emits a canonical 8-byte empty block:
+    - 4 bytes: `entryCount = 0` (uint32 Big-Endian)
+    - 4 bytes: `CRC32-IEEE` checksum computed over the count bytes.
+  - **Decoder Compatibility**: When `DecodeBlockIndex` parses this 8-byte block, it validates the CRC32, reads `entryCount == 0`, and returns an empty `BlockIndex` with zero entries.
+  - **Forward Compatibility**: In Phase 05, when Bloom filters are implemented, the writer will simply populate this meta-index block with a `"filter.lattice.bloom" -> FilterBlockHandle` entry without altering the file layout, footer structure, or reader bootstrap mechanics.
+
+### 5. Why does `TableWriter` strictly prohibit overwriting existing SSTable files?
+* **Question**: If a caller initializes `NewTableWriter` with a path that already exists, the writer immediately returns `ErrSSTableExists`. Why is overwriting forbidden?
+* **Answer**:
+  - **LSM Immutability Principle**: In Log-Structured Merge-Trees, SSTables are immutable artifacts. Once written and referenced by a `Version`, an SSTable is never updated in place; mutations produce new SSTables in higher levels or newer flushes.
+  - **Active Reader Snapshot Safety**: Active queries pin the current `Version` and hold open file descriptors to existing SSTables. If an SSTable could be overwritten in place, active readers reading from that file would encounter torn reads, invalid block offsets, and data corruption.
+  - **Defense Against File Number Collisions**: Reusing an existing SSTable filename indicates a critical state error in sequence numbering (`NextFileNum`) in the manifest/version coordinator. Failing fast prevents catastrophic silent data loss.
+
+### 6. What memory ownership and isolation guarantees does `TableWriter` provide?
+* **Question**: Real-world database engines reuse scratch byte buffers across loop iterations when flushing MemTables. How does `TableWriter` protect itself against caller mutation?
+* **Answer**:
+  - **Defensive Ingestion**: When `w.Add(key, value)` is called, `BlockBuilder.Add` copies the key delta bytes, value payload, and varint lengths into its private contiguous block buffer. The caller's `key.UserKey` and `value` slices are never retained.
+  - **Key Boundary Isolation**: For index tracking, the writer executes `binary.AppendInternalKey(nil, key)`, allocating an owned byte slice for `w.largestKeyInCurrentBlock`.
+  - **Metadata Isolation**: The metadata fields `SmallestKey` and `LargestKey` returned by `Finish()` are independent deep copies. Even if the caller immediately reuses or zeroes out its buffers, the finalized SSTable on disk and the returned `SSTableMetadata` remain uncorrupted.
+
+---
+
 *End of Technical Interview Knowledge Base — Lattice v1.0.0-KNOWLEDGE-BASE*
+
 

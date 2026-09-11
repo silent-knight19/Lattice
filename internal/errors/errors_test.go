@@ -60,6 +60,9 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrFooterTruncated", errors.ErrFooterTruncated, "sstable footer truncated: buffer smaller than 48 bytes"},
 		{"ErrInvalidFooterSize", errors.ErrInvalidFooterSize, "invalid sstable footer buffer size: must be exactly 48 bytes"},
 		{"ErrInvalidFooterPadding", errors.ErrInvalidFooterPadding, "invalid sstable footer padding: reserved padding bytes must be zero"},
+		{"ErrTableWriterClosed", errors.ErrTableWriterClosed, "sstable writer is closed"},
+		{"ErrTableWriterFinalized", errors.ErrTableWriterFinalized, "sstable writer is already finalized"},
+		{"ErrSSTableExists", errors.ErrSSTableExists, "sstable file already exists"},
 	}
 
 	for _, tc := range sentinels {
@@ -168,6 +171,9 @@ func TestSentinelNegativeComparisons(t *testing.T) {
 		errors.ErrMemTableFrozen,
 		errors.ErrIteratorClosed,
 		errors.ErrNilReceiver,
+		errors.ErrTableWriterClosed,
+		errors.ErrTableWriterFinalized,
+		errors.ErrSSTableExists,
 	}
 
 	for i, a := range allSentinels {

@@ -184,6 +184,15 @@ var (
 
 	// ErrInvalidFooterPadding indicates that the reserved 8-byte padding in an SSTable footer is non-zero.
 	ErrInvalidFooterPadding = stdErrors.New("invalid sstable footer padding: reserved padding bytes must be zero")
+
+	// ErrTableWriterClosed indicates that an operation was attempted on a closed SSTable writer.
+	ErrTableWriterClosed = stdErrors.New("sstable writer is closed")
+
+	// ErrTableWriterFinalized indicates that finalization was attempted on an already finalized SSTable writer.
+	ErrTableWriterFinalized = stdErrors.New("sstable writer is already finalized")
+
+	// ErrSSTableExists indicates that an SSTable file already exists at the target path and cannot be overwritten.
+	ErrSSTableExists = stdErrors.New("sstable file already exists")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing

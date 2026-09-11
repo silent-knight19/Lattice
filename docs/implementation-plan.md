@@ -349,15 +349,15 @@ Every future micro-phase implementation response from Claude Code must use this 
 
 ```
 Current Major Phase           : Phase 04 — Persistent SSTable Subsystem
-Current Sub-Phase             : Sub-Phase 04.2 — SSTable Index & Footer Design (COMPLETE)
-Current Micro-Phase           : P04-S02-M02 — Fixed 48-Byte Footer Serializer & Parser (COMPLETE)
+Current Sub-Phase             : Sub-Phase 04.3 — SSTable File Writer & Reader (IN PROGRESS)
+Current Micro-Phase           : P04-S03-M01 — SSTable Sequential File Writer (TableWriter) (COMPLETE)
 Phase 01 Status               : COMPLETE (Sub-Phases 01.1 & 01.2 Complete)
 Phase 02 Status               : COMPLETE (Sub-Phases 02.1, 02.2, 02.3, 02.4 Complete)
 Phase 03 Status               : COMPLETE (Sub-Phases 03.1, 03.2, 03.3 Complete)
-Phase 04 Status               : IN PROGRESS (Sub-Phases 04.1 & 04.2 Complete; Sub-Phase 04.3 Planned)
+Phase 04 Status               : IN PROGRESS (Sub-Phases 04.1 & 04.2 Complete; Sub-Phase 04.3 In Progress)
 Previous Completed Phase      : Phase 03 — In-Memory MemTable & Concurrent SkipList
-Previous Completed Micro-Phase: P04-S02-M02 — Fixed 48-Byte Footer Serializer & Parser
-Next Planned Micro-Phase      : P04-S03-M01 — SSTable Sequential File Writer (TableWriter)
+Previous Completed Micro-Phase: P04-S03-M01 — SSTable Sequential File Writer (TableWriter)
+Next Planned Micro-Phase      : P04-S03-M02 — SSTable Block Reader & Sparse Index Binary Search
 Phase 00 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Phase 01 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Security Audit Track State    : Active
@@ -370,9 +370,9 @@ Security Audit Track State    : Active
   - SEC-06 through SEC-09 (PLANNED)
 Blocking Issues               : None
 Tests Passing                 : `go test -race ./...` (All test suites passing, 0 race conditions), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed, Linux & Windows cross-platform verified
-Security Review Status        : Complete & Verified (SEC-01 foundations established; SEC-02 static audit verified; SEC-03 dynamic persistence audit completed; SEC-04 in-memory engine audit completed; SEC-P03 independent adversarial audit completed; P04-S01-M01 audited; P04-S01-M02 audited; P04-S02-M01 audited; P04-S02-M02 audited with 0 vulnerabilities, exact 48B Big-Endian layout, magic 0x4C41545453535401 verification, strict zero-padding enforcement, zero-allocation codec, BlockHandle integer overflow validation, and file-size boundary checks)
-Interview Knowledge Status    : Updated with Sections 30, 31, 32 & 33 containing deep systems interview questions and answers across prefix compression, restart points, block trailers, sparse two-level indexing, block handles, and fixed 48-byte SSTable footers
-Git Commit                    : feat(sstable): [P04-S02-M02] implement fixed 48-byte footer serializer and parser
+Security Review Status        : Complete & Verified (SEC-01 foundations established; SEC-02 static audit verified; SEC-03 dynamic persistence audit completed; SEC-04 in-memory engine audit completed; SEC-P03 independent adversarial audit completed; P04-S01-M01 audited; P04-S01-M02 audited; P04-S02-M01 audited; P04-S02-M02 audited; P04-S03-M01 audited with 0 vulnerabilities, atomic .tmp staging, directory sync durability barrier, short-write loops, failure unlinking, pre-existing overwrite protection, and memory isolation)
+Interview Knowledge Status    : Updated with Sections 30, 31, 32, 33 & 34 containing deep systems interview questions and answers across prefix compression, restart points, block trailers, sparse two-level indexing, block handles, fixed 48-byte footers, and sequential SSTable file writer architecture
+Git Commit                    : feat(sstable): [P04-S03-M01] implement sequential SSTable table writer
 ```
 
 ---
@@ -1406,11 +1406,41 @@ TOTAL: 184 Discrete, Testable Micro-Phases
 
 ### Sub-Phase 04.3: SSTable File Writer & Reader
 * **P04-S03-M01: SSTable Sequential File Writer (`TableWriter`)**
-  * *Objective*: Stream data blocks from MemTable iterator to `.sst.tmp` file; write filter, index, footer; `fdatasync()`.
-  * *Changes*: `TableWriter.Build(iter MemTableIterator) (*SSTableMetadata, error)`.
-  * *Invariants*: File synced to disk before renaming to final `.sst` name.
-  * *Tests*: Flush a 4MB MemTable to SSTable; inspect binary layout.
-  * *Completion*: SSTable writer passing tests.
+  * *Objective*: Assemble data blocks, meta-index block, index block, and 48-byte footer into an immutable `.sst` file with atomic staging and durability barriers.
+  * *Physical Layout*:
+    - `Data Blocks 0..N-1`: 4KB default prefix-compressed records with restart offsets and CRC32 trailer.
+    - `Meta Index Block`: 8 bytes in Phase 04 (`uint32(0)` entry count + `uint32` CRC32-IEEE checksum).
+    - `Index Block`: Sparse Two-Level Block Index mapping largest keys to 16B `BlockHandle`s with tail offsets and CRC32 trailer.
+    - `Footer`: Fixed 48-byte trailer (`MetaIndexHandle [16B] + IndexHandle [16B] + Padding [8B] + Magic [8B]`).
+  * *Changes*:
+    - `internal/sstable/table_writer.go`: `TableWriter`, `TableWriterOptions`, `DefaultTableWriterOptions()`, `SSTableMetadata`, `Iterator` interface, `NewTableWriter()`, `NewTableWriterWithFile()`, `Add()`, `AddRaw()`, `Build()`, `Finish()`, `Close()`, `BytesWritten()`, `EntryCount()`, `BlockCount()`, `EstimatedSize()`.
+    - `internal/sstable/export_test.go`: Test seams for deterministic fault injection (`SetWriteFnForTesting`, `SetSyncFnForTesting`, `SetCloseFnForTesting`).
+    - `internal/errors/errors.go`: Added `ErrTableWriterClosed`, `ErrTableWriterFinalized`, `ErrSSTableExists`.
+  * *Invariants*:
+    - Keys added in strictly increasing canonical order (`UserKey ASC, SeqNum DESC, OpType DESC`). Out-of-order keys rejected with `KeyOutOfOrderError`.
+    - Atomic Staging: Writes stream to `.sst.tmp`. `Finish()` syncs file, closes descriptor, atomically renames to `.sst`, and syncs parent directory.
+    - Failure Cleanup: Unfinalized close or disk error unlinks the `.tmp` file, preventing orphaned corrupt files.
+    - Overwrite Protection: Pre-existing finalized `.sst` files cannot be overwritten (`ErrSSTableExists`).
+    - Disjoint Regions: Data blocks, meta-index, index, and footer occupy non-overlapping physical file offsets.
+    - Empty Table Semantics: 0 records produces a valid 64-byte file (8B meta + 8B index + 48B footer) satisfying all footer and file-bound constraints.
+  * *Tests*:
+    - Single-block SSTable verification with independent byte-by-byte inspection of every region and CRC.
+    - Multi-block SSTable (>5 blocks) verifying contiguous offsets, monotone handles, and index searchability.
+    - Empty SSTable producing valid 64-byte file.
+    - Key ordering enforcement and duplicate key rejection.
+    - Caller mutation isolation on key and value buffers.
+    - Staging file creation, atomic rename, and abandoned close cleanup.
+    - Pre-existing file conflict rejection.
+    - Lifecycle state machine tests (repeated finish, add after finish/close, close after finish).
+    - Fault injection tests: write failure, short write, sync failure, close failure.
+    - Integration test with `memtable.SkipList.NewIterator()` via `TableWriter.Build(iter)`.
+  * *Benchmarks* (Apple M4, darwin/arm64):
+    - `BenchmarkTableWriter_Sequential_1K`: 8.63 ms/op (writing & fsyncing 1,000 records).
+    - `BenchmarkTableWriter_Sequential_10K`: 10.17 ms/op (writing & fsyncing 10,000 records, ~1MB SSTable, ~1M keys/sec).
+    - `BenchmarkTableWriter_Add_DirectFile`: 143.7 ns/op (~7M ops/sec in-memory buffering).
+  * *Fuzz Testing*:
+    - `FuzzTableWriter`: 1,474 full file lifecycle executions in 11s with 0 failures, 0 panics, 0 file leaks.
+  * *Completion*: Complete and verified under `-race`, `golangci-lint`, Linux and Windows `go vet`.
 * **P04-S03-M02: SSTable Block Reader & Sparse Index Binary Search**
   * *Objective*: Open SSTable, read footer, load index block into RAM, binary search for target key's block handle.
   * *Changes*: `TableReader.Seek(key []byte) ([]byte, error)`.
