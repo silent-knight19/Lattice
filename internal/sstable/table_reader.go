@@ -14,7 +14,7 @@ import (
 )
 
 // TableReader provides point-lookup access to an immutable, finalized SSTable file.
-// Upon opening, the reader reads the fixed 48-byte footer, validates its cryptographic
+// Upon opening, the reader reads the fixed 48-byte footer, validates its format
 // magic and padding, decodes the sparse block index, and retains the index in RAM.
 //
 // Lookups execute via a two-level binary search:
@@ -32,30 +32,20 @@ type TableReader struct {
 	fileSize int64
 	footer   Footer
 	index    *BlockIndex
-	closed   bool
-
-	// readAtFn is the positional read function (default: file.ReadAt).
-	// Can be overridden via test hooks for fault injection.
 	readAtFn func(p []byte, off int64) (int, error)
+	closed   bool
 }
 
-// NewTableReader opens an existing SSTable file at path, reads and validates the footer,
-// and decodes the sparse index block into RAM.
-//
-// If initialization fails at any stage, the opened file descriptor is guaranteed to be
-// closed before returning to prevent resource leaks.
+// NewTableReader opens an SSTable file at path and initializes a TableReader.
 func NewTableReader(path string) (*TableReader, error) {
-	file, err := os.OpenFile(path, os.O_RDONLY, 0)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open sstable file %q: %w", path, err)
+	if path == "" {
+		return nil, os.ErrInvalid
 	}
-
-	reader, err := NewTableReaderWithFile(file)
+	file, err := os.Open(path)
 	if err != nil {
-		_ = file.Close()
 		return nil, err
 	}
-	return reader, nil
+	return NewTableReaderWithFile(file)
 }
 
 // OpenTableReader is an alias for NewTableReader following idiomatic Go naming conventions.
@@ -66,10 +56,22 @@ func OpenTableReader(path string) (*TableReader, error) {
 // NewTableReaderWithFile initializes a TableReader wrapping an existing open *os.File.
 // The reader assumes ownership of the file descriptor; calling Close on the reader
 // will close the provided file.
+//
+// Security Contract:
+// If initialization fails on any early return path (stat failure, truncated file, corrupt footer,
+// oversized index handle, corrupted index), the provided file descriptor is guaranteed to be closed,
+// preventing descriptor leaks.
 func NewTableReaderWithFile(file *os.File) (*TableReader, error) {
 	if file == nil {
 		return nil, errors.ErrNilReceiver
 	}
+
+	var success bool
+	defer func() {
+		if !success {
+			_ = file.Close()
+		}
+	}()
 
 	stat, err := file.Stat()
 	if err != nil {
@@ -136,6 +138,7 @@ func NewTableReaderWithFile(file *os.File) (*TableReader, error) {
 		return nil, err
 	}
 
+	success = true
 	return &TableReader{
 		file:     file,
 		fileSize: fileSize,
@@ -143,6 +146,7 @@ func NewTableReaderWithFile(file *os.File) (*TableReader, error) {
 		index:    blockIndex,
 		readAtFn: file.ReadAt,
 	}, nil
+
 }
 
 // FileSize returns the total physical byte size of the underlying SSTable file.
@@ -317,7 +321,7 @@ func searchDataBlock(blockBuf []byte, targetUserKey []byte, blockOffset uint64) 
 				Reason: "restart offsets are not strictly increasing",
 			}
 		}
-		if int(off) >= entryDataEnd {
+		if uint64(off) >= uint64(entryDataEnd) {
 			return nil, &errors.DataBlockCorruptedError{
 				Offset: blockOffset,
 				Reason: "restart offset exceeds entry data boundary",
@@ -361,13 +365,6 @@ func searchDataBlock(blockBuf []byte, targetUserKey []byte, blockOffset uint64) 
 			}
 		}
 
-		hdrLen := n1 + n2 + n3
-		if uint64(hdrLen)+unshared+valueLen > uint64(len(entrySlice)) {
-			return nil, &errors.DataBlockCorruptedError{
-				Offset: blockOffset + uint64(off),
-				Reason: "restart entry payload exceeds entry data boundary",
-			}
-		}
 		if unshared < binary.MinKeyLen+binary.InternalKeyTrailerLen || unshared > binary.MaxEncodedInternalKeyLen {
 			return nil, &errors.DataBlockCorruptedError{
 				Offset: blockOffset + uint64(off),
@@ -378,6 +375,15 @@ func searchDataBlock(blockBuf []byte, targetUserKey []byte, blockOffset uint64) 
 			return nil, &errors.DataBlockCorruptedError{
 				Offset: blockOffset + uint64(off),
 				Reason: "restart entry value length exceeds MaxValueLen",
+			}
+		}
+
+		hdrLen := n1 + n2 + n3
+		totalPayload := uint64(hdrLen) + unshared + valueLen
+		if totalPayload > uint64(len(entrySlice)) {
+			return nil, &errors.DataBlockCorruptedError{
+				Offset: blockOffset + uint64(off),
+				Reason: "restart entry payload exceeds entry data boundary",
 			}
 		}
 
@@ -442,18 +448,25 @@ func searchDataBlock(blockBuf []byte, targetUserKey []byte, blockOffset uint64) 
 			}
 		}
 
-		hdrLen := n1 + n2 + n3
-		if uint64(hdrLen)+unshared+valueLen > uint64(len(entrySlice)) {
+		if unshared > binary.MaxEncodedInternalKeyLen {
 			return nil, &errors.DataBlockCorruptedError{
 				Offset: blockOffset + uint64(currOffset),
-				Reason: "entry payload exceeds entry data boundary",
+				Reason: "entry unshared key length exceeds MaxEncodedInternalKeyLen",
 			}
 		}
-
 		if valueLen > binary.MaxValueLen {
 			return nil, &errors.DataBlockCorruptedError{
 				Offset: blockOffset + uint64(currOffset),
 				Reason: "entry value length exceeds MaxValueLen",
+			}
+		}
+
+		hdrLen := n1 + n2 + n3
+		totalPayload := uint64(hdrLen) + unshared + valueLen
+		if totalPayload > uint64(len(entrySlice)) {
+			return nil, &errors.DataBlockCorruptedError{
+				Offset: blockOffset + uint64(currOffset),
+				Reason: "entry payload exceeds entry data boundary",
 			}
 		}
 
@@ -463,7 +476,7 @@ func searchDataBlock(blockBuf []byte, targetUserKey []byte, blockOffset uint64) 
 				Reason: "shared key length at restart point must be zero",
 			}
 		}
-		if int(shared) > len(reconstructedKey) {
+		if shared > uint64(len(reconstructedKey)) {
 			return nil, &errors.DataBlockCorruptedError{
 				Offset: blockOffset + uint64(currOffset),
 				Reason: "shared prefix length exceeds reconstructed key length",

@@ -133,9 +133,10 @@ type TableWriter struct {
 	err   error
 
 	// Test seams for deterministic fault injection
-	writeFn func(f *os.File, p []byte) (int, error)
-	syncFn  func(f *os.File) error
-	closeFn func(f *os.File) error
+	writeFn   func(f *os.File, p []byte) (int, error)
+	syncFn    func(f *os.File) error
+	closeFn   func(f *os.File) error
+	syncDirFn func(dirPath string) error
 }
 
 // NewTableWriter initializes a TableWriter to write an SSTable to dstPath using a secure staging file.
@@ -148,6 +149,8 @@ func NewTableWriter(dstPath string, opts TableWriterOptions) (*TableWriter, erro
 	// Reject overwriting an existing finalized SSTable or symlink
 	if _, err := os.Lstat(dstPath); err == nil {
 		return nil, errors.ErrSSTableExists
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("failed to check destination path %q: %w", dstPath, err)
 	}
 
 	if opts.TargetBlockSize <= 0 {
@@ -236,6 +239,7 @@ func NewTableWriter(dstPath string, opts TableWriterOptions) (*TableWriter, erro
 		writeFn:          defaultWrite,
 		syncFn:           defaultSync,
 		closeFn:          defaultClose,
+		syncDirFn:        syncDir,
 	}, nil
 }
 
@@ -277,6 +281,7 @@ func NewTableWriterWithFile(file *os.File, opts TableWriterOptions) (*TableWrite
 		writeFn:          defaultWrite,
 		syncFn:           defaultSync,
 		closeFn:          defaultClose,
+		syncDirFn:        syncDir,
 	}, nil
 }
 
@@ -544,18 +549,40 @@ func (w *TableWriter) Finish() (*SSTableMetadata, error) {
 			w.err = errors.ErrSSTableExists
 			_ = os.Remove(w.tmpPath)
 			return nil, errors.ErrSSTableExists
-		}
-
-		if err := os.Rename(w.tmpPath, w.dstPath); err != nil {
+		} else if !os.IsNotExist(err) {
 			w.state = stateError
 			w.err = err
 			_ = os.Remove(w.tmpPath)
-			return nil, err
+			return nil, fmt.Errorf("failed to check destination path %q: %w", w.dstPath, err)
 		}
-		if err := syncDir(filepath.Dir(w.dstPath)); err != nil {
+
+		// Use atomic link(2) to eliminate the TOCTOU overwrite race between Lstat and Rename.
+		// os.Link fails with EEXIST if w.dstPath already exists, atomically preventing overwrite.
+		// Since tmpPath and dstPath are created in the same directory, hard linking is always on the same filesystem.
+		err := os.Link(w.tmpPath, w.dstPath)
+		if err == nil {
+			_ = os.Remove(w.tmpPath)
+		} else if os.IsExist(err) {
 			w.state = stateError
+			w.err = errors.ErrSSTableExists
+			_ = os.Remove(w.tmpPath)
+			return nil, errors.ErrSSTableExists
+		} else {
+			// Fallback to Rename if filesystem does not support hard links
+			if renameErr := os.Rename(w.tmpPath, w.dstPath); renameErr != nil {
+				w.state = stateError
+				w.err = renameErr
+				_ = os.Remove(w.tmpPath)
+				return nil, renameErr
+			}
+		}
+		// Publication succeeded: file is now at dstPath, staging path no longer exists
+		w.tmpPath = ""
+
+		if err := w.syncDirFn(filepath.Dir(w.dstPath)); err != nil {
+			w.state = stateFinalized
 			w.err = err
-			return nil, err
+			return nil, fmt.Errorf("file published to %q but directory sync failed: %w", w.dstPath, err)
 		}
 	}
 

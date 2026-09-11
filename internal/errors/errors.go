@@ -170,7 +170,7 @@ var (
 	// ErrIndexBlockCorrupted indicates that an index block's trailer, offsets, or entries are corrupted.
 	ErrIndexBlockCorrupted = stdErrors.New("index block corrupted: invalid offsets, count, or entries")
 
-	// ErrInvalidFooter indicates that an SSTable footer failed structural, size, or cryptographic magic checks.
+	// ErrInvalidFooter indicates that an SSTable footer failed structural, size, or format magic checks.
 	ErrInvalidFooter = stdErrors.New("invalid sstable footer")
 
 	// ErrInvalidFooterMagic indicates that an SSTable footer magic number does not match 0x4C41545453535401.

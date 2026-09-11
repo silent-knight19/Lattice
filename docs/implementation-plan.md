@@ -1447,7 +1447,7 @@ TOTAL: 184 Discrete, Testable Micro-Phases
   * *Architecture & Flow*:
     - Open file descriptor and stat physical file size.
     - Read fixed 48-byte footer anchored at `[fileSize - 48 : fileSize]`.
-    - Decode and validate footer structure, cryptographic magic number (`0x4C41545453535401`), and 8-byte zero padding.
+    - Decode and validate footer structure, format magic number (`0x4C41545453535401`), and 8-byte zero padding.
     - Validate footer block handles against physical file boundaries via `ValidateAgainstFileSize`.
     - Read sparse index block bytes from disk at `IndexHandle.Offset` for `IndexHandle.Size` bytes via bounded `ReadAt`.
     - Decode `BlockIndex` and retain index entries in RAM.

@@ -2678,7 +2678,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 * **Question**: In an LSM-tree storage engine, why does `TableReader` read the footer from `file_size - 48`, and why is loading the sparse index block into RAM sufficient for point lookups?
 * **Answer**:
   - **Fixed Physical Anchor**: SSTables contain variable numbers of variable-length data blocks. Because data block sizes cannot be known in advance, the only fixed, predictable location in the entire SSTable is the file trailer: the fixed 48-byte footer anchored at `[file_size - 48 : file_size]`.
-  - **Single $O(1)$ Tail Seek**: Upon opening, the reader executes `file.Stat()` to determine physical file size, then reads exactly 48 bytes from `file_size - 48`. It validates the 64-bit cryptographic magic number (`0x4C41545453535401`) and the 8 zero padding bytes, proving file authenticity.
+  - **Single $O(1)$ Tail Seek**: Upon opening, the reader executes `file.Stat()` to determine physical file size, then reads exactly 48 bytes from `file_size - 48`. It validates the 64-bit format magic number (`0x4C41545453535401`) and the 8 zero padding bytes, proving file format conformance.
   - **Decoupled Index Location**: The footer directly provides the exact `IndexHandle` (offset and size) of the sparse index block. The reader reads only this block and parses it into an in-memory `BlockIndex`.
   - **Sub-Millisecond Startup**: Because only 48 bytes (footer) + the index block (typically $<0.1\%$ of the file) are transferred during open, an SSTable containing millions of keys can be opened and ready for queries in $<1$ millisecond with zero data block reads.
 

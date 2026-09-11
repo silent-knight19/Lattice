@@ -317,3 +317,54 @@ func TestSecurity_Remediation4_PoisonConcurrency(t *testing.T) {
 		t.Fatalf("expected ErrWriterPoisoned after concurrency test, got %v", err)
 	}
 }
+
+// TestSecurity_Issue7_WAL_FilesystemErrorHandling asserts that:
+// 1. OpenWriter and CreateWriter distinguish os.ErrNotExist from unexpected permission/IO errors.
+// 2. Permission errors are not silently converted into "path absent" conditions.
+func TestSecurity_Issue7_WAL_FilesystemErrorHandling(t *testing.T) {
+	dir := t.TempDir()
+
+	t.Run("CreateWriter rejects existing file", func(t *testing.T) {
+		p := filepath.Join(dir, "existing.log")
+		if err := os.WriteFile(p, []byte("existing"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := wal.CreateWriter(p)
+		if !stdErrors.Is(err, os.ErrExist) {
+			t.Fatalf("expected os.ErrExist, got %v", err)
+		}
+	})
+
+	t.Run("OpenWriter and CreateWriter handle permission error without confusing ErrNotExist", func(t *testing.T) {
+		if os.Getenv("GOOS") == "windows" {
+			t.Skip("skipping POSIX permission test on Windows")
+		}
+		restrictedDir := filepath.Join(dir, "restricted")
+		if err := os.Mkdir(restrictedDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		subDir := filepath.Join(restrictedDir, "sub")
+		if err := os.Mkdir(subDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(restrictedDir, 0000); err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = os.Chmod(restrictedDir, 0700) }()
+
+		unsearchablePath := filepath.Join(subDir, "wal.log")
+
+		_, errOpen := wal.OpenWriter(unsearchablePath)
+		if errOpen == nil {
+			t.Fatal("expected OpenWriter error on unsearchable path, got nil")
+		}
+
+		_, errCreate := wal.CreateWriter(unsearchablePath)
+		if errCreate == nil {
+			t.Fatal("expected CreateWriter error on unsearchable path, got nil")
+		}
+		if stdErrors.Is(errCreate, os.ErrExist) {
+			t.Fatalf("permission error must not be confused with os.ErrExist: %v", errCreate)
+		}
+	})
+}

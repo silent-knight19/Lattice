@@ -23,6 +23,13 @@ func (w *TableWriter) SetCloseFnForTesting(fn func(f *os.File) error) {
 	w.closeFn = fn
 }
 
+// SetSyncDirFnForTesting exports syncDirFn seam injection on TableWriter for deterministic fault injection.
+func (w *TableWriter) SetSyncDirFnForTesting(fn func(dirPath string) error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.syncDirFn = fn
+}
+
 // SetReadAtFnForTesting replaces the low-level positional read function for TableReader.
 func (r *TableReader) SetReadAtFnForTesting(fn func(p []byte, off int64) (int, error)) {
 	r.mu.Lock()

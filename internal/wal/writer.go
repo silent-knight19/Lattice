@@ -95,6 +95,8 @@ func OpenWriter(path string) (*WALWriter, error) {
 				Mode: info.Mode(),
 			}
 		}
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("wal: failed to inspect path %s: %w", cleanPath, err)
 	}
 
 	flags := os.O_WRONLY | os.O_CREATE | os.O_APPEND
@@ -169,6 +171,8 @@ func CreateWriter(path string) (*WALWriter, error) {
 			}
 		}
 		return nil, fmt.Errorf("wal: segment file %s already exists: %w", cleanPath, os.ErrExist)
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("wal: failed to inspect path %s: %w", cleanPath, err)
 	}
 
 	// Atomic exclusive creation: kernel guarantees fail-fast if file exists concurrently

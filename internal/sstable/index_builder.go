@@ -406,6 +406,9 @@ func DecodeBlockIndex(data []byte) (*BlockIndex, error) {
 	}
 
 	// 3. Verify offsets trailer bounds
+	if uint64(entryCount) > uint64(math.MaxInt) {
+		return nil, errors.ErrIndexBlockCorrupted
+	}
 	offsetsByteLen := uint64(entryCount) * 4
 	if offsetsByteLen+uint64(IndexTrailerSize) > uint64(len(data)) {
 		return nil, errors.ErrIndexBlockCorrupted
@@ -425,7 +428,7 @@ func DecodeBlockIndex(data []byte) (*BlockIndex, error) {
 		if i > 0 && offsets[i] <= offsets[i-1] {
 			return nil, &errors.IndexBlockCorruptedError{Reason: "entry offsets are not strictly increasing"}
 		}
-		if int(offsets[i]) >= offsetsStart {
+		if uint64(offsets[i]) >= uint64(offsetsStart) {
 			return nil, &errors.IndexBlockCorruptedError{Reason: "entry offset exceeds data region boundary"}
 		}
 	}

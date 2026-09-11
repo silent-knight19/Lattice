@@ -1176,3 +1176,334 @@ func TestSecurity_Remediation7_DataBlock_InternalKey_Validation(t *testing.T) {
 		}
 	})
 }
+
+// TestSecurity_Issue5_NewTableReaderWithFile_DescriptorLeak asserts that:
+//  1. On EVERY early initialization failure, NewTableReaderWithFile closes the provided file descriptor.
+//  2. Resource leakage is provably prevented across truncated files, corrupted footers, oversized handles,
+//     and corrupted indexes.
+func TestSecurity_Issue5_NewTableReaderWithFile_DescriptorLeak(t *testing.T) {
+	dir := t.TempDir()
+
+	isFileClosed := func(f *os.File) bool {
+		var b [1]byte
+		_, err := f.Read(b[:])
+		return stdErrors.Is(err, os.ErrClosed)
+	}
+
+	t.Run("truncated file (< 48 bytes) closes descriptor", func(t *testing.T) {
+		p := filepath.Join(dir, "short.sst")
+		if err := os.WriteFile(p, []byte("too short to contain footer"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.Open(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = sstable.NewTableReaderWithFile(f)
+		if err == nil {
+			t.Fatal("expected error for truncated file, got nil")
+		}
+		if !isFileClosed(f) {
+			t.Fatal("expected file descriptor to be closed after truncated file error")
+		}
+	})
+
+	t.Run("corrupted footer magic closes descriptor", func(t *testing.T) {
+		p := filepath.Join(dir, "bad_magic.sst")
+		badFooter := bytes.Repeat([]byte{0xAA}, 48)
+		if err := os.WriteFile(p, badFooter, 0600); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.Open(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = sstable.NewTableReaderWithFile(f)
+		if err == nil {
+			t.Fatal("expected error for corrupted magic, got nil")
+		}
+		if !isFileClosed(f) {
+			t.Fatal("expected file descriptor to be closed after bad magic error")
+		}
+	})
+
+	t.Run("oversized index block handle closes descriptor", func(t *testing.T) {
+		p := filepath.Join(dir, "oversized_index.sst")
+		footer := sstable.Footer{
+			MetaIndexHandle: sstable.BlockHandle{Offset: 0, Size: 8},
+			IndexHandle:     sstable.BlockHandle{Offset: 8, Size: sstable.MaxIndexBlockSize + 1},
+		}
+		footerBytes := footer.Encode()
+		fileBytes := append(bytes.Repeat([]byte{0}, 100), footerBytes[:]...)
+		if err := os.WriteFile(p, fileBytes, 0600); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.Open(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = sstable.NewTableReaderWithFile(f)
+		if err == nil {
+			t.Fatal("expected error for oversized index handle, got nil")
+		}
+		if !isFileClosed(f) {
+			t.Fatal("expected file descriptor to be closed after oversized index error")
+		}
+	})
+
+	t.Run("corrupted index CRC closes descriptor", func(t *testing.T) {
+		p := filepath.Join(dir, "bad_index_crc.sst")
+		dummyIndex := []byte{0, 0, 0, 0, 0xDE, 0xAD, 0xBE, 0xEF}
+		footer := sstable.Footer{
+			MetaIndexHandle: sstable.BlockHandle{Offset: 0, Size: 8},
+			IndexHandle:     sstable.BlockHandle{Offset: 8, Size: 8},
+		}
+		footerBytes := footer.Encode()
+		fileBytes := append(dummyIndex, dummyIndex...)
+		fileBytes = append(fileBytes, footerBytes[:]...)
+		if err := os.WriteFile(p, fileBytes, 0600); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.Open(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = sstable.NewTableReaderWithFile(f)
+		if err == nil {
+			t.Fatal("expected error for bad index CRC, got nil")
+		}
+		if !isFileClosed(f) {
+			t.Fatal("expected file descriptor to be closed after corrupted index CRC")
+		}
+	})
+
+	t.Run("repeated failures do not leak descriptors", func(t *testing.T) {
+		p := filepath.Join(dir, "leak_test.sst")
+		badFooter := bytes.Repeat([]byte{0x00}, 48)
+		if err := os.WriteFile(p, badFooter, 0600); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 50; i++ {
+			f, err := os.Open(p)
+			if err != nil {
+				t.Fatalf("os.Open failed at iteration %d: %v", i, err)
+			}
+			_, err = sstable.NewTableReaderWithFile(f)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !isFileClosed(f) {
+				t.Fatalf("file descriptor leaked at iteration %d", i)
+			}
+		}
+	})
+}
+
+// TestSecurity_Issue6_IntegerConversionSafety asserts that:
+// 1. Restart offsets with MSB set (0x80000000) do not wrap to negative indices on 32-bit platforms.
+// 2. Linear scan varint shared key length == math.MaxUint64 does not wrap to negative slicing index or panic.
+// 3. Unshared/value lengths close to math.MaxUint64 do not overflow payload arithmetic.
+// 4. DecodeBlockIndex validates entryCount and offsets in unsigned domain before conversion.
+func TestSecurity_Issue6_IntegerConversionSafety(t *testing.T) {
+	assembleBlock := func(entryBytes []byte, restartOffsets []uint32) []byte {
+		var buf bytes.Buffer
+		buf.Write(entryBytes)
+		for _, off := range restartOffsets {
+			var offBuf [4]byte
+			binary.PutUint32(offBuf[:], off)
+			buf.Write(offBuf[:])
+		}
+		var rCountBuf [4]byte
+		binary.PutUint32(rCountBuf[:], uint32(len(restartOffsets)))
+		buf.Write(rCountBuf[:])
+		crc := binary.Checksum(buf.Bytes())
+		var crcBuf [4]byte
+		binary.PutUint32(crcBuf[:], crc)
+		buf.Write(crcBuf[:])
+		return buf.Bytes()
+	}
+
+	encodeEntryHelper := func(shared uint64, key []byte, val []byte) []byte {
+		var buf bytes.Buffer
+		var numBuf [10]byte
+		n := binary.PutVarint64(numBuf[:], shared)
+		buf.Write(numBuf[:n])
+		n = binary.PutVarint64(numBuf[:], uint64(len(key)))
+		buf.Write(numBuf[:n])
+		n = binary.PutVarint64(numBuf[:], uint64(len(val)))
+		buf.Write(numBuf[:n])
+		buf.Write(key)
+		buf.Write(val)
+		return buf.Bytes()
+	}
+
+	t.Run("restart offset with MSB set (0x80000000) does not panic on 32-bit", func(t *testing.T) {
+		ik, _ := binary.NewInternalKey([]byte("valid"), 1, binary.OpTypePut)
+		entry := encodeEntryHelper(0, binary.EncodeInternalKey(ik), []byte("val"))
+		block := assembleBlock(entry, []uint32{0, 0x80000000})
+
+		_, err := sstable.SearchDataBlockForTesting(block, []byte("valid"), 0)
+		if err == nil {
+			t.Fatal("expected corruption error for restart offset 0x80000000, got nil")
+		}
+		if !stdErrors.Is(err, errors.ErrDataBlockCorrupted) {
+			t.Fatalf("expected ErrDataBlockCorrupted, got %v", err)
+		}
+	})
+
+	t.Run("linear scan with varint shared == math.MaxUint64 does not wrap to negative index or panic", func(t *testing.T) {
+		ik, _ := binary.NewInternalKey([]byte("valid"), 1, binary.OpTypePut)
+		e1 := encodeEntryHelper(0, binary.EncodeInternalKey(ik), []byte("v1"))
+
+		var e2 bytes.Buffer
+		var numBuf [10]byte
+		n := binary.PutVarint64(numBuf[:], math.MaxUint64)
+		e2.Write(numBuf[:n])
+		n = binary.PutVarint64(numBuf[:], 10)
+		e2.Write(numBuf[:n])
+		n = binary.PutVarint64(numBuf[:], 2)
+		e2.Write(numBuf[:n])
+		e2.Write(make([]byte, 10)) // delta key
+		e2.Write([]byte("v2"))     // value
+
+		block := assembleBlock(append(e1, e2.Bytes()...), []uint32{0})
+
+		_, err := sstable.SearchDataBlockForTesting(block, []byte("zzzz"), 0)
+		if err == nil {
+			t.Fatal("expected corruption error, got nil")
+		}
+		if !stdErrors.Is(err, errors.ErrDataBlockCorrupted) {
+			t.Fatalf("expected ErrDataBlockCorrupted, got %v", err)
+		}
+	})
+
+	t.Run("linear scan with unshared key length == math.MaxUint64 does not overflow payload or panic", func(t *testing.T) {
+		var e bytes.Buffer
+		var numBuf [10]byte
+		n := binary.PutVarint64(numBuf[:], 0) // shared = 0
+		e.Write(numBuf[:n])
+		n = binary.PutVarint64(numBuf[:], math.MaxUint64-2) // unshared close to max uint64
+		e.Write(numBuf[:n])
+		n = binary.PutVarint64(numBuf[:], 0) // valLen = 0
+		e.Write(numBuf[:n])
+
+		block := assembleBlock(e.Bytes(), []uint32{0})
+		_, err := sstable.SearchDataBlockForTesting(block, []byte("target"), 0)
+		if err == nil {
+			t.Fatal("expected corruption error, got nil")
+		}
+		if !stdErrors.Is(err, errors.ErrDataBlockCorrupted) {
+			t.Fatalf("expected ErrDataBlockCorrupted, got %v", err)
+		}
+	})
+
+	t.Run("DecodeBlockIndex with offset 0x80000000 rejected cleanly", func(t *testing.T) {
+		var buf bytes.Buffer
+		buf.WriteString("dummy_entry_data")
+		var offBuf [4]byte
+		binary.PutUint32(offBuf[:], 0x80000000)
+		buf.Write(offBuf[:])
+		var countBuf [4]byte
+		binary.PutUint32(countBuf[:], 1)
+		buf.Write(countBuf[:])
+		crc := binary.Checksum(buf.Bytes())
+		var crcBuf [4]byte
+		binary.PutUint32(crcBuf[:], crc)
+		buf.Write(crcBuf[:])
+
+		_, err := sstable.DecodeBlockIndex(buf.Bytes())
+		if err == nil {
+			t.Fatal("expected error for index offset 0x80000000, got nil")
+		}
+	})
+}
+
+// TestSecurity_Issue7_FilesystemErrorHandling_AndPublicationSemantics asserts that:
+// 1. Destination paths that exist are rejected with ErrSSTableExists.
+// 2. Permission errors are cleanly distinguished from ErrNotExist and not treated as absent files.
+// 3. TableWriter.Finish clears tmpPath after successful rename, and preserves finalized state on directory sync failure.
+func TestSecurity_Issue7_FilesystemErrorHandling_AndPublicationSemantics(t *testing.T) {
+	dir := t.TempDir()
+
+	t.Run("destination file already exists is rejected on NewTableWriter", func(t *testing.T) {
+		p := filepath.Join(dir, "exists.sst")
+		if err := os.WriteFile(p, []byte("content"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := sstable.NewTableWriter(p, sstable.DefaultTableWriterOptions())
+		if !stdErrors.Is(err, errors.ErrSSTableExists) {
+			t.Fatalf("expected ErrSSTableExists, got %v", err)
+		}
+	})
+
+	t.Run("destination directory permission denied distinguishes ErrNotExist", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("skipping POSIX permission test on Windows")
+		}
+		restrictedDir := filepath.Join(dir, "no_access_dir")
+		if err := os.Mkdir(restrictedDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		subDir := filepath.Join(restrictedDir, "sub")
+		if err := os.Mkdir(subDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(restrictedDir, 0000); err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = os.Chmod(restrictedDir, 0700) }()
+
+		_, err := sstable.NewTableWriter(filepath.Join(subDir, "test.sst"), sstable.DefaultTableWriterOptions())
+		if err == nil {
+			t.Fatal("expected error for unsearchable path, got nil")
+		}
+		if stdErrors.Is(err, errors.ErrSSTableExists) {
+			t.Fatalf("permission error must not be confused with ErrSSTableExists: %v", err)
+		}
+	})
+
+	t.Run("Finish publication succeeds then syncDir fails preserves finalized state", func(t *testing.T) {
+		p := filepath.Join(dir, "sync_dir_failure.sst")
+		w, err := sstable.NewTableWriter(p, sstable.DefaultTableWriterOptions())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		ik, _ := binary.NewInternalKey([]byte("key"), 1, binary.OpTypePut)
+		if err := w.Add(ik, []byte("val")); err != nil {
+			t.Fatal(err)
+		}
+
+		injectedSyncErr := stdErrors.New("injected directory sync error")
+		w.SetSyncDirFnForTesting(func(dirPath string) error {
+			return injectedSyncErr
+		})
+
+		meta, err := w.Finish()
+		if err == nil {
+			t.Fatal("expected error when syncDir fails, got nil")
+		}
+		if !stdErrors.Is(err, injectedSyncErr) {
+			t.Fatalf("expected error wrapping injectedSyncErr, got %v", err)
+		}
+		if meta != nil {
+			t.Fatalf("expected nil metadata on error, got %v", meta)
+		}
+
+		if fi, err := os.Stat(p); err != nil || fi.Size() == 0 {
+			t.Fatalf("file must be published at %q even if directory sync failed: %v", p, err)
+		}
+
+		_, errSecond := w.Finish()
+		if !stdErrors.Is(errSecond, errors.ErrTableWriterFinalized) {
+			t.Fatalf("expected ErrTableWriterFinalized on retry after publication, got %v", errSecond)
+		}
+
+		if err := w.Close(); err != nil {
+			t.Fatalf("Close after publication must be safe, got %v", err)
+		}
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("published file must still exist after Close: %v", err)
+		}
+	})
+}
