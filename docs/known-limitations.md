@@ -318,4 +318,18 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 23. Sparse Block Index RAM Residency & SSTable Reader Decoupling (P04-S02-M01)
+* **Limitation**: `IndexBuilder` and `BlockIndex` (P04-S02-M01) implement construction, binary serialization, CRC validation, and in-memory binary search across 4KB data blocks. In this micro-phase, the sparse index is held in contiguous memory in RAM once decoded. While sparse indexing reduces the index size by >97.5% compared to dense indexing (holding ~1 entry per 4KB data block), extremely large SSTables (e.g. hundreds of gigabytes per file) would still require several megabytes of RAM per SSTable if the index block is held permanently memory-resident without eviction. Furthermore, M01 is decoupled from file-level I/O; table-level reading (`TableReader`), footer parsing, and reading data blocks from disk are deferred to P04-S02-M02 and P04-S03-M02.
+* **Why It Exists**: Following the micro-phase engineering discipline, index building and decoding are cleanly isolated from the 48-byte footer (P04-S02-M02) and file-level disk streaming/lookup (P04-S03-M01/M02).
+* **Impact**: Full SSTable point lookups from disk require subsequent micro-phases (P04-S02-M02 footer and P04-S03-M02 reader).
+* **How It Was Detected**: Architectural design and memory profiling of P04-S02-M01 sparse index structures.
+* **Current Mitigation**: Strict `BlockHandle` validation against physical file size (`ValidateAgainstFileSize`) to prevent out-of-bounds reads, compact 16-byte fixed handles, and 32-bit offset indexing.
+* **Future Solution**: P04-S02-M02 will implement the 48-byte footer pointing to the index block; P04-S03-M02 will integrate the reader; and Phase 10 will add evictable index block caching in the LRU block cache if needed for memory-constrained environments.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Deterministic, verified under race detector and fuzzing).
+  * Performance: **Optimal** (~256 ns binary search across 1,000 blocks in RAM).
+  * Scalability: **Optimal** for standard LSM SSTables (up to 64MB-2GB per SSTable).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*

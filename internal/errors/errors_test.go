@@ -50,6 +50,11 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrBlockFinished", errors.ErrBlockFinished, "block builder is finished"},
 		{"ErrInvalidRestartInterval", errors.ErrInvalidRestartInterval, "invalid restart interval: must be greater than zero"},
 		{"ErrBlockOverflow", errors.ErrBlockOverflow, "block size exceeds maximum 32-bit addressable capacity"},
+		{"ErrBlockHandleTruncated", errors.ErrBlockHandleTruncated, "block handle truncated: buffer smaller than 16 bytes"},
+		{"ErrInvalidBlockHandle", errors.ErrInvalidBlockHandle, "invalid block handle: size must be greater than zero and offset+size must not overflow"},
+		{"ErrIndexFinished", errors.ErrIndexFinished, "index builder is finished"},
+		{"ErrIndexBlockTruncated", errors.ErrIndexBlockTruncated, "index block truncated: buffer smaller than trailer"},
+		{"ErrIndexBlockCorrupted", errors.ErrIndexBlockCorrupted, "index block corrupted: invalid offsets, count, or entries"},
 	}
 
 	for _, tc := range sentinels {
@@ -1118,5 +1123,97 @@ func TestInvalidSkipListLevelError(t *testing.T) {
 	var nilErr *errors.InvalidSkipListLevelError
 	if nilErr.Error() != errors.ErrInvalidSkipListLevel.Error() {
 		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrInvalidSkipListLevel.Error())
+	}
+}
+
+func TestInvalidBlockHandleError(t *testing.T) {
+	err := &errors.InvalidBlockHandleError{
+		Offset: 1024,
+		Size:   0,
+		Reason: "block size cannot be zero",
+	}
+
+	// errors.Is check
+	if !stdErrors.Is(err, errors.ErrInvalidBlockHandle) {
+		t.Errorf("InvalidBlockHandleError must match ErrInvalidBlockHandle via errors.Is")
+	}
+
+	// Negative match
+	if stdErrors.Is(err, errors.ErrKeyNotFound) {
+		t.Errorf("InvalidBlockHandleError must not match ErrKeyNotFound")
+	}
+
+	// Wrapping check
+	wrapped := fmt.Errorf("read block: %w", err)
+	if !stdErrors.Is(wrapped, errors.ErrInvalidBlockHandle) {
+		t.Errorf("wrapped InvalidBlockHandleError must match ErrInvalidBlockHandle via errors.Is")
+	}
+
+	var extracted *errors.InvalidBlockHandleError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("failed to extract *InvalidBlockHandleError from wrapped chain")
+	}
+	if extracted.Offset != 1024 || extracted.Size != 0 {
+		t.Errorf("extracted mismatch: got %+v", extracted)
+	}
+
+	// String check
+	msg := err.Error()
+	if !strings.Contains(msg, "offset=1024") || !strings.Contains(msg, "size=0") || !strings.Contains(msg, "block size cannot be zero") {
+		t.Errorf("unexpected error message: %q", msg)
+	}
+
+	// Typed nil safety
+	var nilErr *errors.InvalidBlockHandleError
+	if nilErr.Error() != errors.ErrInvalidBlockHandle.Error() {
+		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrInvalidBlockHandle.Error())
+	}
+	if !nilErr.Is(errors.ErrInvalidBlockHandle) {
+		t.Errorf("nil *InvalidBlockHandleError must match ErrInvalidBlockHandle via Is")
+	}
+}
+
+func TestIndexBlockCorruptedError(t *testing.T) {
+	err := &errors.IndexBlockCorruptedError{
+		Reason: "offsets array non-monotonic",
+	}
+
+	// errors.Is check
+	if !stdErrors.Is(err, errors.ErrIndexBlockCorrupted) {
+		t.Errorf("IndexBlockCorruptedError must match ErrIndexBlockCorrupted via errors.Is")
+	}
+
+	// Negative match
+	if stdErrors.Is(err, errors.ErrKeyNotFound) {
+		t.Errorf("IndexBlockCorruptedError must not match ErrKeyNotFound")
+	}
+
+	// Wrapping check
+	wrapped := fmt.Errorf("parse index: %w", err)
+	if !stdErrors.Is(wrapped, errors.ErrIndexBlockCorrupted) {
+		t.Errorf("wrapped IndexBlockCorruptedError must match ErrIndexBlockCorrupted via errors.Is")
+	}
+
+	var extracted *errors.IndexBlockCorruptedError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("failed to extract *IndexBlockCorruptedError from wrapped chain")
+	}
+	if extracted.Reason != "offsets array non-monotonic" {
+		t.Errorf("extracted mismatch: got %+v", extracted)
+	}
+
+	// String check
+	msg := err.Error()
+	if !strings.Contains(msg, "index block corrupted: offsets array non-monotonic") {
+		t.Errorf("unexpected error message: %q", msg)
+	}
+
+	// Typed nil safety
+	var nilErr *errors.IndexBlockCorruptedError
+	if nilErr.Error() != errors.ErrIndexBlockCorrupted.Error() {
+		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrIndexBlockCorrupted.Error())
+	}
+	if !nilErr.Is(errors.ErrIndexBlockCorrupted) {
+		t.Errorf("nil *IndexBlockCorruptedError must match ErrIndexBlockCorrupted via Is")
 	}
 }

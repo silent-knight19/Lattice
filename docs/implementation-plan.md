@@ -349,15 +349,15 @@ Every future micro-phase implementation response from Claude Code must use this 
 
 ```
 Current Major Phase           : Phase 04 — Persistent SSTable Subsystem
-Current Sub-Phase             : Sub-Phase 04.1 — Data Block Construction & Prefix Compression (COMPLETE)
-Current Micro-Phase           : P04-S01-M02 — Restart Array & Block Trailer Serialization (COMPLETE)
+Current Sub-Phase             : Sub-Phase 04.2 — SSTable Index & Footer Design (IN PROGRESS)
+Current Micro-Phase           : P04-S02-M01 — Sparse Two-Level Block Index Builder (COMPLETE)
 Phase 01 Status               : COMPLETE (Sub-Phases 01.1 & 01.2 Complete)
 Phase 02 Status               : COMPLETE (Sub-Phases 02.1, 02.2, 02.3, 02.4 Complete)
 Phase 03 Status               : COMPLETE (Sub-Phases 03.1, 03.2, 03.3 Complete)
-Phase 04 Status               : IN PROGRESS (Sub-Phase 04.1 Complete)
+Phase 04 Status               : IN PROGRESS (Sub-Phase 04.1 Complete; Sub-Phase 04.2 In Progress)
 Previous Completed Phase      : Phase 03 — In-Memory MemTable & Concurrent SkipList
-Previous Completed Micro-Phase: P04-S01-M02 — Restart Array & Block Trailer Serialization
-Next Planned Micro-Phase      : P04-S02-M01 — Sparse Two-Level Block Index Builder
+Previous Completed Micro-Phase: P04-S02-M01 — Sparse Two-Level Block Index Builder
+Next Planned Micro-Phase      : P04-S02-M02 — Fixed 48-Byte Footer Serializer & Parser
 Phase 00 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Phase 01 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Security Audit Track State    : Active
@@ -370,9 +370,9 @@ Security Audit Track State    : Active
   - SEC-06 through SEC-09 (PLANNED)
 Blocking Issues               : None
 Tests Passing                 : `go test -race ./...` (All test suites passing, 0 race conditions), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed, Linux & Windows cross-platform verified
-Security Review Status        : Complete & Verified (SEC-01 foundations established; SEC-02 static audit verified; SEC-03 dynamic persistence audit completed; SEC-04 in-memory engine audit completed; SEC-P03 independent adversarial audit completed; P04-S01-M01 audited; P04-S01-M02 audited with 0 vulnerabilities, big-endian framing, overflow guard, caller mutation isolation, and CRC corruption detection)
-Interview Knowledge Status    : Updated with Sections 30 & 31 containing deep systems interview questions and answers across prefix compression, restart points, and block trailer serialization
-Git Commit                    : feat(sstable): [P04-S01-M02] serialize restart array and CRC32 block trailer
+Security Review Status        : Complete & Verified (SEC-01 foundations established; SEC-02 static audit verified; SEC-03 dynamic persistence audit completed; SEC-04 in-memory engine audit completed; SEC-P03 independent adversarial audit completed; P04-S01-M01 audited; P04-S01-M02 audited; P04-S02-M01 audited with 0 vulnerabilities, 16B Big-Endian handle validation, file bounds checks, failure atomicity, caller mutation isolation, and CRC corruption detection)
+Interview Knowledge Status    : Updated with Sections 30, 31 & 32 containing deep systems interview questions and answers across prefix compression, restart points, block trailers, sparse two-level indexing, and block handles
+Git Commit                    : feat(sstable): [P04-S02-M01] implement sparse two-level block index builder and block handle
 ```
 
 ---
@@ -1333,10 +1333,41 @@ TOTAL: 184 Discrete, Testable Micro-Phases
 ### Sub-Phase 04.2: SSTable Index & Footer Design
 * **P04-S02-M01: Sparse Two-Level Block Index Builder**
   * *Objective*: Record largest key and file offset/size handle for each emitted data block.
-  * *Changes*: `IndexBuilder.AddBlock(largestKey []byte, handle BlockHandle)`.
-  * *Invariants*: Exactly one index entry per data block.
-  * *Tests*: Build index across 50 data blocks; verify all handles point to correct offsets.
-  * *Completion*: Index builder verified.
+  * *Changes*:
+    - Created `internal/sstable/block_handle.go`:
+      - Defined `BlockHandle` struct (`Offset uint64`, `Size uint64`) with fixed 16-byte Big-Endian encoding (`BlockHandleSize = 16`).
+      - Implemented `Encode() [16]byte`, `AppendTo(dst []byte) []byte`, `DecodeBlockHandle(src []byte) (BlockHandle, error)`, `Validate() error`, `ValidateAgainstFileSize(fileSize int64) error`.
+    - Created `internal/sstable/index_builder.go`:
+      - Defined `IndexEntry` (`LargestKey []byte`, `Handle BlockHandle`) with `Clone()`.
+      - Implemented `IndexBuilder`: `NewIndexBuilder()`, `AddBlock(largestKey []byte, handle BlockHandle) error`, `AddBlockKey(key binary.InternalKey, handle BlockHandle) error`, `Finish() []byte`, `Reset()`, `EntryCount() int`, `IsEmpty() bool`, `Finished() bool`, `Entries() []IndexEntry`, `FindBlock(targetKey []byte) (BlockHandle, bool)`, `CurrentSizeEstimate() int`.
+      - Defined `BlockIndex` and implemented independent binary reader `DecodeBlockIndex(data []byte) (*BlockIndex, error)`.
+    - Added domain errors in `internal/errors/errors.go`: `ErrBlockHandleTruncated`, `ErrInvalidBlockHandle`, `ErrIndexFinished`, `ErrIndexBlockTruncated`, `ErrIndexBlockCorrupted`, and typed `InvalidBlockHandleError`, `IndexBlockCorruptedError`.
+    - Created `internal/sstable/block_handle_test.go`: unit tests for round-trip encoding, byte layout, truncation, zero size, overflow, and file boundary validation.
+    - Created `internal/sstable/index_builder_test.go`:
+      - Verified sparse index construction across 50 data blocks generated with `BlockBuilder`.
+      - Verified that all 50 handles accurately record the physical offsets and sizes of the emitted blocks.
+      - Tested sparse index binary search (`FindBlock`), failure atomicity, caller isolation, repeated `Finish()` idempotence, and single-bit corruption detection.
+    - Created `internal/sstable/index_builder_fuzz_test.go`:
+      - Added `FuzzBlockHandle_Decode` (>6,073,000 iterations in 10s with 0 failures).
+      - Added `FuzzBlockIndex_Decode` (>5,796,000 iterations in 10s with 0 failures).
+    - Created `internal/sstable/index_builder_bench_test.go`: micro-benchmarks for adding 50 and 1,000 blocks, index serialization, and binary search.
+  * *Invariants Maintained*:
+    - *One Index Entry Per Block*: Exactly one index entry per data block, storing its largest key and physical `BlockHandle`.
+    - *Canonical Ordering*: Keys added to the index builder must be strictly increasing; inversions or duplicates rejected with `KeyOutOfOrderError`.
+    - *Handle Integrity*: Non-zero size (`Size > 0`) and valid offset bounds (`Offset + Size` does not overflow 64-bit address space).
+    - *Failure Atomicity*: Failed additions leave builder state completely unmodified.
+    - *Caller Isolation*: Keys and handles defensively copied on input; `Entries()` and `Finish()` return defensively copied data.
+    - *CRC32 Integrity*: Serialized index block trailer includes 4-byte CRC32-IEEE covering all entry data, offsets, and entry count.
+  * *Measured Results*:
+    - Micro-benchmarks (Apple M4):
+      - `BenchmarkIndexBuilder_AddBlock_50`: ~2,156 ns/op (43.1 ns per block handle added).
+      - `BenchmarkIndexBuilder_AddBlock_1K`: ~49,089 ns/op (49.1 ns per block handle added across 1,000 blocks).
+      - `BenchmarkIndexBuilder_Finish`: ~173.5 ns/op (2,304 B/op, 1 alloc/op for defensive copy).
+      - `BenchmarkBlockIndex_FindBlock_BinarySearch`: ~256.5 ns/op for binary search over 1,000 blocks in RAM.
+    - Fuzz Testing:
+      - `FuzzBlockHandle_Decode`: >6,073,000 iterations in 10s with 0 failures.
+      - `FuzzBlockIndex_Decode`: >5,796,000 iterations in 10s with 0 failures.
+  * *Completion*: Complete and verified under `-race`.
 * **P04-S02-M02: Fixed 48-Byte Footer Serializer & Parser**
   * *Objective*: Implement encoding/decoding of 48-byte trailer (`MetaIndexHandle + IndexHandle + Padding + Magic`).
   * *Changes*: `Footer.Encode()`, `Footer.Decode()`.

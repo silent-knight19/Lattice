@@ -2457,9 +2457,76 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
+# 32. Deep Systems Interview Questions & Answers: SSTable Sparse Two-Level Block Index Architecture & Block Handles (P04-S02-M01)
+
+### 1. What is a sparse two-level block index, and how does it differ fundamentally from a dense index?
+* **Question**: Why does an LSM storage engine like Lattice utilize a sparse two-level block index instead of a dense index?
+* **Answer**:
+  - **Dense Indexing**: A dense index creates one index entry for every single key-value record in the database. While it allows pinpointing an exact record location, the index size grows proportionally with the number of keys ($O(N)$), consuming $>30\%$ of total storage space and making it impossible to keep the index memory-resident in RAM for large datasets.
+  - **Sparse Indexing**: A sparse index stores only **one entry per 4KB data block**, recording the block's largest key and its physical file location (`BlockHandle`). With an average record size of 100 bytes, each 4KB data block holds ~40 records, reducing index entries and RAM memory footprint by over **97.5%**.
+  - **Two-Level Hierarchy**:
+    - *Level 1 (RAM)*: Binary search across the sparse index block to identify the single candidate 4KB data block containing the target key range.
+    - *Level 2 (Disk / Block Cache)*: Binary search within that single 4KB block using its internal restart point array, followed by at most 15 linear prefix delta decodes.
+  - **Disk I/O Guarantee**: Bounded to at most **one 4KB disk read (`pread`)** per SSTable, rather than searching across multiple blocks.
+
+### 2. Why does Lattice index only the largest key of each data block rather than both smallest and largest keys?
+* **Question**: Some database designs record `[smallestKey, largestKey]` ranges per block. Why does Lattice record only the `largestKey` in its index entries?
+* **Answer**:
+  - **Sorted Non-Overlapping Blocks**: Within an SSTable, data blocks are written strictly in sorted key order. Because records are strictly increasing, Block 0 contains keys $(-\infty, K_{\max, 0}]$, Block 1 contains $(K_{\max, 0}, K_{\max, 1}]$, and Block $i$ contains $(K_{\max, i-1}, K_{\max, i}]$.
+  - **Redundancy Elimination**: The smallest key of Block $i$ is implicitly bounded by being strictly greater than the largest key of Block $i-1$. Storing both keys per entry would double the index memory footprint without providing any additional pruning power during binary search.
+  - **Binary Search Invariant**: To locate key $K_{\text{target}}$, the reader searches for the first block whose `largestKey >= targetKey`. If no such block exists (i.e. $K_{\text{target}} > K_{\max, N-1}$), the key cannot exist in the SSTable, and the search terminates with zero disk I/O.
+
+### 3. How does binary search on the sparse index identify the candidate data block?
+* **Question**: Walk through the exact algorithm and pointer arithmetic used to search the sparse index for $K_{\text{target}}$.
+* **Answer**:
+  1. **RAM-Resident Index Array**: The index contains $N$ entries sorted by `LargestKey` in canonical order.
+  2. **Binary Search**: Use standard binary search (`sort.Search`) over $0 \le i < N$ to find the smallest index $i$ where $\text{Compare}(\text{LargestKey}_i, K_{\text{target}}) \ge 0$.
+  3. **Case A ($i < N$)**: Block $i$ is the only candidate block that could contain $K_{\text{target}}$. Return $\text{Handle}_i$. The reader then fetches Block $i$ from cache or disk and executes in-block search.
+  4. **Case B ($i == N$)**: $K_{\text{target}}$ is strictly greater than the largest key of the last data block. Because SSTable keys are strictly sorted, $K_{\text{target}}$ cannot exist anywhere in this SSTable. Return `(BlockHandle{}, false)` immediately with **zero disk reads**.
+
+### 4. What is a `BlockHandle`, and why is it fixed at 16 bytes using Big-Endian encoding?
+* **Question**: Describe the binary representation of a `BlockHandle` and explain the design trade-offs behind its fixed 16-byte size.
+* **Answer**:
+  - **Layout**:
+    - `Offset`: 8 bytes (`uint64`, Big-Endian network byte order).
+    - `Size`: 8 bytes (`uint64`, Big-Endian network byte order).
+    - Total: 16 bytes (`BlockHandleSize = 16`).
+  - **Why Fixed 16 Bytes**:
+    - *Predictable Addressing*: Enables fixed-stride offset calculations. In the SSTable 48-byte footer, the two handles (`MetaIndexHandle` and `IndexHandle`) take exactly $2 \times 16 = 32$ bytes, allowing fixed footer parsing from the end of the file.
+    - *64-Bit Exabyte Addressability*: Supports SSTables up to 16 Exabytes without format changes or integer truncation.
+    - *Simplicity & Security*: Fixed-width integers eliminate varint decode loops and state machine branching in critical offset validation paths.
+  - **Big-Endian Consistency**: All fixed integer fields in Lattice (`uint16`, `uint32`, `uint64`) use strict Big-Endian order, ensuring uniform cross-platform binary representations across Little-Endian (x86_64, ARM64) and Big-Endian architectures.
+
+### 5. How does Lattice protect against "corrupted block offset attacks"?
+* **Question**: If an adversary corrupts an SSTable file on disk and modifies a `BlockHandle`'s offset or size, what attacks could occur, and how does Lattice mitigate them?
+* **Answer**:
+  - **Attack Scenarios**:
+    1. *Out-of-Bounds Disk Read*: An attacker sets `Offset = 0xFFFFFFFFFFFF` or `Size = 0x7FFFFFFF`, causing `pread()` to read beyond file bounds, crash the process with I/O errors, or access unmapped virtual memory.
+    2. *Integer Arithmetic Overflow*: An attacker sets `Offset = MaxUint64 - 10` and `Size = 20`. A naive bounds check `Offset + Size <= FileSize` overflows to 9, bypassing the bounds check and executing an illegal read.
+  - **Lattice Mitigations**:
+    1. *Integer Overflow Guard (`Validate()`)*: Validates that `Size > 0` and `h.Offset <= math.MaxUint64 - h.Size` before any arithmetic is performed.
+    2. *Physical Boundary Guard (`ValidateAgainstFileSize(fileSize)`)*: Verifies that `uint64(fileSize) >= h.Offset + h.Size`. Any handle exceeding the physical file length is rejected with `ErrInvalidBlockHandle` before issuing system calls.
+    3. *Checksum Verification*: The index block itself is protected by CRC32-IEEE. Any modification to a handle in the serialized index causes a CRC mismatch during index loading.
+
+### 6. How does the serialized index block format support $O(\log N)$ random access?
+* **Question**: Why does the serialized index block include an offset table at the tail, and how does it prevent $O(N)$ sequential parsing?
+* **Answer**:
+  - **Problem**: Index entries have variable lengths because keys vary from 1 byte to 65,535 bytes (`KeyLen` varint + `KeyBytes` + 16B handle). Without an offset table, binary search would be impossible; finding the middle entry would require scanning sequentially from byte 0.
+  - **Tail Offset Table Solution**:
+    - Serialized format: `[Entry Data || Offsets (uint32 * N) || Entry Count (uint32) || CRC32 (uint32)]`.
+    - At the tail, an array of 32-bit Big-Endian offsets points to the exact byte position of each index entry.
+    - During binary search or index decoding, the reader seeks directly to `offsets[mid]` in $O(1)$ time, reads the entry, and compares keys.
+    - Backwards parsing: from `len(block) - 8`, the reader reads the entry count $N$, then reads the $N \times 4$ offset bytes preceding it.
+
+### 7. What memory ownership and failure atomicity guarantees are maintained by `IndexBuilder`?
+* **Question**: Explain how `IndexBuilder` guarantees failure atomicity and prevents slice memory aliasing.
+* **Answer**:
+  - **Failure Atomicity**: If `AddBlock()` encounters an error (e.g. an unsorted key, an invalid handle with size 0, or buffer overflow), no state is modified. The entry is not appended to the buffer, the offset is not appended to the offset table, and the in-memory entry list remains unchanged.
+  - **Defensive Copying (Caller Isolation)**:
+    - On `AddBlock(largestKey, handle)`: `IndexBuilder` allocates an owned byte slice and copies `largestKey`. If the caller subsequently mutates the key buffer (e.g. reusing a scratch buffer in `TableWriter`), the index remains uncorrupted.
+    - On `Entries()`: Returns a deep clone of each `IndexEntry` to prevent caller mutations from altering builder state.
+    - On `Finish()`: Returns an owned defensive copy of the serialized buffer. Calling `Finish()` multiple times is idempotent and returns independent copies.
+
+---
+
 *End of Technical Interview Knowledge Base — Lattice v1.0.0-KNOWLEDGE-BASE*
-
-
-
-
-

@@ -154,6 +154,21 @@ var (
 
 	// ErrBlockOverflow indicates that a block's size exceeds 32-bit addressable capacity.
 	ErrBlockOverflow = stdErrors.New("block size exceeds maximum 32-bit addressable capacity")
+
+	// ErrBlockHandleTruncated indicates that a block handle buffer is shorter than 16 bytes.
+	ErrBlockHandleTruncated = stdErrors.New("block handle truncated: buffer smaller than 16 bytes")
+
+	// ErrInvalidBlockHandle indicates that a block handle has an invalid size (zero) or offset+size overflows.
+	ErrInvalidBlockHandle = stdErrors.New("invalid block handle: size must be greater than zero and offset+size must not overflow")
+
+	// ErrIndexFinished indicates that mutation was attempted on an already finished/sealed index builder.
+	ErrIndexFinished = stdErrors.New("index builder is finished")
+
+	// ErrIndexBlockTruncated indicates that an index block buffer is shorter than minimum trailer length.
+	ErrIndexBlockTruncated = stdErrors.New("index block truncated: buffer smaller than trailer")
+
+	// ErrIndexBlockCorrupted indicates that an index block's trailer, offsets, or entries are corrupted.
+	ErrIndexBlockCorrupted = stdErrors.New("index block corrupted: invalid offsets, count, or entries")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing
@@ -489,4 +504,48 @@ func (e *InvalidSkipListLevelError) Error() string {
 // Is reports whether this error matches target sentinel ErrInvalidSkipListLevel.
 func (e *InvalidSkipListLevelError) Is(target error) bool {
 	return target == ErrInvalidSkipListLevel
+}
+
+// InvalidBlockHandleError provides structured context when a block handle violates constraints.
+// It matches ErrInvalidBlockHandle when interrogated with errors.Is().
+type InvalidBlockHandleError struct {
+	Offset uint64
+	Size   uint64
+	Reason string
+}
+
+func (e *InvalidBlockHandleError) Error() string {
+	if e == nil {
+		return ErrInvalidBlockHandle.Error()
+	}
+	if e.Reason != "" {
+		return fmt.Sprintf("invalid block handle [offset=%d, size=%d]: %s", e.Offset, e.Size, e.Reason)
+	}
+	return fmt.Sprintf("invalid block handle [offset=%d, size=%d]", e.Offset, e.Size)
+}
+
+// Is reports whether this error matches target sentinel ErrInvalidBlockHandle.
+func (e *InvalidBlockHandleError) Is(target error) bool {
+	return target == ErrInvalidBlockHandle
+}
+
+// IndexBlockCorruptedError provides structured context when an index block fails integrity or layout checks.
+// It matches ErrIndexBlockCorrupted when interrogated with errors.Is().
+type IndexBlockCorruptedError struct {
+	Reason string
+}
+
+func (e *IndexBlockCorruptedError) Error() string {
+	if e == nil {
+		return ErrIndexBlockCorrupted.Error()
+	}
+	if e.Reason != "" {
+		return fmt.Sprintf("index block corrupted: %s", e.Reason)
+	}
+	return ErrIndexBlockCorrupted.Error()
+}
+
+// Is reports whether this error matches target sentinel ErrIndexBlockCorrupted.
+func (e *IndexBlockCorruptedError) Is(target error) bool {
+	return target == ErrIndexBlockCorrupted
 }
