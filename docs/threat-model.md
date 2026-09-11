@@ -135,9 +135,9 @@
 * **Attack Surface**: POSIX filesystem permissions.
 * **Impact**: High (Local user reads sensitive key-value data).
 * **Likelihood**: Medium.
-* **Existing Mitigation**: Data directories are initialized with POSIX `0700` (`rwx------`) and files are created with `0600` (`rw-------`). The engine checks and warns if permissions are compromised.
-* **Automated Test**: Test verifying file mode bits upon creation.
-* **Residual Risk**: Low (Enforced via POSIX mode bits 0700/0600 on host filesystem).
+* **Existing Mitigation**: Data directories are initialized with POSIX `0700` (`rwx------`) and files are created with `0600` (`rw-------`). TableWriter strictly validates caller-supplied `FileMode` using `ValidateFileMode`, rejecting any mode that grants group/other permissions (non-owner bits `0077`) or execution bits (`0111`) with `ErrInsecureFileMode`. Failing closed ensures no broad permissions (e.g. `0644`, `0666`, `0755`, `0777`) can bypass the security baseline.
+* **Automated Test**: `TestSecurity_Remediation3_FilePermissions_Baseline` verifying rejection of insecure modes (`0644`, `0666`, `0755`, `0777`, `0640`, `0604`, `0700`) and acceptance of owner-only modes (`0600`, `0400`).
+* **Residual Risk**: Low (Enforced via POSIX mode bits 0700/0600 and programmatic validation on host filesystem).
 
 ---
 

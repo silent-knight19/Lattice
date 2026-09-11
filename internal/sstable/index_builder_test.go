@@ -11,6 +11,11 @@ import (
 	"github.com/silent-knight19/lattice/internal/sstable"
 )
 
+func testIKBytes(userKey string) []byte {
+	ik, _ := binary.NewInternalKey([]byte(userKey), 100, binary.OpTypePut)
+	return binary.AppendInternalKey(nil, ik)
+}
+
 // TestIndexBuilder_50DataBlocks verifies the primary architectural invariant of P04-S02-M01:
 // constructing a sparse Two-Level Block Index across 50 sequentially emitted data blocks,
 // and asserting that all 50 handles accurately point to the physical offsets and sizes of the blocks.
@@ -120,7 +125,7 @@ func TestIndexBuilder_50DataBlocks(t *testing.T) {
 
 	// Subsequent AddBlock rejected
 	extraHandle := sstable.BlockHandle{Offset: currentFileOffset, Size: 100}
-	if err := indexBuilder.AddBlock([]byte("extra"), extraHandle); !stdErrors.Is(err, errors.ErrIndexFinished) {
+	if err := indexBuilder.AddBlock(testIKBytes("extra"), extraHandle); !stdErrors.Is(err, errors.ErrIndexFinished) {
 		t.Fatalf("expected ErrIndexFinished after Finish, got %v", err)
 	}
 
@@ -235,7 +240,7 @@ func TestIndexBuilder_Invariants(t *testing.T) {
 	t.Run("nil receiver error handling", func(t *testing.T) {
 		var nilBuilder *sstable.IndexBuilder
 		handle := sstable.BlockHandle{Offset: 0, Size: 100}
-		if err := nilBuilder.AddBlock([]byte("key"), handle); !stdErrors.Is(err, errors.ErrNilReceiver) {
+		if err := nilBuilder.AddBlock(testIKBytes("key"), handle); !stdErrors.Is(err, errors.ErrNilReceiver) {
 			t.Fatalf("expected ErrNilReceiver, got %v", err)
 		}
 		if nilBuilder.Finish() != nil {
@@ -250,11 +255,11 @@ func TestIndexBuilder_Invariants(t *testing.T) {
 		if nilBuilder.Finished() {
 			t.Fatal("expected Finished to be false on nil receiver")
 		}
-		if len(nilBuilder.Entries()) != 0 {
+		if nilBuilder.Entries() != nil && len(nilBuilder.Entries()) != 0 {
 			t.Fatal("expected empty entries on nil receiver")
 		}
 		if _, found := nilBuilder.FindBlock([]byte("key")); found {
-			t.Fatal("expected found=false on nil receiver")
+			t.Fatal("expected found=false from FindBlock on nil receiver")
 		}
 		if nilBuilder.CurrentSizeEstimate() != 0 {
 			t.Fatal("expected 0 size estimate on nil receiver")
@@ -288,7 +293,7 @@ func TestIndexBuilder_Invariants(t *testing.T) {
 
 	t.Run("invalid handle rejected", func(t *testing.T) {
 		builder := sstable.NewIndexBuilder()
-		err := builder.AddBlock([]byte("valid-key"), sstable.BlockHandle{Offset: 0, Size: 0})
+		err := builder.AddBlock(testIKBytes("valid-key"), sstable.BlockHandle{Offset: 0, Size: 0})
 		if !stdErrors.Is(err, errors.ErrInvalidBlockHandle) {
 			t.Fatalf("expected ErrInvalidBlockHandle, got %v", err)
 		}
@@ -302,12 +307,12 @@ func TestIndexBuilder_Invariants(t *testing.T) {
 		h1 := sstable.BlockHandle{Offset: 0, Size: 100}
 		h2 := sstable.BlockHandle{Offset: 100, Size: 100}
 
-		if err := builder.AddBlock([]byte("key-b"), h1); err != nil {
+		if err := builder.AddBlock(testIKBytes("key-b"), h1); err != nil {
 			t.Fatalf("AddBlock key-b failed: %v", err)
 		}
 
 		// Duplicate key rejected
-		errDup := builder.AddBlock([]byte("key-b"), h2)
+		errDup := builder.AddBlock(testIKBytes("key-b"), h2)
 		if !stdErrors.Is(errDup, errors.ErrKeyOutOfOrder) {
 			t.Fatalf("expected ErrKeyOutOfOrder for duplicate key, got %v", errDup)
 		}
@@ -317,7 +322,7 @@ func TestIndexBuilder_Invariants(t *testing.T) {
 		}
 
 		// Regressing key rejected
-		errReg := builder.AddBlock([]byte("key-a"), h2)
+		errReg := builder.AddBlock(testIKBytes("key-a"), h2)
 		if !stdErrors.Is(errReg, errors.ErrKeyOutOfOrder) {
 			t.Fatalf("expected ErrKeyOutOfOrder for regressing key, got %v", errReg)
 		}
@@ -328,7 +333,7 @@ func TestIndexBuilder_Invariants(t *testing.T) {
 		}
 
 		// Strictly greater key succeeds
-		if err := builder.AddBlock([]byte("key-c"), h2); err != nil {
+		if err := builder.AddBlock(testIKBytes("key-c"), h2); err != nil {
 			t.Fatalf("AddBlock key-c failed: %v", err)
 		}
 		if builder.EntryCount() != 2 {
@@ -372,26 +377,28 @@ func TestIndexBuilder_Invariants(t *testing.T) {
 func TestIndexBuilder_FailureAtomicity_And_CallerIsolation(t *testing.T) {
 	builder := sstable.NewIndexBuilder()
 
-	key := []byte("apple")
+	key := testIKBytes("apple")
+	expectedKey := make([]byte, len(key))
+	copy(expectedKey, key)
 	h1 := sstable.BlockHandle{Offset: 0, Size: 100}
 	if err := builder.AddBlock(key, h1); err != nil {
 		t.Fatalf("AddBlock failed: %v", err)
 	}
 
 	// Mutate caller's slice
-	key[0] = 'z' // "zpple"
+	key[0] ^= 0xFF
 	entries := builder.Entries()
-	if bytes.Equal(entries[0].LargestKey, []byte("zpple")) {
+	if bytes.Equal(entries[0].LargestKey, key) {
 		t.Fatal("builder failed caller isolation: internal key mutated by external caller write")
 	}
-	if !bytes.Equal(entries[0].LargestKey, []byte("apple")) {
-		t.Fatalf("expected 'apple', got %s", entries[0].LargestKey)
+	if !bytes.Equal(entries[0].LargestKey, expectedKey) {
+		t.Fatalf("expected %x, got %x", expectedKey, entries[0].LargestKey)
 	}
 
 	// Mutate slice returned from Entries()
-	entries[0].LargestKey[0] = 'x'
+	entries[0].LargestKey[0] ^= 0xFF
 	entries2 := builder.Entries()
-	if bytes.Equal(entries2[0].LargestKey, []byte("xpple")) {
+	if bytes.Equal(entries2[0].LargestKey, entries[0].LargestKey) {
 		t.Fatal("Entries() failed defensive copy isolation")
 	}
 
@@ -400,7 +407,7 @@ func TestIndexBuilder_FailureAtomicity_And_CallerIsolation(t *testing.T) {
 	initialCount := builder.EntryCount()
 
 	// Attempt invalid addition (out of order key "aardvark" < "apple")
-	err := builder.AddBlock([]byte("aardvark"), sstable.BlockHandle{Offset: 100, Size: 50})
+	err := builder.AddBlock(testIKBytes("aardvark"), sstable.BlockHandle{Offset: 100, Size: 50})
 	if err == nil {
 		t.Fatal("expected error on out of order key")
 	}
@@ -418,8 +425,8 @@ func TestIndexBuilder_Reset(t *testing.T) {
 	builder := sstable.NewIndexBuilder()
 
 	// Populate first round
-	_ = builder.AddBlock([]byte("key-1"), sstable.BlockHandle{Offset: 0, Size: 100})
-	_ = builder.AddBlock([]byte("key-2"), sstable.BlockHandle{Offset: 100, Size: 100})
+	_ = builder.AddBlock(testIKBytes("key-1"), sstable.BlockHandle{Offset: 0, Size: 100})
+	_ = builder.AddBlock(testIKBytes("key-2"), sstable.BlockHandle{Offset: 100, Size: 100})
 	_ = builder.Finish()
 
 	if !builder.Finished() {
@@ -439,10 +446,10 @@ func TestIndexBuilder_Reset(t *testing.T) {
 	}
 
 	// Populate second round
-	if err := builder.AddBlock([]byte("new-a"), sstable.BlockHandle{Offset: 0, Size: 500}); err != nil {
+	if err := builder.AddBlock(testIKBytes("new-a"), sstable.BlockHandle{Offset: 0, Size: 500}); err != nil {
 		t.Fatalf("AddBlock after reset failed: %v", err)
 	}
-	if err := builder.AddBlock([]byte("new-b"), sstable.BlockHandle{Offset: 500, Size: 500}); err != nil {
+	if err := builder.AddBlock(testIKBytes("new-b"), sstable.BlockHandle{Offset: 500, Size: 500}); err != nil {
 		t.Fatalf("AddBlock after reset failed: %v", err)
 	}
 
@@ -460,9 +467,9 @@ func TestIndexBuilder_Reset(t *testing.T) {
 // are detected deterministically without panicking.
 func TestIndexBlock_Corruption(t *testing.T) {
 	builder := sstable.NewIndexBuilder()
-	_ = builder.AddBlock([]byte("alpha"), sstable.BlockHandle{Offset: 0, Size: 100})
-	_ = builder.AddBlock([]byte("bravo"), sstable.BlockHandle{Offset: 100, Size: 100})
-	_ = builder.AddBlock([]byte("charlie"), sstable.BlockHandle{Offset: 200, Size: 100})
+	_ = builder.AddBlock(testIKBytes("alpha"), sstable.BlockHandle{Offset: 0, Size: 100})
+	_ = builder.AddBlock(testIKBytes("bravo"), sstable.BlockHandle{Offset: 100, Size: 100})
+	_ = builder.AddBlock(testIKBytes("charlie"), sstable.BlockHandle{Offset: 200, Size: 100})
 	validData := builder.Finish()
 
 	t.Run("single-bit flip anywhere detected by CRC32", func(t *testing.T) {

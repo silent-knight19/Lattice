@@ -199,6 +199,14 @@ var (
 
 	// ErrDataBlockCorrupted indicates that an SSTable data block's trailer, CRC, restart array, or entry framing is corrupted.
 	ErrDataBlockCorrupted = stdErrors.New("data block corrupted: invalid crc, restart metadata, or entry framing")
+
+	// ErrInsecureFileMode indicates that a file mode was requested that violates the security baseline
+	// (e.g. granting group or other permissions, or execution bits).
+	ErrInsecureFileMode = stdErrors.New("insecure file mode: permissions must not grant group/other access or execute bits")
+
+	// ErrWriterPoisoned indicates that an operation was attempted on a WAL writer
+	// that entered an unrecoverable poisoned state following a write or sync failure.
+	ErrWriterPoisoned = stdErrors.New("wal writer is poisoned")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing
@@ -665,4 +673,52 @@ func (e *DataBlockCorruptedError) Error() string {
 // Is reports whether this error matches target sentinel ErrDataBlockCorrupted.
 func (e *DataBlockCorruptedError) Is(target error) bool {
 	return target == ErrDataBlockCorrupted
+}
+
+// InsecureFileModeError provides structured diagnostics when a file mode grants insecure permissions.
+// It matches ErrInsecureFileMode when interrogated with errors.Is().
+type InsecureFileModeError struct {
+	Mode fs.FileMode
+}
+
+func (e *InsecureFileModeError) Error() string {
+	if e == nil {
+		return ErrInsecureFileMode.Error()
+	}
+	return fmt.Sprintf("insecure file mode %04o: permissions must not grant group/other access or execute bits", e.Mode.Perm())
+}
+
+// Is reports whether this error matches target sentinel ErrInsecureFileMode.
+func (e *InsecureFileModeError) Is(target error) bool {
+	return target == ErrInsecureFileMode
+}
+
+// WALWriterPoisonedError provides structured context when an operation is rejected on a poisoned WAL writer.
+// It matches ErrWriterPoisoned when interrogated with errors.Is().
+type WALWriterPoisonedError struct {
+	Path   string
+	Reason error
+}
+
+func (e *WALWriterPoisonedError) Error() string {
+	if e == nil {
+		return ErrWriterPoisoned.Error()
+	}
+	if e.Reason != nil {
+		return fmt.Sprintf("wal writer at %q is poisoned: %v", e.Path, e.Reason)
+	}
+	return fmt.Sprintf("wal writer at %q is poisoned", e.Path)
+}
+
+// Is reports whether this error matches target sentinel ErrWriterPoisoned.
+func (e *WALWriterPoisonedError) Is(target error) bool {
+	return target == ErrWriterPoisoned
+}
+
+// Unwrap returns the underlying error that caused the writer to be poisoned.
+func (e *WALWriterPoisonedError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Reason
 }

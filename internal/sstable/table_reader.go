@@ -5,6 +5,7 @@ import (
 	stdErrors "errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"sync"
 
@@ -103,7 +104,28 @@ func NewTableReaderWithFile(file *os.File) (*TableReader, error) {
 
 	// 4. Read sparse index block from disk
 	indexHandle := footer.IndexHandle
-	indexBuf := make([]byte, indexHandle.Size)
+	if indexHandle.Size == 0 || indexHandle.Size > MaxIndexBlockSize {
+		return nil, &errors.InvalidBlockHandleError{
+			Offset: indexHandle.Offset,
+			Size:   indexHandle.Size,
+			Reason: "index block size exceeds MaxIndexBlockSize or is zero",
+		}
+	}
+	if indexHandle.Offset > math.MaxUint64-indexHandle.Size || indexHandle.Offset+indexHandle.Size > uint64(fileSize)-FooterSize {
+		return nil, &errors.InvalidBlockHandleError{
+			Offset: indexHandle.Offset,
+			Size:   indexHandle.Size,
+			Reason: "index handle extends into footer, exceeds physical file boundary, or overflows address space",
+		}
+	}
+	if indexHandle.Size > math.MaxInt || indexHandle.Offset > math.MaxInt64 {
+		return nil, &errors.InvalidBlockHandleError{
+			Offset: indexHandle.Offset,
+			Size:   indexHandle.Size,
+			Reason: "index handle offset or size exceeds architecture integer bounds",
+		}
+	}
+	indexBuf := make([]byte, int(indexHandle.Size))
 	if err := readExactAt(file.ReadAt, indexBuf, int64(indexHandle.Offset)); err != nil {
 		return nil, fmt.Errorf("failed to read index block at offset %d: %w", indexHandle.Offset, err)
 	}
@@ -203,16 +225,30 @@ func (r *TableReader) Seek(userKey []byte) ([]byte, error) {
 	}
 
 	// 2. Validate data block handle bounds
-	if handle.Size == 0 || handle.Offset+handle.Size > uint64(r.fileSize)-FooterSize {
+	if handle.Size == 0 || handle.Size > MaxDataBlockSize {
 		return nil, &errors.InvalidBlockHandleError{
 			Offset: handle.Offset,
 			Size:   handle.Size,
-			Reason: "candidate data block extends into footer or beyond physical file boundary",
+			Reason: "data block size exceeds MaxDataBlockSize or is zero",
+		}
+	}
+	if handle.Offset > math.MaxUint64-handle.Size || handle.Offset+handle.Size > uint64(r.fileSize)-FooterSize {
+		return nil, &errors.InvalidBlockHandleError{
+			Offset: handle.Offset,
+			Size:   handle.Size,
+			Reason: "candidate data block extends into footer, exceeds physical file boundary, or overflows address space",
+		}
+	}
+	if handle.Size > math.MaxInt || handle.Offset > math.MaxInt64 {
+		return nil, &errors.InvalidBlockHandleError{
+			Offset: handle.Offset,
+			Size:   handle.Size,
+			Reason: "candidate data block offset or size exceeds architecture integer bounds",
 		}
 	}
 
 	// 3. Read candidate data block from disk via ReadAt
-	blockBuf := make([]byte, handle.Size)
+	blockBuf := make([]byte, int(handle.Size))
 	if err := readExactAt(r.readAtFn, blockBuf, int64(handle.Offset)); err != nil {
 		return nil, fmt.Errorf("failed to read data block at offset %d: %w", handle.Offset, err)
 	}
@@ -332,16 +368,30 @@ func searchDataBlock(blockBuf []byte, targetUserKey []byte, blockOffset uint64) 
 				Reason: "restart entry payload exceeds entry data boundary",
 			}
 		}
-		if unshared < binary.InternalKeyTrailerLen {
+		if unshared < binary.MinKeyLen+binary.InternalKeyTrailerLen || unshared > binary.MaxEncodedInternalKeyLen {
 			return nil, &errors.DataBlockCorruptedError{
 				Offset: blockOffset + uint64(off),
-				Reason: "restart entry key shorter than internal key trailer",
+				Reason: "restart entry key length outside valid internal key boundaries",
+			}
+		}
+		if valueLen > binary.MaxValueLen {
+			return nil, &errors.DataBlockCorruptedError{
+				Offset: blockOffset + uint64(off),
+				Reason: "restart entry value length exceeds MaxValueLen",
 			}
 		}
 
-		// InternalKey is UserKey + 9-byte trailer (8-byte SeqNum + 1-byte OpType)
-		userKey := entrySlice[hdrLen : hdrLen+int(unshared)-binary.InternalKeyTrailerLen]
-		return userKey, nil
+		// Decode the InternalKey directly to strictly validate user key, seqnum, and optype
+		keyBytes := entrySlice[hdrLen : hdrLen+int(unshared)]
+		ik, err := binary.DecodeInternalKey(keyBytes)
+		if err != nil {
+			return nil, &errors.DataBlockCorruptedError{
+				Offset: blockOffset + uint64(off),
+				Reason: fmt.Sprintf("invalid internal key at restart point: %v", err),
+			}
+		}
+
+		return ik.UserKey, nil
 	}
 
 	// 6. Binary search over restart points to find the candidate restart interval
@@ -363,6 +413,7 @@ func searchDataBlock(blockBuf []byte, targetUserKey []byte, blockOffset uint64) 
 	// 7. Linear scan forward from restartOffsets[left]
 	currOffset := int(restartOffsets[left])
 	var reconstructedKey []byte
+	var prevIK *binary.InternalKey
 
 	for currOffset < entryDataEnd {
 		entrySlice := blockBuf[currOffset:entryDataEnd]
@@ -399,6 +450,13 @@ func searchDataBlock(blockBuf []byte, targetUserKey []byte, blockOffset uint64) 
 			}
 		}
 
+		if valueLen > binary.MaxValueLen {
+			return nil, &errors.DataBlockCorruptedError{
+				Offset: blockOffset + uint64(currOffset),
+				Reason: "entry value length exceeds MaxValueLen",
+			}
+		}
+
 		if currOffset == int(restartOffsets[left]) && shared != 0 {
 			return nil, &errors.DataBlockCorruptedError{
 				Offset: blockOffset + uint64(currOffset),
@@ -416,29 +474,38 @@ func searchDataBlock(blockBuf []byte, targetUserKey []byte, blockOffset uint64) 
 		deltaKey := entrySlice[hdrLen : hdrLen+int(unshared)]
 		reconstructedKey = append(reconstructedKey[:shared], deltaKey...)
 
-		if len(reconstructedKey) < binary.InternalKeyTrailerLen {
+		if len(reconstructedKey) < binary.MinKeyLen+binary.InternalKeyTrailerLen || len(reconstructedKey) > binary.MaxEncodedInternalKeyLen {
 			return nil, &errors.DataBlockCorruptedError{
 				Offset: blockOffset + uint64(currOffset),
-				Reason: "reconstructed key shorter than internal key trailer",
+				Reason: "reconstructed key length outside valid internal key boundaries",
 			}
 		}
 
-		userKeyLen := len(reconstructedKey) - binary.InternalKeyTrailerLen
-		entryUserKey := reconstructedKey[:userKeyLen]
-		opTypeByte := reconstructedKey[userKeyLen+8]
-
-		opType, err := binary.ParseOpType(opTypeByte)
+		// Decode and strictly validate reconstructed InternalKey
+		currIK, err := binary.DecodeInternalKey(reconstructedKey)
 		if err != nil {
 			return nil, &errors.DataBlockCorruptedError{
 				Offset: blockOffset + uint64(currOffset),
-				Reason: fmt.Sprintf("invalid operation type: 0x%02x", opTypeByte),
+				Reason: fmt.Sprintf("invalid reconstructed internal key: %v", err),
 			}
 		}
 
-		cmp := bytes.Compare(entryUserKey, targetUserKey)
+		// Verify strict monotonic ordering within the data block
+		if prevIK != nil {
+			if binary.CompareInternalKey(*prevIK, currIK) >= 0 {
+				return nil, &errors.DataBlockCorruptedError{
+					Offset: blockOffset + uint64(currOffset),
+					Reason: "entries violate strictly increasing canonical key ordering",
+				}
+			}
+		}
+		curr := currIK
+		prevIK = &curr
+
+		cmp := bytes.Compare(currIK.UserKey, targetUserKey)
 		if cmp == 0 {
 			// First encountered match is guaranteed to be the latest version (SeqNum DESC)
-			if opType == binary.OpTypeDelete {
+			if currIK.OpType == binary.OpTypeDelete {
 				// Logically deleted tombstone
 				return nil, errors.ErrKeyNotFound
 			}

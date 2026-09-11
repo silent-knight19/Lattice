@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/sstable"
 )
 
@@ -58,13 +59,15 @@ func FuzzBlockIndex_Decode(f *testing.F) {
 
 	// Seed 2: 1 entry index block
 	b1 := sstable.NewIndexBuilder()
-	_ = b1.AddBlock([]byte("seed-key-1"), sstable.BlockHandle{Offset: 0, Size: 4096})
+	ik1, _ := binary.NewInternalKey([]byte("seed-key-1"), 10, binary.OpTypePut)
+	_ = b1.AddBlock(binary.EncodeInternalKey(ik1), sstable.BlockHandle{Offset: 0, Size: 4096})
 	f.Add(b1.Finish())
 
 	// Seed 3: 5 entries index block
 	b5 := sstable.NewIndexBuilder()
 	for i := 0; i < 5; i++ {
-		_ = b5.AddBlock([]byte(fmt.Sprintf("key-%02d", i)), sstable.BlockHandle{Offset: uint64(i * 4096), Size: 4096})
+		ik, _ := binary.NewInternalKey([]byte(fmt.Sprintf("key-%02d", i)), binary.SeqNum(i+1), binary.OpTypePut)
+		_ = b5.AddBlock(binary.EncodeInternalKey(ik), sstable.BlockHandle{Offset: uint64(i * 4096), Size: 4096})
 	}
 	f.Add(b5.Finish())
 
@@ -94,12 +97,21 @@ func FuzzBlockIndex_Decode(f *testing.F) {
 			t.Fatalf("entries length %d != entryCount %d", len(entries), entryCount)
 		}
 
-		// Invariant: Keys must be strictly increasing
-		for i := 1; i < entryCount; i++ {
-			prev := entries[i-1].LargestKey
-			curr := entries[i].LargestKey
-			if bytes.Compare(prev, curr) >= 0 {
-				t.Fatalf("decoded index contains non-increasing keys: %x >= %x", prev, curr)
+		// Invariant: Keys must be strictly increasing InternalKeys
+		for i := 0; i < entryCount; i++ {
+			if len(entries[i].Key.UserKey) == 0 {
+				t.Fatalf("decoded entry %d has empty user key", i)
+			}
+			if err := entries[i].Key.OpType.Validate(); err != nil {
+				t.Fatalf("decoded entry %d has invalid op type: %v", i, err)
+			}
+			if !bytes.Equal(entries[i].UserKey(), entries[i].Key.UserKey) {
+				t.Fatalf("decoded entry %d UserKey() mismatch", i)
+			}
+			if i > 0 {
+				if binary.CompareInternalKey(entries[i-1].Key, entries[i].Key) >= 0 {
+					t.Fatalf("decoded index contains non-increasing keys: %v >= %v", entries[i-1].Key, entries[i].Key)
+				}
 			}
 		}
 
@@ -110,9 +122,11 @@ func FuzzBlockIndex_Decode(f *testing.F) {
 			}
 		}
 
-		// Invariant: FindBlock must execute without panic
+		// Invariant: FindBlock, FindBlockKey, FindBlockInternalKey must execute without panic
 		if entryCount > 0 {
-			_, _ = idx.FindBlock(entries[0].LargestKey)
+			_, _ = idx.FindBlock(entries[0].UserKey())
+			_, _ = idx.FindBlockKey(entries[0].Key)
+			_, _ = idx.FindBlockInternalKey(entries[0].LargestKey)
 			_, _ = idx.FindBlock([]byte("arbitrary-search-key"))
 		}
 	})

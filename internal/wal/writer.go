@@ -60,10 +60,12 @@ func SegmentPath(dbPath string, id uint64) string {
 //     Owns the underlying *os.File descriptor. Close() flushes uncommitted buffers, invokes the
 //     durability barrier, and closes the descriptor cleanly.
 type WALWriter struct {
-	mu     sync.Mutex
-	file   *os.File
-	path   string
-	closed bool
+	mu        sync.Mutex
+	file      *os.File
+	path      string
+	closed    bool
+	poisoned  bool
+	poisonErr error
 
 	// Internal test seams for deterministic fault injection
 	syncFn  func(f *os.File) error
@@ -220,6 +222,33 @@ func (w *WALWriter) Path() string {
 	return w.path
 }
 
+// poisonLocked transitions the writer into an unrecoverable error state,
+// preserving the first root-cause I/O or sync error.
+// Must be called with w.mu held.
+func (w *WALWriter) poisonLocked(err error) {
+	if !w.poisoned {
+		w.poisoned = true
+		w.poisonErr = err
+	}
+}
+
+func (w *WALWriter) checkPoisonLocked() error {
+	if w.poisoned {
+		return &errors.WALWriterPoisonedError{
+			Path:   w.path,
+			Reason: w.poisonErr,
+		}
+	}
+	return nil
+}
+
+// IsPoisoned reports whether the writer has entered the poisoned state due to a write or sync failure.
+func (w *WALWriter) IsPoisoned() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.poisoned
+}
+
 // Size returns the current physical byte length of the segment file.
 func (w *WALWriter) Size() (int64, error) {
 	w.mu.Lock()
@@ -227,6 +256,9 @@ func (w *WALWriter) Size() (int64, error) {
 
 	if w.closed {
 		return 0, errors.ErrWriterClosed
+	}
+	if err := w.checkPoisonLocked(); err != nil {
+		return 0, err
 	}
 
 	info, err := w.file.Stat()
@@ -248,6 +280,19 @@ func (w *WALWriter) Close() error {
 	}
 	w.closed = true
 
+	// If writer was poisoned, skip durability sync to avoid further corruption,
+	// ensure descriptor is closed cleanly to prevent resource leak,
+	// and propagate the poisoning error.
+	if w.poisoned {
+		if w.file != nil {
+			_ = w.file.Close()
+		}
+		return &errors.WALWriterPoisonedError{
+			Path:   w.path,
+			Reason: w.poisonErr,
+		}
+	}
+
 	// Best-effort flush and sync before closing descriptor
 	syncErr := w.syncFn(w.file)
 	closeErr := w.file.Close()
@@ -267,8 +312,9 @@ func (w *WALWriter) Close() error {
 //
 // Invariants:
 //   - If the writer is closed, returns errors.ErrWriterClosed.
+//   - If the writer is poisoned, returns errors.ErrWriterPoisoned.
 //   - If rec.Validate() fails, returns the validation error without modifying the file.
-//   - If write fails or produces a short write, returns an error.
+//   - If write fails or produces a short write, poisons the writer and returns an error.
 //   - Does NOT guarantee durability on non-volatile storage until Sync() is called.
 //   - Caller's rec.Key and rec.Value slices are never mutated.
 //   - Concurrent invocations are serialized by an internal mutex to prevent record interleaving.
@@ -279,6 +325,9 @@ func (w *WALWriter) Append(rec Record) error {
 	if w.closed {
 		return errors.ErrWriterClosed
 	}
+	if err := w.checkPoisonLocked(); err != nil {
+		return err
+	}
 
 	return w.appendLocked(rec)
 }
@@ -288,6 +337,8 @@ func (w *WALWriter) Append(rec Record) error {
 //
 // Invariants:
 //   - If the writer is closed, returns errors.ErrWriterClosed.
+//   - If the writer is poisoned, returns errors.ErrWriterPoisoned.
+//   - If fdatasync fails, poisons the writer and returns an error.
 //   - Returns nil if fdatasync succeeds.
 //   - Thread-safe under concurrent callers.
 func (w *WALWriter) Sync() error {
@@ -296,6 +347,9 @@ func (w *WALWriter) Sync() error {
 
 	if w.closed {
 		return errors.ErrWriterClosed
+	}
+	if err := w.checkPoisonLocked(); err != nil {
+		return err
 	}
 
 	return w.syncLocked()
@@ -321,10 +375,14 @@ func (w *WALWriter) appendLocked(rec Record) error {
 			written += n
 		}
 		if writeErr != nil {
-			return fmt.Errorf("wal: write failed after %d/%d bytes: %w", written, len(buf), writeErr)
+			err := fmt.Errorf("wal: write failed after %d/%d bytes: %w", written, len(buf), writeErr)
+			w.poisonLocked(err)
+			return err
 		}
 		if n == 0 {
-			return fmt.Errorf("wal: short write with 0 bytes after %d/%d bytes: %w", written, len(buf), io.ErrShortWrite)
+			err := fmt.Errorf("wal: short write with 0 bytes after %d/%d bytes: %w", written, len(buf), io.ErrShortWrite)
+			w.poisonLocked(err)
+			return err
 		}
 	}
 
@@ -334,7 +392,9 @@ func (w *WALWriter) appendLocked(rec Record) error {
 func (w *WALWriter) syncLocked() error {
 	// Durability barrier: flush data to non-volatile storage
 	if syncErr := w.syncFn(w.file); syncErr != nil {
-		return fmt.Errorf("wal: sync failed: %w", syncErr)
+		err := fmt.Errorf("wal: sync failed: %w", syncErr)
+		w.poisonLocked(err)
+		return err
 	}
 	return nil
 }
@@ -345,9 +405,10 @@ func (w *WALWriter) syncLocked() error {
 // Return Contract:
 //   - Returns nil if and only if all bytes were written AND fdatasync succeeded.
 //   - If the writer is closed, returns errors.ErrWriterClosed.
+//   - If the writer is poisoned, returns errors.ErrWriterPoisoned.
 //   - If rec.Validate() fails, returns the validation error without modifying the file.
-//   - If write fails or produces a short write, returns an error.
-//   - If fdatasync fails, returns the synchronization error.
+//   - If write fails or produces a short write, poisons the writer and returns an error.
+//   - If fdatasync fails, poisons the writer and returns the synchronization error.
 //   - Caller's rec.Key and rec.Value slices are never mutated.
 //   - Concurrent invocations are serialized by an internal mutex to prevent record interleaving.
 func (w *WALWriter) AppendSync(rec Record) error {
@@ -356,6 +417,9 @@ func (w *WALWriter) AppendSync(rec Record) error {
 
 	if w.closed {
 		return errors.ErrWriterClosed
+	}
+	if err := w.checkPoisonLocked(); err != nil {
+		return err
 	}
 
 	if err := w.appendLocked(rec); err != nil {

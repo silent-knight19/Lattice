@@ -49,7 +49,7 @@ func FuzzTableWriter(f *testing.F) {
 		writer, err := sstable.NewTableWriter(sstPath, sstable.TableWriterOptions{
 			TargetBlockSize: 256, // small target to stress block boundary crossing
 			RestartInterval: 4,
-			FileMode:        0644,
+			FileMode:        sstable.DefaultFileMode,
 		})
 		if err != nil {
 			return

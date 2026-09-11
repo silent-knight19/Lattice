@@ -24,6 +24,16 @@ const (
 
 	// BlockTrailerSize is the serialized byte length of the CRC32-IEEE checksum trailer.
 	BlockTrailerSize = 4
+
+	// MaxDataBlockSize is the maximum allowable physical byte size for an uncompressed
+	// SSTable data block on disk (8 MiB). Any BlockHandle advertising a Size exceeding
+	// this ceiling is rejected immediately prior to buffer allocation to prevent memory exhaustion DoS.
+	MaxDataBlockSize = 8 * 1024 * 1024
+
+	// MaxIndexBlockSize is the maximum allowable physical byte size for an SSTable
+	// sparse index block on disk (8 MiB). Any BlockHandle advertising a Size exceeding
+	// this ceiling is rejected immediately prior to buffer allocation to prevent memory exhaustion DoS.
+	MaxIndexBlockSize = 8 * 1024 * 1024
 )
 
 // BlockBuilder constructs prefix-compressed SSTable data blocks from consecutive sorted records.

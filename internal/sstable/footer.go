@@ -163,6 +163,20 @@ func (f Footer) ValidateAgainstFileSize(fileSize int64) error {
 	}
 
 	limit := uint64(fileSize) - FooterSize
+	if f.MetaIndexHandle.Size > MaxIndexBlockSize {
+		return &errors.InvalidBlockHandleError{
+			Offset: f.MetaIndexHandle.Offset,
+			Size:   f.MetaIndexHandle.Size,
+			Reason: "metaindex handle size exceeds MaxIndexBlockSize",
+		}
+	}
+	if f.IndexHandle.Size > MaxIndexBlockSize {
+		return &errors.InvalidBlockHandleError{
+			Offset: f.IndexHandle.Offset,
+			Size:   f.IndexHandle.Size,
+			Reason: "index handle size exceeds MaxIndexBlockSize",
+		}
+	}
 	if f.MetaIndexHandle.Offset+f.MetaIndexHandle.Size > limit {
 		return &errors.InvalidBlockHandleError{
 			Offset: f.MetaIndexHandle.Offset,

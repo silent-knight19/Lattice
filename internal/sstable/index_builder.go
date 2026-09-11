@@ -2,6 +2,7 @@ package sstable
 
 import (
 	"bytes"
+	"fmt"
 	"math"
 	"sort"
 
@@ -17,8 +18,10 @@ const (
 
 // IndexEntry represents a single mapping in an SSTable sparse block index,
 // pairing the largest key contained in a data block with its physical BlockHandle.
+// Every LargestKey is guaranteed to be a valid, canonical encoded binary.InternalKey.
 type IndexEntry struct {
 	LargestKey []byte
+	Key        binary.InternalKey
 	Handle     BlockHandle
 }
 
@@ -27,6 +30,7 @@ func (e IndexEntry) Clone() IndexEntry {
 	if e.LargestKey == nil {
 		return IndexEntry{
 			LargestKey: nil,
+			Key:        e.Key.Clone(),
 			Handle:     e.Handle,
 		}
 	}
@@ -34,19 +38,16 @@ func (e IndexEntry) Clone() IndexEntry {
 	copy(k, e.LargestKey)
 	return IndexEntry{
 		LargestKey: k,
+		Key:        e.Key.Clone(),
 		Handle:     e.Handle,
 	}
 }
 
 // UserKey returns the bare user key portion of LargestKey.
-// If LargestKey is an encoded InternalKey, it extracts ik.UserKey.
-// Otherwise, it returns LargestKey as-is.
+// Since LargestKey is guaranteed to be a valid InternalKey, it returns e.Key.UserKey directly
+// without runtime guessing or fallback heuristics.
 func (e IndexEntry) UserKey() []byte {
-	ik, err := binary.DecodeInternalKey(e.LargestKey)
-	if err == nil {
-		return ik.UserKey
-	}
-	return e.LargestKey
+	return e.Key.UserKey
 }
 
 // IndexBuilder constructs the sparse Two-Level Block Index for an SSTable.
@@ -108,8 +109,8 @@ func NewIndexBuilder() *IndexBuilder {
 // AddBlock records an index entry for an emitted data block.
 //
 // Contract:
-//   - largestKey must be non-empty (1..65,535 bytes).
-//   - largestKey must sort strictly after the previous block's largest key.
+//   - largestKey must be a valid encoded binary.InternalKey (1..65,535 bytes UserKey + 9-byte trailer).
+//   - largestKey must sort strictly after the previous block's largest key (UserKey ASC, SeqNum DESC, OpType DESC).
 //   - handle must be valid (Size > 0 and Offset + Size does not overflow uint64).
 //   - If the builder has already been finished, returns errors.ErrIndexFinished.
 //   - Guarantees failure atomicity: failed AddBlock calls leave builder state completely untouched.
@@ -132,13 +133,17 @@ func (b *IndexBuilder) AddBlock(largestKey []byte, handle BlockHandle) error {
 	if err := handle.Validate(); err != nil {
 		return err
 	}
+	ik, err := binary.DecodeInternalKey(largestKey)
+	if err != nil {
+		return err
+	}
 
 	// Canonical ordering check
 	if len(b.entries) > 0 {
-		if compareIndexEntryKeys(b.prevKey, largestKey) >= 0 {
+		if binary.CompareInternalKey(b.entries[len(b.entries)-1].Key, ik) >= 0 {
 			return &errors.KeyOutOfOrderError{
-				PrevKeyLen: len(b.prevKey),
-				CurrKeyLen: len(largestKey),
+				PrevKeyLen: len(b.entries[len(b.entries)-1].Key.UserKey),
+				CurrKeyLen: len(ik.UserKey),
 			}
 		}
 	}
@@ -170,6 +175,7 @@ func (b *IndexBuilder) AddBlock(largestKey []byte, handle BlockHandle) error {
 	copy(keyCopy, largestKey)
 	b.entries = append(b.entries, IndexEntry{
 		LargestKey: keyCopy,
+		Key:        ik,
 		Handle:     handle,
 	})
 
@@ -179,10 +185,16 @@ func (b *IndexBuilder) AddBlock(largestKey []byte, handle BlockHandle) error {
 }
 
 // AddBlockKey is a convenience method that appends an index entry using an InternalKey struct.
-// The key is encoded via binary.AppendInternalKey and delegated to AddBlock.
+// The key is validated, encoded via binary.AppendInternalKey, and delegated to AddBlock.
 func (b *IndexBuilder) AddBlockKey(key binary.InternalKey, handle BlockHandle) error {
 	if b == nil {
 		return errors.ErrNilReceiver
+	}
+	if err := binary.ValidateKey(key.UserKey); err != nil {
+		return err
+	}
+	if err := key.OpType.Validate(); err != nil {
+		return err
 	}
 	b.scratchKey = binary.AppendInternalKey(b.scratchKey[:0], key)
 	return b.AddBlock(b.scratchKey, handle)
@@ -317,11 +329,7 @@ func (b *IndexBuilder) FindBlockKey(key binary.InternalKey) (BlockHandle, bool) 
 		return BlockHandle{}, false
 	}
 	idx := sort.Search(len(b.entries), func(i int) bool {
-		entryIK, err := binary.DecodeInternalKey(b.entries[i].LargestKey)
-		if err != nil {
-			return bytes.Compare(b.entries[i].LargestKey, key.UserKey) >= 0
-		}
-		return binary.CompareInternalKey(entryIK, key) >= 0
+		return binary.CompareInternalKey(b.entries[i].Key, key) >= 0
 	})
 	if idx >= len(b.entries) {
 		return BlockHandle{}, false
@@ -334,7 +342,7 @@ func (b *IndexBuilder) FindBlockKey(key binary.InternalKey) (BlockHandle, bool) 
 func (b *IndexBuilder) FindBlockInternalKey(targetInternalKey []byte) (BlockHandle, bool) {
 	ik, err := binary.DecodeInternalKey(targetInternalKey)
 	if err != nil {
-		return b.FindBlock(targetInternalKey)
+		return BlockHandle{}, false
 	}
 	return b.FindBlockKey(ik)
 }
@@ -454,6 +462,13 @@ func DecodeBlockIndex(data []byte) (*BlockIndex, error) {
 		keyBytes := entrySlice[n : n+int(keyLen)]
 		handleBytes := entrySlice[n+int(keyLen):]
 
+		ik, err := binary.DecodeInternalKey(keyBytes)
+		if err != nil {
+			return nil, &errors.IndexBlockCorruptedError{
+				Reason: fmt.Sprintf("invalid internal key in index entry: %v", err),
+			}
+		}
+
 		handle, err := DecodeBlockHandle(handleBytes)
 		if err != nil {
 			return nil, err
@@ -461,7 +476,7 @@ func DecodeBlockIndex(data []byte) (*BlockIndex, error) {
 
 		// Strictly increasing key order verification
 		if i > 0 {
-			if compareIndexEntryKeys(entries[i-1].LargestKey, keyBytes) >= 0 {
+			if binary.CompareInternalKey(entries[i-1].Key, ik) >= 0 {
 				return nil, &errors.IndexBlockCorruptedError{Reason: "index entries violate strictly increasing key ordering"}
 			}
 		}
@@ -470,6 +485,7 @@ func DecodeBlockIndex(data []byte) (*BlockIndex, error) {
 		copy(keyCopy, keyBytes)
 		entries[i] = IndexEntry{
 			LargestKey: keyCopy,
+			Key:        ik,
 			Handle:     handle,
 		}
 	}
@@ -530,11 +546,7 @@ func (idx *BlockIndex) FindBlockKey(key binary.InternalKey) (BlockHandle, bool) 
 		return BlockHandle{}, false
 	}
 	searchIdx := sort.Search(len(idx.entries), func(i int) bool {
-		entryIK, err := binary.DecodeInternalKey(idx.entries[i].LargestKey)
-		if err != nil {
-			return bytes.Compare(idx.entries[i].LargestKey, key.UserKey) >= 0
-		}
-		return binary.CompareInternalKey(entryIK, key) >= 0
+		return binary.CompareInternalKey(idx.entries[i].Key, key) >= 0
 	})
 	if searchIdx >= len(idx.entries) {
 		return BlockHandle{}, false
@@ -546,17 +558,7 @@ func (idx *BlockIndex) FindBlockKey(key binary.InternalKey) (BlockHandle, bool) 
 func (idx *BlockIndex) FindBlockInternalKey(targetInternalKey []byte) (BlockHandle, bool) {
 	ik, err := binary.DecodeInternalKey(targetInternalKey)
 	if err != nil {
-		return idx.FindBlock(targetInternalKey)
+		return BlockHandle{}, false
 	}
 	return idx.FindBlockKey(ik)
-}
-
-// compareIndexEntryKeys compares two index entry largest keys for strictly monotonic ordering.
-func compareIndexEntryKeys(a, b []byte) int {
-	ikA, errA := binary.DecodeInternalKey(a)
-	ikB, errB := binary.DecodeInternalKey(b)
-	if errA == nil && errB == nil {
-		return binary.CompareInternalKey(ikA, ikB)
-	}
-	return bytes.Compare(a, b)
 }

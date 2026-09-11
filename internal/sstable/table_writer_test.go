@@ -504,7 +504,7 @@ func TestTableWriter_BuildFromMemTableIterator(t *testing.T) {
 	writer, err := sstable.NewTableWriter(sstPath, sstable.TableWriterOptions{
 		TargetBlockSize: 1024,
 		RestartInterval: 16,
-		FileMode:        0644,
+		FileMode:        sstable.DefaultFileMode,
 	})
 	if err != nil {
 		t.Fatalf("NewTableWriter failed: %v", err)

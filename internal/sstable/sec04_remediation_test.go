@@ -4,8 +4,10 @@ import (
 	"bytes"
 	stdErrors "errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 
@@ -446,4 +448,731 @@ func TestSecurity_Remediation6_InternalKeyRedaction(t *testing.T) {
 	if !bytes.Contains([]byte(debugStr), secretKey) {
 		t.Fatalf("DebugString expected to contain key, got %q", debugStr)
 	}
+}
+
+// TestSecurity_Remediation1_DecodeBlockIndex_MalformedKeys tests that DecodeBlockIndex
+// strictly rejects malformed, truncated, or invalid InternalKeys.
+func TestSecurity_Remediation1_DecodeBlockIndex_MalformedKeys(t *testing.T) {
+	// Helper to build a minimal index block with given raw keys and handles
+	buildRawIndexBlock := func(keys [][]byte, handles []sstable.BlockHandle) []byte {
+		var buf []byte
+		restarts := make([]uint32, len(keys))
+		for i, k := range keys {
+			restarts[i] = uint32(len(buf))
+			var klenBuf [10]byte
+			n := binary.PutVarint64(klenBuf[:], uint64(len(k)))
+			buf = append(buf, klenBuf[:n]...)
+			buf = append(buf, k...)
+			buf = handles[i].AppendTo(buf)
+		}
+		for _, r := range restarts {
+			var rBuf [4]byte
+			binary.PutUint32(rBuf[:], r)
+			buf = append(buf, rBuf[:]...)
+		}
+		var numRestartsBuf [4]byte
+		binary.PutUint32(numRestartsBuf[:], uint32(len(restarts)))
+		buf = append(buf, numRestartsBuf[:]...)
+		checksum := binary.Checksum(buf)
+		var crcBuf [4]byte
+		binary.PutUint32(crcBuf[:], checksum)
+		buf = append(buf, crcBuf[:]...)
+		return buf
+	}
+
+	validIK, err := binary.NewInternalKey([]byte("valid-user-key"), 100, binary.OpTypePut)
+	if err != nil {
+		t.Fatalf("NewInternalKey failed: %v", err)
+	}
+	validEncoded := binary.EncodeInternalKey(validIK)
+
+	h1 := sstable.BlockHandle{Offset: 0, Size: 100}
+	h2 := sstable.BlockHandle{Offset: 100, Size: 100}
+
+	t.Run("ValidIndexDecodesSuccessfully", func(t *testing.T) {
+		blockData := buildRawIndexBlock([][]byte{validEncoded}, []sstable.BlockHandle{h1})
+		idx, err := sstable.DecodeBlockIndex(blockData)
+		if err != nil {
+			t.Fatalf("DecodeBlockIndex failed on valid index: %v", err)
+		}
+		if idx.EntryCount() != 1 {
+			t.Fatalf("expected 1 entry, got %d", idx.EntryCount())
+		}
+		entries := idx.Entries()
+		if !bytes.Equal(entries[0].UserKey(), []byte("valid-user-key")) {
+			t.Fatalf("user key mismatch: got %q", entries[0].UserKey())
+		}
+	})
+
+	t.Run("TruncatedInternalKey_LessThan9Bytes", func(t *testing.T) {
+		shortKey := []byte("short") // 5 bytes < 9
+		blockData := buildRawIndexBlock([][]byte{shortKey}, []sstable.BlockHandle{h1})
+		_, err := sstable.DecodeBlockIndex(blockData)
+		if err == nil {
+			t.Fatal("expected error decoding index with truncated key, got nil")
+		}
+		if !stdErrors.Is(err, errors.ErrIndexBlockCorrupted) {
+			t.Fatalf("expected ErrIndexBlockCorrupted, got %v", err)
+		}
+	})
+
+	t.Run("InvalidOpTypeInInternalKey", func(t *testing.T) {
+		// Valid length (10 bytes: 1 byte key + 8 byte seq + 1 byte invalid op)
+		badOpKey := append([]byte("k"), 0, 0, 0, 0, 0, 0, 0, 1, 0x99)
+		blockData := buildRawIndexBlock([][]byte{badOpKey}, []sstable.BlockHandle{h1})
+		_, err := sstable.DecodeBlockIndex(blockData)
+		if err == nil {
+			t.Fatal("expected error decoding index with invalid op type, got nil")
+		}
+		if !stdErrors.Is(err, errors.ErrIndexBlockCorrupted) {
+			t.Fatalf("expected ErrIndexBlockCorrupted, got %v", err)
+		}
+	})
+
+	t.Run("EmptyUserKeyInInternalKey", func(t *testing.T) {
+		// Exactly 9 bytes: empty user key + 8 byte seq + 1 byte op
+		emptyUserKeyIK := []byte{0, 0, 0, 0, 0, 0, 0, 1, byte(binary.OpTypePut)}
+		blockData := buildRawIndexBlock([][]byte{emptyUserKeyIK}, []sstable.BlockHandle{h1})
+		_, err := sstable.DecodeBlockIndex(blockData)
+		if err == nil {
+			t.Fatal("expected error decoding index with empty user key, got nil")
+		}
+		if !stdErrors.Is(err, errors.ErrIndexBlockCorrupted) {
+			t.Fatalf("expected ErrIndexBlockCorrupted, got %v", err)
+		}
+	})
+
+	t.Run("NonMonotonicInternalKeys", func(t *testing.T) {
+		ikA, _ := binary.NewInternalKey([]byte("key-z"), 100, binary.OpTypePut)
+		ikB, _ := binary.NewInternalKey([]byte("key-a"), 100, binary.OpTypePut)
+		// ikA > ikB, violates strict monotonic ordering
+		blockData := buildRawIndexBlock([][]byte{binary.EncodeInternalKey(ikA), binary.EncodeInternalKey(ikB)}, []sstable.BlockHandle{h1, h2})
+		_, err := sstable.DecodeBlockIndex(blockData)
+		if err == nil {
+			t.Fatal("expected error for non-monotonic index keys, got nil")
+		}
+		if !stdErrors.Is(err, errors.ErrIndexBlockCorrupted) {
+			t.Fatalf("expected ErrIndexBlockCorrupted, got %v", err)
+		}
+	})
+
+	t.Run("EqualInternalKeys", func(t *testing.T) {
+		// Duplicate largest keys in adjacent blocks violate strict ordering
+		blockData := buildRawIndexBlock([][]byte{validEncoded, validEncoded}, []sstable.BlockHandle{h1, h2})
+		_, err := sstable.DecodeBlockIndex(blockData)
+		if err == nil {
+			t.Fatal("expected error for duplicate index keys, got nil")
+		}
+		if !stdErrors.Is(err, errors.ErrIndexBlockCorrupted) {
+			t.Fatalf("expected ErrIndexBlockCorrupted, got %v", err)
+		}
+	})
+}
+
+// TestSecurity_Remediation1_IndexBuilder_AddBlock_Validation verifies that IndexBuilder
+// rejects invalid keys before state mutation and preserves failure atomicity.
+func TestSecurity_Remediation1_IndexBuilder_AddBlock_Validation(t *testing.T) {
+	builder := sstable.NewIndexBuilder()
+	h := sstable.BlockHandle{Offset: 0, Size: 100}
+
+	// Attempt adding truncated key
+	err := builder.AddBlock([]byte("short"), h)
+	if err == nil {
+		t.Fatal("expected error for truncated key, got nil")
+	}
+	if builder.EntryCount() != 0 {
+		t.Fatalf("EntryCount mutated after failed AddBlock: got %d, want 0", builder.EntryCount())
+	}
+
+	// Attempt adding invalid op type
+	badOpKey := append([]byte("k"), 0, 0, 0, 0, 0, 0, 0, 1, 0xFF)
+	err = builder.AddBlock(badOpKey, h)
+	if err == nil {
+		t.Fatal("expected error for invalid op type, got nil")
+	}
+	if builder.EntryCount() != 0 {
+		t.Fatalf("EntryCount mutated after failed AddBlock: got %d, want 0", builder.EntryCount())
+	}
+
+	// Valid add succeeds
+	validIK, _ := binary.NewInternalKey([]byte("valid-k"), 10, binary.OpTypePut)
+	err = builder.AddBlock(binary.EncodeInternalKey(validIK), h)
+	if err != nil {
+		t.Fatalf("expected AddBlock to succeed, got %v", err)
+	}
+	if builder.EntryCount() != 1 {
+		t.Fatalf("EntryCount mismatch: got %d, want 1", builder.EntryCount())
+	}
+
+	// Adding a smaller or equal key violates monotonic ordering and preserves atomicity
+	smallerIK, _ := binary.NewInternalKey([]byte("aaa"), 10, binary.OpTypePut)
+	h2 := sstable.BlockHandle{Offset: 100, Size: 100}
+	err = builder.AddBlock(binary.EncodeInternalKey(smallerIK), h2)
+	if err == nil {
+		t.Fatal("expected error for non-monotonic key, got nil")
+	}
+	if !stdErrors.Is(err, errors.ErrKeyOutOfOrder) {
+		t.Fatalf("expected ErrKeyOutOfOrder, got %v", err)
+	}
+	if builder.EntryCount() != 1 {
+		t.Fatalf("EntryCount mutated after non-monotonic AddBlock: got %d, want 1", builder.EntryCount())
+	}
+}
+
+// TestSecurity_Remediation1_PropertyInvariant_DecodedKeysAreInternalKeys verifies the property:
+// Any successfully decoded BlockIndex contains ONLY valid, canonical InternalKeys.
+func TestSecurity_Remediation1_PropertyInvariant_DecodedKeysAreInternalKeys(t *testing.T) {
+	dir := t.TempDir()
+	sstPath := filepath.Join(dir, "property_test.sst")
+
+	opts := sstable.DefaultTableWriterOptions()
+	opts.TargetBlockSize = 256
+	writer, err := sstable.NewTableWriter(sstPath, opts)
+	if err != nil {
+		t.Fatalf("NewTableWriter failed: %v", err)
+	}
+
+	// Write multiple entries across multiple blocks
+	for i := 0; i < 50; i++ {
+		keyStr := fmt.Sprintf("property-user-key-%04d", i)
+		ik, _ := binary.NewInternalKey([]byte(keyStr), binary.SeqNum(i+1), binary.OpTypePut)
+		if err := writer.Add(ik, []byte("value-payload")); err != nil {
+			t.Fatalf("Add failed: %v", err)
+		}
+	}
+	_, err = writer.Finish()
+	if err != nil {
+		t.Fatalf("Finish failed: %v", err)
+	}
+
+	// Read table and inspect its index
+	f, err := os.Open(sstPath)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	reader, err := sstable.NewTableReaderWithFile(f)
+	if err != nil {
+		t.Fatalf("NewTableReaderWithFile failed: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+
+	idx := reader.Index()
+	if idx == nil || idx.EntryCount() == 0 {
+		t.Fatal("expected non-empty index")
+	}
+
+	// Verify property: every stored index key is a valid InternalKey
+	var prevIK *binary.InternalKey
+	entries := idx.Entries()
+	for i := 0; i < len(entries); i++ {
+		entry := entries[i]
+		// 1. Structure must be valid
+		if len(entry.Key.UserKey) == 0 {
+			t.Fatalf("entry %d has empty user key", i)
+		}
+		if entry.Key.OpType != binary.OpTypePut && entry.Key.OpType != binary.OpTypeDelete {
+			t.Fatalf("entry %d has invalid op type %v", i, entry.Key.OpType)
+		}
+		// 2. UserKey() must match entry.Key.UserKey
+		if !bytes.Equal(entry.UserKey(), entry.Key.UserKey) {
+			t.Fatalf("entry %d UserKey() mismatch", i)
+		}
+		// 3. Monotonic ordering must hold
+		if prevIK != nil {
+			if binary.CompareInternalKey(*prevIK, entry.Key) >= 0 {
+				t.Fatalf("index entries %d and %d not strictly monotonic", i-1, i)
+			}
+		}
+		curr := entry.Key
+		prevIK = &curr
+	}
+}
+
+// TestSecurity_Remediation2_AllocationLimits tests that memory allocation bounds
+// are strictly enforced for both index blocks and data blocks BEFORE allocation.
+func TestSecurity_Remediation2_AllocationLimits(t *testing.T) {
+	dir := t.TempDir()
+	sstPath := filepath.Join(dir, "alloc_limit_test.sst")
+
+	// Create a valid small SSTable
+	opts := sstable.DefaultTableWriterOptions()
+	writer, err := sstable.NewTableWriter(sstPath, opts)
+	if err != nil {
+		t.Fatalf("NewTableWriter failed: %v", err)
+	}
+
+	ik, _ := binary.NewInternalKey([]byte("key-001"), 1, binary.OpTypePut)
+	if err := writer.Add(ik, []byte("value-001")); err != nil {
+		t.Fatalf("Add failed: %v", err)
+	}
+	_, err = writer.Finish()
+	if err != nil {
+		t.Fatalf("Finish failed: %v", err)
+	}
+
+	rawBytes, err := os.ReadFile(sstPath)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+
+	t.Run("IndexBlockExceedsMaxIndexBlockSize", func(t *testing.T) {
+		// Tamper with footer: set IndexHandle.Size to MaxIndexBlockSize + 1
+		tampered := make([]byte, len(rawBytes))
+		copy(tampered, rawBytes)
+
+		footerOffset := len(tampered) - sstable.FooterSize
+		footerBytes := tampered[footerOffset:]
+
+		var footer sstable.Footer
+		if err := footer.Decode(footerBytes); err != nil {
+			t.Fatalf("Decode failed: %v", err)
+		}
+
+		// Create a handle with size > MaxIndexBlockSize
+		tooBigHandle := sstable.BlockHandle{Offset: footer.IndexHandle.Offset, Size: sstable.MaxIndexBlockSize + 1}
+		badFooter := sstable.Footer{IndexHandle: tooBigHandle, MetaIndexHandle: footer.MetaIndexHandle}
+		enc := badFooter.Encode()
+		copy(tampered[footerOffset:], enc[:])
+
+		// Pad file so file size doesn't immediately fail before checking MaxIndexBlockSize
+		padded := make([]byte, len(tampered)+int(sstable.MaxIndexBlockSize)+1024)
+		copy(padded, tampered[:footerOffset])
+		copy(padded[len(padded)-sstable.FooterSize:], enc[:])
+
+		tmpFile := filepath.Join(dir, "oversized_index.sst")
+		if err := os.WriteFile(tmpFile, padded, 0600); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+		defer func() { _ = os.Remove(tmpFile) }()
+
+		f, err := os.Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer func() { _ = f.Close() }()
+
+		var memBefore runtime.MemStats
+		runtime.ReadMemStats(&memBefore)
+
+		_, err = sstable.NewTableReaderWithFile(f)
+		if err == nil {
+			t.Fatal("expected error for oversized index block, got nil")
+		}
+		if !stdErrors.Is(err, errors.ErrInvalidBlockHandle) {
+			t.Fatalf("expected ErrInvalidBlockHandle, got %v", err)
+		}
+
+		var memAfter runtime.MemStats
+		runtime.ReadMemStats(&memAfter)
+		// Ensure no huge 8+ MiB buffer was allocated
+		if memAfter.TotalAlloc-memBefore.TotalAlloc > 4*1024*1024 {
+			t.Fatalf("excessive memory allocated before rejection: %d bytes", memAfter.TotalAlloc-memBefore.TotalAlloc)
+		}
+	})
+
+	t.Run("IndexBlockHandleHugeUint64", func(t *testing.T) {
+		tampered := make([]byte, len(rawBytes))
+		copy(tampered, rawBytes)
+		footerOffset := len(tampered) - sstable.FooterSize
+		footerBytes := tampered[footerOffset:]
+		var footer sstable.Footer
+		if err := footer.Decode(footerBytes); err != nil {
+			t.Fatalf("Decode failed: %v", err)
+		}
+
+		hugeHandle := sstable.BlockHandle{Offset: 0, Size: math.MaxUint64}
+		badFooter := sstable.Footer{IndexHandle: hugeHandle, MetaIndexHandle: footer.MetaIndexHandle}
+		enc := badFooter.Encode()
+		copy(tampered[footerOffset:], enc[:])
+
+		tmpFile := filepath.Join(dir, "huge_uint64_index.sst")
+		if err := os.WriteFile(tmpFile, tampered, 0600); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+		defer func() { _ = os.Remove(tmpFile) }()
+
+		f, err := os.Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer func() { _ = f.Close() }()
+
+		_, err = sstable.NewTableReaderWithFile(f)
+		if err == nil {
+			t.Fatal("expected error for MaxUint64 index handle, got nil")
+		}
+		if !stdErrors.Is(err, errors.ErrInvalidBlockHandle) {
+			t.Fatalf("expected ErrInvalidBlockHandle, got %v", err)
+		}
+	})
+
+	t.Run("DataBlockExceedsMaxDataBlockSize", func(t *testing.T) {
+		// Build raw index block containing a handle that claims size = MaxDataBlockSize + 1
+		ikValid, _ := binary.NewInternalKey([]byte("zzz"), 10, binary.OpTypePut)
+		oversizedHandle := sstable.BlockHandle{Offset: 0, Size: sstable.MaxDataBlockSize + 1}
+
+		// Helper to build index bytes
+		var buf []byte
+		var klenBuf [10]byte
+		encodedKey := binary.EncodeInternalKey(ikValid)
+		n := binary.PutVarint64(klenBuf[:], uint64(len(encodedKey)))
+		buf = append(buf, klenBuf[:n]...)
+		buf = append(buf, encodedKey...)
+		buf = oversizedHandle.AppendTo(buf)
+
+		// Restart
+		var rBuf [4]byte
+		binary.PutUint32(rBuf[:], 0)
+		buf = append(buf, rBuf[:]...)
+		// Num restarts
+		binary.PutUint32(rBuf[:], 1)
+		buf = append(buf, rBuf[:]...)
+		// CRC
+		checksum := binary.Checksum(buf)
+		binary.PutUint32(rBuf[:], checksum)
+		buf = append(buf, rBuf[:]...)
+
+		// Construct an SSTable file with this index block
+		var fileBuf bytes.Buffer
+		fileBuf.WriteString("minimal-data-block")
+		indexOffset := uint64(fileBuf.Len())
+		fileBuf.Write(buf)
+		indexSize := uint64(len(buf))
+
+		idxHandle := sstable.BlockHandle{Offset: indexOffset, Size: indexSize}
+		metaHandle := sstable.BlockHandle{Offset: 0, Size: 1} // Non-zero for valid footer
+		// Write dummy meta block
+		metaOffset := uint64(fileBuf.Len())
+		fileBuf.WriteString("meta")
+		metaHandle.Offset = metaOffset
+		metaHandle.Size = 4
+
+		footer := sstable.Footer{IndexHandle: idxHandle, MetaIndexHandle: metaHandle}
+		footerEnc := footer.Encode()
+		fileBuf.Write(footerEnc[:])
+
+		tmpFile := filepath.Join(dir, "oversized_data_block.sst")
+		if err := os.WriteFile(tmpFile, fileBuf.Bytes(), 0600); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+		defer func() { _ = os.Remove(tmpFile) }()
+
+		f, err := os.Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer func() { _ = f.Close() }()
+
+		reader, err := sstable.NewTableReaderWithFile(f)
+		if err != nil {
+			t.Fatalf("NewTableReaderWithFile failed: %v", err)
+		}
+		defer func() { _ = reader.Close() }()
+
+		// Calling Seek must encounter the oversized block handle and reject it BEFORE allocation
+		var memBefore runtime.MemStats
+		runtime.ReadMemStats(&memBefore)
+
+		_, err = reader.Seek([]byte("zzz"))
+		if err == nil {
+			t.Fatal("expected error seeking oversized data block, got nil")
+		}
+		if !stdErrors.Is(err, errors.ErrInvalidBlockHandle) {
+			t.Fatalf("expected ErrInvalidBlockHandle, got %v", err)
+		}
+
+		var memAfter runtime.MemStats
+		runtime.ReadMemStats(&memAfter)
+		if memAfter.TotalAlloc-memBefore.TotalAlloc > 4*1024*1024 {
+			t.Fatalf("excessive memory allocated during rejected Seek: %d bytes", memAfter.TotalAlloc-memBefore.TotalAlloc)
+		}
+	})
+}
+
+// TestSecurity_Remediation3_FilePermissions_Baseline tests that TableWriter enforces
+// owner-only file permissions and strictly rejects insecure modes (e.g. 0644, 0666, 0755, 0777).
+func TestSecurity_Remediation3_FilePermissions_Baseline(t *testing.T) {
+	dir := t.TempDir()
+
+	insecureModes := []os.FileMode{
+		0644, // Group/other readable
+		0666, // Group/other writable
+		0755, // Executable + group/other readable
+		0777, // World readable/writable/executable
+		0640, // Group readable
+		0604, // Other readable
+		0700, // Executable bit set
+	}
+
+	for _, mode := range insecureModes {
+		t.Run(fmt.Sprintf("RejectMode_%04o", mode), func(t *testing.T) {
+			sstPath := filepath.Join(dir, fmt.Sprintf("insecure_%04o.sst", mode))
+			opts := sstable.DefaultTableWriterOptions()
+			opts.FileMode = mode
+
+			_, err := sstable.NewTableWriter(sstPath, opts)
+			if err == nil {
+				t.Fatalf("expected NewTableWriter to reject mode %04o, but it succeeded", mode)
+			}
+			if !stdErrors.Is(err, errors.ErrInsecureFileMode) {
+				t.Fatalf("expected ErrInsecureFileMode, got %v", err)
+			}
+
+			// Ensure no destination file or temporary file remains
+			if _, err := os.Stat(sstPath); !os.IsNotExist(err) {
+				t.Fatalf("insecure file %s was created despite error", sstPath)
+			}
+			tmpPath := sstPath + ".tmp"
+			if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
+				t.Fatalf("staging file %s was left behind after error", tmpPath)
+			}
+		})
+	}
+
+	t.Run("DefaultAndExplicitOwnerOnlyAccepted", func(t *testing.T) {
+		validModes := []os.FileMode{
+			0,    // Default (0600)
+			0600, // Explicit owner read/write
+			0400, // Owner read-only
+		}
+
+		for _, mode := range validModes {
+			sstPath := filepath.Join(dir, fmt.Sprintf("secure_%04o.sst", mode))
+			opts := sstable.DefaultTableWriterOptions()
+			opts.FileMode = mode
+
+			writer, err := sstable.NewTableWriter(sstPath, opts)
+			if err != nil {
+				t.Fatalf("NewTableWriter failed for valid mode %04o: %v", mode, err)
+			}
+			ik, _ := binary.NewInternalKey([]byte("key"), 1, binary.OpTypePut)
+			_ = writer.Add(ik, []byte("val"))
+			_, err = writer.Finish()
+			if err != nil {
+				t.Fatalf("Finish failed: %v", err)
+			}
+
+			info, err := os.Stat(sstPath)
+			if err != nil {
+				t.Fatalf("Stat failed: %v", err)
+			}
+			perm := info.Mode().Perm()
+			// Must not have group or other bits set
+			if perm&0077 != 0 {
+				t.Fatalf("file %s has insecure permissions %04o", sstPath, perm)
+			}
+		}
+	})
+}
+
+// TestSecurity_Remediation1_FindBlock_Ordering verifies that FindBlock, FindBlockKey,
+// and FindBlockInternalKey adhere to canonical SSTable ordering invariants.
+func TestSecurity_Remediation1_FindBlock_Ordering(t *testing.T) {
+	builder := sstable.NewIndexBuilder()
+
+	// Block 1 largest: ("apple", seq=100, OpTypePut)
+	ik1, _ := binary.NewInternalKey([]byte("apple"), 100, binary.OpTypePut)
+	h1 := sstable.BlockHandle{Offset: 0, Size: 100}
+	if err := builder.AddBlock(binary.EncodeInternalKey(ik1), h1); err != nil {
+		t.Fatalf("AddBlock 1 failed: %v", err)
+	}
+
+	// Block 2 largest: ("banana", seq=50, OpTypeDelete)
+	ik2, _ := binary.NewInternalKey([]byte("banana"), 50, binary.OpTypeDelete)
+	h2 := sstable.BlockHandle{Offset: 100, Size: 100}
+	if err := builder.AddBlock(binary.EncodeInternalKey(ik2), h2); err != nil {
+		t.Fatalf("AddBlock 2 failed: %v", err)
+	}
+
+	// Block 3 largest: ("banana", seq=10, OpTypePut)
+	// Note: in LSM ordering, older seqnum (10) for same user key sorts AFTER newer seqnum (50)
+	ik3, _ := binary.NewInternalKey([]byte("banana"), 10, binary.OpTypePut)
+	h3 := sstable.BlockHandle{Offset: 200, Size: 100}
+	if err := builder.AddBlock(binary.EncodeInternalKey(ik3), h3); err != nil {
+		t.Fatalf("AddBlock 3 failed: %v", err)
+	}
+
+	// Block 4 largest: ("cherry", seq=200, OpTypePut)
+	ik4, _ := binary.NewInternalKey([]byte("cherry"), 200, binary.OpTypePut)
+	h4 := sstable.BlockHandle{Offset: 300, Size: 100}
+	if err := builder.AddBlock(binary.EncodeInternalKey(ik4), h4); err != nil {
+		t.Fatalf("AddBlock 4 failed: %v", err)
+	}
+
+	indexBytes := builder.Finish()
+	idx, err := sstable.DecodeBlockIndex(indexBytes)
+	if err != nil {
+		t.Fatalf("DecodeBlockIndex failed: %v", err)
+	}
+
+	t.Run("FindBlock_UserKeyLookup", func(t *testing.T) {
+		// Lookup "ant" -> should land in Block 1 (apple)
+		h, ok := idx.FindBlock([]byte("ant"))
+		if !ok || h != h1 {
+			t.Fatalf("expected block 1 for 'ant', got %v, ok=%v", h, ok)
+		}
+
+		// Lookup "apple" -> should land in Block 1
+		h, ok = idx.FindBlock([]byte("apple"))
+		if !ok || h != h1 {
+			t.Fatalf("expected block 1 for 'apple', got %v, ok=%v", h, ok)
+		}
+
+		// Lookup "banana" -> should land in Block 2 (first block with banana)
+		h, ok = idx.FindBlock([]byte("banana"))
+		if !ok || h != h2 {
+			t.Fatalf("expected block 2 for 'banana', got %v, ok=%v", h, ok)
+		}
+
+		// Lookup "carrot" -> should land in Block 4 (cherry)
+		h, ok = idx.FindBlock([]byte("carrot"))
+		if !ok || h != h4 {
+			t.Fatalf("expected block 4 for 'carrot', got %v, ok=%v", h, ok)
+		}
+
+		// Lookup "date" (greater than all largest keys) -> should return false
+		_, ok = idx.FindBlock([]byte("date"))
+		if ok {
+			t.Fatal("expected false for key beyond all blocks ('date')")
+		}
+	})
+
+	t.Run("FindBlockKey_InternalKeyLookup", func(t *testing.T) {
+		// Target ("banana", seq=75, Put): sorts before ("banana", seq=50, Delete), lands in Block 2
+		targetIK, _ := binary.NewInternalKey([]byte("banana"), 75, binary.OpTypePut)
+		h, ok := idx.FindBlockKey(targetIK)
+		if !ok || h != h2 {
+			t.Fatalf("expected block 2 for banana@75, got %v, ok=%v", h, ok)
+		}
+
+		// Target ("banana", seq=50, Delete): exact match for Block 2 largest key
+		h, ok = idx.FindBlockKey(ik2)
+		if !ok || h != h2 {
+			t.Fatalf("expected block 2 for exact ik2, got %v, ok=%v", h, ok)
+		}
+
+		// Target ("banana", seq=30, Put): sorts after Block 2, before Block 3 (banana@10), lands in Block 3
+		targetIK30, _ := binary.NewInternalKey([]byte("banana"), 30, binary.OpTypePut)
+		h, ok = idx.FindBlockKey(targetIK30)
+		if !ok || h != h3 {
+			t.Fatalf("expected block 3 for banana@30, got %v, ok=%v", h, ok)
+		}
+
+		// Target ("banana", seq=5, Put): sorts after Block 3, lands in Block 4 (cherry)
+		targetIK5, _ := binary.NewInternalKey([]byte("banana"), 5, binary.OpTypePut)
+		h, ok = idx.FindBlockKey(targetIK5)
+		if !ok || h != h4 {
+			t.Fatalf("expected block 4 for banana@5, got %v, ok=%v", h, ok)
+		}
+	})
+
+	t.Run("FindBlockInternalKey_EncodedKeyLookup", func(t *testing.T) {
+		targetIK, _ := binary.NewInternalKey([]byte("banana"), 30, binary.OpTypePut)
+		h, ok := idx.FindBlockInternalKey(binary.EncodeInternalKey(targetIK))
+		if !ok || h != h3 {
+			t.Fatalf("expected block 3 for encoded banana@30, got %v, ok=%v", h, ok)
+		}
+
+		// Malformed encoded internal key returns false
+		_, ok = idx.FindBlockInternalKey([]byte("too-short"))
+		if ok {
+			t.Fatal("expected false for malformed encoded key")
+		}
+	})
+}
+
+// TestSecurity_Remediation7_DataBlock_InternalKey_Validation verifies that data block parsing
+// strictly validates InternalKey structure, enforces strict monotonic ordering during scan,
+// and rejects values exceeding MaxValueLen.
+func TestSecurity_Remediation7_DataBlock_InternalKey_Validation(t *testing.T) {
+	assembleDataBlock := func(entryData []byte, restarts []uint32) []byte {
+		var buf bytes.Buffer
+		buf.Write(entryData)
+		for _, r := range restarts {
+			var rBuf [4]byte
+			binary.PutUint32(rBuf[:], r)
+			buf.Write(rBuf[:])
+		}
+		var rCountBuf [4]byte
+		binary.PutUint32(rCountBuf[:], uint32(len(restarts)))
+		buf.Write(rCountBuf[:])
+		crc := binary.Checksum(buf.Bytes())
+		var crcBuf [4]byte
+		binary.PutUint32(crcBuf[:], crc)
+		buf.Write(crcBuf[:])
+		return buf.Bytes()
+	}
+
+	encodeEntry := func(shared uint64, key []byte, val []byte) []byte {
+		var buf bytes.Buffer
+		var numBuf [10]byte
+		n := binary.PutVarint64(numBuf[:], shared)
+		buf.Write(numBuf[:n])
+		n = binary.PutVarint64(numBuf[:], uint64(len(key)))
+		buf.Write(numBuf[:n])
+		n = binary.PutVarint64(numBuf[:], uint64(len(val)))
+		buf.Write(numBuf[:n])
+		buf.Write(key)
+		buf.Write(val)
+		return buf.Bytes()
+	}
+
+	t.Run("TruncatedInternalKeyAtRestartPoint", func(t *testing.T) {
+		badKey := []byte{0, 0, 0, 0, 0, 0, 0, 1, 0x01} // 9 bytes < 10 (empty user key)
+		e1 := encodeEntry(0, badKey, []byte("val"))
+		block := assembleDataBlock(e1, []uint32{0})
+
+		_, err := sstable.SearchDataBlockForTesting(block, []byte("k"), 0)
+		if err == nil {
+			t.Fatal("expected error for data block with truncated internal key, got nil")
+		}
+		if !stdErrors.Is(err, errors.ErrDataBlockCorrupted) {
+			t.Fatalf("expected ErrDataBlockCorrupted, got %v", err)
+		}
+	})
+
+	t.Run("NonMonotonicKeysInLinearScan", func(t *testing.T) {
+		ikA, _ := binary.NewInternalKey([]byte("bbb"), 10, binary.OpTypePut)
+		ikB, _ := binary.NewInternalKey([]byte("aaa"), 10, binary.OpTypePut) // sorts before bbb!
+		e1 := encodeEntry(0, binary.EncodeInternalKey(ikA), []byte("v1"))
+		e2 := encodeEntry(0, binary.EncodeInternalKey(ikB), []byte("v2"))
+		block := assembleDataBlock(append(e1, e2...), []uint32{0})
+
+		// Searching for "aaa" will encounter "bbb" first (cmp > 0) or continue; but searching for "zzz"
+		// will scan past "bbb" into "aaa", triggering the monotonic violation check
+		_, err := sstable.SearchDataBlockForTesting(block, []byte("zzz"), 0)
+		if err == nil {
+			t.Fatal("expected error for non-monotonic keys in data block, got nil")
+		}
+		if !stdErrors.Is(err, errors.ErrDataBlockCorrupted) {
+			t.Fatalf("expected ErrDataBlockCorrupted, got %v", err)
+		}
+	})
+
+	t.Run("OversizedValueInEntry", func(t *testing.T) {
+		ik, _ := binary.NewInternalKey([]byte("valid"), 10, binary.OpTypePut)
+		var buf bytes.Buffer
+		var numBuf [10]byte
+		n := binary.PutVarint64(numBuf[:], 0)
+		buf.Write(numBuf[:n])
+		encodedIK := binary.EncodeInternalKey(ik)
+		n = binary.PutVarint64(numBuf[:], uint64(len(encodedIK)))
+		buf.Write(numBuf[:n])
+		// Claim value length > MaxValueLen (4 MiB)
+		n = binary.PutVarint64(numBuf[:], binary.MaxValueLen+1)
+		buf.Write(numBuf[:n])
+		buf.Write(encodedIK)
+		buf.WriteString("dummy-short-value")
+
+		block := assembleDataBlock(buf.Bytes(), []uint32{0})
+		_, err := sstable.SearchDataBlockForTesting(block, []byte("valid"), 0)
+		if err == nil {
+			t.Fatal("expected error for oversized value, got nil")
+		}
+		if !stdErrors.Is(err, errors.ErrDataBlockCorrupted) {
+			t.Fatalf("expected ErrDataBlockCorrupted, got %v", err)
+		}
+	})
 }

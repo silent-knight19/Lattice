@@ -53,6 +53,18 @@ func DefaultTableWriterOptions() TableWriterOptions {
 	}
 }
 
+// ValidateFileMode verifies that the requested file mode strictly adheres to the security baseline.
+// In accordance with Threat 7 of docs/threat-model.md, SSTable files must be owner-only (0600 or 0400).
+// Modes granting group/other permissions (mode & 0077 != 0), execution bits (mode & 0111 != 0),
+// or lacking owner read (mode & 0400 == 0) are strictly rejected.
+func ValidateFileMode(mode os.FileMode) error {
+	perm := mode.Perm()
+	if perm&0077 != 0 || perm&0111 != 0 || perm&0400 == 0 {
+		return &errors.InsecureFileModeError{Mode: mode}
+	}
+	return nil
+}
+
 // SSTableMetadata encapsulates the immutable structural properties of a finalized SSTable file.
 type SSTableMetadata struct {
 	Path            string
@@ -146,6 +158,10 @@ func NewTableWriter(dstPath string, opts TableWriterOptions) (*TableWriter, erro
 	}
 	if opts.FileMode == 0 {
 		opts.FileMode = DefaultFileMode
+	} else {
+		if err := ValidateFileMode(opts.FileMode); err != nil {
+			return nil, err
+		}
 	}
 
 	parentDir := filepath.Dir(dstPath)
@@ -182,6 +198,11 @@ func NewTableWriter(dstPath string, opts TableWriterOptions) (*TableWriter, erro
 		_ = file.Close()
 		_ = os.Remove(tmpPath)
 		return nil, fmt.Errorf("staging path is not a regular file")
+	}
+	if runtime.GOOS != "windows" && fi.Mode().Perm()&0077 != 0 {
+		_ = file.Close()
+		_ = os.Remove(tmpPath)
+		return nil, &errors.InsecureFileModeError{Mode: fi.Mode().Perm()}
 	}
 
 	lfi, err := os.Lstat(tmpPath)
@@ -230,6 +251,13 @@ func NewTableWriterWithFile(file *os.File, opts TableWriterOptions) (*TableWrite
 	}
 	if opts.RestartInterval <= 0 {
 		opts.RestartInterval = DefaultRestartInterval
+	}
+	if opts.FileMode == 0 {
+		opts.FileMode = DefaultFileMode
+	} else {
+		if err := ValidateFileMode(opts.FileMode); err != nil {
+			return nil, err
+		}
 	}
 
 	dataBuilder, err := NewBlockBuilderWithInterval(opts.RestartInterval)
