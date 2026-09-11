@@ -46,6 +46,10 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrMemTableFrozen", errors.ErrMemTableFrozen, "memtable is frozen"},
 		{"ErrIteratorClosed", errors.ErrIteratorClosed, "iterator is closed"},
 		{"ErrNilReceiver", errors.ErrNilReceiver, "nil receiver pointer"},
+		{"ErrKeyOutOfOrder", errors.ErrKeyOutOfOrder, "key out of order: keys must be added in strictly increasing canonical order"},
+		{"ErrBlockFinished", errors.ErrBlockFinished, "block builder is finished"},
+		{"ErrInvalidRestartInterval", errors.ErrInvalidRestartInterval, "invalid restart interval: must be greater than zero"},
+		{"ErrBlockOverflow", errors.ErrBlockOverflow, "block size exceeds maximum 32-bit addressable capacity"},
 	}
 
 	for _, tc := range sentinels {
@@ -99,6 +103,10 @@ func TestSentinelWrappingWithErrorsIs(t *testing.T) {
 		{"ErrMemTableFrozen", errors.ErrMemTableFrozen},
 		{"ErrIteratorClosed", errors.ErrIteratorClosed},
 		{"ErrNilReceiver", errors.ErrNilReceiver},
+		{"ErrKeyOutOfOrder", errors.ErrKeyOutOfOrder},
+		{"ErrBlockFinished", errors.ErrBlockFinished},
+		{"ErrInvalidRestartInterval", errors.ErrInvalidRestartInterval},
+		{"ErrBlockOverflow", errors.ErrBlockOverflow},
 	}
 
 	for _, tc := range tests {
@@ -246,6 +254,44 @@ func TestValueTooLargeError(t *testing.T) {
 	msg := typedErr.Error()
 	if !strings.Contains(msg, "5000000") || !strings.Contains(msg, "4194304") {
 		t.Errorf("unexpected error string formatting: %q", msg)
+	}
+}
+
+func TestKeyOutOfOrderError(t *testing.T) {
+	typedErr := &errors.KeyOutOfOrderError{
+		PrevKeyLen: 10,
+		CurrKeyLen: 8,
+	}
+
+	// Must match sentinel via errors.Is
+	if !stdErrors.Is(typedErr, errors.ErrKeyOutOfOrder) {
+		t.Errorf("KeyOutOfOrderError must match ErrKeyOutOfOrder via errors.Is")
+	}
+
+	// Negative match against other sentinels
+	if stdErrors.Is(typedErr, errors.ErrKeyNotFound) {
+		t.Errorf("KeyOutOfOrderError must not match ErrKeyNotFound")
+	}
+
+	// errors.As extraction
+	var extracted *errors.KeyOutOfOrderError
+	if !stdErrors.As(typedErr, &extracted) {
+		t.Fatalf("errors.As failed to extract *KeyOutOfOrderError")
+	}
+	if extracted.PrevKeyLen != 10 || extracted.CurrKeyLen != 8 {
+		t.Errorf("extracted fields mismatch: got PrevKeyLen=%d, CurrKeyLen=%d", extracted.PrevKeyLen, extracted.CurrKeyLen)
+	}
+
+	// Error string validation: must contain lengths and not leak keys
+	msg := typedErr.Error()
+	if !strings.Contains(msg, "10") || !strings.Contains(msg, "8") {
+		t.Errorf("unexpected error string formatting: %q", msg)
+	}
+
+	// Nil receiver check
+	var nilErr *errors.KeyOutOfOrderError
+	if nilErr.Error() != errors.ErrKeyOutOfOrder.Error() {
+		t.Errorf("expected sentinel message on nil receiver, got %q", nilErr.Error())
 	}
 }
 

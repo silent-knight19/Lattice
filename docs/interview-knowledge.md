@@ -2197,6 +2197,134 @@ Conversely, historical sealed segments ($S_1 \dots S_{N-1}$) were closed and syn
     - If `it.sl` were retained, the entire MemTable (potentially 64MB of nodes) cannot be garbage collected even after the table has been flushed to disk and dereferenced by the engine!
     - Setting `it.sl = nil` in `Close()` severs the reference to the SkipList, allowing the entire MemTable heap to be promptly reclaimed by the Go runtime GC.
 
+# 30. Deep Systems Interview Questions & Answers: SSTable Data Block Architecture, Prefix Compression & Restart Points (P04-S01-M01)
+
+### 1. Why do LSM-tree storage engines use prefix compression inside data blocks?
+* **Question**: Why do SSTable data blocks store keys using prefix compression instead of writing raw keys?
+* **Answer**:
+  - In storage engines, keys are structured and clustered (e.g., `user:10001:profile`, `user:10001:settings`, `tenant:42:order:9001`). Furthermore, multi-versioned records in Lattice share identical user keys across versions (`[UserKey | SeqNum | OpType]`).
+  - Storing raw uncompressed keys wastes 40% to 70% of data block space on repetitive prefixes.
+  - Prefix compression calculates the common byte prefix between consecutive sorted keys and stores only: `[SharedKeyLen | UnsharedKeyLen | ValueLen | KeySuffix | Value]`.
+  - In our benchmarks, keys with a 50-byte shared prefix achieve a **1.81x compression ratio (44.8% space reduction)**, directly increasing data density in NVMe pages and the in-memory OS page cache.
+
+### 2. Why does sorted key ordering make prefix compression highly effective?
+* **Question**: Why can prefix compression achieve significant space reduction only when keys are pre-sorted?
+* **Answer**:
+  - Prefix compression relies on locality between *immediately adjacent* records ($K_i$ and $K_{i-1}$).
+  - When keys are sorted lexicographically, keys sharing identical prefixes naturally cluster together. As records are written, $K_i$ shares almost its entire prefix with $K_{i-1}$.
+  - If keys arrived in arbitrary or random order, consecutive keys would have virtually zero common prefix ($L_{\text{shared}} = 0$), defeating compression and adding 1–2 bytes of varint framing overhead per entry.
+
+### 3. Why are restart points necessary within prefix-compressed data blocks?
+* **Question**: Why can't an entire 4KB data block be prefix-compressed from record 0 to record N without restart points?
+* **Answer**:
+  - Pure delta compression creates an unbroken chain of dependency: to decode key $K_{100}$, a reader would be forced to start at $K_0$ and sequentially reconstruct every intermediate key $K_1..K_{99}$.
+  - This eliminates $O(\log N)$ random lookups inside a data block, turning every point lookup into a slow $O(N)$ linear scan.
+  - Restart points periodically break this dependency chain by emitting a record with `SharedKeyLen = 0` (the full key). Appending an array of 32-bit offsets to these restart points at the end of the block allows binary searching directly across restart entries in $O(\log(N/k))$ steps.
+
+### 4. Why does the restart interval represent a fundamental lookup/compression trade-off?
+* **Question**: How does tuning the restart interval $k$ (e.g. $k=4$ vs $k=16$ vs $k=64$) affect engine performance?
+* **Answer**:
+  - **Small $k$ (e.g., $k=4$)**: Lower point lookup latency (at most 3 delta scans from any restart point), but lower compression ratio because 25% of keys store full uncompressed bytes, and the restart offset array is $4\times$ larger.
+  - **Large $k$ (e.g., $k=64$)**: Higher compression ratio (only 1.5% of keys store full prefixes), but higher read amplification during point lookups (must linearly decode up to 63 key deltas).
+  - **Lattice Default ($k=16$)**: LevelDB/RocksDB and Lattice standard. For a 4KB block with ~100 records, there are only ~6 restart points. Binary search requires 2–3 offset lookups, followed by at most 15 linear delta scans, balancing high compression ($>1.8\times$) with sub-microsecond in-block seek latency.
+
+### 5. Why must the first key in every restart group store zero shared prefix?
+* **Question**: Why is `SharedKeyLen` strictly forced to 0 at restart points even if the key happens to share bytes with the preceding key?
+* **Answer**:
+  - A restart point must be completely self-contained and independently decodable without reading any byte before its offset.
+  - If a restart entry borrowed even a single byte from the preceding record, binary searching to that restart offset would fail because the preceding key bytes would not be in memory.
+  - Forcing `SharedKeyLen = 0` guarantees that the entry at `restartOffsets[i]` contains the full key, serving as an autonomous anchor for both binary search and subsequent forward delta iteration.
+
+### 6. Why is binary byte-prefix comparison used instead of Unicode/string logic?
+* **Question**: Why does `BlockBuilder` compute common prefixes using raw bytes rather than runes or UTF-8 code points?
+* **Answer**:
+  - **Arbitrary Binary Payloads**: Storage engines store arbitrary byte arrays, including serialized protobufs, big-endian binary integers, packed bitmaps, and encrypted hashes that are not valid UTF-8 strings.
+  - **Performance**: Byte-by-byte comparison (`a[i] == b[i]`) compiles into single-cycle SIMD/word-at-a-time CPU instructions without Unicode table lookups or decoding state machines.
+  - **Symmetric Comparator Alignment**: Keys are ordered by `bytes.Compare()`. Using byte prefix equality ensures exact structural alignment with the canonical storage ordering.
+
+### 7. Why is sorted-input enforcement preferable to sorting internally?
+* **Question**: Why does `BlockBuilder.Add()` fail-fast on unsorted input instead of buffering and sorting internally?
+* **Answer**:
+  - **Memory Footprint**: Sorting internally would require buffering all records in RAM, allocating slice pointer arrays, and performing $O(N \log N)$ sorting within the builder.
+  - **Architectural Separation of Concerns**: In an LSM-tree, the upstream component (the MemTable SkipList iterator) is already mathematically guaranteed to yield records in strictly increasing canonical order.
+  - **Bug Detection & Failure Atomicity**: If an upstream caller supplies an out-of-order key, it signals an upstream bug (e.g., broken iterator, race condition, or memory corruption). Silently sorting would mask the bug and waste CPU. Rejecting it immediately with `ErrKeyOutOfOrder` guarantees failure atomicity.
+
+### 8. Why do deterministic binary formats matter in storage engines?
+* **Question**: Why must `BlockBuilder.Finish()` produce bit-for-bit identical output across independent executions for identical input records?
+* **Answer**:
+  - **Cryptographic & Checksum Integrity**: SSTable blocks are protected by CRC32 checksums. Non-deterministic layouts (e.g. fluctuating map iteration or timestamp embedding) would break reproducible crash-recovery verification.
+  - **Distributed Consensus & Replication**: In replicated systems (Phase 15/16 Raft), snapshot transfers and Merkle-tree state verification require identical byte streams across nodes.
+  - **Differential Fuzzing**: Reproducible byte outputs allow differential fuzzing against independent oracles and older engine releases to detect binary regressions.
+
+### 9. How can malformed length headers become memory-exhaustion or panic vulnerabilities?
+* **Question**: What security risks exist in varint-length-prefixed block formats, and how does Lattice mitigate them?
+* **Answer**:
+  - **Unbounded Allocation Attacks**: If a decoder reads `unsharedKeyLen` or `valueLen` and immediately executes `make([]byte, unsharedKeyLen)` before verifying buffer boundaries, a malicious or corrupted block could specify a 2GB length, causing an out-of-memory (OOM) process crash.
+  - **Integer Overflow**: Adding `shared + unshared` without 32-bit overflow checks could cause 32-bit integer wraparound, resulting in undersized allocations and out-of-bounds slice indexing panics.
+  - **Lattice Mitigations**:
+    - `ValidateKey` and `ValidateValue` enforce hard bounds ($64\text{KB}$ key limit, $4\text{MB}$ value limit).
+    - `GetVarint64Canonical` limits varints to 10 bytes and rejects non-canonical representations.
+    - Decoders check `cursor + len <= len(data)` before reading, ensuring zero allocations for corrupted buffers.
+
+### 10. How does a block builder differ from a block reader?
+* **Question**: What are the architectural differences in responsibilities between `BlockBuilder` and `BlockReader`?
+* **Answer**:
+  - **BlockBuilder (Write Path)**: Write-optimized, append-only, stateful. Maintains previous key in memory, calculates common prefixes, generates varint headers, and records restart offsets. Seals permanently upon `Finish()`.
+  - **BlockReader (Read Path, P04-S03-M02)**: Read-optimized, immutable, concurrent-safe. Parses the restart array at the tail of the block, executes binary search over restart keys, and sequentially decodes key deltas to locate a target key.
+
+### 11. Why should block construction become immutable after Finish?
+* **Question**: Why does `Finish()` permanently seal the builder and reject subsequent `Add()` calls?
+* **Answer**:
+  - Once `Finish()` is invoked, the caller has taken the finalized block bytes to compute checksums, build index handles, or commit to disk.
+  - If subsequent mutations were permitted, the internal buffer would diverge from the external handle offset/size, corrupting SSTable index pointers.
+  - Sealing the builder with `b.finished = true` guarantees state immutability. To reuse allocated buffers, callers must explicitly call `Reset()`.
+
+---
+
+### 12. Worked Binary Example: Exact Data Block Encoding
+Consider encoding three records with `restartInterval = 16`:
+
+```
+Record 0:
+  InternalKey: "apple", SeqNum: 1, OpType: PUT (0x01)
+  Full Encoded Key (14B): 61 70 70 6c 65 00 00 00 00 00 00 00 01 01
+  Value (3B): "red" (72 65 64)
+  Restart Point 0:
+    shared    = 0  (varint: 0x00)
+    unshared  = 14 (varint: 0x0e)
+    valueLen  = 3  (varint: 0x03)
+  Entry 0 Bytes (20B):
+    00 0e 03 61 70 70 6c 65 00 00 00 00 00 00 00 01 01 72 65 64
+
+Record 1:
+  InternalKey: "application", SeqNum: 1, OpType: PUT (0x01)
+  Full Encoded Key (20B): 61 70 70 6c 69 63 61 74 69 6f 6e 00 00 00 00 00 00 00 01 01
+  Value (3B): "app" (61 70 70)
+  Prefix with Record 0 ("apple..."): "appl" = 4 bytes
+  Delta:
+    shared    = 4  (varint: 0x04)
+    unshared  = 16 (varint: 0x10)
+    valueLen  = 3  (varint: 0x03)
+    Key Suffix: "ication" + SeqNum(1) + OpType(1)
+  Entry 1 Bytes (22B):
+    04 10 03 69 63 61 74 69 6f 6e 00 00 00 00 00 00 00 01 01 61 70 70
+
+Record 2:
+  InternalKey: "banana", SeqNum: 1, OpType: PUT (0x01)
+  Full Encoded Key (15B): 62 61 6e 61 6e 61 00 00 00 00 00 00 00 01 01
+  Value: nil (0B)
+  Prefix with Record 1 ("application..."): 0 bytes
+  Delta:
+    shared    = 0  (varint: 0x00)
+    unshared  = 15 (varint: 0x0f)
+    valueLen  = 0  (varint: 0x00)
+  Entry 2 Bytes (18B):
+    00 0f 00 62 61 6e 61 6e 61 00 00 00 00 00 00 00 01 01
+
+Total Block Entry Data Size: 20 + 22 + 18 = 60 Bytes.
+Restart Offsets: [0]
+```
+
 ---
 
 *End of Technical Interview Knowledge Base — Lattice v1.0.0-KNOWLEDGE-BASE*

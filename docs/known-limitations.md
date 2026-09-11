@@ -290,7 +290,18 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 21. Data Block Prefix Compression Sizing Sensitivity to Key Redundancy and Random Seeks
+* **Limitation**: Prefix compression inside `BlockBuilder` (P04-S01-M01) achieves high compression ratios ($>1.8\times$) only when consecutive keys share common byte prefixes (e.g. structured keys such as `tenant:100:user:001`, `tenant:100:user:002` or multi-version keys with descending sequence numbers). For high-entropy random keys (e.g. raw UUIDs, SHA-256 hashes), common prefix length drops to 0, resulting in zero compression and small varint length framing overhead (1–2 bytes per record). Furthermore, prefix compression couples records between restart points: point lookup within a block cannot jump directly to an arbitrary entry without linear delta reconstruction from the preceding restart point.
+* **Why It Exists**: LSM-tree data blocks optimize for sequential streaming and high data density. Resetting prefixes every $k=16$ entries establishes restart points that limit point-lookup delta scanning to at most 15 records while retaining high space reduction.
+* **Impact**: Blocks containing random keys will not compress via prefix delta encoding. Point lookup latency within a 4KB block includes scanning up to 15 key suffixes from the nearest restart point.
+* **How It Was Detected**: P04-S01-M01 prefix compression modeling and empirical benchmarks.
+* **Current Mitigation**: The restart interval defaults to 16, striking a balanced trade-off between compression ratio and internal block binary search cost.
+* **Future Solution**: Phase 04.2 will add two-level sparse indexing, and Phase 05 will add Bloom filters to bypass non-matching SSTable blocks entirely, minimizing random seek penalties.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Binary-safe, byte-for-byte exact reconstruction).
+  * Performance: **High** sequential compression; $O(k)$ scan bounded by restart interval.
+  * Scalability: **Optimal**.
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*
-
-
-

@@ -142,7 +142,38 @@ var (
 
 	// ErrNilReceiver indicates that a method was invoked on a nil pointer receiver.
 	ErrNilReceiver = stdErrors.New("nil receiver pointer")
+
+	// ErrKeyOutOfOrder indicates that an entry was added out of strictly increasing canonical order.
+	ErrKeyOutOfOrder = stdErrors.New("key out of order: keys must be added in strictly increasing canonical order")
+
+	// ErrBlockFinished indicates that mutation was attempted on an already finished/sealed block builder.
+	ErrBlockFinished = stdErrors.New("block builder is finished")
+
+	// ErrInvalidRestartInterval indicates that an invalid restart interval was provided (must be >= 1).
+	ErrInvalidRestartInterval = stdErrors.New("invalid restart interval: must be greater than zero")
+
+	// ErrBlockOverflow indicates that a block's size exceeds 32-bit addressable capacity.
+	ErrBlockOverflow = stdErrors.New("block size exceeds maximum 32-bit addressable capacity")
 )
+
+// KeyOutOfOrderError provides structured context when a key violates strictly increasing
+// canonical ordering. Raw key bytes are omitted to prevent sensitive credential disclosure.
+type KeyOutOfOrderError struct {
+	PrevKeyLen int
+	CurrKeyLen int
+}
+
+func (e *KeyOutOfOrderError) Error() string {
+	if e == nil {
+		return ErrKeyOutOfOrder.Error()
+	}
+	return fmt.Sprintf("key out of order: current key (len=%d) sorts before or equal to previous key (len=%d)", e.CurrKeyLen, e.PrevKeyLen)
+}
+
+// Is reports whether this error matches target sentinel ErrKeyOutOfOrder.
+func (e *KeyOutOfOrderError) Is(target error) bool {
+	return target == ErrKeyOutOfOrder
+}
 
 // KeyTooLargeError provides structured context when a key violates maximum size limits.
 // It matches ErrKeyTooLarge when interrogated with errors.Is().
