@@ -63,6 +63,8 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrTableWriterClosed", errors.ErrTableWriterClosed, "sstable writer is closed"},
 		{"ErrTableWriterFinalized", errors.ErrTableWriterFinalized, "sstable writer is already finalized"},
 		{"ErrSSTableExists", errors.ErrSSTableExists, "sstable file already exists"},
+		{"ErrTableReaderClosed", errors.ErrTableReaderClosed, "sstable reader is closed"},
+		{"ErrDataBlockCorrupted", errors.ErrDataBlockCorrupted, "data block corrupted: invalid crc, restart metadata, or entry framing"},
 	}
 
 	for _, tc := range sentinels {
@@ -120,6 +122,8 @@ func TestSentinelWrappingWithErrorsIs(t *testing.T) {
 		{"ErrBlockFinished", errors.ErrBlockFinished},
 		{"ErrInvalidRestartInterval", errors.ErrInvalidRestartInterval},
 		{"ErrBlockOverflow", errors.ErrBlockOverflow},
+		{"ErrTableReaderClosed", errors.ErrTableReaderClosed},
+		{"ErrDataBlockCorrupted", errors.ErrDataBlockCorrupted},
 	}
 
 	for _, tc := range tests {
@@ -171,9 +175,25 @@ func TestSentinelNegativeComparisons(t *testing.T) {
 		errors.ErrMemTableFrozen,
 		errors.ErrIteratorClosed,
 		errors.ErrNilReceiver,
+		errors.ErrKeyOutOfOrder,
+		errors.ErrBlockFinished,
+		errors.ErrInvalidRestartInterval,
+		errors.ErrBlockOverflow,
+		errors.ErrBlockHandleTruncated,
+		errors.ErrInvalidBlockHandle,
+		errors.ErrIndexFinished,
+		errors.ErrIndexBlockTruncated,
+		errors.ErrIndexBlockCorrupted,
+		errors.ErrInvalidFooter,
+		errors.ErrInvalidFooterMagic,
+		errors.ErrFooterTruncated,
+		errors.ErrInvalidFooterSize,
+		errors.ErrInvalidFooterPadding,
 		errors.ErrTableWriterClosed,
 		errors.ErrTableWriterFinalized,
 		errors.ErrSSTableExists,
+		errors.ErrTableReaderClosed,
+		errors.ErrDataBlockCorrupted,
 	}
 
 	for i, a := range allSentinels {
@@ -1393,5 +1413,57 @@ func TestInvalidFooterSizeError(t *testing.T) {
 	}
 	if !nilErr.Is(errors.ErrInvalidFooter) {
 		t.Errorf("nil *InvalidFooterSizeError must match ErrInvalidFooter via Is")
+	}
+}
+
+func TestDataBlockCorruptedError(t *testing.T) {
+	err := &errors.DataBlockCorruptedError{
+		Offset: 4096,
+		Reason: "checksum mismatch",
+	}
+
+	// errors.Is check
+	if !stdErrors.Is(err, errors.ErrDataBlockCorrupted) {
+		t.Errorf("DataBlockCorruptedError must match ErrDataBlockCorrupted via errors.Is")
+	}
+
+	// Negative match
+	if stdErrors.Is(err, errors.ErrKeyNotFound) {
+		t.Errorf("DataBlockCorruptedError must not match ErrKeyNotFound")
+	}
+
+	// Wrapping check
+	wrapped := fmt.Errorf("read block: %w", err)
+	if !stdErrors.Is(wrapped, errors.ErrDataBlockCorrupted) {
+		t.Errorf("wrapped DataBlockCorruptedError must match ErrDataBlockCorrupted via errors.Is")
+	}
+
+	var extracted *errors.DataBlockCorruptedError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("failed to extract *DataBlockCorruptedError from wrapped chain")
+	}
+	if extracted.Offset != 4096 || extracted.Reason != "checksum mismatch" {
+		t.Errorf("extracted mismatch: got %+v", extracted)
+	}
+
+	// String check with reason
+	msg := err.Error()
+	if !strings.Contains(msg, "data block corrupted at offset 4096: checksum mismatch") {
+		t.Errorf("unexpected error message: %q", msg)
+	}
+
+	// String check without reason
+	errNoReason := &errors.DataBlockCorruptedError{Offset: 8192}
+	if errNoReason.Error() != "data block corrupted at offset 8192" {
+		t.Errorf("unexpected error message without reason: %q", errNoReason.Error())
+	}
+
+	// Typed nil safety
+	var nilErr *errors.DataBlockCorruptedError
+	if nilErr.Error() != errors.ErrDataBlockCorrupted.Error() {
+		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrDataBlockCorrupted.Error())
+	}
+	if !nilErr.Is(errors.ErrDataBlockCorrupted) {
+		t.Errorf("nil *DataBlockCorruptedError must match ErrDataBlockCorrupted via Is")
 	}
 }

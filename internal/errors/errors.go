@@ -193,6 +193,12 @@ var (
 
 	// ErrSSTableExists indicates that an SSTable file already exists at the target path and cannot be overwritten.
 	ErrSSTableExists = stdErrors.New("sstable file already exists")
+
+	// ErrTableReaderClosed indicates that an operation was attempted on a closed SSTable reader.
+	ErrTableReaderClosed = stdErrors.New("sstable reader is closed")
+
+	// ErrDataBlockCorrupted indicates that an SSTable data block's trailer, CRC, restart array, or entry framing is corrupted.
+	ErrDataBlockCorrupted = stdErrors.New("data block corrupted: invalid crc, restart metadata, or entry framing")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing
@@ -637,4 +643,26 @@ func (e *InvalidFooterSizeError) Is(target error) bool {
 		return true
 	}
 	return target == ErrInvalidFooterSize
+}
+
+// DataBlockCorruptedError provides structured diagnostics when an SSTable data block fails integrity or layout checks.
+// It matches ErrDataBlockCorrupted when interrogated with errors.Is().
+type DataBlockCorruptedError struct {
+	Offset uint64
+	Reason string
+}
+
+func (e *DataBlockCorruptedError) Error() string {
+	if e == nil {
+		return ErrDataBlockCorrupted.Error()
+	}
+	if e.Reason != "" {
+		return fmt.Sprintf("data block corrupted at offset %d: %s", e.Offset, e.Reason)
+	}
+	return fmt.Sprintf("data block corrupted at offset %d", e.Offset)
+}
+
+// Is reports whether this error matches target sentinel ErrDataBlockCorrupted.
+func (e *DataBlockCorruptedError) Is(target error) bool {
+	return target == ErrDataBlockCorrupted
 }

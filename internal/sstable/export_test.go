@@ -22,3 +22,15 @@ func (w *TableWriter) SetCloseFnForTesting(fn func(f *os.File) error) {
 	defer w.mu.Unlock()
 	w.closeFn = fn
 }
+
+// SetReadAtFnForTesting replaces the low-level positional read function for TableReader.
+func (r *TableReader) SetReadAtFnForTesting(fn func(p []byte, off int64) (int, error)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.readAtFn = fn
+}
+
+// SearchDataBlockForTesting exports searchDataBlock for isolated unit testing and fuzzing.
+func SearchDataBlockForTesting(blockBuf []byte, targetUserKey []byte, blockOffset uint64) ([]byte, error) {
+	return searchDataBlock(blockBuf, targetUserKey, blockOffset)
+}

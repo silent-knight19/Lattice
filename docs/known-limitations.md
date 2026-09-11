@@ -354,6 +354,22 @@ This document tracks all **genuine architectural and operational limitations** o
   * Performance: **Optimal** (Over 1,000,000 keys/sec persistent write throughput; ~143.7 ns in-memory ingestion).
   * Scalability: **Optimal** (Streaming append pipeline scales to multi-gigabyte SSTables).
 
+### 26. SSTable Point Reads Lack Bloom Filter Acceleration and Block Cache Buffering (P04-S03-M02)
+* **Limitation**: In `TableReader` (P04-S03-M02), point lookup (`Seek`) operates directly on a single finalized SSTable file on disk. In this phase:
+  1. *No Bloom Filter Acceleration*: Reads do not yet evaluate a Bloom filter before issuing disk reads. If a requested key is absent but falls within the key span of a data block ($S_i \le K \le L_i$), `TableReader` must read the candidate data block from disk to confirm absence. Bloom filter generation and filtering are deferred to Phase 05.
+  2. *No In-Memory Block Cache*: Repeated `Seek()` operations against keys in the same data block read the block from disk via `ReadAt` on each call rather than reusing a cached uncompressed block from an LRU block cache. Block cache integration is deferred to Phase 10.
+  3. *Single-Table Scope*: `TableReader` queries exactly one `.sst` file; multi-level searching, version set snapshots, manifest tracking, and LSM compaction merges are deferred to Phases 06 and 07.
+  4. *Point Lookup Only*: `TableReader` implements exact point lookup via `Seek()`; bidirectional range iteration (`Iterator`) across blocks and tables is deferred to future engine phases.
+* **Why It Exists**: Following the micro-phase engineering discipline, the persistent reader, sparse index search, and prefix-compressed data block decoder are cleanly implemented and validated in isolation before composing with probabilistic filters, caching layers, and multi-SSTable version sets.
+* **Impact**: Cold absent reads falling within block key ranges require 1 disk seek. Repeated reads incur disk I/O latency unless cached by OS page cache.
+* **How It Was Detected**: Architectural design and micro-phase boundaries of Phase 04 Sub-Phase 04.3.
+* **Current Mitigation**: The in-memory sparse `BlockIndex` immediately rejects any target key greater than all largest keys with zero data block disk I/O (~103.9 ns/op). Restart point binary search bounds forward scans to at most 16 records.
+* **Future Solution**: Phase 05 will implement Bloom filters eliminating $>99\%$ of cold read disk I/Os; Phase 06 will integrate multi-SSTable `VersionSet` lookups; and Phase 10 will add an LRU block cache.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (100% verified point lookup accuracy across 100,000 keys; strict multi-version and tombstone resolution; corruption protection).
+  * Performance: **High** (~877.4 ns hot block seek, ~1,218 ns random seek, ~103.9 ns missing key rejection).
+  * Scalability: **Optimal** (Stateless `ReadAt` scales concurrently across multiple goroutines).
+
 ---
 
 *End of Known Limitations — To be updated continuously throughout implementation.*

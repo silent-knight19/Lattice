@@ -348,16 +348,16 @@ Every future micro-phase implementation response from Claude Code must use this 
 # 16. Current Execution State
 
 ```
-Current Major Phase           : Phase 04 — Persistent SSTable Subsystem
-Current Sub-Phase             : Sub-Phase 04.3 — SSTable File Writer & Reader (IN PROGRESS)
-Current Micro-Phase           : P04-S03-M01 — SSTable Sequential File Writer (TableWriter) (COMPLETE)
+Current Major Phase           : Phase 04 — Persistent SSTable Subsystem (COMPLETE)
+Current Sub-Phase             : Sub-Phase 04.3 — SSTable File Writer & Reader (COMPLETE)
+Current Micro-Phase           : P04-S03-M02 — SSTable Block Reader & Sparse Index Binary Search (COMPLETE)
 Phase 01 Status               : COMPLETE (Sub-Phases 01.1 & 01.2 Complete)
 Phase 02 Status               : COMPLETE (Sub-Phases 02.1, 02.2, 02.3, 02.4 Complete)
 Phase 03 Status               : COMPLETE (Sub-Phases 03.1, 03.2, 03.3 Complete)
-Phase 04 Status               : IN PROGRESS (Sub-Phases 04.1 & 04.2 Complete; Sub-Phase 04.3 In Progress)
-Previous Completed Phase      : Phase 03 — In-Memory MemTable & Concurrent SkipList
-Previous Completed Micro-Phase: P04-S03-M01 — SSTable Sequential File Writer (TableWriter)
-Next Planned Micro-Phase      : P04-S03-M02 — SSTable Block Reader & Sparse Index Binary Search
+Phase 04 Status               : COMPLETE (Sub-Phases 04.1, 04.2, 04.3 Complete)
+Previous Completed Phase      : Phase 04 — Persistent SSTable Subsystem
+Previous Completed Micro-Phase: P04-S03-M02 — SSTable Block Reader & Sparse Index Binary Search
+Next Planned Micro-Phase      : P05-S01-M01 — Bloom Filter Parameter Calculator & Bitset Allocator
 Phase 00 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Phase 01 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Security Audit Track State    : Active
@@ -370,9 +370,9 @@ Security Audit Track State    : Active
   - SEC-06 through SEC-09 (PLANNED)
 Blocking Issues               : None
 Tests Passing                 : `go test -race ./...` (All test suites passing, 0 race conditions), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed, Linux & Windows cross-platform verified
-Security Review Status        : Complete & Verified (SEC-01 foundations established; SEC-02 static audit verified; SEC-03 dynamic persistence audit completed; SEC-04 in-memory engine audit completed; SEC-P03 independent adversarial audit completed; P04-S01-M01 audited; P04-S01-M02 audited; P04-S02-M01 audited; P04-S02-M02 audited; P04-S03-M01 audited with 0 vulnerabilities, atomic .tmp staging, directory sync durability barrier, short-write loops, failure unlinking, pre-existing overwrite protection, and memory isolation)
-Interview Knowledge Status    : Updated with Sections 30, 31, 32, 33 & 34 containing deep systems interview questions and answers across prefix compression, restart points, block trailers, sparse two-level indexing, block handles, fixed 48-byte footers, and sequential SSTable file writer architecture
-Git Commit                    : feat(sstable): [P04-S03-M01] implement sequential SSTable table writer
+Security Review Status        : Complete & Verified (SEC-01 foundations established; SEC-02 static audit verified; SEC-03 dynamic persistence audit completed; SEC-04 in-memory engine audit completed; SEC-P03 independent adversarial audit completed; P04-S01-M01 audited; P04-S01-M02 audited; P04-S02-M01 audited; P04-S02-M02 audited; P04-S03-M01 audited; P04-S03-M02 audited with 0 vulnerabilities, bounded ReadAt disk reads, defensive value copies, CRC32 block verification, bounds-checked restart offset arithmetic, and clean error discrimination)
+Interview Knowledge Status    : Updated with Sections 30 through 35 containing deep systems interview questions and answers across prefix compression, restart points, block trailers, sparse two-level indexing, block handles, fixed 48-byte footers, sequential SSTable file writer, and SSTable point read/seek architecture
+Git Commit                    : feat(sstable): [P04-S03-M02] implement SSTable block reader and point lookup
 ```
 
 ---
@@ -1442,10 +1442,51 @@ TOTAL: 184 Discrete, Testable Micro-Phases
     - `FuzzTableWriter`: 1,474 full file lifecycle executions in 11s with 0 failures, 0 panics, 0 file leaks.
   * *Completion*: Complete and verified under `-race`, `golangci-lint`, Linux and Windows `go vet`.
 * **P04-S03-M02: SSTable Block Reader & Sparse Index Binary Search**
-  * *Objective*: Open SSTable, read footer, load index block into RAM, binary search for target key's block handle.
-  * *Changes*: `TableReader.Seek(key []byte) ([]byte, error)`.
-  * *Tests*: Point lookup across 100,000 keys in SSTable; verify 100% correct values.
-  * *Completion*: SSTable reader verified.
+  * *Status*: Complete
+  * *Objective*: Open SSTable, read footer, load index block into RAM, binary search for target key's block handle, read candidate data block via positional `ReadAt`, decode prefix-compressed records, and perform exact point lookup.
+  * *Architecture & Flow*:
+    - Open file descriptor and stat physical file size.
+    - Read fixed 48-byte footer anchored at `[fileSize - 48 : fileSize]`.
+    - Decode and validate footer structure, cryptographic magic number (`0x4C41545453535401`), and 8-byte zero padding.
+    - Validate footer block handles against physical file boundaries via `ValidateAgainstFileSize`.
+    - Read sparse index block bytes from disk at `IndexHandle.Offset` for `IndexHandle.Size` bytes via bounded `ReadAt`.
+    - Decode `BlockIndex` and retain index entries in RAM.
+    - `Seek(userKey []byte)` executes two-level binary search:
+      1. Sparse in-memory binary search via `BlockIndex.FindBlock`: finds first entry where `LargestKey >= targetKey`. If `targetKey > all LargestKeys`, returns `ErrKeyNotFound` with zero disk I/O.
+      2. Validates candidate data block handle bounds against physical file size.
+      3. Reads exactly `handle.Size` bytes from `handle.Offset` via positional `ReadAt`.
+      4. Validates data block CRC32-IEEE checksum over `[entry data || restart offsets || restart count]`.
+      5. Parses and validates restart count and strictly monotonic restart offsets.
+      6. Binary-searches restart points to locate nearest restart interval.
+      7. Scans prefix-compressed entries forward from restart offset, reconstructing full `InternalKey`s.
+      8. Multi-version resolution: first encountered match is latest version (`SeqNum DESC`). If `OpType == OpTypePut`, returns owned defensive copy of value bytes. If `OpType == OpTypeDelete`, returns `ErrKeyNotFound` (tombstone). If scanned past key (`UserKey > target`), stops and returns `ErrKeyNotFound`.
+  * *Invariants*:
+    - Safe Concurrency: `TableReader` is safe for concurrent `Seek` calls across multiple goroutines using `sync.RWMutex.RLock()`.
+    - Non-destructive I/O: Positional `ReadAt` leaves file offsets untouched.
+    - Resource Safety: `Close()` releases file descriptor; subsequent operations return `ErrTableReaderClosed`; repeated `Close()` is idempotent.
+    - Zero Corruption Masking: Corrupt magic, corrupt CRC32, truncated buffers, out-of-bounds restart offsets return explicit corruption errors; never misclassified as `ErrKeyNotFound`.
+    - Memory Isolation: Returned value slices are owned defensive copies.
+  * *Tests*:
+    - Initialization: valid file, nonexistent file, empty file (0B), truncated file (<48B), empty finalized SSTable (64B), nil file rejection.
+    - Footer validation: corrupted magic, corrupted padding, out-of-bounds index handle.
+    - Index validation: corrupted index CRC32 checksum rejection.
+    - Single-block point lookups: exact keys, first key, last key, absent key before first, absent key between entries, absent key after last, invalid key bounds.
+    - Multi-block point lookups: 1,000 keys across multiple 4KB blocks with 100% correct values and absent probes.
+    - Revisions and tombstones: multi-version PUT resolution (latest returned), tombstone deletion resolution (`ErrKeyNotFound` returned).
+    - Data block corruption: corrupted CRC32 rejection, zero restart count rejection, truncated buffer rejection.
+    - Lifecycle: `Close()`, repeated `Close()`, `Seek()` after close (`ErrTableReaderClosed`), nil receiver safety.
+    - Concurrency: 20 concurrent goroutines querying 200 keys under `go test -race` with 0 race conditions.
+    - Differential testing: reference model `map[string][]byte` compared against `TableReader.Seek` across 300 mixed PUT/DELETE operations with 100% match.
+    - Large dataset verification: 100,000 keys in SSTable (770 data blocks, 3.19 MB) with 100,000 / 100,000 lookups verified 100.0% correct.
+  * *Benchmarks* (Apple M4, darwin/arm64):
+    - `BenchmarkTableReader_Seek_HotBlock-10`: 2,633,008 ops, 877.4 ns/op, 3,537 B/op, 5 allocs/op (~1.14M point lookups/sec).
+    - `BenchmarkTableReader_Seek_Random-10`: 1,998,081 ops, 1,218 ns/op, 4,776 B/op, 15 allocs/op (~821K random reads/sec).
+    - `BenchmarkTableReader_Seek_Missing-10`: 23,812,101 ops, 103.9 ns/op, 150 B/op, 12 allocs/op (~9.6M absent probes/sec with zero data block disk reads).
+  * *Fuzz Testing*:
+    - `FuzzSearchDataBlock`: 5,345,098 executions in 10s with 0 crashes, 0 hangs, 0 memory leaks.
+    - `FuzzTableReader_Seek`: 4,879,733 executions in 10s with 0 crashes, 0 hangs.
+    - `FuzzTableReader_CorruptedFile`: 520 file mutations in 11s with deterministic error handling and zero crashes.
+  * *Completion*: Complete and verified under `-race`, `golangci-lint`, Linux and Windows `go vet`. Sub-Phase 04.3 and Phase 04 are fully COMPLETE.
 
 ---
 

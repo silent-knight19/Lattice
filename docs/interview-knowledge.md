@@ -2672,6 +2672,71 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
+# 35. Deep Systems Interview Questions & Answers: SSTable Block Reader & Sparse Index Point Lookup (P04-S03-M02)
+
+### 1. How does `TableReader` bootstrap an SSTable without scanning data blocks?
+* **Question**: In an LSM-tree storage engine, why does `TableReader` read the footer from `file_size - 48`, and why is loading the sparse index block into RAM sufficient for point lookups?
+* **Answer**:
+  - **Fixed Physical Anchor**: SSTables contain variable numbers of variable-length data blocks. Because data block sizes cannot be known in advance, the only fixed, predictable location in the entire SSTable is the file trailer: the fixed 48-byte footer anchored at `[file_size - 48 : file_size]`.
+  - **Single $O(1)$ Tail Seek**: Upon opening, the reader executes `file.Stat()` to determine physical file size, then reads exactly 48 bytes from `file_size - 48`. It validates the 64-bit cryptographic magic number (`0x4C41545453535401`) and the 8 zero padding bytes, proving file authenticity.
+  - **Decoupled Index Location**: The footer directly provides the exact `IndexHandle` (offset and size) of the sparse index block. The reader reads only this block and parses it into an in-memory `BlockIndex`.
+  - **Sub-Millisecond Startup**: Because only 48 bytes (footer) + the index block (typically $<0.1\%$ of the file) are transferred during open, an SSTable containing millions of keys can be opened and ready for queries in $<1$ millisecond with zero data block reads.
+
+### 2. Why does the sparse index binary search select candidate blocks based on `LargestKey`?
+* **Question**: Why does the SSTable index record the *largest* key of each data block rather than the *smallest* key, and how does `FindBlock(targetKey)` locate the correct block?
+* **Answer**:
+  - **Mathematical Partitioning**: An SSTable stores keys in strictly increasing sorted order. Each data block $i$ contains a contiguous key range $[S_i, L_i]$, where $S_i$ is the smallest key and $L_i$ is the largest key in block $i$. Because keys are globally sorted across blocks:
+    $$L_{i-1} < S_i \le L_i < S_{i+1}$$
+  - **Upper-Bound Selection**: If a target key $K$ exists in the SSTable, it must reside in the *first* block $i$ whose largest key is greater than or equal to $K$ ($L_i \ge K$). If $K > L_i$, it cannot possibly be in block $i$ (it would have to be in a later block). If $K \le L_i$, block $i$ is the *only* candidate block that could contain $K$.
+  - **Zero-I/O Fast Path for Out-of-Bounds Keys**: `sort.Search` evaluates `compareIndexKeys(entries[i].LargestKey, targetKey) >= 0`. If `targetKey > all LargestKeys`, the search returns `len(entries)`, `FindBlock` returns `false`, and `Seek()` immediately returns `ErrKeyNotFound` with **zero data block disk I/O**.
+  - If smallest keys were indexed instead, determining the candidate block would require inspecting adjacent entries, adding edge-case branching for the final block and ambiguous boundaries for missing keys.
+
+### 3. How does two-level binary search with restart points optimize point lookup?
+* **Question**: Explain the two-level binary search architecture used during `TableReader.Seek(key)`. How do restart points prevent decoding the entire 4KB block from byte zero?
+* **Answer**:
+  - **Level 1: In-Memory Index Search**:
+    - Binary search over $M$ sparse index entries in RAM ($O(\log M)$ time, 0 disk I/O).
+    - Pinpoints the exact candidate data block handle `[offset, size)`.
+  - **Level 2: On-Disk Data Block Restart Search**:
+    - The candidate 4KB data block is read into memory via positional `ReadAt` (1 disk seek).
+    - The block trailer contains $R$ restart offsets. At every restart offset, prefix compression is reset (`SharedKeyLen = 0`), and the unshared bytes store the complete encoded `InternalKey`.
+    - `TableReader` binary-searches the restart points ($O(\log R)$ comparisons) to find the largest restart index where `restart_key < targetKey`.
+  - **Bounded Forward Scan**:
+    - From that chosen restart point, the reader scans forward entry by entry, reconstructing keys via `previousKey[:shared] + deltaKey`.
+    - Because restart points occur every 16 entries by default, the linear scan evaluates at most 16 records ($K \le 16$) before either matching the key or encountering a key $> \text{targetKey}$.
+  - **Total Search Complexity**: $O(\log M + \log R + K)$ comparisons, where $K \le 16$. This combines logarithmic binary search efficiency with prefix compression storage density without decompressing the entire block.
+
+### 4. Why must `TableReader` use positional `ReadAt` rather than sequential `Read`?
+* **Question**: In concurrent multi-threaded storage engines, why must `TableReader` use `os.File.ReadAt` rather than standard `os.File.Read` or `Seek`?
+* **Answer**:
+  - **Shared Mutable File Offset Hazard**: Standard `os.File.Read()` and `Seek()` rely on a single file descriptor offset maintained inside the operating system kernel. If two goroutines concurrently call `Seek()` and `Read()` on the same `*os.File`, their offsets interleave, resulting in data races, reading the wrong block bytes, and silent corruption.
+  - **Concurrent-Safe Positional I/O**: `os.File.ReadAt(p, offset)` maps directly to POSIX `pread(2)` on Unix/Linux/macOS and `ReadFile` with `OVERLAPPED` on Windows. The kernel executes the read at the specified offset without updating or inspecting the descriptor's internal seek pointer.
+  - **Lock-Free Read Scalability**: Because `ReadAt` is stateless, multiple goroutines can execute concurrent `TableReader.Seek()` calls simultaneously under a shared read lock (`sync.RWMutex.RLock()`), achieving linear multicore read throughput without serializing disk reads behind a mutex.
+
+### 5. How does `TableReader` enforce LSM multi-version ordering and tombstone deletion semantics?
+* **Question**: How does `TableReader` handle multiple revisions of the same user key or deleted records (tombstones) during point lookup?
+* **Answer**:
+  - **InternalKey Sort Order**: In Lattice, data blocks order records by `CompareInternalKey`:
+    1. `UserKey ASC`
+    2. `SeqNum DESC` (higher sequence numbers sort before lower sequence numbers)
+    3. `OpType DESC` (`OpTypeDelete (0x02)` sorts before `OpTypePut (0x01)`)
+  - **Latest Version Guarantee**: When scanning forward within the candidate restart interval, the **very first** record encountered matching `UserKey` is mathematically guaranteed to be the latest version (highest sequence number visible in this SSTable).
+  - **Tombstone Masking**: If that first matching record has `OpType == OpTypeDelete`, the key was deleted. `TableReader.Seek()` immediately returns `nil, errors.ErrKeyNotFound`. It never scans further and never returns an older `OpTypePut` that might exist later in the block.
+  - **Put Value Return**: If the record has `OpType == OpTypePut`, the reader returns an independent, defensively copied byte slice of the value payload and `nil` error.
+
+### 6. Why is corruption strictly distinguished from "Key Not Found"?
+* **Question**: Why is it a catastrophic bug for an SSTable reader to catch I/O errors, CRC mismatches, or malformed varints and return `ErrKeyNotFound`?
+* **Answer**:
+  - **LSM-Tree Fallthrough Cascade**: In an LSM-tree, point lookups search levels sequentially ($L_0 \to L_1 \to \dots \to L_k$). If an SSTable returns `ErrKeyNotFound`, the engine falls through to search older levels.
+  - **Silent Stale Reads**: If a corrupted SSTable at $L_0$ returns `ErrKeyNotFound` instead of an error, the engine queries $L_1$ and returns an **old, stale version** of the key that was overwritten at $L_0$. The application receives obsolete data without any warning.
+  - **Compaction Data Loss**: During compaction, if corrupted records are treated as missing or empty, compaction merges could drop valid data permanently.
+  - **Lattice Implementation**: `TableReader` strictly returns explicit corruption errors:
+    - `ChecksumMismatchError` on failed CRC32 integrity checks.
+    - `DataBlockCorruptedError` on malformed varints, out-of-bounds restart offsets, or payload truncation.
+    - `InvalidFooterMagicError` / `InvalidFooterPaddingError` on corrupted footers.
+    - `ErrTableReaderClosed` on operations after close.
+    - Only a structurally intact, validated block where the key is genuinely absent (or tombstoned) returns `ErrKeyNotFound`.
+
+---
+
 *End of Technical Interview Knowledge Base — Lattice v1.0.0-KNOWLEDGE-BASE*
-
-
