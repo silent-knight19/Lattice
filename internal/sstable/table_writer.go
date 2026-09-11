@@ -137,6 +137,7 @@ type TableWriter struct {
 	syncFn    func(f *os.File) error
 	closeFn   func(f *os.File) error
 	syncDirFn func(dirPath string) error
+	linkFn    func(oldname, newname string) error
 }
 
 // NewTableWriter initializes a TableWriter to write an SSTable to dstPath using a secure staging file.
@@ -240,6 +241,7 @@ func NewTableWriter(dstPath string, opts TableWriterOptions) (*TableWriter, erro
 		syncFn:           defaultSync,
 		closeFn:          defaultClose,
 		syncDirFn:        syncDir,
+		linkFn:           os.Link,
 	}, nil
 }
 
@@ -282,6 +284,7 @@ func NewTableWriterWithFile(file *os.File, opts TableWriterOptions) (*TableWrite
 		syncFn:           defaultSync,
 		closeFn:          defaultClose,
 		syncDirFn:        syncDir,
+		linkFn:           os.Link,
 	}, nil
 }
 
@@ -564,7 +567,7 @@ func (w *TableWriter) Finish() (*SSTableMetadata, error) {
 		// filesystem mount), cross-device (EXDEV) failures cannot occur. Therefore
 		// no fallback to os.Rename is needed or safe — Rename can silently replace
 		// an existing destination, violating the no-overwrite invariant.
-		err := os.Link(w.tmpPath, w.dstPath)
+		err := w.linkFn(w.tmpPath, w.dstPath)
 		if err == nil {
 			_ = os.Remove(w.tmpPath)
 		} else if os.IsExist(err) {

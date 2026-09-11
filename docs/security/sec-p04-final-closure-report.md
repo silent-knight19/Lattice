@@ -154,12 +154,13 @@ The following subsystems were intentionally not implemented, maintaining strict 
 ### Remediation 7: Filesystem Error Handling & Atomic Publication (FINDING-07)
 * **Root Cause**: 
   1. `os.Lstat` errors other than `os.ErrNotExist` were silently ignored, causing permission or I/O errors to be treated as absent files.
-  2. `TableWriter.Finish` used `os.Rename(w.tmpPath, w.dstPath)` which suffered from a TOCTOU race where concurrent writers could overwrite each other. Furthermore, if `syncDir` failed after `Rename`, `w.tmpPath` was not cleared.
+  2. `TableWriter.Finish` originally used `os.Rename(w.tmpPath, w.dstPath)` which suffered from a TOCTOU race where concurrent writers could overwrite each other. An intermediate fix introduced `os.Link` with an unsafe `os.Rename` fallback for non-`EEXIST` errors, which could still overwrite destinations.
 * **Code Change**:
   - In `table_writer.go` and `wal/writer.go`, `os.Lstat` results distinguish `nil`, `os.IsNotExist(err)`, and unexpected filesystem errors.
-  - In `TableWriter.Finish`, publication uses atomic `os.Link(w.tmpPath, w.dstPath)` (failing with `EEXIST` if destination exists concurrently, with fallback to `Rename`), clears `w.tmpPath = ""` immediately upon publication, and transitions state to `stateFinalized` even if directory sync fails.
+  - In `TableWriter.Finish`, publication uses atomic `os.Link(w.tmpPath, w.dstPath)` exclusively. `EEXIST` returns `ErrSSTableExists`. Any other `Link` failure (permission, I/O) fails closed with a descriptive error. There is no `os.Rename` fallback — it was removed because it is overwrite-capable. Staging and destination are always in the same directory, so cross-device `Link` failures cannot occur. `w.tmpPath = ""` is cleared immediately upon publication, and state transitions to `stateFinalized` even if directory sync fails.
 * **Proving Tests**:
   - `TestSecurity_Remediation3_StagingFileHardening` (verified over 20 concurrent iterations without race)
+  - `TestSecurity_PublicationPrimitiveFailure_NoRenameFallback` (injected non-EEXIST Link error proves no Rename fallback, destination preserved, error state correct)
   - `TestSecurity_Issue7_FilesystemErrorHandling_AndPublicationSemantics`
   - `TestSecurity_Issue7_WAL_FilesystemErrorHandling`
 

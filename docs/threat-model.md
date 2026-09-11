@@ -159,8 +159,8 @@
 * **Attack Surface**: Filesystem staging path generation, file creation flags, and atomic publication rename.
 * **Impact**: High (Unauthorized file overwrite, corrupted SSTables, silent data replacement).
 * **Likelihood**: Medium.
-* **Existing Mitigation**: Staging files are created in the same parent directory using `os.CreateTemp` with randomized prefixes and atomic `O_CREATE|O_EXCL` semantics with mode `0600`. The file descriptor is verified against `os.Lstat` using `os.SameFile` and regular file checks to defeat symlink hijacking. In `Finish()`, destination existence is re-verified via `os.Lstat` immediately prior to rename, failing closed with `ErrSSTableExists` rather than overwriting concurrently created tables.
-* **Automated Test**: `TestSecurity_Remediation3_StagingFileHardening` verifying concurrent writer contention, destination overwrite prevention, and symlink rejection.
+* **Existing Mitigation**: Staging files are created in the same parent directory using `os.CreateTemp` with randomized prefixes and atomic `O_CREATE|O_EXCL` semantics with mode `0600`. The file descriptor is verified against `os.Lstat` using `os.SameFile` and regular file checks to defeat symlink hijacking. In `Finish()`, publication uses atomic `os.Link(tmpPath, dstPath)` which fails with `EEXIST` if the destination already exists, preventing any overwrite. There is no fallback to `os.Rename`; if `Link` fails for any non-`EEXIST` reason, the operation fails closed.
+* **Automated Test**: `TestSecurity_Remediation3_StagingFileHardening` (concurrent writer contention, destination overwrite prevention, symlink rejection), `TestSecurity_PublicationPrimitiveFailure_NoRenameFallback` (injected Link failure proves no Rename fallback).
 * **Residual Risk**: Negligible.
 
 ---

@@ -289,6 +289,135 @@ func TestSecurity_Remediation3_StagingFileHardening(t *testing.T) {
 	})
 }
 
+// TestSecurity_PublicationPrimitiveFailure_NoRenameFallback verifies that when
+// the atomic publication primitive (os.Link) fails with a non-EEXIST error,
+// the writer fails closed WITHOUT falling back to os.Rename.
+// This is the core test proving Property B: "No unsafe fallback".
+func TestSecurity_PublicationPrimitiveFailure_NoRenameFallback(t *testing.T) {
+	t.Run("non-EEXIST link failure fails closed without overwriting", func(t *testing.T) {
+		dir := t.TempDir()
+		targetPath := filepath.Join(dir, "link_failure.sst")
+
+		writer, err := sstable.NewTableWriter(targetPath, sstable.DefaultTableWriterOptions())
+		if err != nil {
+			t.Fatalf("NewTableWriter failed: %v", err)
+		}
+
+		ik, _ := binary.NewInternalKey([]byte("key-link-fail"), 1, binary.OpTypePut)
+		if err := writer.Add(ik, []byte("val")); err != nil {
+			t.Fatalf("Add failed: %v", err)
+		}
+
+		// Inject a non-EEXIST link error (simulating permission denied or I/O error)
+		injectedErr := stdErrors.New("injected link permission denied")
+		writer.SetLinkFnForTesting(func(oldname, newname string) error {
+			return injectedErr
+		})
+
+		_, err = writer.Finish()
+		if err == nil {
+			t.Fatal("expected error when link fails with non-EEXIST, got nil")
+		}
+
+		// Error must NOT be ErrSSTableExists (it's a different class of failure)
+		if stdErrors.Is(err, errors.ErrSSTableExists) {
+			t.Fatal("non-EEXIST link error must not be classified as ErrSSTableExists")
+		}
+
+		// The injected error must be wrapped in the returned error
+		if !stdErrors.Is(err, injectedErr) {
+			t.Fatalf("expected error wrapping injectedErr, got %v", err)
+		}
+
+		// Destination must NOT exist (no Rename fallback occurred)
+		if _, statErr := os.Stat(targetPath); statErr == nil {
+			t.Fatal("destination must not exist when link fails — Rename fallback must not be used")
+		}
+	})
+
+	t.Run("link failure does not overwrite pre-existing destination", func(t *testing.T) {
+		dir := t.TempDir()
+		targetPath := filepath.Join(dir, "link_fail_preserve.sst")
+
+		writer, err := sstable.NewTableWriter(targetPath, sstable.DefaultTableWriterOptions())
+		if err != nil {
+			t.Fatalf("NewTableWriter failed: %v", err)
+		}
+
+		ik, _ := binary.NewInternalKey([]byte("key-preserve"), 1, binary.OpTypePut)
+		if err := writer.Add(ik, []byte("val")); err != nil {
+			t.Fatalf("Add failed: %v", err)
+		}
+
+		// Simulate: another process creates the destination between init and Finish,
+		// AND os.Link returns a non-EEXIST error (e.g., permission denied).
+		// This is the worst-case scenario where a naive Rename fallback would overwrite.
+		sentinelContent := []byte("sentinel-must-be-preserved")
+		if err := os.WriteFile(targetPath, sentinelContent, 0600); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+
+		// Inject link failure that is NOT EEXIST (bypassing the Lstat pre-check would
+		// require the file to appear after Lstat but before Link — we simulate by
+		// making Link itself return a non-EEXIST error)
+		injectedErr := stdErrors.New("injected link I/O error")
+		writer.SetLinkFnForTesting(func(oldname, newname string) error {
+			return injectedErr
+		})
+
+		_, err = writer.Finish()
+		// Finish should fail (either ErrSSTableExists from Lstat, or the injected error)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+
+		// Sentinel content must be preserved regardless of failure path
+		content, readErr := os.ReadFile(targetPath)
+		if readErr != nil {
+			t.Fatalf("ReadFile failed: %v", readErr)
+		}
+		if !bytes.Equal(content, sentinelContent) {
+			t.Fatalf("destination content was modified: got %q, want %q", string(content), string(sentinelContent))
+		}
+	})
+
+	t.Run("writer enters error state after link failure", func(t *testing.T) {
+		dir := t.TempDir()
+		targetPath := filepath.Join(dir, "link_fail_state.sst")
+
+		writer, err := sstable.NewTableWriter(targetPath, sstable.DefaultTableWriterOptions())
+		if err != nil {
+			t.Fatalf("NewTableWriter failed: %v", err)
+		}
+
+		ik, _ := binary.NewInternalKey([]byte("key-state"), 1, binary.OpTypePut)
+		if err := writer.Add(ik, []byte("val")); err != nil {
+			t.Fatalf("Add failed: %v", err)
+		}
+
+		writer.SetLinkFnForTesting(func(oldname, newname string) error {
+			return stdErrors.New("injected link error")
+		})
+
+		_, err = writer.Finish()
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+
+		// Second Finish must fail with the writer's error state
+		_, err2 := writer.Finish()
+		if err2 == nil {
+			t.Fatal("expected error on second Finish after link failure")
+		}
+
+		// Second Add must also fail
+		ik2, _ := binary.NewInternalKey([]byte("key-state-2"), 2, binary.OpTypePut)
+		if addErr := writer.Add(ik2, []byte("val2")); addErr == nil {
+			t.Fatal("expected Add to fail after link error state")
+		}
+	})
+}
+
 // TestSecurity_Remediation4_MaxKeyLengthBoundary verifies that:
 // - 65,535-byte user keys are fully supported through Add, block flush, index, Finish, and Seek
 // - 65,544-byte encoded InternalKeys are supported in the sparse index
