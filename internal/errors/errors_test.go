@@ -55,6 +55,11 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrIndexFinished", errors.ErrIndexFinished, "index builder is finished"},
 		{"ErrIndexBlockTruncated", errors.ErrIndexBlockTruncated, "index block truncated: buffer smaller than trailer"},
 		{"ErrIndexBlockCorrupted", errors.ErrIndexBlockCorrupted, "index block corrupted: invalid offsets, count, or entries"},
+		{"ErrInvalidFooter", errors.ErrInvalidFooter, "invalid sstable footer"},
+		{"ErrInvalidFooterMagic", errors.ErrInvalidFooterMagic, "invalid sstable footer magic number"},
+		{"ErrFooterTruncated", errors.ErrFooterTruncated, "sstable footer truncated: buffer smaller than 48 bytes"},
+		{"ErrInvalidFooterSize", errors.ErrInvalidFooterSize, "invalid sstable footer buffer size: must be exactly 48 bytes"},
+		{"ErrInvalidFooterPadding", errors.ErrInvalidFooterPadding, "invalid sstable footer padding: reserved padding bytes must be zero"},
 	}
 
 	for _, tc := range sentinels {
@@ -1215,5 +1220,172 @@ func TestIndexBlockCorruptedError(t *testing.T) {
 	}
 	if !nilErr.Is(errors.ErrIndexBlockCorrupted) {
 		t.Errorf("nil *IndexBlockCorruptedError must match ErrIndexBlockCorrupted via Is")
+	}
+}
+
+func TestInvalidFooterMagicError(t *testing.T) {
+	err := &errors.InvalidFooterMagicError{
+		Expected: 0x4C41545453535401,
+		Actual:   0x1234567890ABCDEF,
+	}
+
+	// errors.Is check (matches both ErrInvalidFooterMagic and ErrInvalidFooter)
+	if !stdErrors.Is(err, errors.ErrInvalidFooterMagic) {
+		t.Errorf("InvalidFooterMagicError must match ErrInvalidFooterMagic via errors.Is")
+	}
+	if !stdErrors.Is(err, errors.ErrInvalidFooter) {
+		t.Errorf("InvalidFooterMagicError must match ErrInvalidFooter via errors.Is")
+	}
+
+	// Negative match
+	if stdErrors.Is(err, errors.ErrKeyNotFound) {
+		t.Errorf("InvalidFooterMagicError must not match ErrKeyNotFound")
+	}
+
+	// Wrapping check
+	wrapped := fmt.Errorf("decode footer: %w", err)
+	if !stdErrors.Is(wrapped, errors.ErrInvalidFooterMagic) {
+		t.Errorf("wrapped InvalidFooterMagicError must match ErrInvalidFooterMagic via errors.Is")
+	}
+	if !stdErrors.Is(wrapped, errors.ErrInvalidFooter) {
+		t.Errorf("wrapped InvalidFooterMagicError must match ErrInvalidFooter via errors.Is")
+	}
+
+	var extracted *errors.InvalidFooterMagicError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("failed to extract *InvalidFooterMagicError from wrapped chain")
+	}
+	if extracted.Expected != 0x4C41545453535401 || extracted.Actual != 0x1234567890ABCDEF {
+		t.Errorf("extracted mismatch: got %+v", extracted)
+	}
+
+	// String check
+	msg := err.Error()
+	if !strings.Contains(msg, "expected 0x4c41545453535401") || !strings.Contains(msg, "got 0x1234567890abcdef") {
+		t.Errorf("unexpected error message: %q", msg)
+	}
+
+	// Typed nil safety
+	var nilErr *errors.InvalidFooterMagicError
+	if nilErr.Error() != errors.ErrInvalidFooterMagic.Error() {
+		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrInvalidFooterMagic.Error())
+	}
+	if !nilErr.Is(errors.ErrInvalidFooterMagic) {
+		t.Errorf("nil *InvalidFooterMagicError must match ErrInvalidFooterMagic via Is")
+	}
+	if !nilErr.Is(errors.ErrInvalidFooter) {
+		t.Errorf("nil *InvalidFooterMagicError must match ErrInvalidFooter via Is")
+	}
+}
+
+func TestInvalidFooterPaddingError(t *testing.T) {
+	err := &errors.InvalidFooterPaddingError{
+		Padding: [8]byte{0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+	}
+
+	// errors.Is check
+	if !stdErrors.Is(err, errors.ErrInvalidFooterPadding) {
+		t.Errorf("InvalidFooterPaddingError must match ErrInvalidFooterPadding via errors.Is")
+	}
+	if !stdErrors.Is(err, errors.ErrInvalidFooter) {
+		t.Errorf("InvalidFooterPaddingError must match ErrInvalidFooter via errors.Is")
+	}
+
+	// Negative match
+	if stdErrors.Is(err, errors.ErrKeyNotFound) {
+		t.Errorf("InvalidFooterPaddingError must not match ErrKeyNotFound")
+	}
+
+	// Wrapping check
+	wrapped := fmt.Errorf("validate footer: %w", err)
+	if !stdErrors.Is(wrapped, errors.ErrInvalidFooterPadding) {
+		t.Errorf("wrapped InvalidFooterPaddingError must match ErrInvalidFooterPadding via errors.Is")
+	}
+
+	var extracted *errors.InvalidFooterPaddingError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("failed to extract *InvalidFooterPaddingError from wrapped chain")
+	}
+	if extracted.Padding != err.Padding {
+		t.Errorf("extracted mismatch: got %+v", extracted)
+	}
+
+	// String check
+	msg := err.Error()
+	if !strings.Contains(msg, "invalid sstable footer padding: expected all zeros") {
+		t.Errorf("unexpected error message: %q", msg)
+	}
+
+	// Typed nil safety
+	var nilErr *errors.InvalidFooterPaddingError
+	if nilErr.Error() != errors.ErrInvalidFooterPadding.Error() {
+		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrInvalidFooterPadding.Error())
+	}
+	if !nilErr.Is(errors.ErrInvalidFooterPadding) {
+		t.Errorf("nil *InvalidFooterPaddingError must match ErrInvalidFooterPadding via Is")
+	}
+	if !nilErr.Is(errors.ErrInvalidFooter) {
+		t.Errorf("nil *InvalidFooterPaddingError must match ErrInvalidFooter via Is")
+	}
+}
+
+func TestInvalidFooterSizeError(t *testing.T) {
+	errTruncated := &errors.InvalidFooterSizeError{
+		Expected: 48,
+		Actual:   30,
+	}
+
+	// errors.Is check for truncated: matches ErrFooterTruncated, ErrInvalidFooterSize, ErrInvalidFooter
+	if !stdErrors.Is(errTruncated, errors.ErrFooterTruncated) {
+		t.Errorf("errTruncated must match ErrFooterTruncated via errors.Is")
+	}
+	if !stdErrors.Is(errTruncated, errors.ErrInvalidFooterSize) {
+		t.Errorf("errTruncated must match ErrInvalidFooterSize via errors.Is")
+	}
+	if !stdErrors.Is(errTruncated, errors.ErrInvalidFooter) {
+		t.Errorf("errTruncated must match ErrInvalidFooter via errors.Is")
+	}
+
+	errOversized := &errors.InvalidFooterSizeError{
+		Expected: 48,
+		Actual:   60,
+	}
+
+	// errors.Is check for oversized: matches ErrInvalidFooterSize, ErrInvalidFooter (not ErrFooterTruncated)
+	if stdErrors.Is(errOversized, errors.ErrFooterTruncated) {
+		t.Errorf("errOversized must not match ErrFooterTruncated")
+	}
+	if !stdErrors.Is(errOversized, errors.ErrInvalidFooterSize) {
+		t.Errorf("errOversized must match ErrInvalidFooterSize via errors.Is")
+	}
+	if !stdErrors.Is(errOversized, errors.ErrInvalidFooter) {
+		t.Errorf("errOversized must match ErrInvalidFooter via errors.Is")
+	}
+
+	// Negative match
+	if stdErrors.Is(errTruncated, errors.ErrKeyNotFound) {
+		t.Errorf("must not match ErrKeyNotFound")
+	}
+
+	// Wrapping check
+	wrapped := fmt.Errorf("read footer: %w", errTruncated)
+	var extracted *errors.InvalidFooterSizeError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("failed to extract *InvalidFooterSizeError from wrapped chain")
+	}
+	if extracted.Expected != 48 || extracted.Actual != 30 {
+		t.Errorf("extracted mismatch: got %+v", extracted)
+	}
+
+	// Typed nil safety
+	var nilErr *errors.InvalidFooterSizeError
+	if nilErr.Error() != errors.ErrInvalidFooterSize.Error() {
+		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrInvalidFooterSize.Error())
+	}
+	if !nilErr.Is(errors.ErrInvalidFooterSize) {
+		t.Errorf("nil *InvalidFooterSizeError must match ErrInvalidFooterSize via Is")
+	}
+	if !nilErr.Is(errors.ErrInvalidFooter) {
+		t.Errorf("nil *InvalidFooterSizeError must match ErrInvalidFooter via Is")
 	}
 }

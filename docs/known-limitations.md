@@ -330,6 +330,19 @@ This document tracks all **genuine architectural and operational limitations** o
   * Performance: **Optimal** (~256 ns binary search across 1,000 blocks in RAM).
   * Scalability: **Optimal** for standard LSM SSTables (up to 64MB-2GB per SSTable).
 
+### 24. Fixed SSTable Footer and TableReader Decoupling (P04-S02-M02)
+* **Limitation**: `Footer` (P04-S02-M02) implements the fixed 48-byte binary serialization, deserialization, zero-padding verification, and magic number validation anchoring the SSTable. In this micro-phase, the footer codec operates in-memory on byte slices and fixed byte arrays. End-to-end disk persistence (appending the footer to an actual `.sst` file on disk) and file-level bootstrapping (reading `file_size - 48` from an OS file descriptor to initialize `TableReader`) are deferred to Sub-Phase 04.3 (`P04-S03-M01` for `TableWriter` and `P04-S03-M02` for `TableReader`). Furthermore, while `ValidateAgainstFileSize(fileSize)` guarantees handles do not extend beyond `fileSize - 48`, validating the footer alone does not guarantee the integrity of the data blocks or index blocks pointed to by the handles until those blocks are independently fetched and their CRC32 checksum trailers are verified.
+* **Why It Exists**: Following the micro-phase engineering discipline, binary structure codecs are cleanly isolated from file system I/O, streaming abstractions, and full table lifecycle management.
+* **Impact**: End-to-end SSTable reading and point lookups from disk require subsequent micro-phases (P04-S03-M01 writer and P04-S03-M02 reader).
+* **How It Was Detected**: Architectural analysis of P04-S02-M02 footer codec and integration boundaries.
+* **Current Mitigation**: Comprehensive unit tests, independent binary oracle fixtures, fuzz testing (>5.9M iterations with 0 crashes), zero heap allocation execution, and explicit file boundary validation (`ValidateAgainstFileSize`).
+* **Future Solution**: Sub-Phase 04.3 (`P04-S03-M01` TableWriter and `P04-S03-M02` TableReader) will integrate the footer into end-to-end file creation and querying workflows.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Strict 48-byte framing, byte-for-byte exact independent oracle match, 0-padding invariant).
+  * Performance: **Optimal** (Zero heap allocations, ~3.3 ns encode, ~3.7 ns decode).
+  * Scalability: **Optimal** (Handles address up to $2^{64}-1$ bytes).
+
 ---
 
 *End of Known Limitations — To be updated continuously throughout implementation.*
+

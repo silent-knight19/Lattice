@@ -169,6 +169,21 @@ var (
 
 	// ErrIndexBlockCorrupted indicates that an index block's trailer, offsets, or entries are corrupted.
 	ErrIndexBlockCorrupted = stdErrors.New("index block corrupted: invalid offsets, count, or entries")
+
+	// ErrInvalidFooter indicates that an SSTable footer failed structural, size, or cryptographic magic checks.
+	ErrInvalidFooter = stdErrors.New("invalid sstable footer")
+
+	// ErrInvalidFooterMagic indicates that an SSTable footer magic number does not match 0x4C41545453535401.
+	ErrInvalidFooterMagic = stdErrors.New("invalid sstable footer magic number")
+
+	// ErrFooterTruncated indicates that a buffer provided to decode an SSTable footer is shorter than 48 bytes.
+	ErrFooterTruncated = stdErrors.New("sstable footer truncated: buffer smaller than 48 bytes")
+
+	// ErrInvalidFooterSize indicates that an SSTable footer buffer does not match exactly 48 bytes.
+	ErrInvalidFooterSize = stdErrors.New("invalid sstable footer buffer size: must be exactly 48 bytes")
+
+	// ErrInvalidFooterPadding indicates that the reserved 8-byte padding in an SSTable footer is non-zero.
+	ErrInvalidFooterPadding = stdErrors.New("invalid sstable footer padding: reserved padding bytes must be zero")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing
@@ -548,4 +563,69 @@ func (e *IndexBlockCorruptedError) Error() string {
 // Is reports whether this error matches target sentinel ErrIndexBlockCorrupted.
 func (e *IndexBlockCorruptedError) Is(target error) bool {
 	return target == ErrIndexBlockCorrupted
+}
+
+// InvalidFooterMagicError provides structured context when an SSTable footer magic number check fails.
+// It matches ErrInvalidFooterMagic and ErrInvalidFooter when interrogated with errors.Is().
+type InvalidFooterMagicError struct {
+	Expected uint64
+	Actual   uint64
+}
+
+func (e *InvalidFooterMagicError) Error() string {
+	if e == nil {
+		return ErrInvalidFooterMagic.Error()
+	}
+	return fmt.Sprintf("invalid sstable footer magic: expected 0x%016x, got 0x%016x", e.Expected, e.Actual)
+}
+
+// Is reports whether this error matches target sentinels ErrInvalidFooterMagic or ErrInvalidFooter.
+func (e *InvalidFooterMagicError) Is(target error) bool {
+	return target == ErrInvalidFooterMagic || target == ErrInvalidFooter
+}
+
+// InvalidFooterPaddingError provides structured context when an SSTable footer padding check fails.
+// It matches ErrInvalidFooterPadding and ErrInvalidFooter when interrogated with errors.Is().
+type InvalidFooterPaddingError struct {
+	Padding [8]byte
+}
+
+func (e *InvalidFooterPaddingError) Error() string {
+	if e == nil {
+		return ErrInvalidFooterPadding.Error()
+	}
+	return fmt.Sprintf("invalid sstable footer padding: expected all zeros, got 0x%x", e.Padding[:])
+}
+
+// Is reports whether this error matches target sentinels ErrInvalidFooterPadding or ErrInvalidFooter.
+func (e *InvalidFooterPaddingError) Is(target error) bool {
+	return target == ErrInvalidFooterPadding || target == ErrInvalidFooter
+}
+
+// InvalidFooterSizeError provides structured context when an SSTable footer buffer length is invalid.
+// It matches ErrInvalidFooterSize, ErrFooterTruncated, and ErrInvalidFooter when interrogated with errors.Is().
+type InvalidFooterSizeError struct {
+	Expected int
+	Actual   int
+}
+
+func (e *InvalidFooterSizeError) Error() string {
+	if e == nil {
+		return ErrInvalidFooterSize.Error()
+	}
+	if e.Actual < e.Expected {
+		return fmt.Sprintf("sstable footer truncated: expected %d bytes, got %d bytes", e.Expected, e.Actual)
+	}
+	return fmt.Sprintf("invalid sstable footer buffer size: expected %d bytes, got %d bytes", e.Expected, e.Actual)
+}
+
+// Is reports whether this error matches target sentinels ErrInvalidFooterSize, ErrFooterTruncated, or ErrInvalidFooter.
+func (e *InvalidFooterSizeError) Is(target error) bool {
+	if target == ErrInvalidFooter {
+		return true
+	}
+	if e != nil && e.Actual < e.Expected && target == ErrFooterTruncated {
+		return true
+	}
+	return target == ErrInvalidFooterSize
 }
