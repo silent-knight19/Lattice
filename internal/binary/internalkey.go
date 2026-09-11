@@ -64,10 +64,17 @@ func (k InternalKey) Clone() InternalKey {
 	}
 }
 
-// String returns a human-readable representation of the InternalKey with the user key
-// formatted using Go-quoted string syntax to safely represent binary or arbitrary bytes.
-// For production logging where user keys may contain sensitive data, use Redact() or RedactedString().
+// String returns a privacy-safe human-readable representation of the InternalKey where
+// the raw user key bytes are redacted to prevent accidental disclosure of credentials, tokens,
+// or PII in logs, terminal outputs, or format strings (%v, %s).
 func (k InternalKey) String() string {
+	return k.RedactedString()
+}
+
+// DebugString returns an unredacted representation of the InternalKey with the user key
+// formatted using Go-quoted string syntax. This method is strictly intended for explicit
+// offline forensic diagnostics and debugging where key disclosure is intentional.
+func (k InternalKey) DebugString() string {
 	return fmt.Sprintf("InternalKey(%q, seq=%s, op=%s)", k.UserKey, k.SeqNum.String(), k.OpType.String())
 }
 

@@ -3,6 +3,7 @@ package binary_test
 import (
 	"bytes"
 	stdErrors "errors"
+	"fmt"
 	"math"
 	"math/rand"
 	"sort"
@@ -128,21 +129,43 @@ func TestInternalKey_CloneStringEqual(t *testing.T) {
 		t.Errorf("cloning nil UserKey should preserve nil")
 	}
 
-	// 2. String representation
+	// 2. Privacy-safe default String representation (Redacted by default: SEC-REMED-06)
 	str := k1.String()
-	if !strings.Contains(str, `"test-key"`) || !strings.Contains(str, "seq=42") || !strings.Contains(str, "op=PUT") {
+	if strings.Contains(str, "test-key") {
+		t.Errorf("String() leaked raw user key: %q", str)
+	}
+	if !strings.Contains(str, "len=8") || !strings.Contains(str, "seq=42") || !strings.Contains(str, "op=PUT") {
 		t.Errorf("unexpected string output: %q", str)
 	}
 
-	// Binary characters in String()
+	// Verify fmt.Sprintf("%v") does not disclose raw user key
+	formattedStr := fmt.Sprintf("%v", k1)
+	if strings.Contains(formattedStr, "test-key") {
+		t.Errorf("fmt.Sprintf(%%v) leaked raw user key: %q", formattedStr)
+	}
+
+	// Explicit DebugString provides quoted raw user keys for forensic diagnostics
+	debugStr := k1.DebugString()
+	if !strings.Contains(debugStr, `"test-key"`) || !strings.Contains(debugStr, "seq=42") || !strings.Contains(debugStr, "op=PUT") {
+		t.Errorf("unexpected DebugString output: %q", debugStr)
+	}
+
+	// Binary characters in DebugString() and String()
 	binKey := binary.InternalKey{
 		UserKey: []byte{0x00, 0xFF, 'A'},
 		SeqNum:  10,
 		OpType:  binary.OpTypeDelete,
 	}
+	binDebugStr := binKey.DebugString()
+	if !strings.Contains(binDebugStr, `\x00\xffA`) && !strings.Contains(binDebugStr, `op=DELETE`) {
+		t.Errorf("unexpected binary debug string output: %q", binDebugStr)
+	}
 	binStr := binKey.String()
-	if !strings.Contains(binStr, `\x00\xffA`) && !strings.Contains(binStr, `op=DELETE`) {
-		t.Errorf("unexpected binary string output: %q", binStr)
+	if strings.Contains(binStr, "\x00") || strings.Contains(binStr, "\xff") {
+		t.Errorf("default String() leaked raw binary bytes: %q", binStr)
+	}
+	if !strings.Contains(binStr, "len=3") || !strings.Contains(binStr, "op=DELETE") {
+		t.Errorf("unexpected binary default String output: %q", binStr)
 	}
 
 	// 2b. Privacy-safe Redact and RedactedString representations

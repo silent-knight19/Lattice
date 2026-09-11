@@ -378,12 +378,11 @@ func TestTableWriter_PreExistingFileConflict(t *testing.T) {
 	}
 }
 
-// TestTableWriter_AtomicStagingAndCleanup verifies that .tmp staging files exist during
+// TestTableWriter_AtomicStagingAndCleanup verifies that secure staging files exist during
 // writing, are renamed on Finish, and are removed on Close without Finish.
 func TestTableWriter_AtomicStagingAndCleanup(t *testing.T) {
 	dir := t.TempDir()
 	sstPath := filepath.Join(dir, "atomic.sst")
-	tmpPath := sstPath + ".tmp"
 
 	// 1. Staging file exists during writing
 	writer, err := sstable.NewTableWriter(sstPath, sstable.DefaultTableWriterOptions())
@@ -391,8 +390,13 @@ func TestTableWriter_AtomicStagingAndCleanup(t *testing.T) {
 		t.Fatalf("NewTableWriter failed: %v", err)
 	}
 
+	tmpPath := writer.TempPath()
+	if tmpPath == "" {
+		t.Fatal("expected non-empty TempPath for active staging writer")
+	}
+
 	if _, err := os.Stat(tmpPath); err != nil {
-		t.Fatalf("expected .tmp file to exist during write: %v", err)
+		t.Fatalf("expected staging file to exist during write: %v", err)
 	}
 	if _, err := os.Stat(sstPath); !os.IsNotExist(err) {
 		t.Fatalf("final .sst file must NOT exist before Finish")
@@ -400,32 +404,36 @@ func TestTableWriter_AtomicStagingAndCleanup(t *testing.T) {
 
 	_ = writer.Add(makeTestIK("k1", 1, binary.OpTypePut), []byte("v1"))
 
-	// 2. Finish renames .tmp to final .sst
+	// 2. Finish renames staging file to final .sst
 	if _, err := writer.Finish(); err != nil {
 		t.Fatalf("Finish failed: %v", err)
 	}
 
 	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
-		t.Fatalf(".tmp file must be removed after Finish")
+		t.Fatalf("staging file must be removed after Finish")
 	}
 	if _, err := os.Stat(sstPath); err != nil {
 		t.Fatalf("final .sst file must exist after Finish: %v", err)
 	}
 
-	// 3. Close without Finish unlinks .tmp
+	// 3. Close without Finish unlinks staging file
 	sstPath2 := filepath.Join(dir, "abandoned.sst")
-	tmpPath2 := sstPath2 + ".tmp"
 	writer2, err := sstable.NewTableWriter(sstPath2, sstable.DefaultTableWriterOptions())
 	if err != nil {
 		t.Fatalf("NewTableWriter failed: %v", err)
 	}
+	tmpPath2 := writer2.TempPath()
+	if tmpPath2 == "" {
+		t.Fatal("expected non-empty TempPath for second active writer")
+	}
+
 	_ = writer2.Add(makeTestIK("k2", 1, binary.OpTypePut), []byte("v2"))
 
 	if err := writer2.Close(); err != nil {
 		t.Fatalf("Close failed: %v", err)
 	}
 	if _, err := os.Stat(tmpPath2); !os.IsNotExist(err) {
-		t.Fatalf(".tmp file must be removed after Close")
+		t.Fatalf("staging file must be removed after Close")
 	}
 	if _, err := os.Stat(sstPath2); !os.IsNotExist(err) {
 		t.Fatalf("final .sst file must NOT exist after abandoned Close")

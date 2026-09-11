@@ -38,6 +38,17 @@ func (e IndexEntry) Clone() IndexEntry {
 	}
 }
 
+// UserKey returns the bare user key portion of LargestKey.
+// If LargestKey is an encoded InternalKey, it extracts ik.UserKey.
+// Otherwise, it returns LargestKey as-is.
+func (e IndexEntry) UserKey() []byte {
+	ik, err := binary.DecodeInternalKey(e.LargestKey)
+	if err == nil {
+		return ik.UserKey
+	}
+	return e.LargestKey
+}
+
 // IndexBuilder constructs the sparse Two-Level Block Index for an SSTable.
 //
 // In Lattice's SSTable architecture (ADR-004), a sparse block index records exactly one entry
@@ -109,8 +120,14 @@ func (b *IndexBuilder) AddBlock(largestKey []byte, handle BlockHandle) error {
 	if b.finished {
 		return errors.ErrIndexFinished
 	}
-	if err := binary.ValidateKey(largestKey); err != nil {
-		return err
+	if len(largestKey) == 0 {
+		return errors.ErrEmptyKey
+	}
+	if len(largestKey) > binary.MaxEncodedInternalKeyLen {
+		return &errors.KeyTooLargeError{
+			KeySize: uint32(len(largestKey)),
+			MaxSize: binary.MaxEncodedInternalKeyLen,
+		}
 	}
 	if err := handle.Validate(); err != nil {
 		return err
@@ -118,7 +135,7 @@ func (b *IndexBuilder) AddBlock(largestKey []byte, handle BlockHandle) error {
 
 	// Canonical ordering check
 	if len(b.entries) > 0 {
-		if compareIndexKeys(b.prevKey, largestKey) >= 0 {
+		if compareIndexEntryKeys(b.prevKey, largestKey) >= 0 {
 			return &errors.KeyOutOfOrderError{
 				PrevKeyLen: len(b.prevKey),
 				CurrKeyLen: len(largestKey),
@@ -274,22 +291,52 @@ func (b *IndexBuilder) Entries() []IndexEntry {
 }
 
 // FindBlock performs binary search over the in-memory index entries to find the single candidate
-// data block that could contain targetKey.
+// data block that could contain targetUserKey.
 //
-// In an SSTable sparse index, this is the first block whose LargestKey >= targetKey.
-// If targetKey is strictly greater than all largest keys in the index, false is returned,
+// In an SSTable sparse index, this compares the user key component of each block's LargestKey
+// against targetUserKey.
+// If targetUserKey is strictly greater than all largest keys in the index, false is returned,
 // proving the key cannot exist in this SSTable without performing any disk I/O.
-func (b *IndexBuilder) FindBlock(targetKey []byte) (BlockHandle, bool) {
-	if b == nil || len(b.entries) == 0 || len(targetKey) == 0 {
+func (b *IndexBuilder) FindBlock(targetUserKey []byte) (BlockHandle, bool) {
+	if b == nil || len(b.entries) == 0 || len(targetUserKey) == 0 {
 		return BlockHandle{}, false
 	}
 	idx := sort.Search(len(b.entries), func(i int) bool {
-		return compareIndexKeys(b.entries[i].LargestKey, targetKey) >= 0
+		return bytes.Compare(b.entries[i].UserKey(), targetUserKey) >= 0
 	})
 	if idx >= len(b.entries) {
 		return BlockHandle{}, false
 	}
 	return b.entries[idx].Handle, true
+}
+
+// FindBlockKey performs binary search over the in-memory index entries when the search target
+// is a structured binary.InternalKey.
+func (b *IndexBuilder) FindBlockKey(key binary.InternalKey) (BlockHandle, bool) {
+	if b == nil || len(b.entries) == 0 {
+		return BlockHandle{}, false
+	}
+	idx := sort.Search(len(b.entries), func(i int) bool {
+		entryIK, err := binary.DecodeInternalKey(b.entries[i].LargestKey)
+		if err != nil {
+			return bytes.Compare(b.entries[i].LargestKey, key.UserKey) >= 0
+		}
+		return binary.CompareInternalKey(entryIK, key) >= 0
+	})
+	if idx >= len(b.entries) {
+		return BlockHandle{}, false
+	}
+	return b.entries[idx].Handle, true
+}
+
+// FindBlockInternalKey performs binary search over the in-memory index entries when the search target
+// is an encoded InternalKey byte slice.
+func (b *IndexBuilder) FindBlockInternalKey(targetInternalKey []byte) (BlockHandle, bool) {
+	ik, err := binary.DecodeInternalKey(targetInternalKey)
+	if err != nil {
+		return b.FindBlock(targetInternalKey)
+	}
+	return b.FindBlockKey(ik)
 }
 
 // CurrentSizeEstimate returns the estimated total size of the finished index block in bytes,
@@ -395,7 +442,7 @@ func DecodeBlockIndex(data []byte) (*BlockIndex, error) {
 		if err != nil {
 			return nil, &errors.IndexBlockCorruptedError{Reason: "varint key length truncated or invalid"}
 		}
-		if keyLen == 0 || keyLen > binary.MaxKeyLen {
+		if keyLen == 0 || keyLen > binary.MaxEncodedInternalKeyLen {
 			return nil, &errors.IndexBlockCorruptedError{Reason: "key length outside valid boundaries"}
 		}
 
@@ -414,7 +461,7 @@ func DecodeBlockIndex(data []byte) (*BlockIndex, error) {
 
 		// Strictly increasing key order verification
 		if i > 0 {
-			if compareIndexKeys(entries[i-1].LargestKey, keyBytes) >= 0 {
+			if compareIndexEntryKeys(entries[i-1].LargestKey, keyBytes) >= 0 {
 				return nil, &errors.IndexBlockCorruptedError{Reason: "index entries violate strictly increasing key ordering"}
 			}
 		}
@@ -459,15 +506,17 @@ func (idx *BlockIndex) Entries() []IndexEntry {
 }
 
 // FindBlock performs binary search over the index entries to find the single candidate
-// data block that could contain targetKey.
+// data block that could contain targetUserKey.
 //
-// Returns (handle, true) if found, (BlockHandle{}, false) if targetKey > all keys in the SSTable.
-func (idx *BlockIndex) FindBlock(targetKey []byte) (BlockHandle, bool) {
-	if idx == nil || len(idx.entries) == 0 || len(targetKey) == 0 {
+// In an SSTable sparse index, this compares the user key component of each block's LargestKey
+// against targetUserKey.
+// Returns (handle, true) if found, (BlockHandle{}, false) if targetUserKey > all keys in the SSTable.
+func (idx *BlockIndex) FindBlock(targetUserKey []byte) (BlockHandle, bool) {
+	if idx == nil || len(idx.entries) == 0 || len(targetUserKey) == 0 {
 		return BlockHandle{}, false
 	}
 	searchIdx := sort.Search(len(idx.entries), func(i int) bool {
-		return compareIndexKeys(idx.entries[i].LargestKey, targetKey) >= 0
+		return bytes.Compare(idx.entries[i].UserKey(), targetUserKey) >= 0
 	})
 	if searchIdx >= len(idx.entries) {
 		return BlockHandle{}, false
@@ -475,34 +524,39 @@ func (idx *BlockIndex) FindBlock(targetKey []byte) (BlockHandle, bool) {
 	return idx.entries[searchIdx].Handle, true
 }
 
-// compareIndexKeys compares two keys using canonical storage engine ordering.
-//
-// Logic:
-//   - If both keys decode as binary.InternalKey (with 9-byte sequence/op trailer),
-//     it evaluates binary.CompareInternalKey (UserKey ASC, SeqNum DESC, OpType DESC).
-//   - If one is an InternalKey and the other is a raw UserKey:
-//     compares the user key portion. If user keys are identical, the InternalKey
-//     sorts after the bare user key because it represents a versioned record.
-//   - Otherwise, it evaluates bytes.Compare(a, b).
-func compareIndexKeys(a, b []byte) int {
+// FindBlockKey performs binary search over the index entries when looking up by a structured InternalKey.
+func (idx *BlockIndex) FindBlockKey(key binary.InternalKey) (BlockHandle, bool) {
+	if idx == nil || len(idx.entries) == 0 {
+		return BlockHandle{}, false
+	}
+	searchIdx := sort.Search(len(idx.entries), func(i int) bool {
+		entryIK, err := binary.DecodeInternalKey(idx.entries[i].LargestKey)
+		if err != nil {
+			return bytes.Compare(idx.entries[i].LargestKey, key.UserKey) >= 0
+		}
+		return binary.CompareInternalKey(entryIK, key) >= 0
+	})
+	if searchIdx >= len(idx.entries) {
+		return BlockHandle{}, false
+	}
+	return idx.entries[searchIdx].Handle, true
+}
+
+// FindBlockInternalKey performs binary search over the index entries when looking up by an encoded InternalKey byte slice.
+func (idx *BlockIndex) FindBlockInternalKey(targetInternalKey []byte) (BlockHandle, bool) {
+	ik, err := binary.DecodeInternalKey(targetInternalKey)
+	if err != nil {
+		return idx.FindBlock(targetInternalKey)
+	}
+	return idx.FindBlockKey(ik)
+}
+
+// compareIndexEntryKeys compares two index entry largest keys for strictly monotonic ordering.
+func compareIndexEntryKeys(a, b []byte) int {
 	ikA, errA := binary.DecodeInternalKey(a)
 	ikB, errB := binary.DecodeInternalKey(b)
 	if errA == nil && errB == nil {
 		return binary.CompareInternalKey(ikA, ikB)
-	}
-	if errA == nil && errB != nil {
-		cmp := bytes.Compare(ikA.UserKey, b)
-		if cmp != 0 {
-			return cmp
-		}
-		return 1
-	}
-	if errA != nil && errB == nil {
-		cmp := bytes.Compare(a, ikB.UserKey)
-		if cmp != 0 {
-			return cmp
-		}
-		return -1
 	}
 	return bytes.Compare(a, b)
 }

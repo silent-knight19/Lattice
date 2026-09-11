@@ -22,6 +22,13 @@ const (
 	stateError
 )
 
+const (
+	// DefaultFileMode is the secure default file permissions for SSTables (0600 - owner read/write only).
+	DefaultFileMode os.FileMode = 0600
+	// DefaultDirMode is the secure default directory permissions for SSTable storage (0700 - owner read/write/exec only).
+	DefaultDirMode os.FileMode = 0700
+)
+
 // TableWriterOptions configures the construction and flushing behavior of an SSTable file.
 type TableWriterOptions struct {
 	// TargetBlockSize is the threshold size in bytes at which a data block is flushed to disk.
@@ -33,7 +40,7 @@ type TableWriterOptions struct {
 	RestartInterval int
 
 	// FileMode is the permission mode for the created SSTable file.
-	// Default: 0644.
+	// Default: 0600 (DefaultFileMode).
 	FileMode os.FileMode
 }
 
@@ -42,7 +49,7 @@ func DefaultTableWriterOptions() TableWriterOptions {
 	return TableWriterOptions{
 		TargetBlockSize: TargetBlockSize,
 		RestartInterval: DefaultRestartInterval,
-		FileMode:        0644,
+		FileMode:        DefaultFileMode,
 	}
 }
 
@@ -119,15 +126,15 @@ type TableWriter struct {
 	closeFn func(f *os.File) error
 }
 
-// NewTableWriter initializes a TableWriter to write an SSTable to dstPath using a staging .tmp file.
+// NewTableWriter initializes a TableWriter to write an SSTable to dstPath using a secure staging file.
 // If an SSTable already exists at dstPath, it returns errors.ErrSSTableExists.
 func NewTableWriter(dstPath string, opts TableWriterOptions) (*TableWriter, error) {
 	if dstPath == "" {
 		return nil, os.ErrInvalid
 	}
 
-	// Reject overwriting an existing finalized SSTable
-	if _, err := os.Stat(dstPath); err == nil {
+	// Reject overwriting an existing finalized SSTable or symlink
+	if _, err := os.Lstat(dstPath); err == nil {
 		return nil, errors.ErrSSTableExists
 	}
 
@@ -138,18 +145,55 @@ func NewTableWriter(dstPath string, opts TableWriterOptions) (*TableWriter, erro
 		opts.RestartInterval = DefaultRestartInterval
 	}
 	if opts.FileMode == 0 {
-		opts.FileMode = 0644
+		opts.FileMode = DefaultFileMode
 	}
 
 	parentDir := filepath.Dir(dstPath)
-	if err := os.MkdirAll(parentDir, 0755); err != nil {
+	if err := os.MkdirAll(parentDir, DefaultDirMode); err != nil {
 		return nil, err
 	}
 
-	tmpPath := dstPath + ".tmp"
-	file, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, opts.FileMode)
+	// Secure staging file creation:
+	// Use os.CreateTemp with O_CREATE|O_EXCL semantics in the same parent directory.
+	// This prevents predictable staging collisions, symlink hijacking, and TOCTOU overwrites.
+	file, err := os.CreateTemp(parentDir, fmt.Sprintf(".tmp_%s_*", filepath.Base(dstPath)))
 	if err != nil {
 		return nil, err
+	}
+	tmpPath := file.Name()
+
+	// Ensure permissions match opts.FileMode if caller specified custom mode
+	if opts.FileMode != DefaultFileMode {
+		if err := file.Chmod(opts.FileMode); err != nil {
+			_ = file.Close()
+			_ = os.Remove(tmpPath)
+			return nil, err
+		}
+	}
+
+	// Verify file descriptor refers to a regular file and not a symlink
+	fi, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		_ = os.Remove(tmpPath)
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		_ = file.Close()
+		_ = os.Remove(tmpPath)
+		return nil, fmt.Errorf("staging path is not a regular file")
+	}
+
+	lfi, err := os.Lstat(tmpPath)
+	if err != nil {
+		_ = file.Close()
+		_ = os.Remove(tmpPath)
+		return nil, err
+	}
+	if lfi.Mode()&os.ModeSymlink != 0 || !os.SameFile(fi, lfi) {
+		_ = file.Close()
+		_ = os.Remove(tmpPath)
+		return nil, fmt.Errorf("staging path symlink detected")
 	}
 
 	dataBuilder, err := NewBlockBuilderWithInterval(opts.RestartInterval)
@@ -231,7 +275,18 @@ func (w *TableWriter) Add(key binary.InternalKey, value []byte) error {
 		return errors.ErrTableWriterClosed
 	}
 
-	// 1. Verify strictly monotonic key ordering
+	// 1. Validate key, opType, and value BEFORE mutating writer state or flushing
+	if err := binary.ValidateKey(key.UserKey); err != nil {
+		return err
+	}
+	if err := key.OpType.Validate(); err != nil {
+		return err
+	}
+	if err := binary.ValidateValue(value); err != nil {
+		return err
+	}
+
+	// 2. Verify strictly monotonic key ordering
 	if w.hasPrevKey {
 		if binary.CompareInternalKey(w.prevKey, key) >= 0 {
 			return &errors.KeyOutOfOrderError{
@@ -241,7 +296,7 @@ func (w *TableWriter) Add(key binary.InternalKey, value []byte) error {
 		}
 	}
 
-	// 2. Flush current block if adding another entry would exceed target size
+	// 3. Flush current block if adding another entry would exceed target size
 	if w.dataBlockBuilder.CurrentSizeEstimate() >= w.opts.TargetBlockSize && !w.dataBlockBuilder.IsEmpty() {
 		if err := w.flushDataBlock(); err != nil {
 			return err
@@ -453,8 +508,16 @@ func (w *TableWriter) Finish() (*SSTableMetadata, error) {
 	}
 	w.file = nil
 
-	// 7. Atomic Rename & Directory Sync (if staging file was used)
+	// 7. Atomic Publication & Directory Sync (if staging file was used)
 	if w.tmpPath != "" {
+		// Verify destination path does not already exist before atomic rename
+		if _, err := os.Lstat(w.dstPath); err == nil {
+			w.state = stateError
+			w.err = errors.ErrSSTableExists
+			_ = os.Remove(w.tmpPath)
+			return nil, errors.ErrSSTableExists
+		}
+
 		if err := os.Rename(w.tmpPath, w.dstPath); err != nil {
 			w.state = stateError
 			w.err = err
@@ -563,6 +626,14 @@ func (w *TableWriter) BlockCount() uint64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.dataBlockCount
+}
+
+// TempPath returns the physical staging path currently in use by this writer,
+// or empty string if writing directly to a file descriptor.
+func (w *TableWriter) TempPath() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.tmpPath
 }
 
 // EstimatedSize returns the estimated size of the SSTable if finalized now.

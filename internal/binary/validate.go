@@ -13,6 +13,13 @@ const (
 	// MaxKeyLen is the maximum legal byte length for a user key (65,535 bytes / 64 KB - 1).
 	MaxKeyLen = 65535
 
+	// MaxUserKeyLen is the maximum legal byte length for a user key (65,535 bytes / 64 KB - 1).
+	MaxUserKeyLen = MaxKeyLen
+
+	// MaxEncodedInternalKeyLen is the maximum legal byte length for a serialized InternalKey:
+	// MaxUserKeyLen (65,535 bytes) + InternalKeyTrailerLen (9 bytes) = 65,544 bytes.
+	MaxEncodedInternalKeyLen = MaxKeyLen + InternalKeyTrailerLen
+
 	// MaxKeyBytes is an alias for MaxKeyLen.
 	MaxKeyBytes = MaxKeyLen
 
@@ -52,6 +59,30 @@ func ValidateKey(key []byte) error {
 		}
 	}
 	return nil
+}
+
+// ValidateEncodedInternalKey verifies that data represents a valid serialized InternalKey:
+// MinKeyLen + InternalKeyTrailerLen (10) <= len(data) <= MaxEncodedInternalKeyLen (65,544 bytes).
+// It verifies that the user key portion satisfies 1 <= len(UserKey) <= 65,535 bytes
+// and the operation type trailer byte represents a valid database operation.
+func ValidateEncodedInternalKey(data []byte) error {
+	l := len(data)
+	if l < MinKeyLen+InternalKeyTrailerLen {
+		return errors.ErrInternalKeyTruncated
+	}
+	if l > MaxEncodedInternalKeyLen {
+		return &errors.KeyTooLargeError{
+			KeySize: safeUint32(l),
+			MaxSize: MaxEncodedInternalKeyLen,
+		}
+	}
+	userKeyLen := l - InternalKeyTrailerLen
+	if err := ValidateKey(data[:userKeyLen]); err != nil {
+		return err
+	}
+	opTypeByte := data[userKeyLen+8]
+	_, err := ParseOpType(opTypeByte)
+	return err
 }
 
 // ValidateValue verifies that val satisfies storage boundary constraints:

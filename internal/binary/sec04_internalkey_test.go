@@ -343,8 +343,9 @@ func TestSEC04_Concurrency_01_HighConcurrencyReadWrite(t *testing.T) {
 	wg.Wait()
 }
 
-// TestSEC04_Disclosure_01_StringFormatSafelyQuotesBinary verifies that InternalKey.String()
-// quotes arbitrary binary bytes safely without producing unescaped control characters.
+// TestSEC04_Disclosure_01_StringFormatSafelyQuotesBinary verifies that InternalKey.DebugString()
+// quotes arbitrary binary bytes safely without producing unescaped control characters,
+// while InternalKey.String() redacts the key payload by default.
 func TestSEC04_Disclosure_01_StringFormatSafelyQuotesBinary(t *testing.T) {
 	binaryKey := []byte{0x00, 0x07, 0x1B, 0xFF, 'h', 'e', 'l', 'l', 'o'}
 	ik := binary.InternalKey{
@@ -353,12 +354,27 @@ func TestSEC04_Disclosure_01_StringFormatSafelyQuotesBinary(t *testing.T) {
 		OpType:  binary.OpTypePut,
 	}
 
-	str := ik.String()
-	// Must contain Go-quoted string representation \x00, \x07, \x1b, \xff
-	if !strings.Contains(str, `\x00`) || !strings.Contains(str, `\xff`) {
-		t.Fatalf("InternalKey.String() did not properly escape binary characters: %s", str)
+	// Default String() must redact raw key bytes
+	defaultStr := ik.String()
+	if strings.Contains(defaultStr, "\x00") || strings.Contains(defaultStr, "hello") {
+		t.Fatalf("InternalKey.String() leaked raw key bytes: %s", defaultStr)
 	}
-	if !strings.Contains(str, "seq=42") || !strings.Contains(str, "op=PUT") {
-		t.Fatalf("InternalKey.String() missing metadata: %s", str)
+	if !strings.Contains(defaultStr, "len=9") || !strings.Contains(defaultStr, "seq=42") || !strings.Contains(defaultStr, "op=PUT") {
+		t.Fatalf("InternalKey.String() missing metadata: %s", defaultStr)
+	}
+
+	// fmt.Sprintf("%v") must also be redacted
+	fmtStr := fmt.Sprintf("%v", ik)
+	if strings.Contains(fmtStr, "\x00") || strings.Contains(fmtStr, "hello") {
+		t.Fatalf("fmt.Sprintf(%%v) leaked raw key bytes: %s", fmtStr)
+	}
+
+	// Forensic DebugString() must contain Go-quoted string representation \x00, \x07, \x1b, \xff
+	debugStr := ik.DebugString()
+	if !strings.Contains(debugStr, `\x00`) || !strings.Contains(debugStr, `\xff`) {
+		t.Fatalf("InternalKey.DebugString() did not properly escape binary characters: %s", debugStr)
+	}
+	if !strings.Contains(debugStr, "seq=42") || !strings.Contains(debugStr, "op=PUT") {
+		t.Fatalf("InternalKey.DebugString() missing metadata: %s", debugStr)
 	}
 }

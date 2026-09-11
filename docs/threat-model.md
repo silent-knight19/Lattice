@@ -153,4 +153,52 @@
 
 ---
 
+### Threat 9: SSTable Staging File Hijacking, Symlink Attacks & TOCTOU Overwrites
+* **Asset**: SSTable data integrity and destination file publication.
+* **Threat**: Predictable staging file names (e.g. `<target>.tmp`) open opportunities for local unprivileged processes to pre-create symlinks pointing to sensitive files (e.g. `/etc/passwd`), cause file truncation via `O_TRUNC`, or hijack concurrent table flushes. Furthermore, race conditions between table creation and finalization could cause silent destination overwrites.
+* **Attack Surface**: Filesystem staging path generation, file creation flags, and atomic publication rename.
+* **Impact**: High (Unauthorized file overwrite, corrupted SSTables, silent data replacement).
+* **Likelihood**: Medium.
+* **Existing Mitigation**: Staging files are created in the same parent directory using `os.CreateTemp` with randomized prefixes and atomic `O_CREATE|O_EXCL` semantics with mode `0600`. The file descriptor is verified against `os.Lstat` using `os.SameFile` and regular file checks to defeat symlink hijacking. In `Finish()`, destination existence is re-verified via `os.Lstat` immediately prior to rename, failing closed with `ErrSSTableExists` rather than overwriting concurrently created tables.
+* **Automated Test**: `TestSecurity_Remediation3_StagingFileHardening` verifying concurrent writer contention, destination overwrite prevention, and symlink rejection.
+* **Residual Risk**: Negligible.
+
+---
+
+### Threat 10: Sparse Index Key Comparator Type Confusion
+* **Asset**: SSTable point lookup correctness and sparse index block selection.
+* **Threat**: Heuristic key comparators that attempt to decode arbitrary byte slices as `InternalKey`s can misidentify bare binary user keys ($\ge 10$ bytes ending in `0x01` or `0x02`) as versioned records. This truncates the user key, corrupts sparse index binary search, and produces false `ErrKeyNotFound` errors for valid data.
+* **Attack Surface**: `BlockIndex.FindBlock`, `IndexBuilder.FindBlock`, and SSTable `Seek` path.
+* **Impact**: High (Data unavailability, false negative lookups for valid keys).
+* **Likelihood**: High for binary user keys.
+* **Existing Mitigation**: The comparator explicitly distinguishes between operand representations. In the SSTable point lookup path, `BlockIndex.FindBlock(targetUserKey)` extracts `entry.UserKey()` from the index block's largest key and evaluates `bytes.Compare` against the bare target user key. Binary keys ending in `0x01`, `0x02`, or containing null bytes are never decoded as internal keys. Separate explicit methods (`FindBlockKey`, `FindBlockInternalKey`) handle internal key targets.
+* **Automated Test**: `TestSecurity_Remediation1_SparseIndexTypeConfusion` verifying exact point lookups and boundary checks across binary keys ending in `0x01`, `0x02`, zero bytes, and trailer-like suffixes.
+* **Residual Risk**: Negligible.
+
+---
+
+### Threat 11: SSTable Key Length Boundary Inconsistencies
+* **Asset**: Maximum supported user key size (65,535 bytes) and memory allocation bounding.
+* **Threat**: Applying user-key maximum lengths (`MaxKeyLen = 65,535`) to encoded `InternalKey`s (which include an additional 9-byte trailer) causes valid maximum-size user keys to be rejected during block index encoding or decoding, while failing to bound internal representations permits denial-of-service memory blowups.
+* **Attack Surface**: `TableWriter.Add`, `IndexBuilder.AddBlock`, and `DecodeBlockIndex`.
+* **Impact**: Medium (Rejection of valid maximum-boundary user keys; availability degradation).
+* **Likelihood**: Medium for applications using 64KB keys.
+* **Existing Mitigation**: Explicit separation of representation boundaries: `MaxUserKeyLen` (65,535 bytes) and `MaxEncodedInternalKeyLen` (65,544 bytes). `TableWriter.Add` validates user keys against `MaxUserKeyLen`, while `IndexBuilder` and `DecodeBlockIndex` validate index entries against `MaxEncodedInternalKeyLen`.
+* **Automated Test**: `TestSecurity_Remediation4_MaxKeyLengthBoundary` asserting 65,535-byte user keys write, index, and read back correctly, while lengths exceeding ceilings are rejected.
+* **Residual Risk**: Negligible.
+
+---
+
+### Threat 12: Cleartext Key Disclosure via Default String Formatting
+* **Asset**: Sensitive data confidentiality in user keys.
+* **Threat**: Generic string formatting (e.g. `fmt.Sprintf("%v", key)`) invoking `InternalKey.String()` formats raw user key bytes, inadvertently leaking sensitive tokens, passwords, or PII into standard error, third-party libraries, or unredacted logging sinks.
+* **Attack Surface**: `InternalKey.String()`, `%v`, `%s`, and generic formatting callers.
+* **Impact**: Low/Medium (Confidentiality leakage).
+* **Likelihood**: Medium.
+* **Existing Mitigation**: `InternalKey.String()` is safe by default and returns metadata-only redacted formatting (`InternalKey(len=%d, seq=%d, op=%s)`). Raw cleartext key formatting is restricted to explicitly invoked `DebugString()` calls intended for forensic analysis.
+* **Automated Test**: `TestSecurity_Remediation6_InternalKeyRedaction` asserting default string representations omit raw payload bytes.
+* **Residual Risk**: Negligible.
+
+---
+
 *End of Security Threat Model — Lattice v1.0.0-THREAT-MODEL*

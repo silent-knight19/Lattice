@@ -405,9 +405,15 @@ func TestAudit_SEC_P03_06_InternalKeyStringInformationDisclosure(t *testing.T) {
 	}
 
 	strRep := ik.String()
-	// InternalKey.String() exposes the raw key bytes in quotes for debug purposes:
-	if !bytes.Contains([]byte(strRep), secretPayload) {
-		t.Fatalf("expected raw secret payload to be present in InternalKey.String()")
+	// Remediated: InternalKey.String() is safe by default and does NOT expose raw key bytes:
+	if bytes.Contains([]byte(strRep), secretPayload) {
+		t.Fatalf("DEFECT: raw secret payload leaked in InternalKey.String(): %s", strRep)
+	}
+
+	// Explicit debug visibility is available via DebugString():
+	debugStr := ik.DebugString()
+	if !bytes.Contains([]byte(debugStr), secretPayload) {
+		t.Fatalf("expected raw secret payload to be present in InternalKey.DebugString()")
 	}
 
 	// Remediated via SEC-P03-WEAK-01: RedactedString() and Redact() strictly mask the user key payload:

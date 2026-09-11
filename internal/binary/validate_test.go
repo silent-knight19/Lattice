@@ -444,3 +444,119 @@ func BenchmarkValidateValue_4MB(b *testing.B) {
 		sinkErr = ValidateValue(val)
 	}
 }
+
+func TestValidateEncodedInternalKey_Boundaries(t *testing.T) {
+	// Buffer large enough for MaxEncodedInternalKeyLen + 10 = 65554 bytes
+	buf := make([]byte, MaxEncodedInternalKeyLen+10)
+	// Set valid opType byte at all possible positions
+	for i := range buf {
+		buf[i] = 0x41 // 'A'
+	}
+
+	makeEncoded := func(length int, op OpType) []byte {
+		b := make([]byte, length)
+		copy(b, buf[:length])
+		if length >= InternalKeyTrailerLen {
+			b[length-1] = byte(op)
+		}
+		return b
+	}
+
+	tests := []struct {
+		name          string
+		data          []byte
+		expectErr     error
+		expectIsError error
+	}{
+		{
+			name:          "truncated 0 bytes",
+			data:          []byte{},
+			expectErr:     errors.ErrInternalKeyTruncated,
+			expectIsError: errors.ErrInternalKeyTruncated,
+		},
+		{
+			name:          "truncated 9 bytes",
+			data:          makeEncoded(9, OpTypePut),
+			expectErr:     errors.ErrInternalKeyTruncated,
+			expectIsError: errors.ErrInternalKeyTruncated,
+		},
+		{
+			name:          "min valid 10 bytes (1 byte user key)",
+			data:          makeEncoded(10, OpTypePut),
+			expectErr:     nil,
+			expectIsError: nil,
+		},
+		{
+			name:          "boundary 65526 bytes (user key 65517)",
+			data:          makeEncoded(65526, OpTypePut),
+			expectErr:     nil,
+			expectIsError: nil,
+		},
+		{
+			name:          "boundary 65527 bytes (user key 65518)",
+			data:          makeEncoded(65527, OpTypePut),
+			expectErr:     nil,
+			expectIsError: nil,
+		},
+		{
+			name:          "boundary 65528 bytes (user key 65519)",
+			data:          makeEncoded(65528, OpTypePut),
+			expectErr:     nil,
+			expectIsError: nil,
+		},
+		{
+			name:          "boundary 65534 bytes (user key 65525)",
+			data:          makeEncoded(65534, OpTypePut),
+			expectErr:     nil,
+			expectIsError: nil,
+		},
+		{
+			name:          "boundary 65535 bytes (user key 65526)",
+			data:          makeEncoded(65535, OpTypePut),
+			expectErr:     nil,
+			expectIsError: nil,
+		},
+		{
+			name:          "boundary 65536 bytes (user key 65527)",
+			data:          makeEncoded(65536, OpTypePut),
+			expectErr:     nil,
+			expectIsError: nil,
+		},
+		{
+			name:          "max valid 65544 bytes (user key 65535)",
+			data:          makeEncoded(65544, OpTypePut),
+			expectErr:     nil,
+			expectIsError: nil,
+		},
+		{
+			name:          "oversized 65545 bytes (user key 65536)",
+			data:          makeEncoded(65545, OpTypePut),
+			expectErr:     errors.ErrKeyTooLarge,
+			expectIsError: errors.ErrKeyTooLarge,
+		},
+		{
+			name:          "invalid opType byte",
+			data:          makeEncoded(20, OpType(0xFF)),
+			expectErr:     errors.ErrInvalidOpType,
+			expectIsError: errors.ErrInvalidOpType,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateEncodedInternalKey(tc.data)
+			if tc.expectIsError == nil {
+				if err != nil {
+					t.Fatalf("expected nil error, got %v", err)
+				}
+			} else {
+				if err == nil {
+					t.Fatalf("expected error matching %v, got nil", tc.expectIsError)
+				}
+				if !stdErrors.Is(err, tc.expectIsError) {
+					t.Fatalf("expected error %v, got %v", tc.expectIsError, err)
+				}
+			}
+		})
+	}
+}

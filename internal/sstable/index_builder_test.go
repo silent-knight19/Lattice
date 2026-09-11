@@ -145,39 +145,61 @@ func TestIndexBuilder_50DataBlocks(t *testing.T) {
 
 	// Binary search verification across all 50 blocks
 	for i := 0; i < numBlocks; i++ {
-		// 1. Query exact largest key of block i
-		handle, found := decodedIndex.FindBlock(blocks[i].largestKey)
+		// 1. Query exact largest key of block i (using FindBlockInternalKey for encoded internal key)
+		handle, found := decodedIndex.FindBlockInternalKey(blocks[i].largestKey)
 		if !found {
-			t.Fatalf("block %d largest key not found via FindBlock", i)
+			t.Fatalf("block %d largest key not found via FindBlockInternalKey", i)
 		}
 		if handle != blocks[i].handle {
-			t.Fatalf("FindBlock(%d) returned handle %+v, want %+v", i, handle, blocks[i].handle)
+			t.Fatalf("FindBlockInternalKey(%d) returned handle %+v, want %+v", i, handle, blocks[i].handle)
 		}
 
-		// 2. Query record 0 from block i (should resolve to block i)
+		// 2. Query record 0 from block i via internal key
 		probeKey, _ := binary.NewInternalKey([]byte(fmt.Sprintf("partition:%04d:record:0000", i)), 100, binary.OpTypePut)
 		probeKeyBytes := binary.AppendInternalKey(nil, probeKey)
-		hProbe, foundProbe := decodedIndex.FindBlock(probeKeyBytes)
+		hProbe, foundProbe := decodedIndex.FindBlockInternalKey(probeKeyBytes)
 		if !foundProbe {
 			t.Fatalf("probe key for block %d not found", i)
 		}
 		if hProbe != blocks[i].handle {
 			t.Fatalf("probe key for block %d resolved to wrong handle: got %+v, want %+v", i, hProbe, blocks[i].handle)
 		}
+
+		// 3. Query record from block i via bare UserKey (the primary TableReader.Seek path)
+		userKey := []byte(fmt.Sprintf("partition:%04d:record:0005", i))
+		hUser, foundUser := decodedIndex.FindBlock(userKey)
+		if !foundUser {
+			t.Fatalf("bare user key for block %d not found via FindBlock", i)
+		}
+		if hUser != blocks[i].handle {
+			t.Fatalf("bare user key for block %d resolved to wrong handle: got %+v, want %+v", i, hUser, blocks[i].handle)
+		}
 	}
 
 	// Query key smaller than all keys in SSTable (should resolve to block 0)
 	minKey, _ := binary.NewInternalKey([]byte("partition:0000:record:!first"), 100, binary.OpTypePut)
-	hMin, foundMin := decodedIndex.FindBlock(binary.AppendInternalKey(nil, minKey))
+	hMin, foundMin := decodedIndex.FindBlockInternalKey(binary.AppendInternalKey(nil, minKey))
 	if !foundMin || hMin != blocks[0].handle {
 		t.Fatalf("expected minKey to resolve to block 0, got found=%v, handle=%+v", foundMin, hMin)
 	}
 
+	// Query bare user key smaller than all keys in SSTable (should resolve to block 0)
+	hMinUser, foundMinUser := decodedIndex.FindBlock([]byte("partition:0000:record:!first"))
+	if !foundMinUser || hMinUser != blocks[0].handle {
+		t.Fatalf("expected minUserKey to resolve to block 0, got found=%v, handle=%+v", foundMinUser, hMinUser)
+	}
+
 	// Query key strictly larger than the largest key in the entire SSTable (should return false)
 	maxKey, _ := binary.NewInternalKey([]byte("partition:9999:record:9999"), 100, binary.OpTypePut)
-	_, foundMax := decodedIndex.FindBlock(binary.AppendInternalKey(nil, maxKey))
+	_, foundMax := decodedIndex.FindBlockInternalKey(binary.AppendInternalKey(nil, maxKey))
 	if foundMax {
-		t.Fatal("expected FindBlock to return false for key exceeding all block boundaries")
+		t.Fatal("expected FindBlockInternalKey to return false for key exceeding all block boundaries")
+	}
+
+	// Query bare user key strictly larger than the largest key in the entire SSTable (should return false)
+	_, foundMaxUser := decodedIndex.FindBlock([]byte("partition:9999:record:9999"))
+	if foundMaxUser {
+		t.Fatal("expected FindBlock to return false for user key exceeding all block boundaries")
 	}
 }
 
@@ -254,7 +276,7 @@ func TestIndexBuilder_Invariants(t *testing.T) {
 
 	t.Run("key too large rejected", func(t *testing.T) {
 		builder := sstable.NewIndexBuilder()
-		oversizedKey := make([]byte, binary.MaxKeyLen+1)
+		oversizedKey := make([]byte, binary.MaxEncodedInternalKeyLen+1)
 		err := builder.AddBlock(oversizedKey, sstable.BlockHandle{Offset: 0, Size: 100})
 		if !stdErrors.Is(err, errors.ErrKeyTooLarge) {
 			t.Fatalf("expected ErrKeyTooLarge, got %v", err)

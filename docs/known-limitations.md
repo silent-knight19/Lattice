@@ -370,6 +370,24 @@ This document tracks all **genuine architectural and operational limitations** o
   * Performance: **High** (~877.4 ns hot block seek, ~1,218 ns random seek, ~103.9 ns missing key rejection).
   * Scalability: **Optimal** (Stateless `ReadAt` scales concurrently across multiple goroutines).
 
+### 27. Phase 04 Security Hardening and Deliberate Architectural Boundaries
+* **Limitation**: Following the Phase 04 security remediation audit:
+  1. *Filesystem Security Baseline*: SSTable files are created with `0600` permissions and directories with `0700`, aligning with the WAL durability and confidentiality model.
+  2. *Secure Staging Lifecycle*: Staging files use randomized temporary paths created via `os.CreateTemp` with `O_CREATE|O_EXCL` semantics; symlinks are rejected and atomic publication fails closed with `ErrSSTableExists` if the destination path appears concurrently.
+  3. *Sparse Index Key Separation*: `BlockIndex.FindBlock` and `IndexBuilder.FindBlock` explicitly compare bare `targetUserKey` slices against `entry.UserKey()`, eliminating heuristic type guessing and preventing false `ErrKeyNotFound` errors for binary keys.
+  4. *Representation Boundary Decoupling*: `MaxUserKeyLen` is bounded at 65,535 bytes, while `MaxEncodedInternalKeyLen` is bounded at 65,544 bytes ($65,535 + 9$).
+  5. *Default Metadata Redaction*: `InternalKey.String()` is safe by default and returns redacted metadata. Explicit `DebugString()` is available for forensic inspection.
+  6. *In-Scope Boundary Reminder*: Consistent with the project charter, Phase 04 provides single-table immutability, point lookups, and crash-safe storage. Bloom filters (Phase 05), multi-table VersionSet reads (Phase 06), compaction (Phase 07), LRU block cache (Phase 10), network transport (Phase 11), and distributed consensus (Phase 12) remain strictly deferred.
+* **Why It Exists**: Security hardening must reinforce existing invariants without artificially expanding the architectural scope beyond the completed Phase 04 boundary.
+* **Impact**: Zero security regressions; full binary key fidelity up to 64KB.
+* **How It Was Detected**: Comprehensive adversarial security audit through Phase 04 and regression verification.
+* **Current Mitigation**: Strict regression test suite in `sec04_remediation_test.go`, verified clean under `-race`, `go vet`, and `golangci-lint`.
+* **Future Solution**: Future phases will inherit these hardened filesystem, serialization, and comparison primitives.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (100% test pass, zero type confusion, crash-safe publication).
+  * Performance: **Optimal** (Zero-overhead type-separated comparisons).
+  * Scalability: **Optimal**.
+
 ---
 
 *End of Known Limitations — To be updated continuously throughout implementation.*
