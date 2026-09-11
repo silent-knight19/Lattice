@@ -15,12 +15,39 @@ const (
 
 	// TargetBlockSize is the default target capacity in bytes for uncompressed SSTable data blocks.
 	TargetBlockSize = 4096
+
+	// RestartOffsetSize is the serialized byte length of a single 32-bit restart point offset.
+	RestartOffsetSize = 4
+
+	// RestartCountSize is the serialized byte length of the 32-bit restart point count field.
+	RestartCountSize = 4
+
+	// BlockTrailerSize is the serialized byte length of the CRC32-IEEE checksum trailer.
+	BlockTrailerSize = 4
 )
 
 // BlockBuilder constructs prefix-compressed SSTable data blocks from consecutive sorted records.
 //
-// Layout within a Data Block (P04-S01-M01):
-// Each record entry is framed as:
+// Layout of a Canonical SSTable Data Block (P04-S01-M02):
+//
+//	+-------------------------------+
+//	| Entry Data Region             |
+//	|   Record 0 (Restart Point 0)  |
+//	|   Record 1                    |
+//	|   ...                         |
+//	|   Record N-1                  |
+//	+-------------------------------+
+//	| Restart Offset 0   (uint32)   |
+//	| Restart Offset 1   (uint32)   |
+//	| ...                           |
+//	| Restart Offset M-1 (uint32)   |
+//	+-------------------------------+
+//	| Restart Count      (uint32)   |
+//	+-------------------------------+
+//	| CRC32-IEEE         (uint32)   |
+//	+-------------------------------+
+//
+// Each record entry in the Entry Data Region is framed as:
 //   - SharedKeyLen   (7-bit varint, 1-10 bytes): number of bytes shared with previous encoded key
 //   - UnsharedKeyLen (7-bit varint, 1-10 bytes): number of unshared key suffix bytes in this record
 //   - ValueLength    (7-bit varint, 1-10 bytes): byte length of the value payload
@@ -32,6 +59,13 @@ const (
 //   - UnsharedKeyLen = len(encoded InternalKey)
 //   - KeyDeltaBytes contains the complete encoded InternalKey
 //
+// The trailer appended by Finish() consists of:
+//   - Restart Offsets: uint32 Big-Endian offsets into the Entry Data Region where each restart entry begins.
+//     Invariant: restartOffsets[0] == 0 for any non-empty block, and offsets are strictly increasing.
+//   - Restart Count: uint32 Big-Endian count equal to len(restartOffsets).
+//   - CRC32-IEEE: 4-byte Big-Endian checksum computed over [Entry Data || Restart Offsets || Restart Count].
+//     The CRC field itself is strictly excluded from its own checksum calculation.
+//
 // Invariants:
 //   - Monotonic Ordering: Entries must be added in strictly increasing canonical order
 //     (UserKey ASC, SeqNum DESC, OpType DESC).
@@ -39,6 +73,8 @@ const (
 //     the builder's state is completely unmodified.
 //   - Caller Isolation: Input slices are never retained across Add calls; Finish returns an
 //     owned defensive copy.
+//   - Determinism: Identical records added in identical sequence produce byte-for-byte identical output.
+//   - Repeated Finish Idempotence: Calling Finish() multiple times returns identical byte slices.
 //
 // Concurrency:
 // BlockBuilder is single-threaded and not safe for concurrent use by multiple goroutines.
@@ -53,6 +89,7 @@ type BlockBuilder struct {
 	prevInternalKey     binary.InternalKey
 	scratchKey          []byte
 	finished            bool
+	finishedBuf         []byte
 }
 
 // NewBlockBuilder creates a BlockBuilder configured with DefaultRestartInterval (16).
@@ -166,7 +203,15 @@ func (b *BlockBuilder) addEncodedKey(currKeyBytes []byte, key binary.InternalKey
 	headerLen := n1 + n2 + n3
 
 	entryTotalBytes := headerLen + unshared + valueLen
-	if uint64(len(b.buf))+uint64(entryTotalBytes) > math.MaxUint32 {
+
+	// Check for 32-bit addressable capacity overflow for entry data + metadata trailer
+	additionalRestarts := 0
+	if isRestart {
+		additionalRestarts = 1
+	}
+	projectedRestarts := len(b.restartOffsets) + additionalRestarts
+	projectedTrailerBytes := uint64(projectedRestarts)*uint64(RestartOffsetSize) + uint64(RestartCountSize) + uint64(BlockTrailerSize)
+	if uint64(len(b.buf))+uint64(entryTotalBytes)+projectedTrailerBytes > math.MaxUint32 {
 		return errors.ErrBlockOverflow
 	}
 
@@ -195,19 +240,55 @@ func (b *BlockBuilder) addEncodedKey(currKeyBytes []byte, key binary.InternalKey
 	return nil
 }
 
-// Finish seals the BlockBuilder and returns an owned defensive copy of the constructed
-// entry-data bytes. Subsequent Add operations are rejected with errors.ErrBlockFinished.
+// Finish seals the BlockBuilder and returns an owned defensive copy of the fully serialized
+// canonical SSTable data block, including entry data, restart offset array, restart count,
+// and CRC32-IEEE checksum trailer.
+//
+// Subsequent Add operations are rejected with errors.ErrBlockFinished.
 // Repeated Finish calls are idempotent and return identical bytes.
+// If the builder is empty (zero entries added), Finish returns an empty slice ([]byte{}).
 func (b *BlockBuilder) Finish() []byte {
 	if b == nil {
 		return nil
 	}
+	if b.finished {
+		if len(b.finishedBuf) == 0 {
+			return []byte{}
+		}
+		out := make([]byte, len(b.finishedBuf))
+		copy(out, b.finishedBuf)
+		return out
+	}
+
 	b.finished = true
 	if len(b.buf) == 0 {
+		b.finishedBuf = nil
 		return []byte{}
 	}
-	out := make([]byte, len(b.buf))
-	copy(out, b.buf)
+
+	// Serialize trailer into b.buf:
+	// 1. Restart offsets (uint32 each, Big-Endian)
+	var uint32Buf [4]byte
+	for _, offset := range b.restartOffsets {
+		binary.PutUint32(uint32Buf[:], offset)
+		b.buf = append(b.buf, uint32Buf[:]...)
+	}
+
+	// 2. Restart count (uint32, Big-Endian)
+	binary.PutUint32(uint32Buf[:], uint32(len(b.restartOffsets)))
+	b.buf = append(b.buf, uint32Buf[:]...)
+
+	// 3. CRC32-IEEE checksum computed over [entry data || restart offsets || restart count]
+	checksum := binary.Checksum(b.buf)
+	binary.PutUint32(uint32Buf[:], checksum)
+	b.buf = append(b.buf, uint32Buf[:]...)
+
+	// Cache finished bytes to ensure repeated Finish() calls are idempotent
+	b.finishedBuf = b.buf
+
+	// Return owned defensive copy to isolate caller mutations from internal state
+	out := make([]byte, len(b.finishedBuf))
+	copy(out, b.finishedBuf)
 	return out
 }
 
@@ -225,6 +306,7 @@ func (b *BlockBuilder) Reset() {
 	b.prevKeyValid = false
 	b.prevInternalKey = binary.InternalKey{}
 	b.finished = false
+	b.finishedBuf = nil
 }
 
 // RestartOffsets returns a defensive copy of the byte offsets where each restart entry begins.
@@ -261,22 +343,40 @@ func (b *BlockBuilder) RestartInterval() int {
 	return b.restartInterval
 }
 
-// DataSize returns the exact number of entry-data bytes currently in the buffer.
+// DataSize returns the exact number of entry-data bytes currently in the buffer
+// (prior to trailer serialization).
 func (b *BlockBuilder) DataSize() int {
 	if b == nil {
 		return 0
 	}
+	// If finished, calculate the entry data size by subtracting trailer length
+	if b.finished {
+		if len(b.finishedBuf) == 0 {
+			return 0
+		}
+		trailerLen := len(b.restartOffsets)*RestartOffsetSize + RestartCountSize + BlockTrailerSize
+		if len(b.finishedBuf) >= trailerLen {
+			return len(b.finishedBuf) - trailerLen
+		}
+		return len(b.finishedBuf)
+	}
 	return len(b.buf)
 }
 
-// CurrentSizeEstimate returns the estimated total size of the block in bytes,
-// including entry data and the future restart array trailer (offsets + count).
-// Calculation: DataSize + (len(restartOffsets) * 4) + 4 bytes.
+// CurrentSizeEstimate returns the estimated total size of the finished block in bytes,
+// including entry data, restart offset array, restart count, and CRC32 checksum trailer.
+// Calculation: DataSize + (len(restartOffsets) * 4) + 4 (count) + 4 (CRC32).
 func (b *BlockBuilder) CurrentSizeEstimate() int {
 	if b == nil {
 		return 0
 	}
-	return len(b.buf) + (len(b.restartOffsets) * 4) + 4
+	if b.finished {
+		return len(b.finishedBuf)
+	}
+	if len(b.buf) == 0 {
+		return 0
+	}
+	return len(b.buf) + (len(b.restartOffsets) * RestartOffsetSize) + RestartCountSize + BlockTrailerSize
 }
 
 // IsEmpty reports whether the builder contains zero entries.

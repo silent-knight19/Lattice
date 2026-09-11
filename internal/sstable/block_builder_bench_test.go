@@ -69,25 +69,115 @@ func BenchmarkBlockBuilder_Add_10K(b *testing.B) {
 	}
 }
 
-func BenchmarkBlockBuilder_Finish(b *testing.B) {
-	const count = 100
-	builder := sstable.NewBlockBuilder()
+func BenchmarkBlockBuilder_Finish_Small(b *testing.B) {
+	const count = 10
+	keys := make([]binary.InternalKey, count)
+	vals := make([][]byte, count)
 	for i := 0; i < count; i++ {
-		k, err := binary.NewInternalKey([]byte(fmt.Sprintf("key:%04d", i)), binary.SeqNum(count-i), binary.OpTypePut)
+		k, err := binary.NewInternalKey([]byte(fmt.Sprintf("k:%04d", i)), binary.SeqNum(count-i), binary.OpTypePut)
 		if err != nil {
 			b.Fatalf("failed to create key: %v", err)
 		}
-		if err := builder.Add(k, []byte("val")); err != nil {
-			b.Fatalf("Add failed: %v", err)
-		}
+		keys[i] = k
+		vals[i] = []byte("val")
 	}
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		data := builder.Finish()
-		sinkBytes = data
+		builder := sstable.NewBlockBuilder()
+		for j := 0; j < count; j++ {
+			if err := builder.Add(keys[j], vals[j]); err != nil {
+				b.Fatalf("Add failed: %v", err)
+			}
+		}
+		sinkBytes = builder.Finish()
+	}
+}
+
+func BenchmarkBlockBuilder_Finish_4KB(b *testing.B) {
+	// Construct records roughly totalling 4KB
+	const count = 80
+	keys := make([]binary.InternalKey, count)
+	vals := make([][]byte, count)
+	for i := 0; i < count; i++ {
+		k, err := binary.NewInternalKey([]byte(fmt.Sprintf("tenant:0100:cluster:us-west-2:sensor:%06d", i)), binary.SeqNum(count-i), binary.OpTypePut)
+		if err != nil {
+			b.Fatalf("failed to create key: %v", err)
+		}
+		keys[i] = k
+		vals[i] = make([]byte, 32)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		builder := sstable.NewBlockBuilder()
+		for j := 0; j < count; j++ {
+			if err := builder.Add(keys[j], vals[j]); err != nil {
+				b.Fatalf("Add failed: %v", err)
+			}
+		}
+		sinkBytes = builder.Finish()
+	}
+}
+
+func BenchmarkBlockBuilder_Finish_ManyRestarts(b *testing.B) {
+	// Custom restart interval 1 -> 100 restart points
+	const count = 100
+	keys := make([]binary.InternalKey, count)
+	vals := make([][]byte, count)
+	for i := 0; i < count; i++ {
+		k, err := binary.NewInternalKey([]byte(fmt.Sprintf("k:%06d", i)), binary.SeqNum(count-i), binary.OpTypePut)
+		if err != nil {
+			b.Fatalf("failed to create key: %v", err)
+		}
+		keys[i] = k
+		vals[i] = []byte("val")
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		builder, _ := sstable.NewBlockBuilderWithInterval(1)
+		for j := 0; j < count; j++ {
+			if err := builder.Add(keys[j], vals[j]); err != nil {
+				b.Fatalf("Add failed: %v", err)
+			}
+		}
+		sinkBytes = builder.Finish()
+	}
+}
+
+func BenchmarkBlockBuilder_Reset_Rebuild(b *testing.B) {
+	const count = 20
+	keys := make([]binary.InternalKey, count)
+	vals := make([][]byte, count)
+	for i := 0; i < count; i++ {
+		k, err := binary.NewInternalKey([]byte(fmt.Sprintf("reuse:key:%04d", i)), binary.SeqNum(count-i), binary.OpTypePut)
+		if err != nil {
+			b.Fatalf("failed to create key: %v", err)
+		}
+		keys[i] = k
+		vals[i] = []byte("val")
+	}
+
+	builder := sstable.NewBlockBuilder()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		builder.Reset()
+		for j := 0; j < count; j++ {
+			if err := builder.Add(keys[j], vals[j]); err != nil {
+				b.Fatalf("Add failed: %v", err)
+			}
+		}
+		sinkBytes = builder.Finish()
 	}
 }
 

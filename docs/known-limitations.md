@@ -304,4 +304,18 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 22. SSTable Data Block Checksum Scope and Reader Decoupling (P04-S01-M02)
+* **Limitation**: In `BlockBuilder` (P04-S01-M02), the serialized block trailer includes a 32-bit CRC32-IEEE checksum covering `[Entry Data || Restart Offsets || Restart Count]`. While CRC32-IEEE reliably detects random hardware bit flips, network corruption, torn writes, and storage decay, it is **not a cryptographic digest or message authentication code (MAC)**. It does not provide cryptographic integrity or protection against malicious adversarial tampering where an attacker with write access can recalculate the CRC. Furthermore, M02 implements block-level construction and trailer serialization; block seeking, binary searching restart points, and block decoding remain decoupled and deferred to the reader implementation in P04-S03-M02.
+* **Why It Exists**: Storage engines prioritize high-throughput serialization with zero-allocation CRC calculation in NVMe data paths over heavy cryptographic hashing (e.g. SHA-256). In-memory block reading and sparse index lookup are separate architectural responsibilities cleanly isolated from writer serialization.
+* **Impact**: Blocks can detect corruption and torn writes via CRC mismatch but cannot authenticate against active adversaries with disk write access. Point lookup within written blocks requires the reader subsystem (P04-S03-M02).
+* **How It Was Detected**: Architectural analysis of P04-S01-M02 block serialization and security review.
+* **Current Mitigation**: Strict verification of Big-Endian uint32 layout, restart offset monotonicity, capacity overflow guards, and independent CRC validation.
+* **Future Solution**: P04-S03-M02 will implement `TableReader` with binary search across restart points. At the system boundary, optional encryption/signing layers (e.g. TLS on wire, LUKS/dm-crypt on disk) provide cryptographic protection if required.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Self-contained, deterministically verifiable trailer).
+  * Performance: **Optimal** (Zero-allocation CRC32-IEEE computation).
+  * Scalability: **Optimal**.
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*

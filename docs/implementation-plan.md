@@ -349,15 +349,15 @@ Every future micro-phase implementation response from Claude Code must use this 
 
 ```
 Current Major Phase           : Phase 04 — Persistent SSTable Subsystem
-Current Sub-Phase             : Sub-Phase 04.1 — Data Block Construction & Prefix Compression (IN PROGRESS)
-Current Micro-Phase           : P04-S01-M01 — Data Block Builder with Prefix Compression (COMPLETE)
+Current Sub-Phase             : Sub-Phase 04.1 — Data Block Construction & Prefix Compression (COMPLETE)
+Current Micro-Phase           : P04-S01-M02 — Restart Array & Block Trailer Serialization (COMPLETE)
 Phase 01 Status               : COMPLETE (Sub-Phases 01.1 & 01.2 Complete)
 Phase 02 Status               : COMPLETE (Sub-Phases 02.1, 02.2, 02.3, 02.4 Complete)
 Phase 03 Status               : COMPLETE (Sub-Phases 03.1, 03.2, 03.3 Complete)
-Phase 04 Status               : IN PROGRESS (P04-S01-M01 Complete)
+Phase 04 Status               : IN PROGRESS (Sub-Phase 04.1 Complete)
 Previous Completed Phase      : Phase 03 — In-Memory MemTable & Concurrent SkipList
-Previous Completed Micro-Phase: P04-S01-M01 — Data Block Builder with Prefix Compression
-Next Planned Micro-Phase      : P04-S01-M02 — Restart Array & Block Trailer Serialization
+Previous Completed Micro-Phase: P04-S01-M02 — Restart Array & Block Trailer Serialization
+Next Planned Micro-Phase      : P04-S02-M01 — Sparse Two-Level Block Index Builder
 Phase 00 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Phase 01 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Security Audit Track State    : Active
@@ -370,9 +370,9 @@ Security Audit Track State    : Active
   - SEC-06 through SEC-09 (PLANNED)
 Blocking Issues               : None
 Tests Passing                 : `go test -race ./...` (All test suites passing, 0 race conditions), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed, Linux & Windows cross-platform verified
-Security Review Status        : Complete & Verified (SEC-01 foundations established; SEC-02 static audit verified; SEC-03 dynamic persistence audit completed; SEC-04 in-memory engine audit completed; SEC-P03 independent adversarial audit completed; P04-S01-M01 audited with 0 vulnerabilities, failure atomicity, and boundary validation)
-Interview Knowledge Status    : Updated with Section 30 containing deep systems interview questions and answers across prefix compression, restart points, and block builder invariants
-Git Commit                    : feat(sstable): [P04-S01-M01] implement data block builder with prefix compression
+Security Review Status        : Complete & Verified (SEC-01 foundations established; SEC-02 static audit verified; SEC-03 dynamic persistence audit completed; SEC-04 in-memory engine audit completed; SEC-P03 independent adversarial audit completed; P04-S01-M01 audited; P04-S01-M02 audited with 0 vulnerabilities, big-endian framing, overflow guard, caller mutation isolation, and CRC corruption detection)
+Interview Knowledge Status    : Updated with Sections 30 & 31 containing deep systems interview questions and answers across prefix compression, restart points, and block trailer serialization
+Git Commit                    : feat(sstable): [P04-S01-M02] serialize restart array and CRC32 block trailer
 ```
 
 ---
@@ -1277,11 +1277,58 @@ TOTAL: 184 Discrete, Testable Micro-Phases
     - Fuzz Testing: >690,000 iterations of `FuzzBlockBuilder_ValidSequence` and >2,500,000 iterations of `FuzzBlockBuilder_AdversarialOrdering` with zero failures or crashes.
   * *Completion*: Complete and verified under `-race`.
 * **P04-S01-M02: Restart Array & Block Trailer Serialization**
-  * *Objective*: Append 32-bit restart point offsets and restart count to block tail; add CRC32 trailer.
-  * *Changes*: `BlockBuilder.Finish() []byte`.
-  * *Invariants*: Block ends with restart array followed by 1-byte compression type and 4-byte CRC32.
-  * *Tests*: Verify block trailer offset calculations.
-  * *Completion*: Block serialization complete.
+  * *Objective*: Append 32-bit restart point offsets and restart count to block tail; add CRC32-IEEE trailer.
+  * *Changes*:
+    - `internal/sstable/block_builder.go`:
+      - Added constants `RestartOffsetSize = 4`, `RestartCountSize = 4`, `BlockTrailerSize = 4`.
+      - Updated `BlockBuilder` with `finishedBuf []byte` for idempotent repeated `Finish()` calls.
+      - Updated `Finish() []byte` to serialize:
+        `[Entry Data] + [Restart Offsets (Big-Endian uint32 * N)] + [Restart Count (Big-Endian uint32)] + [CRC32-IEEE (Big-Endian uint32)]`.
+      - Empty builder returns `[]byte{}` with zero allocations and enters sealed finished state.
+      - CRC32-IEEE covers `[Entry Data || Restart Offsets || Restart Count]`, strictly excluding the CRC trailer field itself.
+      - Updated `CurrentSizeEstimate()` to reflect entry data + restart array + restart count + CRC32 trailer.
+      - Updated `DataSize()` to report entry data size prior to or excluding trailer.
+      - Added capacity overflow guard checking entry data + projected trailer bytes against `math.MaxUint32`.
+      - Updated `Reset()` to clear finished buffer and restore reusable state.
+    - `internal/sstable/block_builder_test.go`:
+      - Created independent reference oracle `parseFullBlock` and bit-by-bit software CRC32-IEEE oracle `referenceCRC32IEEE`.
+      - Implemented hand-calculated exact byte fixtures:
+        - Fixture A: 1 entry, 1 restart point.
+        - Fixture B: 3 entries with prefix compression (72 bytes exact sequence).
+        - Fixture C: 16 entries (boundary of first restart group, 288 bytes).
+        - Fixture D: 17 entries (second restart point emitted at offset 276, 312 bytes).
+        - Fixture E: Custom restart interval $k=4$ with 6 records (124 bytes).
+        - Fixture F: Binary values with null bytes, 0xFF, and high-bit sequences.
+        - Fixture G: InternalKey with tombstone / `OpTypeDelete`.
+      - Implemented CRC32 test vector verification (`123456789 -> 0xCBF43926`).
+      - Implemented single-bit corruption detection across entry data, restart offsets, restart count, and CRC trailer.
+      - Implemented repeated `Finish()` idempotence and memory mutation isolation tests.
+    - `internal/sstable/block_builder_bench_test.go`:
+      - Added benchmarks: `BenchmarkBlockBuilder_Finish_Small`, `BenchmarkBlockBuilder_Finish_4KB`, `BenchmarkBlockBuilder_Finish_ManyRestarts`, `BenchmarkBlockBuilder_Reset_Rebuild`.
+  * *Invariants*:
+    - Block layout: `[Entry Data || Restart Offsets (uint32 * M) || Restart Count (uint32) || CRC32-IEEE (uint32)]`.
+    - Big-Endian byte order for all fixed numeric metadata fields.
+    - `restartOffsets[0] == 0` for non-empty blocks; strictly increasing monotonically; all offsets `< len(entryData)`.
+    - `restartCount == len(restartOffsets)`.
+    - CRC32-IEEE covers `[Entry Data || Restart Offsets || Restart Count]`.
+    - Determinism: byte-for-byte identical output for identical records.
+    - Failure atomicity: builder state unmodified on invalid inputs.
+    - Caller isolation: defensive copy returned, mutations do not affect internal state.
+  * *Tests & Benchmarks*:
+    - Micro-benchmarks (Apple M4):
+      - `BenchmarkBlockBuilder_Finish_Small`: ~542.9 ns/op (4.5 KB/op, 15 allocs/op).
+      - `BenchmarkBlockBuilder_Finish_4KB`: ~3,772 ns/op (12.2 KB/op, 85 allocs/op).
+      - `BenchmarkBlockBuilder_Finish_ManyRestarts`: ~3,451 ns/op (9.0 KB/op, 108 allocs/op).
+      - `BenchmarkBlockBuilder_Reset_Rebuild`: ~651.7 ns/op (704 B/op, 21 allocs/op).
+    - Fuzz Testing:
+      - `FuzzBlockBuilder_ValidSequence`: >1,134,000 iterations in 10s with 0 failures.
+      - `FuzzBlockBuilder_AdversarialOrdering`: >5,104,000 iterations in 10s with 0 failures.
+    - Full suite passing under `go test -race ./...`.
+  * *Security Review*:
+    - Integer safety: 32-bit overflow checked before buffer append.
+    - Checksum coverage: verified bit-by-bit; CRC field strictly excluded from its own digest.
+    - Memory isolation: defensive copy verified by post-Finish buffer mutation test.
+  * *Completion*: Complete and verified under `-race`.
 
 ### Sub-Phase 04.2: SSTable Index & Footer Design
 * **P04-S02-M01: Sparse Two-Level Block Index Builder**

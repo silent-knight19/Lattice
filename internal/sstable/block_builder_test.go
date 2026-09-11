@@ -22,33 +22,109 @@ type decodedEntry struct {
 	value    []byte
 }
 
-// parseBlockData is an independent test-side oracle that parses prefix-compressed data blocks
+// decodedBlock represents the complete independently decoded contents of a serialized SSTable block.
+type decodedBlock struct {
+	entries        []decodedEntry
+	restartOffsets []uint32
+	restartCount   uint32
+	crc            uint32
+}
+
+// parseBlockData is an independent test-side oracle that parses canonical SSTable data blocks
+// (including entry data, restart offset array, restart count, and CRC32-IEEE checksum trailer)
 // without using any production decode functions.
-func parseBlockData(t *testing.T, data []byte) []decodedEntry {
+func parseBlockData(t *testing.T, blockBytes []byte) []decodedEntry {
 	t.Helper()
+	parsed := parseFullBlock(t, blockBytes)
+	return parsed.entries
+}
+
+// parseFullBlock parses and independently validates the entire serialized block structure:
+// CRC32 trailer, restart count, restart offsets, entry data boundary, and prefix-compressed records.
+func parseFullBlock(t *testing.T, blockBytes []byte) decodedBlock {
+	t.Helper()
+	if len(blockBytes) == 0 {
+		return decodedBlock{}
+	}
+
+	// Minimum block size for a non-empty block:
+	// At least 1 entry (>0 bytes) + 1 restart offset (4B) + restart count (4B) + CRC (4B) = >12 bytes.
+	const minTrailerSize = 4 + 4 + 4 // 1 offset + count + CRC
+	if len(blockBytes) < minTrailerSize {
+		t.Fatalf("block too small: len=%d < minTrailerSize=%d", len(blockBytes), minTrailerSize)
+	}
+
+	// 1. Verify and extract 4-byte CRC32-IEEE from tail
+	crcPos := len(blockBytes) - 4
+	expectedCRC := binary.GetUint32(blockBytes[crcPos:])
+
+	// Independent reference CRC calculation (bit-by-bit software simulation)
+	computedCRC := referenceCRC32IEEE(blockBytes[:crcPos])
+	if computedCRC != expectedCRC {
+		t.Fatalf("independent CRC mismatch: computed 0x%08X != block 0x%08X", computedCRC, expectedCRC)
+	}
+
+	// 2. Extract 4-byte restart count (precedes CRC)
+	countPos := crcPos - 4
+	restartCount := binary.GetUint32(blockBytes[countPos:])
+	if restartCount == 0 {
+		t.Fatalf("serialized non-empty block has restartCount == 0")
+	}
+
+	// 3. Extract restart offsets
+	restartsTotalBytes := int(restartCount) * 4
+	offsetsPos := countPos - restartsTotalBytes
+	if offsetsPos < 0 {
+		t.Fatalf("restart array (len=%d) extends before block start (offsetsPos=%d)", restartsTotalBytes, offsetsPos)
+	}
+
+	restartOffsets := make([]uint32, restartCount)
+	for i := 0; i < int(restartCount); i++ {
+		off := binary.GetUint32(blockBytes[offsetsPos+i*4:])
+		restartOffsets[i] = off
+	}
+
+	// Validate restart offset invariants
+	if restartOffsets[0] != 0 {
+		t.Fatalf("restartOffsets[0] must be 0, got %d", restartOffsets[0])
+	}
+	entryDataLen := offsetsPos
+	for i := 1; i < len(restartOffsets); i++ {
+		if restartOffsets[i] <= restartOffsets[i-1] {
+			t.Fatalf("restart offsets not strictly increasing: [%d]=%d <= [%d]=%d",
+				i, restartOffsets[i], i-1, restartOffsets[i-1])
+		}
+	}
+	if int(restartOffsets[len(restartOffsets)-1]) >= entryDataLen {
+		t.Fatalf("last restart offset %d >= entry data length %d",
+			restartOffsets[len(restartOffsets)-1], entryDataLen)
+	}
+
+	// 4. Parse Entry Data Region [0..entryDataLen]
+	entryData := blockBytes[:entryDataLen]
 	var entries []decodedEntry
 	var prevKey []byte
 	cursor := 0
 
-	for cursor < len(data) {
+	for cursor < len(entryData) {
 		entryOffset := cursor
 
-		// 1. Read shared varint
-		shared, n1, err := binary.GetVarint64Canonical(data[cursor:])
+		// Read shared varint
+		shared, n1, err := binary.GetVarint64Canonical(entryData[cursor:])
 		if err != nil {
 			t.Fatalf("offset %d: failed to read shared varint: %v", cursor, err)
 		}
 		cursor += n1
 
-		// 2. Read unshared varint
-		unshared, n2, err := binary.GetVarint64Canonical(data[cursor:])
+		// Read unshared varint
+		unshared, n2, err := binary.GetVarint64Canonical(entryData[cursor:])
 		if err != nil {
 			t.Fatalf("offset %d: failed to read unshared varint: %v", cursor, err)
 		}
 		cursor += n2
 
-		// 3. Read valueLen varint
-		valueLen, n3, err := binary.GetVarint64Canonical(data[cursor:])
+		// Read valueLen varint
+		valueLen, n3, err := binary.GetVarint64Canonical(entryData[cursor:])
 		if err != nil {
 			t.Fatalf("offset %d: failed to read valueLen varint: %v", cursor, err)
 		}
@@ -57,18 +133,18 @@ func parseBlockData(t *testing.T, data []byte) []decodedEntry {
 		if int(shared) > len(prevKey) {
 			t.Fatalf("offset %d: shared (%d) > len(prevKey) (%d)", entryOffset, shared, len(prevKey))
 		}
-		if cursor+int(unshared) > len(data) {
-			t.Fatalf("offset %d: unshared key extends beyond data boundary", entryOffset)
+		if cursor+int(unshared) > len(entryData) {
+			t.Fatalf("offset %d: unshared key extends beyond entry data boundary", entryOffset)
 		}
 
-		suffix := data[cursor : cursor+int(unshared)]
+		suffix := entryData[cursor : cursor+int(unshared)]
 		cursor += int(unshared)
 
-		if cursor+int(valueLen) > len(data) {
-			t.Fatalf("offset %d: value extends beyond data boundary", entryOffset)
+		if cursor+int(valueLen) > len(entryData) {
+			t.Fatalf("offset %d: value extends beyond entry data boundary", entryOffset)
 		}
 
-		val := data[cursor : cursor+int(valueLen)]
+		val := entryData[cursor : cursor+int(valueLen)]
 		cursor += int(valueLen)
 
 		fullKey := make([]byte, int(shared)+int(unshared))
@@ -93,7 +169,29 @@ func parseBlockData(t *testing.T, data []byte) []decodedEntry {
 		prevKey = fullKey
 	}
 
-	return entries
+	return decodedBlock{
+		entries:        entries,
+		restartOffsets: restartOffsets,
+		restartCount:   restartCount,
+		crc:            expectedCRC,
+	}
+}
+
+// referenceCRC32IEEE computes CRC32-IEEE using a classic bit-by-bit software simulation.
+// This serves as an independent correctness oracle completely separate from hash/crc32.
+func referenceCRC32IEEE(data []byte) uint32 {
+	crc := uint32(0xFFFFFFFF)
+	for _, b := range data {
+		crc ^= uint32(b)
+		for i := 0; i < 8; i++ {
+			if crc&1 != 0 {
+				crc = (crc >> 1) ^ 0xEDB88320
+			} else {
+				crc >>= 1
+			}
+		}
+	}
+	return crc ^ 0xFFFFFFFF
 }
 
 func mustInternalKey(t *testing.T, userKey string, seq uint64, op binary.OpType) binary.InternalKey {
@@ -306,7 +404,12 @@ func TestBlockBuilder_ExactBinaryFormat(t *testing.T) {
 	//     0x00, 0x0f, 0x00,
 	//     0x62, 0x61, 0x6e, 0x61, 0x6e, 0x61, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01
 	//
-	// Total expected block bytes = 20 + 22 + 18 = 60 bytes.
+	// Entry Data: 20 + 22 + 18 = 60 bytes.
+	// Restart Offset 0: uint32(0) -> [0x00, 0x00, 0x00, 0x00] (4 bytes)
+	// Restart Count: uint32(1) -> [0x00, 0x00, 0x00, 0x01] (4 bytes)
+	// CRC32-IEEE over [Entry Data (60B) + Restart Offset (4B) + Restart Count (4B)]:
+	//   CRC32 = 0xFEAEC13C -> [0xfe, 0xae, 0xc1, 0x3c] (4 bytes)
+	// Total block bytes = 60 + 4 + 4 + 4 = 72 bytes.
 
 	expectedBytes := []byte{
 		// Entry 0 (offset 0)
@@ -322,6 +425,15 @@ func TestBlockBuilder_ExactBinaryFormat(t *testing.T) {
 		// Entry 2 (offset 42)
 		0x00, 0x0f, 0x00,
 		'b', 'a', 'n', 'a', 'n', 'a', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01,
+
+		// Restart Offset 0 (offset 60): 0
+		0x00, 0x00, 0x00, 0x00,
+
+		// Restart Count (offset 64): 1
+		0x00, 0x00, 0x00, 0x01,
+
+		// CRC32-IEEE (offset 68): 0xFEAEC13C
+		0xfe, 0xae, 0xc1, 0x3c,
 	}
 
 	b := sstable.NewBlockBuilder()
@@ -867,5 +979,392 @@ func TestBlockBuilder_AddRaw(t *testing.T) {
 	b2 := sstable.NewBlockBuilder()
 	if err := b2.AddRaw([]byte("short"), []byte("v")); !stdErrors.Is(err, errors.ErrInternalKeyTruncated) {
 		t.Errorf("expected ErrInternalKeyTruncated, got %v", err)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Exact Byte-Level Fixtures (M02 Requirement 13)
+// -----------------------------------------------------------------------------
+
+// Fixture A: Exactly one entry, one restart point.
+func TestBlockBuilder_FixtureA_SingleEntry(t *testing.T) {
+	b := sstable.NewBlockBuilder()
+	k := mustInternalKey(t, "apple", 1, binary.OpTypePut)
+	if err := b.Add(k, []byte("red")); err != nil {
+		t.Fatalf("Add failed: %v", err)
+	}
+
+	block := b.Finish()
+
+	// Hand-calculated expected byte sequence:
+	// Entry 0: shared=0, unshared=14, valLen=3, key="apple"+seq(1)+put(1), val="red" (20 bytes)
+	// Restart Offset 0: 0x00000000 (4 bytes)
+	// Restart Count:    0x00000001 (4 bytes)
+	// CRC32-IEEE:       0xEB4A06BB (4 bytes)
+	// Total: 32 bytes
+	expected := []byte{
+		0x00, 0x0e, 0x03,
+		'a', 'p', 'p', 'l', 'e', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01,
+		'r', 'e', 'd',
+		0x00, 0x00, 0x00, 0x00, // restart offset 0
+		0x00, 0x00, 0x00, 0x01, // restart count = 1
+		0xeb, 0x4a, 0x06, 0xbb, // CRC32-IEEE
+	}
+
+	if !bytes.Equal(block, expected) {
+		t.Fatalf("Fixture A mismatch:\ngot:  %x\nwant: %x", block, expected)
+	}
+
+	parsed := parseFullBlock(t, block)
+	if len(parsed.entries) != 1 || parsed.restartCount != 1 || parsed.restartOffsets[0] != 0 {
+		t.Fatalf("Fixture A parseFullBlock mismatch: %+v", parsed)
+	}
+	if parsed.crc != 0xEB4A06BB {
+		t.Fatalf("Fixture A CRC mismatch: got 0x%08X, want 0xEB4A06BB", parsed.crc)
+	}
+}
+
+// Fixture B: Two or more entries with prefix compression (covered in TestBlockBuilder_ExactBinaryFormat).
+func TestBlockBuilder_FixtureB_PrefixCompression(t *testing.T) {
+	b := sstable.NewBlockBuilder()
+	k0 := mustInternalKey(t, "apple", 1, binary.OpTypePut)
+	k1 := mustInternalKey(t, "application", 1, binary.OpTypePut)
+	k2 := mustInternalKey(t, "banana", 1, binary.OpTypePut)
+
+	if err := b.Add(k0, []byte("red")); err != nil {
+		t.Fatalf("Add k0 failed: %v", err)
+	}
+	if err := b.Add(k1, []byte("app")); err != nil {
+		t.Fatalf("Add k1 failed: %v", err)
+	}
+	if err := b.Add(k2, nil); err != nil {
+		t.Fatalf("Add k2 failed: %v", err)
+	}
+
+	block := b.Finish()
+	parsed := parseFullBlock(t, block)
+	if len(parsed.entries) != 3 {
+		t.Fatalf("Fixture B entries count: got %d, want 3", len(parsed.entries))
+	}
+	if parsed.crc != 0xFEAEC13C {
+		t.Fatalf("Fixture B CRC mismatch: got 0x%08X, want 0xFEAEC13C", parsed.crc)
+	}
+	if len(block) != 72 {
+		t.Fatalf("Fixture B length: got %d, want 72", len(block))
+	}
+}
+
+// Fixture C: Exactly 16 entries (boundary of first restart group).
+func TestBlockBuilder_FixtureC_Exactly16Entries(t *testing.T) {
+	b := sstable.NewBlockBuilder() // interval 16
+	for i := 0; i < 16; i++ {
+		k := mustInternalKey(t, fmt.Sprintf("k:%02d", i), 1, binary.OpTypePut)
+		if err := b.Add(k, []byte(fmt.Sprintf("v:%02d", i))); err != nil {
+			t.Fatalf("Add %d failed: %v", i, err)
+		}
+	}
+
+	block := b.Finish()
+	parsed := parseFullBlock(t, block)
+
+	if len(parsed.entries) != 16 {
+		t.Fatalf("expected 16 entries, got %d", len(parsed.entries))
+	}
+	// Exactly 1 restart point (at index 0)
+	if parsed.restartCount != 1 {
+		t.Fatalf("expected 1 restart point, got %d", parsed.restartCount)
+	}
+	if parsed.restartOffsets[0] != 0 {
+		t.Fatalf("restartOffsets[0] must be 0, got %d", parsed.restartOffsets[0])
+	}
+	// Verified exact hand-computed CRC: 0x1DAF964C
+	if parsed.crc != 0x1DAF964C {
+		t.Fatalf("Fixture C CRC mismatch: got 0x%08X, want 0x1DAF964C", parsed.crc)
+	}
+	if len(block) != 288 {
+		t.Fatalf("Fixture C length mismatch: got %d, want 288", len(block))
+	}
+}
+
+// Fixture D: 17 entries so the second restart point appears.
+func TestBlockBuilder_FixtureD_17Entries_SecondRestartPoint(t *testing.T) {
+	b := sstable.NewBlockBuilder() // interval 16
+	for i := 0; i < 17; i++ {
+		k := mustInternalKey(t, fmt.Sprintf("k:%02d", i), 1, binary.OpTypePut)
+		if err := b.Add(k, []byte(fmt.Sprintf("v:%02d", i))); err != nil {
+			t.Fatalf("Add %d failed: %v", i, err)
+		}
+	}
+
+	block := b.Finish()
+	parsed := parseFullBlock(t, block)
+
+	if len(parsed.entries) != 17 {
+		t.Fatalf("expected 17 entries, got %d", len(parsed.entries))
+	}
+	// Exactly 2 restart points (at index 0 and index 16)
+	if parsed.restartCount != 2 {
+		t.Fatalf("expected 2 restart points, got %d", parsed.restartCount)
+	}
+	if parsed.restartOffsets[0] != 0 || parsed.restartOffsets[1] != 276 {
+		t.Fatalf("expected restart offsets [0, 276], got %v", parsed.restartOffsets)
+	}
+	// Verified exact hand-computed CRC: 0x479D41B7
+	if parsed.crc != 0x479D41B7 {
+		t.Fatalf("Fixture D CRC mismatch: got 0x%08X, want 0x479D41B7", parsed.crc)
+	}
+	if len(block) != 312 {
+		t.Fatalf("Fixture D length mismatch: got %d, want 312", len(block))
+	}
+}
+
+// Fixture E: Custom restart interval (k=4 with 6 records).
+func TestBlockBuilder_FixtureE_CustomRestartInterval(t *testing.T) {
+	b, err := sstable.NewBlockBuilderWithInterval(4)
+	if err != nil {
+		t.Fatalf("NewBlockBuilderWithInterval failed: %v", err)
+	}
+	for i := 0; i < 6; i++ {
+		k := mustInternalKey(t, fmt.Sprintf("user:%02d", i), 1, binary.OpTypePut)
+		if err := b.Add(k, []byte("val")); err != nil {
+			t.Fatalf("Add %d failed: %v", i, err)
+		}
+	}
+
+	block := b.Finish()
+	parsed := parseFullBlock(t, block)
+
+	if len(parsed.entries) != 6 {
+		t.Fatalf("expected 6 entries, got %d", len(parsed.entries))
+	}
+	// Restart entries at 0 and 4 -> exactly 2 restart points
+	if parsed.restartCount != 2 {
+		t.Fatalf("expected 2 restart points, got %d", parsed.restartCount)
+	}
+	if parsed.restartOffsets[0] != 0 || parsed.restartOffsets[1] != 70 {
+		t.Fatalf("expected restart offsets [0, 70], got %v", parsed.restartOffsets)
+	}
+	// Verified exact hand-computed CRC: 0x668ECF77
+	if parsed.crc != 0x668ECF77 {
+		t.Fatalf("Fixture E CRC mismatch: got 0x%08X, want 0x668ECF77", parsed.crc)
+	}
+	if len(block) != 124 {
+		t.Fatalf("Fixture E length mismatch: got %d, want 124", len(block))
+	}
+}
+
+// Fixture F: Binary values containing 0x00, 0xFF, and high-bit arbitrary data.
+func TestBlockBuilder_FixtureF_BinaryValues(t *testing.T) {
+	b := sstable.NewBlockBuilder()
+	k1 := binary.InternalKey{UserKey: []byte("\x00\x00\x01\x02"), SeqNum: 1, OpType: binary.OpTypePut}
+	k2 := binary.InternalKey{UserKey: []byte("\x00\x00\x01\x03"), SeqNum: 1, OpType: binary.OpTypePut}
+	k3 := binary.InternalKey{UserKey: []byte("\xff\xfe\xfd"), SeqNum: 1, OpType: binary.OpTypePut}
+	k4 := binary.InternalKey{UserKey: []byte("\xff\xff\x00"), SeqNum: 1, OpType: binary.OpTypePut}
+
+	if err := b.Add(k1, []byte("\x00\xff\x00")); err != nil {
+		t.Fatalf("Add k1 failed: %v", err)
+	}
+	if err := b.Add(k2, []byte("\xfe\xdc\xba")); err != nil {
+		t.Fatalf("Add k2 failed: %v", err)
+	}
+	if err := b.Add(k3, []byte("\x80\x81\x82")); err != nil {
+		t.Fatalf("Add k3 failed: %v", err)
+	}
+	if err := b.Add(k4, []byte("\x00")); err != nil {
+		t.Fatalf("Add k4 failed: %v", err)
+	}
+
+	block := b.Finish()
+	parsed := parseFullBlock(t, block)
+
+	if len(parsed.entries) != 4 {
+		t.Fatalf("expected 4 entries, got %d", len(parsed.entries))
+	}
+	if parsed.crc != 0xD05F2A1E {
+		t.Fatalf("Fixture F CRC mismatch: got 0x%08X, want 0xD05F2A1E", parsed.crc)
+	}
+	if len(block) != 80 {
+		t.Fatalf("Fixture F length mismatch: got %d, want 80", len(block))
+	}
+}
+
+// Fixture G: InternalKey with tombstone / OpTypeDelete.
+func TestBlockBuilder_FixtureG_Tombstone(t *testing.T) {
+	b := sstable.NewBlockBuilder()
+	kLive := mustInternalKey(t, "active-key", 2, binary.OpTypePut)
+	kTomb := mustInternalKey(t, "deleted-key", 1, binary.OpTypeDelete)
+
+	if err := b.Add(kLive, []byte("live-data")); err != nil {
+		t.Fatalf("Add kLive failed: %v", err)
+	}
+	if err := b.Add(kTomb, nil); err != nil {
+		t.Fatalf("Add kTomb failed: %v", err)
+	}
+
+	block := b.Finish()
+	parsed := parseFullBlock(t, block)
+
+	if len(parsed.entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(parsed.entries))
+	}
+	if parsed.entries[1].key.OpType != binary.OpTypeDelete {
+		t.Fatalf("expected tombstone OpTypeDelete, got %v", parsed.entries[1].key.OpType)
+	}
+	if len(parsed.entries[1].value) != 0 {
+		t.Fatalf("expected empty value for tombstone")
+	}
+	if parsed.crc != 0xDC6F11A7 {
+		t.Fatalf("Fixture G CRC mismatch: got 0x%08X, want 0xDC6F11A7", parsed.crc)
+	}
+	if len(block) != 66 {
+		t.Fatalf("Fixture G length mismatch: got %d, want 66", len(block))
+	}
+}
+
+// -----------------------------------------------------------------------------
+// CRC32 Test Vectors & Canonical Verification (M02 Requirement 14)
+// -----------------------------------------------------------------------------
+
+func TestBlockBuilder_CRC32_CanonicalVectors(t *testing.T) {
+	// Canonical ASCII standard check
+	const canonicalInput = "123456789"
+	const expectedCRC = uint32(0xCBF43926)
+
+	refCRC := referenceCRC32IEEE([]byte(canonicalInput))
+	if refCRC != expectedCRC {
+		t.Fatalf("reference CRC oracle mismatch on canonical input: got 0x%08X, want 0x%08X", refCRC, expectedCRC)
+	}
+
+	prodCRC := binary.Checksum([]byte(canonicalInput))
+	if prodCRC != expectedCRC {
+		t.Fatalf("production CRC mismatch on canonical input: got 0x%08X, want 0x%08X", prodCRC, expectedCRC)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Corruption Tests (M02 Requirement 15)
+// -----------------------------------------------------------------------------
+
+func TestBlockBuilder_CorruptionDetection(t *testing.T) {
+	b := sstable.NewBlockBuilder()
+	k1 := mustInternalKey(t, "k1", 1, binary.OpTypePut)
+	k2 := mustInternalKey(t, "k2", 1, binary.OpTypePut)
+	if err := b.Add(k1, []byte("v1")); err != nil {
+		t.Fatalf("Add k1 failed: %v", err)
+	}
+	if err := b.Add(k2, []byte("v2")); err != nil {
+		t.Fatalf("Add k2 failed: %v", err)
+	}
+
+	validBlock := b.Finish()
+	crcPos := len(validBlock) - 4
+	expectedCRC := binary.GetUint32(validBlock[crcPos:])
+
+	// Verify the original block is clean
+	if referenceCRC32IEEE(validBlock[:crcPos]) != expectedCRC {
+		t.Fatalf("clean block failed CRC check")
+	}
+
+	// 1. Entry Data byte corruption (offset 5)
+	corruptEntry := make([]byte, len(validBlock))
+	copy(corruptEntry, validBlock)
+	corruptEntry[5] ^= 0x01
+	if referenceCRC32IEEE(corruptEntry[:crcPos]) == expectedCRC {
+		t.Fatalf("CRC did not detect single-bit corruption in entry data region")
+	}
+
+	// 2. Restart Offset byte corruption (offset at crcPos - 8)
+	corruptOffset := make([]byte, len(validBlock))
+	copy(corruptOffset, validBlock)
+	corruptOffset[crcPos-8] ^= 0x01
+	if referenceCRC32IEEE(corruptOffset[:crcPos]) == expectedCRC {
+		t.Fatalf("CRC did not detect single-bit corruption in restart offset region")
+	}
+
+	// 3. Restart Count byte corruption (offset at crcPos - 4)
+	corruptCount := make([]byte, len(validBlock))
+	copy(corruptCount, validBlock)
+	corruptCount[crcPos-4] ^= 0x01
+	if referenceCRC32IEEE(corruptCount[:crcPos]) == expectedCRC {
+		t.Fatalf("CRC did not detect single-bit corruption in restart count field")
+	}
+
+	// 4. CRC Trailer byte corruption (flip bit in stored CRC)
+	corruptCRC := make([]byte, len(validBlock))
+	copy(corruptCRC, validBlock)
+	corruptCRC[crcPos+2] ^= 0x01
+	storedCRC := binary.GetUint32(corruptCRC[crcPos:])
+	if referenceCRC32IEEE(corruptCRC[:crcPos]) == storedCRC {
+		t.Fatalf("CRC corruption failed: corrupted trailer CRC matched data checksum")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Repeated Finish Idempotence & Mutation Safety (M02 Requirement 10)
+// -----------------------------------------------------------------------------
+
+func TestBlockBuilder_FinishIdempotence_NoTrailingGrowth(t *testing.T) {
+	b := sstable.NewBlockBuilder()
+	k := mustInternalKey(t, "idempotent-key", 1, binary.OpTypePut)
+	if err := b.Add(k, []byte("val")); err != nil {
+		t.Fatalf("Add failed: %v", err)
+	}
+
+	sizeEstimateBefore := b.CurrentSizeEstimate()
+
+	b1 := b.Finish()
+	b2 := b.Finish()
+	b3 := b.Finish()
+
+	if !bytes.Equal(b1, b2) || !bytes.Equal(b2, b3) {
+		t.Fatalf("repeated Finish calls returned non-identical byte slices")
+	}
+
+	if len(b1) != sizeEstimateBefore {
+		t.Fatalf("finished size %d != CurrentSizeEstimate %d", len(b1), sizeEstimateBefore)
+	}
+
+	// Caller mutation of b1 must not alter subsequent Finish calls or internal state
+	b1[0] = 0xAA
+	b1[len(b1)-1] = 0x55
+
+	b4 := b.Finish()
+	if b4[0] == 0xAA || b4[len(b4)-1] == 0x55 {
+		t.Fatalf("mutating returned slice corrupted internal block buffer!")
+	}
+	if b.CurrentSizeEstimate() != len(b4) {
+		t.Fatalf("CurrentSizeEstimate drifted after Finish calls: got %d, want %d",
+			b.CurrentSizeEstimate(), len(b4))
+	}
+}
+
+// -----------------------------------------------------------------------------
+// CurrentSizeEstimate Accuracy Across Lifecycle
+// -----------------------------------------------------------------------------
+
+func TestBlockBuilder_CurrentSizeEstimate_Accuracy(t *testing.T) {
+	b := sstable.NewBlockBuilder()
+	if b.CurrentSizeEstimate() != 0 {
+		t.Fatalf("empty builder CurrentSizeEstimate must be 0, got %d", b.CurrentSizeEstimate())
+	}
+
+	for i := 0; i < 20; i++ {
+		k := mustInternalKey(t, fmt.Sprintf("k:%04d", i), 1, binary.OpTypePut)
+		if err := b.Add(k, []byte("val")); err != nil {
+			t.Fatalf("Add %d failed: %v", i, err)
+		}
+	}
+
+	estimatedSize := b.CurrentSizeEstimate()
+	finished := b.Finish()
+
+	if len(finished) != estimatedSize {
+		t.Fatalf("CurrentSizeEstimate (%d) != actual finished block length (%d)", estimatedSize, len(finished))
+	}
+
+	// After Finish, CurrentSizeEstimate remains stable
+	if b.CurrentSizeEstimate() != len(finished) {
+		t.Fatalf("CurrentSizeEstimate after finish (%d) != finished block length (%d)",
+			b.CurrentSizeEstimate(), len(finished))
 	}
 }
