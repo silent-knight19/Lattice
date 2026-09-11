@@ -556,9 +556,14 @@ func (w *TableWriter) Finish() (*SSTableMetadata, error) {
 			return nil, fmt.Errorf("failed to check destination path %q: %w", w.dstPath, err)
 		}
 
-		// Use atomic link(2) to eliminate the TOCTOU overwrite race between Lstat and Rename.
-		// os.Link fails with EEXIST if w.dstPath already exists, atomically preventing overwrite.
-		// Since tmpPath and dstPath are created in the same directory, hard linking is always on the same filesystem.
+		// Use atomic link(2) to publish the SSTable without TOCTOU overwrite races.
+		// os.Link creates dstPath as a new hard link to tmpPath and fails atomically
+		// with EEXIST if dstPath already exists, preventing any overwrite.
+		//
+		// Since tmpPath and dstPath are always in the same parent directory (same
+		// filesystem mount), cross-device (EXDEV) failures cannot occur. Therefore
+		// no fallback to os.Rename is needed or safe — Rename can silently replace
+		// an existing destination, violating the no-overwrite invariant.
 		err := os.Link(w.tmpPath, w.dstPath)
 		if err == nil {
 			_ = os.Remove(w.tmpPath)
@@ -568,13 +573,13 @@ func (w *TableWriter) Finish() (*SSTableMetadata, error) {
 			_ = os.Remove(w.tmpPath)
 			return nil, errors.ErrSSTableExists
 		} else {
-			// Fallback to Rename if filesystem does not support hard links
-			if renameErr := os.Rename(w.tmpPath, w.dstPath); renameErr != nil {
-				w.state = stateError
-				w.err = renameErr
-				_ = os.Remove(w.tmpPath)
-				return nil, renameErr
-			}
+			// Any other Link failure (permission denied, I/O error, etc.) is a real
+			// error. Do NOT fall back to os.Rename — it is overwrite-capable and would
+			// reintroduce the TOCTOU race this code exists to prevent.
+			w.state = stateError
+			w.err = fmt.Errorf("atomic publication via link failed for %q: %w", w.dstPath, err)
+			_ = os.Remove(w.tmpPath)
+			return nil, w.err
 		}
 		// Publication succeeded: file is now at dstPath, staging path no longer exists
 		w.tmpPath = ""
