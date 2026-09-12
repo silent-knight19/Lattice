@@ -65,6 +65,10 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrSSTableExists", errors.ErrSSTableExists, "sstable file already exists"},
 		{"ErrTableReaderClosed", errors.ErrTableReaderClosed, "sstable reader is closed"},
 		{"ErrDataBlockCorrupted", errors.ErrDataBlockCorrupted, "data block corrupted: invalid crc, restart metadata, or entry framing"},
+		{"ErrFilterBlockTruncated", errors.ErrFilterBlockTruncated, "filter block truncated: buffer smaller than trailer"},
+		{"ErrFilterBlockCorrupted", errors.ErrFilterBlockCorrupted, "filter block corrupted: invalid bit count, size, or metadata"},
+		{"ErrUnsupportedHashCount", errors.ErrUnsupportedHashCount, "unsupported filter hash count: must be 7"},
+		{"ErrFilterFinished", errors.ErrFilterFinished, "filter block builder is finished"},
 	}
 
 	for _, tc := range sentinels {
@@ -1465,5 +1469,56 @@ func TestDataBlockCorruptedError(t *testing.T) {
 	}
 	if !nilErr.Is(errors.ErrDataBlockCorrupted) {
 		t.Errorf("nil *DataBlockCorruptedError must match ErrDataBlockCorrupted via Is")
+	}
+}
+
+func TestFilterBlockCorruptedError(t *testing.T) {
+	err := &errors.FilterBlockCorruptedError{
+		Reason: "bit count exceeds maximum key capacity",
+	}
+
+	// errors.Is check
+	if !stdErrors.Is(err, errors.ErrFilterBlockCorrupted) {
+		t.Errorf("FilterBlockCorruptedError must match ErrFilterBlockCorrupted via errors.Is")
+	}
+
+	// Negative match
+	if stdErrors.Is(err, errors.ErrKeyNotFound) {
+		t.Errorf("FilterBlockCorruptedError must not match ErrKeyNotFound")
+	}
+
+	// Wrapping check
+	wrapped := fmt.Errorf("read filter: %w", err)
+	if !stdErrors.Is(wrapped, errors.ErrFilterBlockCorrupted) {
+		t.Errorf("wrapped FilterBlockCorruptedError must match ErrFilterBlockCorrupted via errors.Is")
+	}
+
+	var extracted *errors.FilterBlockCorruptedError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("failed to extract *FilterBlockCorruptedError from wrapped chain")
+	}
+	if extracted.Reason != "bit count exceeds maximum key capacity" {
+		t.Errorf("extracted mismatch: got %+v", extracted)
+	}
+
+	// String check with reason
+	msg := err.Error()
+	if !strings.Contains(msg, "filter block corrupted: bit count exceeds maximum key capacity") {
+		t.Errorf("unexpected error message: %q", msg)
+	}
+
+	// String check without reason
+	errNoReason := &errors.FilterBlockCorruptedError{}
+	if errNoReason.Error() != errors.ErrFilterBlockCorrupted.Error() {
+		t.Errorf("unexpected error message without reason: %q", errNoReason.Error())
+	}
+
+	// Typed nil safety
+	var nilErr *errors.FilterBlockCorruptedError
+	if nilErr.Error() != errors.ErrFilterBlockCorrupted.Error() {
+		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrFilterBlockCorrupted.Error())
+	}
+	if !nilErr.Is(errors.ErrFilterBlockCorrupted) {
+		t.Errorf("nil *FilterBlockCorruptedError must match ErrFilterBlockCorrupted via Is")
 	}
 }

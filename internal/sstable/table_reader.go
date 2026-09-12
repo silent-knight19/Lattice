@@ -11,6 +11,7 @@ import (
 
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
+	"github.com/silent-knight19/lattice/internal/filter"
 )
 
 // TableReader provides point-lookup access to an immutable, finalized SSTable file.
@@ -559,4 +560,66 @@ func readExactAt(readAt func(p []byte, off int64) (int, error), buf []byte, offs
 		}
 	}
 	return nil
+}
+
+// ReadFilterBlock reads, parses, and validates the BloomFilter referenced by the table's MetaIndex block.
+//
+// Return Contract:
+//   - If the table contains no filter block (or MetaIndex is empty), returns (nil, nil).
+//   - If the table contains a filter block, reads the block bytes from disk, validates its CRC32 checksum
+//     and structural invariants via filter.DecodeFilterBlock, and returns the decoded *filter.BloomFilter.
+//   - If the filter block is corrupted, truncated, or fails checksum verification, returns an explicit
+//     error (fail-closed security).
+//   - Zero side-effects: Does not modify the reader's point lookup paths.
+func (r *TableReader) ReadFilterBlock() (*filter.BloomFilter, error) {
+	if r == nil {
+		return nil, errors.ErrNilReceiver
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.closed {
+		return nil, errors.ErrTableReaderClosed
+	}
+
+	metaHandle := r.footer.MetaIndexHandle
+	if metaHandle.Size == 0 || metaHandle.Size == MetaIndexTrailerSize {
+		// Empty MetaIndex block (entryCount = 0)
+		return nil, nil
+	}
+
+	// Read MetaIndex block from disk
+	metaBuf := make([]byte, int(metaHandle.Size))
+	if err := readExactAt(r.readAtFn, metaBuf, int64(metaHandle.Offset)); err != nil {
+		return nil, fmt.Errorf("failed to read metaindex block at offset %d: %w", metaHandle.Offset, err)
+	}
+
+	// Resolve filter handle
+	filterHandle, found, err := FindMetaIndexEntry(metaBuf, filter.FilterMetaKey)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, nil
+	}
+
+	// Validate filter handle bounds against file size and metaindex boundary
+	if err := filterHandle.Validate(); err != nil {
+		return nil, err
+	}
+	if filterHandle.Offset+filterHandle.Size > r.footer.MetaIndexHandle.Offset {
+		return nil, &errors.InvalidBlockHandleError{
+			Offset: filterHandle.Offset,
+			Size:   filterHandle.Size,
+			Reason: "filter block handle overlaps or exceeds metaindex boundary",
+		}
+	}
+
+	// Read Filter block from disk
+	filterBuf := make([]byte, int(filterHandle.Size))
+	if err := readExactAt(r.readAtFn, filterBuf, int64(filterHandle.Offset)); err != nil {
+		return nil, fmt.Errorf("failed to read filter block at offset %d: %w", filterHandle.Offset, err)
+	}
+
+	// Decode and validate filter block
+	return filter.DecodeFilterBlock(filterBuf)
 }

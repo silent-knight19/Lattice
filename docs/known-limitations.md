@@ -396,19 +396,27 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
-### 29. Bloom Filter Membership Serialization & SSTable Integration Decoupling (P05-S01-M02)
-* **Limitation**: `BloomFilter` (P05-S01-M02) implements in-memory Murmur3 128-bit double-hashing, Kirsch–Mitzenmacher probe calculation, `Add`, and `MayContain` with zero false negatives. However, filter block binary serialization (`FilterBlockBuilder`), persistent storage format, SSTable reader/writer integration, and formal empirical false-positive rate benchmarking over 1,000,000 keys are decoupled and deferred to Sub-Phase 05.2 (P05-S02-M01 and P05-S02-M02). Additionally, `Bitset()` returns a direct slice to the underlying buffer; external modification of this slice will corrupt filter invariants without synchronization (intended concurrency model: single-writer population, concurrent immutable querying).
-* **Why It Exists**: Following micro-phase engineering discipline, low-level hashing and probabilistic membership invariants are thoroughly tested and fuzzed independently from block framing and on-disk SSTable file layouts.
-* **Impact**: In-memory Bloom filters cannot yet be persisted into SSTable files or read by `TableReader`.
-* **How It Was Detected**: Architectural design and micro-phase scoping of Phase 05.
-* **Current Mitigation**: Comprehensive in-memory tests, SMHasher verification test (`0x6384BA69`), property-based fuzz tests (>3.0M executions with 0 failures), bounded sanity check, zero-allocation enforcement (0 B/op on `Add` and `MayContain`).
-* **Future Solution**: Sub-Phase 05.2 will implement `FilterBlockBuilder` serialization (M01) and empirical 1M key false-positive rate benchmark (M02). Phase 06+ will integrate filter blocks into `TableWriter` and `TableReader`.
+* **Resolution**: Resolved in P05-S02-M01 with the implementation of `FilterBlockBuilder`, persistent Filter Block binary serialization (`[Bitset] [BitCount 8B] [k 1B] [CRC32 4B]`), SSTable MetaIndex block integration (`"filter.bloom" -> FilterHandle`), and reader extraction via `TableReader.ReadFilterBlock()`.
+
+---
+
+### 30. SSTable Point Lookup Bloom Filter Bypass & Empirical 1M FPR Validation Boundary (P05-S02-M01)
+* **Limitation**: In `P05-S02-M01`:
+  1. *Empirical 1M-Key FPR Benchmark Deferred*: While mathematical sizing targets $p \approx 0.0082$ and tests confirm round-trip correctness and zero false negatives, formal empirical validation over 1,000,000 keys is strictly scoped to `P05-S02-M02`.
+  2. *TableReader Point Lookup Bypass Decoupled*: `TableReader.ReadFilterBlock()` verifies retrieval, structural integrity, and CRC verification of the filter block from disk, but active point-lookup (`TableReader.Seek`) does not yet query the in-memory Bloom filter before reading data blocks. In-memory filter evaluation on the hot read path is scheduled for subsequent reader optimization phases.
+  3. *Fixed Hash Policy*: Hash probe count $k$ is fixed at $k=7$. Filter blocks declaring $k \ne 7$ are intentionally rejected with `ErrUnsupportedHashCount` to preserve strict project policy.
+* **Why It Exists**: Following single micro-phase discipline, persistent serialization and structural SSTable region integration are isolated and verified before building large empirical verification benchmarks or modifying the point-lookup read path.
+* **Impact**: SSTable files on disk now contain canonical Filter Blocks and MetaIndex entries, but `TableReader.Seek` continues to execute sparse index searches directly until filter evaluation is wired into point lookup.
+* **How It Was Detected**: Architectural design boundaries of Phase 05 Sub-Phase 05.2.
+* **Current Mitigation**: Forensic tests verify bitset preservation, exact byte fixtures, ownership isolation, CRC corruption detection, and SSTable non-overlapping region contiguous ordering (`Data` -> `Filter` -> `MetaIndex` -> `Index` -> `Footer`).
+* **Future Solution**: Sub-Phase 05.2 M02 will run the formal 1,000,000-key empirical benchmark; future phases will wire Bloom filtering into `Seek()`.
 * **Dimensional Impact**:
-  * Correctness: **Optimal** (Zero false negatives on inserted keys, SMHasher test passed, overflow-safe modular probing).
-  * Performance: **Optimal** (~14.3 ns/op `Add`, ~7.4 ns/op `MayContain` miss, ~15.1 ns/op hit, 0 allocs/op).
-  * Scalability: **Optimal** (Supports up to ~209.7 million keys per filter block).
+  * Correctness: **Optimal** (Deterministic serialization, exact `bitCount` preservation, fail-closed CRC and metadata validation).
+  * Performance: **Optimal** (Serialization: ~28 ns for 100 keys, ~201 ns for 1,000 keys; Deserialization: ~33 ns for 100 keys, ~215 ns for 1,000 keys).
+  * Scalability: **Optimal** (Bounded allocation ceiling enforces `MaxBitsetBytes` 256 MiB against hostile data).
 
 ---
 
 *End of Known Limitations — To be updated continuously throughout implementation.*
+
 

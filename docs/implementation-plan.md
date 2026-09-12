@@ -1557,10 +1557,40 @@ TOTAL: 184 Discrete, Testable Micro-Phases
 
 ### Sub-Phase 05.2: Filter Block Serialization & Empirical Testing
 * **P05-S02-M01: Filter Block Binary Serialization**
-  * *Objective*: Serialize Bloom bitset, append $k$ count byte, and integrate into SSTable filter block.
-  * *Changes*: `FilterBlockBuilder.Finish() []byte`.
-  * *Tests*: Round-trip filter serialization and deserialization.
-  * *Completion*: Filter block codec verified.
+  * *Objective*: Establish persistent binary wire representation of the Bloom filter as an SSTable filter block, append $k$ count byte, and integrate into SSTable filter block and MetaIndex block.
+  * *Binary Wire Format*:
+    - `[Bitset Payload (N bytes, N = ceil(m/8))]`
+    - `[BitCount m (8 bytes, Big-Endian uint64)]`
+    - `[HashCount k (1 byte, uint8 = 7)]`
+    - `[CRC32-IEEE Checksum (4 bytes, Big-Endian uint32)]`
+    - Trailer size: 13 bytes (`FilterBlockTrailerSize = 13`).
+    - Checksum covers `Bitset || BitCount || HashCount`.
+    - Empty filter ($m=0, N=0$): exactly 13 bytes (`0B bitset || 8B 0x00 || 1B 0x07 || 4B CRC32`).
+  * *Changes*:
+    - `internal/errors`: Added `ErrFilterBlockTruncated`, `ErrFilterBlockCorrupted`, `ErrUnsupportedHashCount`, `ErrFilterFinished`, `FilterBlockCorruptedError`.
+    - `internal/filter/bloom.go`: Added `FilterBlockTrailerSize = 13`, `FilterMetaKey = "filter.bloom"`, `(f *BloomFilter) Encode() []byte`, `EncodeFilterBlock(f *BloomFilter) []byte`, `DecodeFilterBlock(data []byte) (*BloomFilter, error)`.
+    - `internal/filter/filter_builder.go`: Implemented `FilterBlockBuilder` with lifecycle (`NewFilterBlockBuilder`, `NewFilterBlockBuilderWithFilter`, `AddKey`, `Finish`, `Reset`, `Filter`, `AddedKeys`, `IsEmpty`, `CurrentSizeEstimate`).
+    - `internal/sstable/meta_index.go`: Implemented `BuildMetaIndexBlock(entries map[string]BlockHandle) []byte`, `DecodeMetaIndexBlock(data []byte) (map[string]BlockHandle, error)`, `FindMetaIndexEntry(data []byte, key string) (BlockHandle, bool, error)`.
+    - `internal/sstable/table_writer.go`: Wired `FilterBuilder *filter.FilterBlockBuilder` into `TableWriterOptions`; flushes Filter Block before MetaIndex block and records `FilterHandle` in `SSTableMetadata`.
+    - `internal/sstable/table_reader.go`: Added `(r *TableReader) ReadFilterBlock() (*filter.BloomFilter, error)` for fail-closed disk retrieval and validation.
+  * *Invariants & Security*:
+    - Bounds validation: `len(data) <= MaxBitsetBytes + 13` enforced before allocation (guards against memory exhaustion DoS).
+    - Exact probe preservation: Storing exact `bitCount` preserves modular reduction without false negatives on non-multiple-of-8 bitsets.
+    - Fail-closed corruption handling: CRC32 mismatches, truncated buffers, bad $k \ne 7$, and length mismatches return explicit errors; never silently pretend keys are absent.
+    - Physical region ordering: `Data Blocks` -> `Filter Block` -> `MetaIndex Block` -> `Index Block` -> `48-Byte Footer`. All regions strictly contiguous, non-overlapping, and physically bounded.
+  * *Tests & Benchmarks*:
+    - Exact-byte fixtures comparing against hand-calculated independent oracle.
+    - Round-trip tests across $n \in \{0, 1, 2, 7, 8, 9, 10, 16, 50, 100, 1000, 5000\}$ verifying 100% membership equivalence and zero false negatives.
+    - Determinism, idempotence, and ownership isolation tests.
+    - Full corruption matrix: bit flips in CRC, payload, bitCount; invalid $k$; truncated buffers; bounds violations.
+    - Fuzz testing: `FuzzFilterBlockCodec` verifying no panics on arbitrary malformed inputs.
+    - SSTable integration tests: `TestSSTable_FilterBlockIntegration`, `TestSSTable_NoFilter_BackwardCompatibility`, `TestSSTable_CorruptedFilterBlockOnDisk`, `TestMetaIndexBlock_Codec`.
+    - Microbenchmarks (Apple M4):
+      - Serialize ($N=100$ keys): ~28.39 ns/op (144 B/op, 1 allocs/op)
+      - Deserialize ($N=100$ keys): ~33.21 ns/op (176 B/op, 2 allocs/op)
+      - Serialize ($N=1000$ keys): ~201.0 ns/op (1280 B/op, 1 allocs/op)
+      - Deserialize ($N=1000$ keys): ~214.9 ns/op (1328 B/op, 2 allocs/op)
+  * *Completion*: Complete and verified under `-race`, `go vet`, `golangci-lint`. P05-S02-M02 remains next planned micro-phase.
 * **P05-S02-M02: Empirical False-Positive Rate Verification Benchmark**
   * *Objective*: Benchmark measuring false-positive rate across 1,000,000 non-existent keys.
   * *Tests*: Assert empirical false positive rate $p \le 0.01$ (under 1%).

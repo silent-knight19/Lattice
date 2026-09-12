@@ -2,6 +2,9 @@ package filter
 
 import (
 	"math"
+
+	"github.com/silent-knight19/lattice/internal/binary"
+	"github.com/silent-knight19/lattice/internal/errors"
 )
 
 const (
@@ -24,6 +27,14 @@ const (
 	// MaxKeyCount is the maximum key count supported for physical Bloom filter allocation.
 	// Calculated as (MaxBitsetBytes * 8) / BitsPerKey = 209,715,200 keys.
 	MaxKeyCount = (MaxBitsetBytes * 8) / BitsPerKey
+
+	// FilterBlockTrailerSize is the serialized length of the trailing metadata and CRC32 fields.
+	// 8 bytes (BitCount uint64 Big-Endian) + 1 byte (HashCount uint8) + 4 bytes (CRC32-IEEE uint32 Big-Endian) = 13 bytes.
+	FilterBlockTrailerSize = 13
+
+	// FilterMetaKey is the canonical identifier key used in an SSTable MetaIndex block
+	// to point to the Bloom filter block.
+	FilterMetaKey = "filter.bloom"
 )
 
 // BloomFilter represents a space-efficient probabilistic data structure
@@ -266,4 +277,152 @@ func (f *BloomFilter) Probes(key []byte) []uint64 {
 		probes[i] = (h1Mod + uint64(i)*h2Mod) % m
 	}
 	return probes
+}
+
+// Encode serializes the BloomFilter into its persistent on-disk binary format.
+//
+// Filter Block Layout:
+//
+//	+-----------------------------------------------------------------+
+//	| Bitset Payload (N bytes, N = ceil(m / 8) = (m + 7) / 8)         |
+//	+-----------------------------------------------------------------+
+//	| BitCount m (8 bytes, Big-Endian uint64)                         |
+//	+-----------------------------------------------------------------+
+//	| HashCount k (1 byte, uint8 = 7)                                 |
+//	+-----------------------------------------------------------------+
+//	| CRC32-IEEE Checksum (4 bytes, Big-Endian uint32)                |
+//	+-----------------------------------------------------------------+
+//
+// Binary Invariants:
+//   - Total serialized length is N + FilterBlockTrailerSize (N + 13 bytes).
+//   - An empty filter (m = 0, N = 0) serializes to exactly 13 bytes:
+//     8 zero bytes (BitCount=0) + 1 byte (k=7) + 4 bytes CRC32 over the 9 metadata bytes.
+//   - Checksum covers data[:len(data)-4] (Bitset || BitCount || HashCount).
+//   - Ownership: The returned byte slice is an independent allocation. Mutating the returned
+//     bytes will not affect the receiver's bitset, and subsequent mutations to the receiver
+//     will not affect already-serialized bytes.
+func (f *BloomFilter) Encode() []byte {
+	return EncodeFilterBlock(f)
+}
+
+// EncodeFilterBlock serializes f into its persistent on-disk binary format.
+// If f is nil, it serializes a valid empty filter (13 bytes).
+func EncodeFilterBlock(f *BloomFilter) []byte {
+	if f == nil || f.bitCount == 0 || len(f.bitset) == 0 {
+		var buf [FilterBlockTrailerSize]byte
+		// BitCount = 0 (bytes 0..7 are zero)
+		buf[8] = byte(DefaultHashFunctions) // k = 7
+		crc := binary.Checksum(buf[:9])
+		binary.PutUint32(buf[9:13], crc)
+		out := make([]byte, FilterBlockTrailerSize)
+		copy(out, buf[:])
+		return out
+	}
+
+	bitsetLen := len(f.bitset)
+	totalLen := bitsetLen + FilterBlockTrailerSize
+	out := make([]byte, totalLen)
+
+	// 1. Bitset payload
+	copy(out[:bitsetLen], f.bitset)
+
+	// 2. BitCount (8 bytes, Big-Endian)
+	trailerStart := bitsetLen
+	binary.PutUint64(out[trailerStart:trailerStart+8], f.bitCount)
+
+	// 3. HashCount k (1 byte)
+	k := f.hashCount
+	if k == 0 {
+		k = DefaultHashFunctions
+	}
+	out[trailerStart+8] = byte(k)
+
+	// 4. CRC32-IEEE checksum over [Bitset || BitCount || HashCount]
+	checksum := binary.Checksum(out[:totalLen-4])
+	binary.PutUint32(out[totalLen-4:], checksum)
+
+	return out
+}
+
+// DecodeFilterBlock decodes and validates a persistent SSTable filter block from raw bytes.
+//
+// Validation & Fail-Closed Security Contract:
+//   - If len(data) < FilterBlockTrailerSize (13 bytes): returns errors.ErrFilterBlockTruncated.
+//   - If len(data) > MaxBitsetBytes + FilterBlockTrailerSize: returns errors.ErrFilterBlockCorrupted
+//     to prevent memory exhaustion DoS attacks before any allocation occurs.
+//   - Verifies CRC32-IEEE checksum over [Bitset || BitCount || HashCount].
+//     Returns *errors.ChecksumMismatchError on checksum failure.
+//   - Verifies hashCount k == DefaultHashFunctions (7). Returns errors.ErrUnsupportedHashCount if k != 7.
+//   - Verifies bitCount does not exceed MaxKeyCount * BitsPerKey.
+//   - Verifies that declared bitCount exactly matches actual bitset byte length (len(data) - 13 == ceil(bitCount / 8)).
+//     Returns errors.ErrFilterBlockCorrupted on mismatch.
+//   - Ownership: The decoded BloomFilter owns an independent copy of the bitset; modifying
+//     data after decoding will not affect the filter.
+func DecodeFilterBlock(data []byte) (*BloomFilter, error) {
+	if len(data) < FilterBlockTrailerSize {
+		return nil, errors.ErrFilterBlockTruncated
+	}
+
+	if len(data) > MaxBitsetBytes+FilterBlockTrailerSize {
+		return nil, &errors.FilterBlockCorruptedError{
+			Reason: "filter block size exceeds maximum bitset size",
+		}
+	}
+
+	// 1. Verify CRC32-IEEE checksum
+	checksumOffset := len(data) - 4
+	expectedCRC := binary.GetUint32(data[checksumOffset:])
+	actualCRC := binary.Checksum(data[:checksumOffset])
+	if expectedCRC != actualCRC {
+		return nil, &errors.ChecksumMismatchError{
+			Offset:   int64(checksumOffset),
+			Expected: expectedCRC,
+			Actual:   actualCRC,
+		}
+	}
+
+	// 2. Read and validate HashCount k (1 byte preceding CRC)
+	k := int(data[len(data)-5])
+	if k != DefaultHashFunctions {
+		return nil, errors.ErrUnsupportedHashCount
+	}
+
+	// 3. Read and validate BitCount m (8 bytes preceding k)
+	bitCountOffset := len(data) - FilterBlockTrailerSize
+	bitCount := binary.GetUint64(data[bitCountOffset : bitCountOffset+8])
+
+	maxBits := uint64(MaxKeyCount) * uint64(BitsPerKey)
+	if bitCount > maxBits {
+		return nil, &errors.FilterBlockCorruptedError{
+			Reason: "bit count exceeds maximum key capacity",
+		}
+	}
+
+	// 4. Validate bitset byte length against declared bitCount
+	var expectedBytes int
+	if bitCount > 0 {
+		expectedBytes = int((bitCount + 7) / 8)
+	}
+
+	actualBitsetBytes := len(data) - FilterBlockTrailerSize
+	if actualBitsetBytes != expectedBytes {
+		return nil, &errors.FilterBlockCorruptedError{
+			Reason: "bitset byte length does not match declared bit count",
+		}
+	}
+
+	// 5. Commit owned bitset
+	bitset := make([]byte, expectedBytes)
+	if expectedBytes > 0 {
+		copy(bitset, data[:expectedBytes])
+	}
+
+	keyCount := int(bitCount / uint64(BitsPerKey))
+
+	return &BloomFilter{
+		keyCount:  keyCount,
+		bitCount:  bitCount,
+		hashCount: k,
+		bitset:    bitset,
+	}, nil
 }

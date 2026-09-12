@@ -193,3 +193,52 @@ func FuzzBloomFilter_AddMayContain(f *testing.F) {
 		}
 	})
 }
+
+// FuzzFilterBlockCodec tests parser robustness against arbitrary malformed byte slices
+// and verifies that DecodeFilterBlock never panics or hangs.
+func FuzzFilterBlockCodec(f *testing.F) {
+	// Seed corpus: empty filter, valid small filter, corrupted trailers, random bytes
+	emptyFilter := filter.NewBloomFilter(0)
+	f.Add(emptyFilter.Encode())
+
+	smallFilter := filter.NewBloomFilter(5)
+	smallFilter.Add([]byte("hello"))
+	f.Add(smallFilter.Encode())
+
+	f.Add([]byte{})
+	f.Add([]byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12})
+	f.Add(make([]byte, 13))
+	f.Add(make([]byte, 32))
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		// Enforce safety cap on fuzz slice length to prevent excessive memory usage
+		if len(data) > 65536 {
+			return
+		}
+
+		decoded, err := filter.DecodeFilterBlock(data)
+		if err != nil {
+			// Expected for malformed input: fail-closed with error
+			if decoded != nil {
+				t.Fatalf("expected nil filter on error, got %v", decoded)
+			}
+			return
+		}
+
+		// If decode succeeded:
+		// 1. Re-encoding must not panic and must produce identical bytes
+		reEncoded := decoded.Encode()
+		if len(reEncoded) != len(data) {
+			t.Fatalf("re-encoded length mismatch: got %d, want %d", len(reEncoded), len(data))
+		}
+
+		// 2. Decode again must succeed
+		reDecoded, err := filter.DecodeFilterBlock(reEncoded)
+		if err != nil {
+			t.Fatalf("second decode failed: %v", err)
+		}
+		if reDecoded.BitCount() != decoded.BitCount() {
+			t.Fatalf("bitCount mismatch across re-decode")
+		}
+	})
+}

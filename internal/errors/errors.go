@@ -207,6 +207,18 @@ var (
 	// ErrWriterPoisoned indicates that an operation was attempted on a WAL writer
 	// that entered an unrecoverable poisoned state following a write or sync failure.
 	ErrWriterPoisoned = stdErrors.New("wal writer is poisoned")
+
+	// ErrFilterBlockTruncated indicates that a filter block buffer is shorter than the minimum trailer length (13 bytes).
+	ErrFilterBlockTruncated = stdErrors.New("filter block truncated: buffer smaller than trailer")
+
+	// ErrFilterBlockCorrupted indicates that a filter block's bit count, size, or metadata is corrupted.
+	ErrFilterBlockCorrupted = stdErrors.New("filter block corrupted: invalid bit count, size, or metadata")
+
+	// ErrUnsupportedHashCount indicates that a serialized filter block specifies an unsupported hash count (must be 7).
+	ErrUnsupportedHashCount = stdErrors.New("unsupported filter hash count: must be 7")
+
+	// ErrFilterFinished indicates that mutation was attempted on an already finished/sealed filter block builder.
+	ErrFilterFinished = stdErrors.New("filter block builder is finished")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing
@@ -586,6 +598,27 @@ func (e *IndexBlockCorruptedError) Error() string {
 // Is reports whether this error matches target sentinel ErrIndexBlockCorrupted.
 func (e *IndexBlockCorruptedError) Is(target error) bool {
 	return target == ErrIndexBlockCorrupted
+}
+
+// FilterBlockCorruptedError provides structured context when a filter block fails integrity or layout checks.
+// It matches ErrFilterBlockCorrupted when interrogated with errors.Is().
+type FilterBlockCorruptedError struct {
+	Reason string
+}
+
+func (e *FilterBlockCorruptedError) Error() string {
+	if e == nil {
+		return ErrFilterBlockCorrupted.Error()
+	}
+	if e.Reason != "" {
+		return fmt.Sprintf("filter block corrupted: %s", e.Reason)
+	}
+	return ErrFilterBlockCorrupted.Error()
+}
+
+// Is reports whether this error matches target sentinel ErrFilterBlockCorrupted.
+func (e *FilterBlockCorruptedError) Is(target error) bool {
+	return target == ErrFilterBlockCorrupted
 }
 
 // InvalidFooterMagicError provides structured context when an SSTable footer magic number check fails.

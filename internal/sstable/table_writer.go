@@ -10,6 +10,7 @@ import (
 
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
+	"github.com/silent-knight19/lattice/internal/filter"
 )
 
 // writerState represents the lifecycle phase of an active TableWriter.
@@ -42,6 +43,11 @@ type TableWriterOptions struct {
 	// FileMode is the permission mode for the created SSTable file.
 	// Default: 0600 (DefaultFileMode).
 	FileMode os.FileMode
+
+	// FilterBuilder is an optional FilterBlockBuilder. If non-nil, user keys added to the SSTable
+	// are recorded into the filter builder, and a serialized Filter Block is written and indexed
+	// in the MetaIndex block under key "filter.bloom".
+	FilterBuilder *filter.FilterBlockBuilder
 }
 
 // DefaultTableWriterOptions returns production defaults for TableWriterOptions.
@@ -77,6 +83,7 @@ type SSTableMetadata struct {
 	LargestSeqNum   uint64
 	MetaIndexHandle BlockHandle
 	IndexHandle     BlockHandle
+	FilterHandle    BlockHandle
 }
 
 // Iterator defines the sequential record traversal interface accepted by TableWriter.Build.
@@ -128,6 +135,9 @@ type TableWriter struct {
 	offset         uint64
 	dataBlockCount uint64
 	entryCount     uint64
+
+	filterBuilder *filter.FilterBlockBuilder
+	filterHandle  BlockHandle
 
 	state writerState
 	err   error
@@ -235,6 +245,7 @@ func NewTableWriter(dstPath string, opts TableWriterOptions) (*TableWriter, erro
 		file:             file,
 		dataBlockBuilder: dataBuilder,
 		indexBuilder:     NewIndexBuilder(),
+		filterBuilder:    opts.FilterBuilder,
 		smallestSeqNum:   math.MaxUint64,
 		state:            stateOpen,
 		writeFn:          defaultWrite,
@@ -278,6 +289,7 @@ func NewTableWriterWithFile(file *os.File, opts TableWriterOptions) (*TableWrite
 		file:             file,
 		dataBlockBuilder: dataBuilder,
 		indexBuilder:     NewIndexBuilder(),
+		filterBuilder:    opts.FilterBuilder,
 		smallestSeqNum:   math.MaxUint64,
 		state:            stateOpen,
 		writeFn:          defaultWrite,
@@ -342,6 +354,11 @@ func (w *TableWriter) Add(key binary.InternalKey, value []byte) error {
 	// 3. Add to data block builder
 	if err := w.dataBlockBuilder.Add(key, value); err != nil {
 		return err
+	}
+
+	// Add user key to filter builder if configured
+	if w.filterBuilder != nil {
+		_ = w.filterBuilder.AddKey(key.UserKey)
 	}
 
 	// 4. Update largest key in current block (defensive copy)
@@ -466,8 +483,35 @@ func (w *TableWriter) Finish() (*SSTableMetadata, error) {
 		return nil, err
 	}
 
-	// 2. Write MetaIndex block (in Phase 04, valid empty 8-byte block with 0 count + CRC32)
-	metaBytes := emptyMetaIndexBlock()
+	// 2. Write Filter block if filter builder is configured and non-empty
+	var filterHandle BlockHandle
+	hasFilter := w.filterBuilder != nil && !w.filterBuilder.IsEmpty()
+	if hasFilter {
+		filterBytes := w.filterBuilder.Finish()
+		filterOffset := w.offset
+		if err := w.writeAll(filterBytes); err != nil {
+			w.state = stateError
+			w.err = err
+			_ = w.cleanupStaging()
+			return nil, err
+		}
+		filterHandle = BlockHandle{
+			Offset: filterOffset,
+			Size:   uint64(len(filterBytes)),
+		}
+		w.filterHandle = filterHandle
+	}
+
+	// 3. Write MetaIndex block (points to filter block if present, or 8-byte empty block)
+	var metaBytes []byte
+	if hasFilter {
+		metaEntries := map[string]BlockHandle{
+			filter.FilterMetaKey: filterHandle,
+		}
+		metaBytes = BuildMetaIndexBlock(metaEntries)
+	} else {
+		metaBytes = emptyMetaIndexBlock()
+	}
 	metaOffset := w.offset
 	if err := w.writeAll(metaBytes); err != nil {
 		w.state = stateError
@@ -608,6 +652,7 @@ func (w *TableWriter) Finish() (*SSTableMetadata, error) {
 		LargestSeqNum:   w.largestSeqNum,
 		MetaIndexHandle: metaHandle,
 		IndexHandle:     indexHandle,
+		FilterHandle:    filterHandle,
 	}
 	if w.entryCount == 0 {
 		meta.SmallestSeqNum = 0
@@ -703,7 +748,13 @@ func (w *TableWriter) TempPath() string {
 func (w *TableWriter) EstimatedSize() uint64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.offset + uint64(w.dataBlockBuilder.CurrentSizeEstimate()) + uint64(w.indexBuilder.CurrentSizeEstimate()) + 8 + FooterSize
+	filterSize := uint64(0)
+	metaSize := uint64(8)
+	if w.filterBuilder != nil && !w.filterBuilder.IsEmpty() {
+		filterSize = uint64(w.filterBuilder.CurrentSizeEstimate())
+		metaSize = 41
+	}
+	return w.offset + uint64(w.dataBlockBuilder.CurrentSizeEstimate()) + uint64(w.indexBuilder.CurrentSizeEstimate()) + filterSize + metaSize + FooterSize
 }
 
 // emptyMetaIndexBlock creates an 8-byte valid serialized block with entryCount=0 and CRC32-IEEE.
