@@ -1499,9 +1499,30 @@ TOTAL: 184 Discrete, Testable Micro-Phases
 ### Sub-Phase 05.1: Mathematical Modeling & Bitset Implementation
 * **P05-S01-M01: Bloom Filter Parameter Calculator & Bitset Allocator**
   * *Objective*: Calculate optimal bitset length ($m = n \times 10$) and hash count ($k=7$).
-  * *Changes*: `NewBloomFilter(keyCount int) *BloomFilter`.
-  * *Tests*: Validate bitset memory sizing across various key counts ($100$ to $10,000,000$).
-  * *Completion*: Sizing verified.
+  * *Changes*:
+    - Created `internal/filter/bloom.go`: implemented `BloomFilter`, `OptimalBitsetSize()`, `NewBloomFilter()`, and accessors (`KeyCount()`, `BitCount()`, `HashCount()`, `ByteSize()`, `Bitset()`, `IsEmpty()`). Defined fixed project policy constants `BitsPerKey = 10`, `DefaultHashFunctions = 7`, `MaxBitsetBytes = 256 MiB`, and `MaxKeyCount = 209,715,200`.
+    - Created `internal/filter/bloom_test.go`: table-driven tests for basic sizing across cardinalities (1 to 10,000,000 keys), byte-rounding boundaries ($\lceil m/8 \rceil$), zero input semantics ($n=0 \implies 0$ bits, 0 bytes), negative input semantics ($n < 0 \implies \text{nil}$), integer multiplication overflow guards, `MaxKeyCount` allocation ceiling, zero-initialization verification, and nil-receiver safety.
+    - Created `internal/filter/bloom_bench_test.go`: constructor allocation micro-benchmarks across 100 to 1,000,000 keys and in-register sizing calculation.
+    - Created `internal/filter/bloom_fuzz_test.go`: `FuzzOptimalBitsetSize` testing arithmetic invariants and `FuzzNewBloomFilter_Bounded` testing bounded physical allocation.
+  * *Invariants Maintained*:
+    - *Exact Mathematical Sizing*: Bit count strictly satisfies $m = n \times 10$; byte allocation strictly satisfies $\lceil m / 8 \rceil = (m + 7) / 8$.
+    - *Fixed Policy Parameters*: `BitsPerKey == 10`, `HashFunctions == 7`.
+    - *Arithmetic Overflow Safety*: Sizing guards against multiplication overflow; values exceeding $(math.MaxInt - 7) / 10$ fail closed returning `(0, 0, false)`.
+    - *Fail-Closed Boundary Defense*: Negative key counts and counts exceeding `MaxKeyCount` safely return `nil`.
+    - *Empty Set Consistency*: $n = 0$ yields a valid non-nil empty filter ($m = 0, \text{bytes} = 0, k = 7$).
+    - *Deterministic Zero-Initialization*: All allocated bitset bytes are guaranteed `0x00` (no bits set).
+  * *Measured Results*:
+    - Micro-benchmarks (Apple M4, darwin/arm64):
+      - `BenchmarkNewBloomFilter_100`: ~36.5 ns/op (176 B/op, 2 allocs/op).
+      - `BenchmarkNewBloomFilter_1K`: ~114.6 ns/op (1,328 B/op, 2 allocs/op).
+      - `BenchmarkNewBloomFilter_10K`: ~640.2 ns/op (13,616 B/op, 2 allocs/op).
+      - `BenchmarkNewBloomFilter_100K`: ~4,874 ns/op (131,121 B/op, 2 allocs/op).
+      - `BenchmarkNewBloomFilter_1M`: ~40,052 ns/op (1,253,424 B/op, 2 allocs/op).
+      - `BenchmarkOptimalBitsetSize`: ~0.27 ns/op (0 B/op, 0 allocs/op).
+    - Fuzz Testing:
+      - `FuzzOptimalBitsetSize`: >3,181,000 executions with 0 failures.
+      - `FuzzNewBloomFilter_Bounded`: >2,784,000 executions with 0 failures.
+  * *Completion*: Complete and verified under `-race`, `go vet`, `golangci-lint`.
 * **P05-S01-M02: Murmur3 Double-Hashing Implementation**
   * *Objective*: Implement Kirsch-Mitzenmacher optimization generating $k$ hashes from two 64-bit hash values:
     $$g_i(x) = h_1(x) + i \cdot h_2(x) \pmod{m}$$
