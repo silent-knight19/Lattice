@@ -348,16 +348,17 @@ Every future micro-phase implementation response from Claude Code must use this 
 # 16. Current Execution State
 
 ```
-Current Major Phase           : Phase 04 — Persistent SSTable Subsystem (COMPLETE)
-Current Sub-Phase             : Sub-Phase 04.3 — SSTable File Writer & Reader (COMPLETE)
-Current Micro-Phase           : P04-S03-M02 — SSTable Block Reader & Sparse Index Binary Search (COMPLETE)
+Current Major Phase           : Phase 05 — Bloom Filter & Probabilistic Indexing Subsystem (COMPLETE)
+Current Sub-Phase             : Sub-Phase 05.2 — Filter Block Serialization & Empirical Testing (COMPLETE)
+Current Micro-Phase           : P05-S02-M02 — Empirical False-Positive Rate Verification Benchmark (COMPLETE)
 Phase 01 Status               : COMPLETE (Sub-Phases 01.1 & 01.2 Complete)
 Phase 02 Status               : COMPLETE (Sub-Phases 02.1, 02.2, 02.3, 02.4 Complete)
 Phase 03 Status               : COMPLETE (Sub-Phases 03.1, 03.2, 03.3 Complete)
 Phase 04 Status               : COMPLETE (Sub-Phases 04.1, 04.2, 04.3 Complete)
-Previous Completed Phase      : Phase 04 — Persistent SSTable Subsystem
-Previous Completed Micro-Phase: P04-S03-M02 — SSTable Block Reader & Sparse Index Binary Search
-Next Planned Micro-Phase      : P05-S01-M01 — Bloom Filter Parameter Calculator & Bitset Allocator
+Phase 05 Status               : COMPLETE (Sub-Phases 05.1 & 05.2 Complete)
+Previous Completed Phase      : Phase 05 — Bloom Filter & Probabilistic Indexing Subsystem
+Previous Completed Micro-Phase: P05-S02-M02 — Empirical False-Positive Rate Verification Benchmark
+Next Planned Micro-Phase      : P06-S01-M01 — VersionEdit Binary Representation
 Phase 00 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Phase 01 Final Audit          : Completed — PASS WITH REMEDIATIONS
 Security Audit Track State    : Active
@@ -370,9 +371,9 @@ Security Audit Track State    : Active
   - SEC-06 through SEC-09 (PLANNED)
 Blocking Issues               : None
 Tests Passing                 : `go test -race ./...` (All test suites passing, 0 race conditions), `golangci-lint run ./...` clean (0 issues), `go mod verify` passed, Linux & Windows cross-platform verified
-Security Review Status        : Complete & Verified (SEC-01 foundations established; SEC-02 static audit verified; SEC-03 dynamic persistence audit completed; SEC-04 in-memory engine audit completed; SEC-P03 independent adversarial audit completed; P04-S01-M01 audited; P04-S01-M02 audited; P04-S02-M01 audited; P04-S02-M02 audited; P04-S03-M01 audited; P04-S03-M02 audited with 0 vulnerabilities, bounded ReadAt disk reads, defensive value copies, CRC32 block verification, bounds-checked restart offset arithmetic, and clean error discrimination)
-Interview Knowledge Status    : Updated with Sections 30 through 35 containing deep systems interview questions and answers across prefix compression, restart points, block trailers, sparse two-level indexing, block handles, fixed 48-byte footers, sequential SSTable file writer, and SSTable point read/seek architecture
-Git Commit                    : feat(sstable): [P04-S03-M02] implement SSTable block reader and point lookup
+Security Review Status        : Complete & Verified (SEC-01 foundations established; SEC-02 static audit verified; SEC-03 dynamic persistence audit completed; SEC-04 in-memory engine audit completed; SEC-P03 independent adversarial audit completed; Phase 04 audited; P05-S01-M01 audited; P05-S01-M02 audited; P05-S02-M01 audited; P05-S02-M02 audited with zero unbounded allocations, streaming key generation, division-by-zero guards, and 95% Wilson confidence interval verification)
+Interview Knowledge Status    : Updated with Section 5 containing deep systems interview questions and answers across Bloom filter theory, Kirsch–Mitzenmacher double-hashing, exact bitCount serialization, fail-closed corruption handling, and empirical 1,000,000-key verification results
+Git Commit                    : feat(filter): [P05-S02-M02] verify empirical false-positive rate
 ```
 
 ---
@@ -1587,14 +1588,42 @@ TOTAL: 184 Discrete, Testable Micro-Phases
     - SSTable integration tests: `TestSSTable_FilterBlockIntegration`, `TestSSTable_NoFilter_BackwardCompatibility`, `TestSSTable_CorruptedFilterBlockOnDisk`, `TestMetaIndexBlock_Codec`.
     - Microbenchmarks (Apple M4):
       - Serialize ($N=100$ keys): ~28.39 ns/op (144 B/op, 1 allocs/op)
-      - Deserialize ($N=100$ keys): ~33.21 ns/op (176 B/op, 2 allocs/op)
-      - Serialize ($N=1000$ keys): ~201.0 ns/op (1280 B/op, 1 allocs/op)
-      - Deserialize ($N=1000$ keys): ~214.9 ns/op (1328 B/op, 2 allocs/op)
-  * *Completion*: Complete and verified under `-race`, `go vet`, `golangci-lint`. P05-S02-M02 remains next planned micro-phase.
+  * *Completion*: Complete and verified under `-race`, `go vet`, `golangci-lint`.
 * **P05-S02-M02: Empirical False-Positive Rate Verification Benchmark**
-  * *Objective*: Benchmark measuring false-positive rate across 1,000,000 non-existent keys.
-  * *Tests*: Assert empirical false positive rate $p \le 0.01$ (under 1%).
-  * *Completion*: Precision verified against mathematical model.
+  * *Objective*: Empirically validate the false-positive behavior of the completed Bloom Filter implementation under the project's fixed design: 10 bits per key, 7 hash functions, MurmurHash3_x64_128 (seed 0), Kirsch–Mitzenmacher double hashing, and exact `bitCount` sizing across 1,000,000 inserted keys and 1,000,000 disjoint absent queries.
+  * *Architecture & Implementation*:
+    - `internal/filter/bloom_fpr.go`:
+      - `TheoreticalFPR(bitsPerKey, hashCount)`: Calculates $(1 - e^{-k / (m/n)})^k$.
+      - `WilsonConfidenceInterval(trials, successes, z)`: Calculates two-tailed Wilson score binomial confidence interval with boundary clamping.
+      - `ZScore(trials, successes, pTheoretical)`: Computes standardized normal test deviate $(x - \mu)/\sigma$.
+      - `FormatKey(dst, prefix, id)`: Stack-allocated deterministic key formatter with zero heap allocations.
+      - `RunFPRExperiment(insertedCount, queryCount)`: Orchestrates streaming insertion, control checks, disjoint querying, and statistical analysis.
+    - `internal/filter/bloom_fpr_test.go`:
+      - `TestTheoreticalFPR`: Independent oracle check against $(1-e^{-0.7})^7 \approx 0.0081937221$, monotonicity, and boundary guards.
+      - `TestWilsonConfidenceInterval`: Textbook binomial verification ($n=100, x=10$), zero/full success boundary cases, degenerate input guards.
+      - `TestZScore`: Mean $Z=0$, standard deviation scaling, invalid input handling.
+      - `TestFormatKey`: Prefix separation, 10-digit zero padding, zero allocations verification (`testing.AllocsPerRun`).
+      - `TestFPRExperiment_Controls`: Control A (0 false negatives on inserted keys), Control B (disjointness validation), Control C (empty filter sanity).
+      - `TestBloomFilter_EmpiricalFPR_Matrix`: Convergence verification across $N \in \{1000, 10000, 100000\}$.
+      - `TestBloomFilter_EmpiricalFalsePositiveRate_1M`: Authoritative 1,000,000-key empirical verification.
+      - `BenchmarkBloomFilter_EmpiricalFPR_1M`: Performance and allocation benchmark.
+  * *Measured Results (Apple M4, Go 1.27.1 darwin/arm64)*:
+    - Inserted Population: 1,000,000 keys (`"insert:0000000000"` ... `"insert:0000999999"`)
+    - Absent Query Population: 1,000,000 disjoint keys (`"absent:0000000000"` ... `"absent:0000999999"`)
+    - Bit Count: $m = 10,000,000$ bits ($m/n = 10.0$)
+    - Physical Bitset Allocation: $1,250,000$ bytes (1.25 MB)
+    - Hash Probes: $k = 7$
+    - False Negatives on Inserted Keys: 0 (100% true positive retention)
+    - False Positives: 8,186 / 1,000,000 queries
+    - True Negatives: 991,814 / 1,000,000 queries
+    - Observed FPR: 0.008186 (0.8186%)
+    - Theoretical FPR: 0.008194 (0.8194%)
+    - Expected False Positives: 8,193.7
+    - 95% Wilson Score Confidence Interval: [0.008011, 0.008365] ([0.8011%, 0.8365%])
+    - Standardized Z-Score: -0.0857 (deviates by only -0.086 standard deviations from expected mean)
+    - Statistical Verdict: The theoretical FPR falls within the 95% Wilson confidence interval, and $|Z| \le 3.0$. The empirical result is statistically consistent with the theoretical Bernoulli model.
+    - Benchmark Throughput: ~72.1–108 ms per 2,010,000 operations (>18.5M ops/sec), 4 allocs/op (1.25 MB total, 0 allocs in inner loops).
+  * *Completion*: Complete and verified under `-race`, `go vet`, `golangci-lint`. P05-S02 complete; Phase 06 remains next major phase.
 
 ---
 
