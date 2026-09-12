@@ -171,3 +171,99 @@ func (f *BloomFilter) IsEmpty() bool {
 	}
 	return f.bitCount == 0
 }
+
+// Add inserts a key into the Bloom filter by setting the bits corresponding to its k hash probes.
+//
+// Probe Generation (Kirsch-Mitzenmacher Double-Hashing):
+//
+//	h1, h2 = Murmur3_128(key, DefaultMurmur3Seed)
+//	g_i(key) = ((h1 % m) + i * (h2 % m)) % m    for i in [0, hashCount-1]
+//
+// This modular reduction formulation guarantees exact mathematical values in Z/mZ and avoids
+// 64-bit integer addition or multiplication overflow prior to modulo reduction.
+//
+// Concurrency & Safety:
+//   - If the receiver is nil, this method safely returns (no-op).
+//   - If the filter has zero bit capacity (f.bitCount == 0 || len(f.bitset) == 0), this is a safe no-op.
+//   - Nil and empty byte keys ([]byte{}) are treated as valid binary inputs.
+//   - BloomFilter is designed for single-writer construction/population followed by concurrent
+//     immutable reading. Add is NOT safe for concurrent execution without external synchronization.
+func (f *BloomFilter) Add(key []byte) {
+	if f == nil || f.bitCount == 0 || len(f.bitset) == 0 {
+		return
+	}
+
+	h1, h2 := Murmur3_128(key, DefaultMurmur3Seed)
+	m := f.bitCount
+	h1Mod := h1 % m
+	h2Mod := h2 % m
+
+	for i := 0; i < f.hashCount; i++ {
+		probe := (h1Mod + uint64(i)*h2Mod) % m
+		byteIdx := probe / 8
+		bitMask := byte(1 << (probe % 8))
+		if byteIdx < uint64(len(f.bitset)) {
+			f.bitset[byteIdx] |= bitMask
+		}
+	}
+}
+
+// MayContain queries whether key might be a member of the Bloom filter.
+//
+// Mathematical Invariants:
+//   - Zero False Negatives: If the key was previously added via Add(key) and the filter
+//     has not been externally modified, MayContain is mathematically guaranteed to return true.
+//   - Probabilistic False Positives: If the key was NOT added, MayContain may return true with
+//     a theoretical false positive probability p ≈ 0.0082 (under 1% for 10 bits/key and k=7).
+//
+// Return Contract:
+//   - If the receiver is nil or has zero capacity (f.bitCount == 0), returns false (empty set contains nothing).
+//   - Fails fast: returns false immediately upon encountering the first probe whose bit is 0.
+//   - Returns true if and only if all k probe bits are 1.
+//
+// Performance:
+//   - Executes in O(k) time (at most 7 bit probes).
+//   - Zero heap allocations (0 B/op).
+//
+// Concurrency:
+//   - MayContain is safe for concurrent read access across multiple goroutines once construction is complete.
+func (f *BloomFilter) MayContain(key []byte) bool {
+	if f == nil || f.bitCount == 0 || len(f.bitset) == 0 {
+		return false
+	}
+
+	h1, h2 := Murmur3_128(key, DefaultMurmur3Seed)
+	m := f.bitCount
+	h1Mod := h1 % m
+	h2Mod := h2 % m
+
+	for i := 0; i < f.hashCount; i++ {
+		probe := (h1Mod + uint64(i)*h2Mod) % m
+		byteIdx := probe / 8
+		bitMask := byte(1 << (probe % 8))
+		if byteIdx >= uint64(len(f.bitset)) || (f.bitset[byteIdx]&bitMask) == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// Probes returns the k bit-indices generated for key in this BloomFilter.
+// This method is provided for diagnostics, testing, and mathematical verification.
+// If the receiver is nil or has zero bit capacity, it returns nil.
+func (f *BloomFilter) Probes(key []byte) []uint64 {
+	if f == nil || f.bitCount == 0 {
+		return nil
+	}
+
+	h1, h2 := Murmur3_128(key, DefaultMurmur3Seed)
+	m := f.bitCount
+	h1Mod := h1 % m
+	h2Mod := h2 % m
+
+	probes := make([]uint64, f.hashCount)
+	for i := 0; i < f.hashCount; i++ {
+		probes[i] = (h1Mod + uint64(i)*h2Mod) % m
+	}
+	return probes
+}

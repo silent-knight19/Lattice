@@ -117,3 +117,79 @@ func FuzzNewBloomFilter_Bounded(f *testing.F) {
 		}
 	})
 }
+
+// FuzzMurmur3_128 verifies that Murmur3_128 safely processes arbitrary binary payloads
+// without panics, memory faults, or non-deterministic variance.
+func FuzzMurmur3_128(f *testing.F) {
+	seeds := [][]byte{
+		{},
+		[]byte("a"),
+		[]byte("test"),
+		[]byte("hello"),
+		[]byte("The quick brown fox jumps over the lazy dog"),
+		make([]byte, 16),
+		make([]byte, 17),
+		make([]byte, 31),
+		make([]byte, 32),
+		make([]byte, 64),
+	}
+	for _, seed := range seeds {
+		f.Add(seed, uint64(0))
+		f.Add(seed, uint64(42))
+	}
+
+	f.Fuzz(func(t *testing.T, data []byte, seed uint64) {
+		h1A, h2A := filter.Murmur3_128(data, seed)
+		h1B, h2B := filter.Murmur3_128(data, seed)
+
+		if h1A != h1B || h2A != h2B {
+			t.Fatalf("determinism failure: (%x, %x) != (%x, %x)", h1A, h2A, h1B, h2B)
+		}
+	})
+}
+
+// FuzzBloomFilter_AddMayContain verifies the invariant that for any arbitrary key and any
+// valid bounded filter size, Add(key) followed by MayContain(key) NEVER produces a false negative.
+func FuzzBloomFilter_AddMayContain(f *testing.F) {
+	keys := [][]byte{
+		{},
+		[]byte("key"),
+		[]byte("longer_user_key_string"),
+		[]byte("\x00\x00\x00"),
+		[]byte("\xff\xff\xff"),
+	}
+	capacities := []int{0, 1, 2, 7, 8, 10, 100, 1000}
+
+	for _, k := range keys {
+		for _, c := range capacities {
+			f.Add(k, c)
+		}
+	}
+
+	f.Fuzz(func(t *testing.T, key []byte, rawN int) {
+		// Bound filter sizing to [0, 5000] for memory safety during fuzzing
+		if rawN < 0 || rawN > 5000 {
+			return
+		}
+
+		filterObj := filter.NewBloomFilter(rawN)
+		if filterObj == nil {
+			t.Fatalf("NewBloomFilter(%d) unexpectedly returned nil", rawN)
+		}
+
+		filterObj.Add(key)
+
+		// If filter has 0 bits (rawN == 0), MayContain must return false
+		if rawN == 0 {
+			if filterObj.MayContain(key) {
+				t.Fatalf("empty filter (n=0) MayContain returned true; want false")
+			}
+			return
+		}
+
+		// Non-empty filter MUST contain the inserted key (zero false negatives)
+		if !filterObj.MayContain(key) {
+			t.Fatalf("false negative detected for n=%d, key=%q", rawN, key)
+		}
+	})
+}

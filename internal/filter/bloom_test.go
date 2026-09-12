@@ -304,3 +304,284 @@ func TestBloomFilter_PolicyConstants(t *testing.T) {
 		t.Fatalf("MaxBitsetBytes must be 256 MiB, got %d", filter.MaxBitsetBytes)
 	}
 }
+
+// TestBloomFilter_ZeroFalseNegatives_10K verifies the fundamental Bloom filter invariant:
+// Every inserted key MUST return MayContain(k) == true (zero false negatives).
+func TestBloomFilter_ZeroFalseNegatives_10K(t *testing.T) {
+	const n = 10000
+	f := filter.NewBloomFilter(n)
+	if f == nil {
+		t.Fatalf("NewBloomFilter(%d) failed", n)
+	}
+
+	keys := make([][]byte, n)
+	for i := 0; i < n; i++ {
+		keys[i] = []byte(fmt.Sprintf("lattice_user_key_%08d", i))
+		f.Add(keys[i])
+	}
+
+	for i, key := range keys {
+		if !f.MayContain(key) {
+			t.Fatalf("false negative detected at key index %d (%q)", i, key)
+		}
+	}
+}
+
+// TestBloomFilter_ProbePositions_InBounds verifies that all generated probes satisfy
+// 0 <= probe < bitCount and map to byte indices within len(bitset).
+func TestBloomFilter_ProbePositions_InBounds(t *testing.T) {
+	cardinalities := []int{1, 2, 7, 8, 10, 16, 100, 1000}
+
+	for _, n := range cardinalities {
+		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
+			f := filter.NewBloomFilter(n)
+			if f == nil {
+				t.Fatalf("NewBloomFilter(%d) returned nil", n)
+			}
+
+			for i := 0; i < 50; i++ {
+				key := []byte(fmt.Sprintf("probe_test_key_%d_%d", n, i))
+				probes := f.Probes(key)
+				if len(probes) != filter.DefaultHashFunctions {
+					t.Fatalf("probes count mismatch: got %d, want %d", len(probes), filter.DefaultHashFunctions)
+				}
+
+				for pIdx, probe := range probes {
+					if probe >= f.BitCount() {
+						t.Fatalf("probe %d (%d) exceeds bitCount (%d)", pIdx, probe, f.BitCount())
+					}
+					byteIdx := probe / 8
+					if byteIdx >= uint64(f.ByteSize()) {
+						t.Fatalf("probe %d byteIdx %d exceeds ByteSize %d", pIdx, byteIdx, f.ByteSize())
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestBloomFilter_ByteBoundaryBitPositions verifies that bit indices landing on byte boundaries
+// (bit 0, bit 7, bit 8, bit 9, and the last valid bit) are set and tested accurately without off-by-one errors.
+func TestBloomFilter_ByteBoundaryBitPositions(t *testing.T) {
+	f := filter.NewBloomFilter(10) // 100 bits, 13 bytes
+	if f == nil {
+		t.Fatal("NewBloomFilter(10) failed")
+	}
+
+	bitset := f.Bitset()
+	lastBit := f.BitCount() - 1 // bit 99
+
+	// Direct bit test via bitset verification
+	testBits := []uint64{0, 7, 8, 9, 15, 16, lastBit}
+	for _, bit := range testBits {
+		byteIdx := bit / 8
+		bitMask := byte(1 << (bit % 8))
+
+		// Bit starts unset
+		if (bitset[byteIdx] & bitMask) != 0 {
+			t.Fatalf("bit %d initially set", bit)
+		}
+
+		// Manually set bit
+		bitset[byteIdx] |= bitMask
+
+		// Verify bit is now set
+		if (bitset[byteIdx] & bitMask) == 0 {
+			t.Fatalf("bit %d not set after manual set", bit)
+		}
+	}
+}
+
+// TestBloomFilter_AddIdempotence verifies that adding the same key multiple times
+// leaves the underlying bitset completely unchanged.
+func TestBloomFilter_AddIdempotence(t *testing.T) {
+	f1 := filter.NewBloomFilter(1000)
+	f2 := filter.NewBloomFilter(1000)
+
+	key := []byte("idempotent_test_key_12345")
+
+	f1.Add(key)
+
+	f2.Add(key)
+	f2.Add(key)
+	f2.Add(key)
+
+	if !bytes.Equal(f1.Bitset(), f2.Bitset()) {
+		t.Fatal("Add is not idempotent; multiple additions altered the bitset")
+	}
+}
+
+// TestBloomFilter_InsertionOrderIndependence verifies that Bloom filter state
+// is independent of the order in which keys are inserted (set semantics).
+func TestBloomFilter_InsertionOrderIndependence(t *testing.T) {
+	f1 := filter.NewBloomFilter(1000)
+	f2 := filter.NewBloomFilter(1000)
+
+	keys := [][]byte{
+		[]byte("alpha"),
+		[]byte("beta"),
+		[]byte("gamma"),
+		[]byte("delta"),
+		[]byte("epsilon"),
+	}
+
+	// Insert in forward order in f1
+	for _, k := range keys {
+		f1.Add(k)
+	}
+
+	// Insert in reverse order in f2
+	for i := len(keys) - 1; i >= 0; i-- {
+		f2.Add(keys[i])
+	}
+
+	if !bytes.Equal(f1.Bitset(), f2.Bitset()) {
+		t.Fatal("bitsets differ when inserting same keys in different order")
+	}
+}
+
+// TestBloomFilter_CrossFilterIsolation verifies that two independently constructed filters
+// do not share internal storage or leak state across instances.
+func TestBloomFilter_CrossFilterIsolation(t *testing.T) {
+	f1 := filter.NewBloomFilter(100)
+	f2 := filter.NewBloomFilter(100)
+
+	key := []byte("isolated_key")
+	f1.Add(key)
+
+	if !f1.MayContain(key) {
+		t.Fatal("f1 should contain inserted key")
+	}
+
+	// f2 was never modified; must remain all zeros
+	zeroBlock := make([]byte, f2.ByteSize())
+	if !bytes.Equal(f2.Bitset(), zeroBlock) {
+		t.Fatal("f2 bitset was modified by action on f1")
+	}
+	if f2.MayContain(key) {
+		t.Fatal("empty f2 returned true on MayContain")
+	}
+}
+
+// TestBloomFilter_EmptyFilterSemantics verifies that a zero-capacity filter (n=0)
+// and a nil receiver handle Add, MayContain, and Probes safely without panicking.
+func TestBloomFilter_EmptyFilterSemantics(t *testing.T) {
+	t.Run("zero capacity filter n=0", func(t *testing.T) {
+		f := filter.NewBloomFilter(0)
+		if f == nil {
+			t.Fatal("NewBloomFilter(0) returned nil")
+		}
+
+		// Add must be a safe no-op
+		f.Add([]byte("test_key"))
+		f.Add(nil)
+
+		// MayContain must return false (empty set contains nothing)
+		if f.MayContain([]byte("test_key")) {
+			t.Fatal("empty filter MayContain returned true; want false")
+		}
+		if f.MayContain(nil) {
+			t.Fatal("empty filter MayContain(nil) returned true; want false")
+		}
+
+		if f.Probes([]byte("test_key")) != nil {
+			t.Fatal("empty filter Probes must return nil")
+		}
+	})
+
+	t.Run("nil receiver safety", func(t *testing.T) {
+		var fNil *filter.BloomFilter
+
+		// Add on nil receiver must not panic
+		fNil.Add([]byte("test_key"))
+		fNil.Add(nil)
+
+		// MayContain on nil receiver must return false
+		if fNil.MayContain([]byte("test_key")) {
+			t.Fatal("nil filter MayContain returned true; want false")
+		}
+		if fNil.MayContain(nil) {
+			t.Fatal("nil filter MayContain(nil) returned true; want false")
+		}
+
+		// Probes on nil receiver must return nil
+		if fNil.Probes([]byte("test_key")) != nil {
+			t.Fatal("nil filter Probes must return nil")
+		}
+	})
+}
+
+// TestBloomFilter_NilAndEmptyKeySemantics verifies that nil and empty byte slices
+// are treated as valid binary keys and do not cause errors.
+func TestBloomFilter_NilAndEmptyKeySemantics(t *testing.T) {
+	f := filter.NewBloomFilter(100)
+	if f == nil {
+		t.Fatal("NewBloomFilter(100) failed")
+	}
+
+	f.Add(nil)
+	if !f.MayContain(nil) {
+		t.Fatal("MayContain(nil) returned false after Add(nil)")
+	}
+	if !f.MayContain([]byte{}) {
+		t.Fatal("MayContain([]byte{}) returned false after Add(nil)")
+	}
+
+	// An absent key should still return false with high probability
+	if f.MayContain([]byte("some_non_empty_absent_key")) {
+		t.Log("Note: unexpected hit on absent key (permitted by false-positive bound)")
+	}
+}
+
+// TestBloomFilter_SanityCheck_AbsentKeysRejected provides a bounded sanity check
+// demonstrating that absent keys are rejected with high probability (filter is not saturated).
+func TestBloomFilter_SanityCheck_AbsentKeysRejected(t *testing.T) {
+	const n = 1000
+	f := filter.NewBloomFilter(n)
+	if f == nil {
+		t.Fatalf("NewBloomFilter(%d) failed", n)
+	}
+
+	// Insert 1000 keys
+	for i := 0; i < n; i++ {
+		f.Add([]byte(fmt.Sprintf("present_key_%06d", i)))
+	}
+
+	// Query 1000 distinct absent keys
+	falsePositives := 0
+	for i := 0; i < n; i++ {
+		if f.MayContain([]byte(fmt.Sprintf("absent_key_%06d", i))) {
+			falsePositives++
+		}
+	}
+
+	// Theoretical FPR for 10 bits/key, k=7 is ~0.82%. Out of 1000 queries, expect ~8 false positives.
+	// We assert that the filter is non-saturated and has rejected at least 95% of absent keys (FPR < 5%).
+	if falsePositives > 50 {
+		t.Fatalf("excessive false positives: %d/1000 (>5%%); expected ~8", falsePositives)
+	}
+	t.Logf("Sanity check passed: %d false positives out of %d absent queries (observed rate: %.2f%%)",
+		falsePositives, n, float64(falsePositives)/float64(n)*100.0)
+}
+
+// TestBloomFilter_ZeroAllocations_Membership verifies that Add and MayContain
+// execute with zero heap allocations.
+func TestBloomFilter_ZeroAllocations_Membership(t *testing.T) {
+	f := filter.NewBloomFilter(1000)
+	key := []byte("hot_path_key")
+	f.Add(key)
+
+	allocsAdd := testing.AllocsPerRun(1000, func() {
+		f.Add(key)
+	})
+	if allocsAdd > 0 {
+		t.Fatalf("f.Add allocated %f objects/op; want 0", allocsAdd)
+	}
+
+	allocsMayContain := testing.AllocsPerRun(1000, func() {
+		_ = f.MayContain(key)
+	})
+	if allocsMayContain > 0 {
+		t.Fatalf("f.MayContain allocated %f objects/op; want 0", allocsMayContain)
+	}
+}

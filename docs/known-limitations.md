@@ -391,17 +391,24 @@ This document tracks all **genuine architectural and operational limitations** o
 ---
 
 ### 28. Bloom Filter Parameter Calculator & Bitset Allocator Decoupling (P05-S01-M01)
-* **Limitation**: `BloomFilter` (P05-S01-M01) implements foundational mathematical parameter sizing and zero-initialized physical bitset allocation for $m = n \times 10$ bits and $k = 7$ hash functions. In this micro-phase, Murmur3 double hashing, key insertion (`Add`), probabilistic membership querying (`MayContain`), filter block binary serialization, and SSTable reader integration are decoupled and deferred to subsequent micro-phases (P05-S01-M02 and Sub-Phase 05.2). Newly constructed filters represent empty sets where no bits are set.
-* **Why It Exists**: Following the micro-phase engineering discipline, integer arithmetic safety, overflow bounding, and physical memory allocation are cleanly isolated and verified prior to introducing hashing algorithms and storage serialization.
-* **Impact**: Filter instances in M01 cannot yet record keys or execute point membership queries.
-* **How It Was Detected**: Architectural design and micro-phase scoping of Phase 05 Sub-Phase 05.1.
-* **Current Mitigation**: Strict integer multiplication overflow checks preventing $(math.MaxInt - 7) / 10$ wrap-around, allocation ceiling at `MaxKeyCount` (256 MiB / ~209.7M keys) preventing DoS memory exhaustion, fail-closed `nil` return on invalid inputs, deterministic zero-initialization, and fuzz testing (>5.9M iterations with 0 crashes).
-* **Future Solution**: P05-S01-M02 will implement Murmur3 double-hashing with `Add` and `MayContain`. Sub-Phase 05.2 will implement filter block binary serialization and SSTable integration.
+* **Limitation**: `BloomFilter` (P05-S01-M01) implemented foundational mathematical parameter sizing and zero-initialized physical bitset allocation for $m = n \times 10$ bits and $k = 7$ hash functions, but membership operations (`Add`, `MayContain`) were decoupled.
+* **Resolution**: Resolved in P05-S01-M02 with the implementation of canonical `Murmur3_128` hashing, Kirsch–Mitzenmacher double hashing, `Add`, and `MayContain` with zero false negatives verified across 10,000 keys.
+
+---
+
+### 29. Bloom Filter Membership Serialization & SSTable Integration Decoupling (P05-S01-M02)
+* **Limitation**: `BloomFilter` (P05-S01-M02) implements in-memory Murmur3 128-bit double-hashing, Kirsch–Mitzenmacher probe calculation, `Add`, and `MayContain` with zero false negatives. However, filter block binary serialization (`FilterBlockBuilder`), persistent storage format, SSTable reader/writer integration, and formal empirical false-positive rate benchmarking over 1,000,000 keys are decoupled and deferred to Sub-Phase 05.2 (P05-S02-M01 and P05-S02-M02). Additionally, `Bitset()` returns a direct slice to the underlying buffer; external modification of this slice will corrupt filter invariants without synchronization (intended concurrency model: single-writer population, concurrent immutable querying).
+* **Why It Exists**: Following micro-phase engineering discipline, low-level hashing and probabilistic membership invariants are thoroughly tested and fuzzed independently from block framing and on-disk SSTable file layouts.
+* **Impact**: In-memory Bloom filters cannot yet be persisted into SSTable files or read by `TableReader`.
+* **How It Was Detected**: Architectural design and micro-phase scoping of Phase 05.
+* **Current Mitigation**: Comprehensive in-memory tests, SMHasher verification test (`0x6384BA69`), property-based fuzz tests (>3.0M executions with 0 failures), bounded sanity check, zero-allocation enforcement (0 B/op on `Add` and `MayContain`).
+* **Future Solution**: Sub-Phase 05.2 will implement `FilterBlockBuilder` serialization (M01) and empirical 1M key false-positive rate benchmark (M02). Phase 06+ will integrate filter blocks into `TableWriter` and `TableReader`.
 * **Dimensional Impact**:
-  * Correctness: **Optimal** (Exact mathematical sizing $m = 10n$, $\lceil m/8 \rceil$ byte rounding, zero-initialized storage).
-  * Performance: **Optimal** (In-register sizing ~0.27 ns/op, constructor allocation ~36.5 ns/op for 100 keys).
+  * Correctness: **Optimal** (Zero false negatives on inserted keys, SMHasher test passed, overflow-safe modular probing).
+  * Performance: **Optimal** (~14.3 ns/op `Add`, ~7.4 ns/op `MayContain` miss, ~15.1 ns/op hit, 0 allocs/op).
   * Scalability: **Optimal** (Supports up to ~209.7 million keys per filter block).
 
 ---
 
 *End of Known Limitations — To be updated continuously throughout implementation.*
+

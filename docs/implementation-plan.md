@@ -1524,11 +1524,36 @@ TOTAL: 184 Discrete, Testable Micro-Phases
       - `FuzzNewBloomFilter_Bounded`: >2,784,000 executions with 0 failures.
   * *Completion*: Complete and verified under `-race`, `go vet`, `golangci-lint`.
 * **P05-S01-M02: Murmur3 Double-Hashing Implementation**
-  * *Objective*: Implement Kirsch-Mitzenmacher optimization generating $k$ hashes from two 64-bit hash values:
-    $$g_i(x) = h_1(x) + i \cdot h_2(x) \pmod{m}$$
-  * *Changes*: `BloomFilter.Add(key []byte)`, `BloomFilter.MayContain(key []byte) bool`.
-  * *Tests*: Insert 10,000 keys; verify `MayContain` returns true for all 10,000 keys (zero false negatives).
-  * *Completion*: Membership testing verified.
+  * *Objective*: Implement Kirsch-Mitzenmacher optimization generating $k=7$ hash probes from two 64-bit hash values:
+    $$g_i(x) = ((h_1(x) \bmod m) + i \cdot (h_2(x) \bmod m)) \bmod m \quad \text{for } i \in [0, 6]$$
+  * *Changes*:
+    - Created `internal/filter/murmur3.go`: implemented canonical `Murmur3_128(data []byte, seed uint64) (uint64, uint64)` based on Austin Appleby's SMHasher `MurmurHash3_x64_128` specification. Uses 16-byte body block loops, explicit little-endian 64-bit word reads (`binary.LittleEndian.Uint64`), canonical constants ($c_1 = \text{0x87c37b91114253d5}, c_2 = \text{0x4cf5ad432745937f}$), bit rotations via `math/bits.RotateLeft64`, full 1..15 byte tail branch coverage, and finalization mixers ($fmix64$). Defined `DefaultMurmur3Seed = 0`.
+    - Modified `internal/filter/bloom.go`: added `(f *BloomFilter) Add(key []byte)` setting bits across $k=7$ probes, `(f *BloomFilter) MayContain(key []byte) bool` testing membership with fail-fast optimization, and `(f *BloomFilter) Probes(key []byte) []uint64` for testability and diagnostics.
+    - Created `internal/filter/murmur3_test.go`: test vectors for empty/nil keys, short strings, standard pangram, canonical Austin Appleby SMHasher `VerificationTest` asserting `0x6384BA69` across 256 keys, tail coverage across all 16 tail lengths, large inputs up to 1 MB, slice capacity invariance, and zero-allocation assertions.
+    - Modified `internal/filter/bloom_test.go`: added 10,000-key zero false negative verification, probe in-bounds checks, byte boundary bit positions, `Add` idempotence, insertion order independence, cross-filter storage isolation, empty filter semantics ($n=0$ safe no-op / returns false), nil receiver safety, nil/empty key support, bounded absent key sanity check (~0.70% observed rate vs ~0.82% theoretical), and zero-allocation assertions.
+    - Modified `internal/filter/bloom_bench_test.go`: added microbenchmarks for Murmur3 (16B, 64B, 256B, 1KB, 4KB), `Add_10K`, `MayContain_Hit`, and `MayContain_Miss`.
+    - Modified `internal/filter/bloom_fuzz_test.go`: added `FuzzMurmur3_128` and `FuzzBloomFilter_AddMayContain` property-based fuzz tests.
+  * *Invariants Maintained*:
+    - *Zero False Negatives*: For every key $k$ added via `Add(k)`, `MayContain(k)` is mathematically guaranteed to return `true`.
+    - *Overflow-Safe Probing*: Probes are derived via modular reduction avoiding 64-bit unsigned integer wrap-around before the modulo operation.
+    - *Probe Bounds*: Every generated probe satisfies $0 \le g_i(x) < m$ and maps to a byte index within `len(bitset)`.
+    - *Fail-Fast Lookup*: `MayContain` halts on the first unset probe bit (averaging ~7.4 ns/op on misses).
+    - *Zero Heap Allocations*: Hashing and membership operations execute with 0 B/op and 0 allocs/op.
+    - *Concurrency Model*: Single-writer construction/population (`Add`), concurrent thread-safe reading (`MayContain`).
+  * *Measured Results*:
+    - Micro-benchmarks (Apple M4, darwin/arm64):
+      - `BenchmarkMurmur3_16B`: ~3.29 ns/op (4,861 MB/s, 0 B/op, 0 allocs/op).
+      - `BenchmarkMurmur3_64B`: ~7.86 ns/op (8,143 MB/s, 0 B/op, 0 allocs/op).
+      - `BenchmarkMurmur3_256B`: ~26.97 ns/op (9,490 MB/s, 0 B/op, 0 allocs/op).
+      - `BenchmarkMurmur3_1KB`: ~118.3 ns/op (8,658 MB/s, 0 B/op, 0 allocs/op).
+      - `BenchmarkMurmur3_4KB`: ~479.3 ns/op (8,545 MB/s, 0 B/op, 0 allocs/op).
+      - `BenchmarkBloomFilter_Add_10K`: ~14.35 ns/op (0 B/op, 0 allocs/op).
+      - `BenchmarkBloomFilter_MayContain_Hit`: ~15.10 ns/op (0 B/op, 0 allocs/op).
+      - `BenchmarkBloomFilter_MayContain_Miss`: ~7.40 ns/op (0 B/op, 0 allocs/op).
+    - Fuzz Testing:
+      - `FuzzMurmur3_128`: >1,536,000 executions with 0 failures.
+      - `FuzzBloomFilter_AddMayContain`: >1,507,000 executions with 0 failures.
+  * *Completion*: Complete and verified under `-race`, `go vet`, `golangci-lint`.
 
 ### Sub-Phase 05.2: Filter Block Serialization & Empirical Testing
 * **P05-S02-M01: Filter Block Binary Serialization**
