@@ -78,6 +78,9 @@ func NewTableReaderWithFile(file *os.File) (*TableReader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to stat sstable file: %w", err)
 	}
+	if !stat.Mode().IsRegular() {
+		return nil, fmt.Errorf("sstable: %q is not a regular file (mode: %s)", file.Name(), stat.Mode())
+	}
 
 	fileSize := stat.Size()
 	if fileSize < int64(FooterSize) {
@@ -605,6 +608,21 @@ func (r *TableReader) ReadFilterBlock() (*filter.BloomFilter, error) {
 	// Validate filter handle bounds against file size and metaindex boundary
 	if err := filterHandle.Validate(); err != nil {
 		return nil, err
+	}
+	maxFilterBlockSize := uint64(filter.MaxBitsetBytes + filter.FilterBlockTrailerSize)
+	if filterHandle.Size > maxFilterBlockSize {
+		return nil, &errors.InvalidBlockHandleError{
+			Offset: filterHandle.Offset,
+			Size:   filterHandle.Size,
+			Reason: "filter block handle size exceeds maximum filter block capacity",
+		}
+	}
+	if filterHandle.Size > math.MaxInt || filterHandle.Offset > math.MaxInt64 {
+		return nil, &errors.InvalidBlockHandleError{
+			Offset: filterHandle.Offset,
+			Size:   filterHandle.Size,
+			Reason: "filter block handle exceeds architecture integer bounds",
+		}
 	}
 	if filterHandle.Offset+filterHandle.Size > r.footer.MetaIndexHandle.Offset {
 		return nil, &errors.InvalidBlockHandleError{

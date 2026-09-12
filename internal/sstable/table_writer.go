@@ -358,7 +358,9 @@ func (w *TableWriter) Add(key binary.InternalKey, value []byte) error {
 
 	// Add user key to filter builder if configured
 	if w.filterBuilder != nil {
-		_ = w.filterBuilder.AddKey(key.UserKey)
+		if err := w.filterBuilder.AddKey(key.UserKey); err != nil {
+			return fmt.Errorf("failed adding key to filter builder: %w", err)
+		}
 	}
 
 	// 4. Update largest key in current block (defensive copy)
