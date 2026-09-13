@@ -1687,12 +1687,36 @@ TOTAL: 184 Discrete, Testable Micro-Phases
     - `BenchmarkManifestWriter_LogEdit_Complex_Sync`: 3.77 ms/op.
   * *Completion*: Complete and verified under `-race`, `go vet`, `golangci-lint`. P06-S01-M02 complete; P06-S02-M01 remains next micro-phase.
 
-### Sub-Phase 06.2: CURRENT Pointer & VersionSet Invariants
 * **P06-S02-M01: Atomic CURRENT Pointer File Swapper**
-  * *Objective*: Write active manifest filename to `CURRENT.tmp` and swap atomically via `os.Rename()`.
-  * *Changes*: `SetCurrentManifest(dir string, manifestNum uint64) error`.
-  * *Tests*: Crash-safety test simulating power interruption during pointer write.
-  * *Completion*: Atomic pointer swap verified.
+  * *Status*: **COMPLETE**
+  * *Objective*: Write active manifest filename to `CURRENT.tmp` and swap atomically via `os.Rename()` with directory durability.
+  * *CURRENT Wire Representation*:
+    - Canonical ASCII text format: `"MANIFEST-%06d\n"`.
+    - Exact 16 bytes for 6-digit manifest IDs (e.g. `"MANIFEST-000001\n"`: `4d414e49464553542d3030303030310a`).
+    - Standard trailing newline terminator (`\n`), matching LevelDB/RocksDB POSIX text pointer conventions.
+  * *API & Types Implemented*:
+    - `CurrentFilename = "CURRENT"`, `CurrentTempFilename = "CURRENT.tmp"`, `CurrentFileMode = 0600`.
+    - `SetCurrentManifest(dir string, manifestNum uint64) error`: staging write to `CURRENT.tmp`, `fdatasync()`, atomic `os.Rename()`, and parent directory sync.
+    - `syncDir(dirPath string) error`: flushes directory block dentries down to disk; safely bypasses on Windows (`runtime.GOOS == "windows"`).
+    - Sentinels in `internal/errors`: `ErrInvalidManifestNum`, `ErrCurrentSymlink`, `ErrCurrentDirectorySync`.
+  * *Invariants & Security Hardening*:
+    - *Zero In-Place Truncation*: `CURRENT` is never opened with `O_TRUNC`. Updates stage fully to `CURRENT.tmp` before atomic replacement.
+    - *Atomic Pointer Replacement*: Single `os.Rename(CURRENT.tmp, CURRENT)` replacement guarantees readers never observe empty, partial, or torn pointers.
+    - *Hardware Durability Sequence*: `Write to CURRENT.tmp` $\to$ `fdatasync(CURRENT.tmp)` $\to$ `Close(CURRENT.tmp)` $\to$ `os.Rename(CURRENT.tmp, CURRENT)` $\to$ `syncDir(dir)`.
+    - *Prior Pointer Preservation*: If any failure occurs before rename, `CURRENT.tmp` is unlinked and the prior `CURRENT` pointer remains completely untouched.
+    - *Symlink Defense & Inode Pinning*: Pre-creation Lstat rejects symlinks at `dir`, `CURRENT`, and `CURRENT.tmp`. Post-creation `os.SameFile` ensures descriptor is pinned to disk inode.
+    - *Stale Temp Cleanup*: Stale regular files left by prior crashes at `CURRENT.tmp` are safely cleaned up before creation; symlinks are never followed.
+  * *Tests Added* (`internal/version/current_test.go`, `current_bench_test.go`):
+    - Exact-byte fixtures for manifest 1 (16B) and manifest 42 (16B).
+    - Lifecycle: initial creation, atomic replacement, and 50 sequential updates verifying pointer integrity.
+    - Fault injection: simulated write error, short write, sync failure, close failure, rename failure, and parent directory sync failure.
+    - Stale file cleanup: pre-existing stale regular `CURRENT.tmp` purged safely without touching `CURRENT`.
+    - Symlink & directory defense: rejects symlinked target, symlinked tmp, symlinked directory, directory at target, directory at tmp, and regular file passed as dir.
+    - Large manifest numbers: verified formatting for 7-digit IDs (1,000,000) and `math.MaxUint64`.
+  * *Measured Results* (Apple M4, Darwin arm64):
+    - `BenchmarkSetCurrentManifest_NoSync`: 118 µs/op, 2,559 B/op, 21 allocs/op (~8.4k ops/sec).
+    - `BenchmarkSetCurrentManifest_Sync`: 8.53 ms/op (dominated by double physical hardware barrier: file `fdatasync` + parent directory `fsync`).
+  * *Completion*: Complete and verified under `-race`, `go vet`, `golangci-lint`. P06-S02-M01 complete; P06-S02-M02 remains next micro-phase.
 * **P06-S02-M02: `VersionSet` & Version-Pinned Reference Counting**
   * *Objective*: Maintain linked list of active `Version` structs with atomic `Ref()` and `Unref()`.
   * *Changes*: `VersionSet.AppendVersion(v *Version)`, `Version.Ref()`, `Version.Unref()`.

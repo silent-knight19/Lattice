@@ -81,6 +81,9 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrManifestExists", errors.ErrManifestExists, "manifest file already exists"},
 		{"ErrManifestHeaderTruncated", errors.ErrManifestHeaderTruncated, "manifest header truncated: buffer smaller than 8 bytes"},
 		{"ErrManifestPayloadTruncated", errors.ErrManifestPayloadTruncated, "manifest payload truncated: buffer smaller than payload length"},
+		{"ErrInvalidManifestNum", errors.ErrInvalidManifestNum, "invalid manifest number: must be greater than zero"},
+		{"ErrCurrentSymlink", errors.ErrCurrentSymlink, "cannot write CURRENT over symbolic link"},
+		{"ErrCurrentDirectorySync", errors.ErrCurrentDirectorySync, "failed to synchronize parent directory for CURRENT"},
 	}
 
 	for _, tc := range sentinels {

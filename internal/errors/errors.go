@@ -256,6 +256,15 @@ var (
 
 	// ErrManifestPayloadTruncated indicates that a MANIFEST record payload ended prematurely before its specified length.
 	ErrManifestPayloadTruncated = stdErrors.New("manifest payload truncated: buffer smaller than payload length")
+
+	// ErrInvalidManifestNum indicates that a manifest sequence number was zero or invalid (must be >= 1).
+	ErrInvalidManifestNum = stdErrors.New("invalid manifest number: must be greater than zero")
+
+	// ErrCurrentSymlink indicates that a CURRENT or CURRENT.tmp operation was rejected because the path is a symbolic link.
+	ErrCurrentSymlink = stdErrors.New("cannot write CURRENT over symbolic link")
+
+	// ErrCurrentDirectorySync indicates that hardware synchronization of the parent directory failed following a CURRENT rename.
+	ErrCurrentDirectorySync = stdErrors.New("failed to synchronize parent directory for CURRENT")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing

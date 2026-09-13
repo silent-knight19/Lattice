@@ -2846,5 +2846,71 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
+# 30. Systems Questions on Atomic CURRENT Pointer Swapping & Directory Durability (P06-S02-M01)
+
+### 1. Why must CURRENT be written through a temporary file (`CURRENT.tmp`) rather than modified in place?
+* **Question**: Why does Lattice stage updates to `CURRENT.tmp` before renaming, instead of opening `CURRENT` with `O_TRUNC` and writing the new manifest filename directly?
+* **Answer**:
+  - **The Truncation Catastrophe**: If an engine opens `CURRENT` with `O_TRUNC` (or seeks to offset 0) and a sudden power loss or process crash (`kill -9`) occurs mid-write, the file on disk is left empty, truncated, or containing half of the new filename (e.g. `"MANIF"`).
+  - **Irrevocable Pointer Loss**: On reboot, the database cannot identify which `MANIFEST` file is active. Even if `MANIFEST-000001` and `MANIFEST-000002` are physically intact on disk, the database cannot safely determine which version reflects the committed state.
+  - **Staging Invariant**: By writing and synchronizing the new pointer to an isolated temporary file (`CURRENT.tmp`), the active `CURRENT` file remains 100% valid and untouched throughout the entire write and flush sequence.
+
+### 2. Why is `os.Rename` an atomic replacement mechanism on POSIX filesystems?
+* **Question**: What makes `os.Rename(CURRENT.tmp, CURRENT)` atomic, and why does it eliminate race conditions for concurrent readers?
+* **Answer**:
+  - **VFS / Inode Directory Atomic Swap**: On POSIX-compliant filesystems (ext4, XFS, APFS, ZFS), `rename(2)` is guaranteed by the kernel to be atomic with respect to other system calls. If the target `CURRENT` already exists, the kernel atomically updates the directory entry to point to the new inode and unlinks the old inode in a single filesystem transaction.
+  - **Zero Disappearance Window**: At no point in time does `CURRENT` disappear from the directory listing. A reader opening `CURRENT` will observe either the exact old manifest pointer or the exact new manifest pointer; it can never observe a missing file (`ENOENT`) or a partially written file.
+  - **Anti-Pattern Rejection**: Implementing pointer swapping via `os.Remove(CURRENT)` followed by `os.Rename(tmp, CURRENT)` is an anti-pattern because it creates an observable timing window where `CURRENT` does not exist, causing concurrent readers or sudden crashes to fail with `ErrNotExist`.
+
+### 3. Why must the temporary file (`CURRENT.tmp`) be synchronized via `fdatasync()` before calling `os.Rename`?
+* **Question**: Why is it a critical durability flaw to execute `os.Rename(CURRENT.tmp, CURRENT)` immediately after `file.Write()` without calling `fdatasync()`?
+* **Answer**:
+  - **Data vs. Metadata Ordering Inversion**: In modern operating systems, `write()` transfers bytes to the kernel page cache (dirty RAM buffers). Calling `rename()` updates directory metadata.
+  - **Zero-Byte File Disaster on Crash**: If the machine loses power after the directory metadata has been journaled/flushed but before the dirty page cache data of `CURRENT.tmp` is written to physical flash cells, the system reboots to find `CURRENT` pointing to an allocated inode with **0 bytes of data** (or uninitialized zero sectors).
+  - **The Durability Ordering Invariant**: Software must enforce:
+    $$\text{Write Data} \longrightarrow \text{fdatasync(CURRENT.tmp)} \longrightarrow \text{Close(CURRENT.tmp)} \longrightarrow \text{Rename(CURRENT.tmp, CURRENT)}$$
+    This guarantees that physical data blocks are safely anchored in non-volatile storage before the filesystem directory entry is updated to point to them.
+
+### 4. Why must the parent directory itself be synchronized (`syncDir`) following the rename?
+* **Question**: Why does `SetCurrentManifest` open the parent directory and call `Sync()` after `os.Rename()` succeeds?
+* **Answer**:
+  - **Directory Entries Live in Parent Inodes**: In Unix filesystems, directory entries (mapping `"CURRENT"` $\to$ inode number) reside within the data blocks of the **parent directory**.
+  - **Delayed Metadata Write-Back**: While `fdatasync()` flushes the contents of the file, it does not flush the modified blocks of the parent directory. Filesystems may buffer directory index tree modifications in RAM for 5 to 30 seconds before writing them to disk.
+  - **Post-Crash Rollback Risk**: If a power cut occurs 2 seconds after `os.Rename()`, the disk may commit the file's data blocks while the parent directory's un-flushed directory entry rolls back to its pre-crash state on journal replay.
+  - **Full Durability Barrier**: Synchronizing the parent directory file descriptor (`dir.Sync()`) ensures that the directory block containing the `"CURRENT"` dentry is flushed to disk media. On Windows, directory `fsync` is unsupported by the OS and safely bypassed.
+
+### 5. What happens if `os.Rename()` succeeds but parent directory synchronization (`syncDir`) fails?
+* **Question**: If `os.Rename` successfully replaces `CURRENT` but the subsequent `syncDir` call returns an I/O error, what state is the filesystem left in and why must cleanup NOT delete `CURRENT`?
+* **Answer**:
+  - **Filesystem Reality**: The atomic rename has already been committed in the kernel's active directory cache. `CURRENT` now physically points to the new manifest on disk.
+  - **Uncertain Durability**: The I/O error during `syncDir` means physical durability of the directory entry across an immediate power loss cannot be guaranteed by the OS.
+  - **Do No Harm (Never Delete CURRENT)**: Attempting to delete `CURRENT` or roll back would destroy the only pointer to the database metadata! A partially durable valid pointer is infinitely better than destroying the database state.
+  - **Error Propagation**: `SetCurrentManifest` returns an error wrapping `ErrCurrentDirectorySync` and the underlying OS error. The caller knows the pointer was updated, but hardware synchronization failed.
+
+### 6. Why must failure cleanup never remove the target `CURRENT` file?
+* **Question**: If an error occurs during temporary file creation, writing, or syncing in `SetCurrentManifest`, why must the cleanup routine only remove `CURRENT.tmp` and never touch `CURRENT`?
+* **Answer**:
+  - **The Trusted Pointer Rule**: The existing `CURRENT` file points to the last known-good, committed `MANIFEST` that currently governs the database.
+  - **Failure Isolation**: A failure while preparing the new pointer (e.g. disk full `ENOSPC` while writing `CURRENT.tmp`) indicates that the rollover could not complete.
+  - **Preserving Availability**: By restricting failure cleanup strictly to `CURRENT.tmp` (`needsCleanup` guard), the database retains its existing, fully functional metadata pointer. Deleting `CURRENT` would turn a recoverable rollover failure into a fatal outage requiring manual disaster recovery.
+
+### 7. How does `SetCurrentManifest` defend against symbolic link vulnerabilities and TOCTOU races?
+* **Question**: What specific security mechanisms prevent an attacker from using symbolic links at `CURRENT` or `CURRENT.tmp` to overwrite arbitrary system files?
+* **Answer**:
+  - **Pre-Creation Lstat Inspection**: `SetCurrentManifest` calls `os.Lstat` on both `CURRENT` and `CURRENT.tmp`. If either path is a symbolic link (`info.Mode() & os.ModeSymlink != 0`), the operation immediately aborts with `ErrCurrentSymlink` without opening or following the link.
+  - **Victim File Protection**: If an attacker creates a symlink `CURRENT.tmp -> /etc/shadow`, opening the file blindly would truncate or overwrite the target. `ErrCurrentSymlink` prevents touching the target.
+  - **Atomic Exclusive Creation (`O_EXCL`)**: `CURRENT.tmp` is created with `os.O_CREATE | os.O_EXCL`. The kernel guarantees atomic failure if the file already exists or was substituted between check and open.
+  - **Post-Creation Inode Pinning (`os.SameFile`)**: The open file descriptor's `Stat()` is cross-verified against `os.Lstat(tmpPath)` using `os.SameFile` to prove that the descriptor references the exact inode created on disk.
+
+### 8. Why is `CURRENT` kept as a distinct file rather than embedded within the `MANIFEST` file itself?
+* **Question**: Why does an LSM-tree separate the active pointer (`CURRENT`) from the append-only manifest log (`MANIFEST-NNNNNN`)?
+* **Answer**:
+  - **Immutable Append-Only vs. Mutable Pointer**: The `MANIFEST` is an append-only log of immutable delta records (`VersionEdit`). An append-only log cannot easily declare its own obsolescence without seeking backwards or mutating headers.
+  - **Log Compaction & Rollover**: Over weeks of operation, a `MANIFEST` accumulates thousands of historical edits. To prevent unbounded recovery time on startup, the engine rolls over: it snapshots the active `Version` into a fresh `MANIFEST-000002` and deletes `MANIFEST-000001`.
+  - **Indirection & O(1) Switching**: The `CURRENT` file acts as a single level of indirection. Switching the entire database to a new manifest snapshot is an instantaneous $O(1)$ atomic file rename of `CURRENT`, decoupling log growth from active state identification.
+
+---
+
 *End of Technical Interview Knowledge Base — Lattice v1.0.0-KNOWLEDGE-BASE*
+
 
