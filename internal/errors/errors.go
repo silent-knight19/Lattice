@@ -223,6 +223,18 @@ var (
 	// ErrInvalidLevel indicates that an LSM-tree level index violates the architectural bounds [0, NumLevels-1].
 	ErrInvalidLevel = stdErrors.New("invalid level")
 
+	// ErrInvalidFileNum indicates that an SSTable file number was zero or invalid (must be >= 1).
+	ErrInvalidFileNum = stdErrors.New("invalid file number: must be greater than zero")
+
+	// ErrInvalidFileSize indicates that an SSTable file size was zero or invalid (must be >= 1).
+	ErrInvalidFileSize = stdErrors.New("invalid file size: must be greater than zero")
+
+	// ErrInvalidKeyRange indicates that an SSTable's SmallestKey sorts after its LargestKey.
+	ErrInvalidKeyRange = stdErrors.New("invalid key range: smallest key sorts after largest key")
+
+	// ErrInvalidSeqNumRange indicates that an SSTable's SmallestSeqNum is greater than its LargestSeqNum.
+	ErrInvalidSeqNumRange = stdErrors.New("invalid sequence number range: smallest sequence number greater than largest sequence number")
+
 	// ErrCorruptedVersionEdit indicates that a serialized VersionEdit record failed structural or boundary validation.
 	ErrCorruptedVersionEdit = stdErrors.New("version edit corrupted")
 

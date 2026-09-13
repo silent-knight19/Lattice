@@ -196,21 +196,67 @@ func (e *VersionEdit) ClearLastSeqNum() {
 	e.hasLastSeqNum = false
 }
 
-// AddFile records an SSTable addition at the designated level with the provided metadata.
-//
-// Validation & Security Contracts:
-//   - Level must satisfy 0 <= level < NumLevels (7).
-//   - SmallestKey and LargestKey byte slices must not exceed binary.MaxEncodedInternalKeyLen.
-//   - Key byte slices are defensively cloned to ensure memory isolation.
-func (e *VersionEdit) AddFile(level uint32, meta FileMetadata) error {
+// ValidateFileMetadata validates that an SSTable addition entry at the designated level
+// satisfies all structural, identity, encoding, and range invariants required by Lattice:
+//  1. Level Invariant: 0 <= level < NumLevels (7).
+//  2. File Number Invariant: FileNum > 0 (zero is reserved as an unassigned/sentinel value).
+//  3. File Size Invariant: FileSize > 0 (finalized SSTables must have non-zero on-disk size).
+//  4. Sequence Number Range Invariant: SmallestSeqNum <= LargestSeqNum.
+//  5. SmallestKey Invariant: Valid serialized InternalKey (10 <= len <= 65544, valid UserKey, valid OpType).
+//  6. LargestKey Invariant: Valid serialized InternalKey (10 <= len <= 65544, valid UserKey, valid OpType).
+//  7. Key Range Invariant: SmallestKey <= LargestKey under canonical storage engine comparator (binary.CompareInternalKey).
+func ValidateFileMetadata(level uint32, meta FileMetadata) error {
 	if level >= NumLevels {
 		return &errors.InvalidLevelError{Level: level, MaxLevel: NumLevels - 1}
 	}
-	if len(meta.SmallestKey) > binary.MaxEncodedInternalKeyLen {
-		return &errors.KeyTooLargeError{KeySize: uint32(len(meta.SmallestKey)), MaxSize: binary.MaxEncodedInternalKeyLen}
+	if meta.FileNum == 0 {
+		return errors.ErrInvalidFileNum
 	}
-	if len(meta.LargestKey) > binary.MaxEncodedInternalKeyLen {
-		return &errors.KeyTooLargeError{KeySize: uint32(len(meta.LargestKey)), MaxSize: binary.MaxEncodedInternalKeyLen}
+	if meta.FileSize == 0 {
+		return errors.ErrInvalidFileSize
+	}
+	if meta.SmallestSeqNum > meta.LargestSeqNum {
+		return errors.ErrInvalidSeqNumRange
+	}
+
+	if err := binary.ValidateEncodedInternalKey(meta.SmallestKey); err != nil {
+		return err
+	}
+	if err := binary.ValidateEncodedInternalKey(meta.LargestKey); err != nil {
+		return err
+	}
+
+	skUserLen := len(meta.SmallestKey) - binary.InternalKeyTrailerLen
+	ikSmall := binary.InternalKey{
+		UserKey: meta.SmallestKey[:skUserLen],
+		SeqNum:  binary.SeqNum(binary.GetUint64(meta.SmallestKey[skUserLen : skUserLen+8])),
+		OpType:  binary.OpType(meta.SmallestKey[skUserLen+8]),
+	}
+
+	lkUserLen := len(meta.LargestKey) - binary.InternalKeyTrailerLen
+	ikLarge := binary.InternalKey{
+		UserKey: meta.LargestKey[:lkUserLen],
+		SeqNum:  binary.SeqNum(binary.GetUint64(meta.LargestKey[lkUserLen : lkUserLen+8])),
+		OpType:  binary.OpType(meta.LargestKey[lkUserLen+8]),
+	}
+
+	if binary.CompareInternalKey(ikSmall, ikLarge) > 0 {
+		return errors.ErrInvalidKeyRange
+	}
+
+	return nil
+}
+
+// AddFile records an SSTable addition at the designated level with the provided metadata.
+//
+// Validation & Security Contracts:
+//   - Validates all level, identity, size, internal key encoding, and key/sequence range invariants
+//     via ValidateFileMetadata.
+//   - Atomicity: If validation fails, the VersionEdit is not modified.
+//   - Memory Isolation: Key byte slices are defensively cloned to ensure memory isolation.
+func (e *VersionEdit) AddFile(level uint32, meta FileMetadata) error {
+	if err := ValidateFileMetadata(level, meta); err != nil {
+		return err
 	}
 
 	e.addedFiles = append(e.addedFiles, AddFileEntry{
@@ -684,16 +730,21 @@ func DecodeVersionEdit(data []byte) (*VersionEdit, error) {
 				return nil, &errors.CorruptedVersionEditError{Offset: int64(fieldStart), Reason: "trailing bytes in AddFile payload"}
 			}
 
+			meta := FileMetadata{
+				FileNum:        fNum,
+				FileSize:       fSize,
+				SmallestKey:    smallestKey,
+				LargestKey:     largestKey,
+				SmallestSeqNum: sSeq,
+				LargestSeqNum:  lSeq,
+			}
+			if err := ValidateFileMetadata(uint32(lvl), meta); err != nil {
+				return nil, err
+			}
+
 			edit.addedFiles = append(edit.addedFiles, AddFileEntry{
 				Level: uint32(lvl),
-				Meta: FileMetadata{
-					FileNum:        fNum,
-					FileSize:       fSize,
-					SmallestKey:    smallestKey,
-					LargestKey:     largestKey,
-					SmallestSeqNum: sSeq,
-					LargestSeqNum:  lSeq,
-				},
+				Meta:  meta,
 			})
 
 		default:

@@ -126,8 +126,8 @@ func TestFixtureC_MultipleDeleteFile(t *testing.T) {
 
 func TestFixtureD_SingleAddFile(t *testing.T) {
 	edit := NewVersionEdit()
-	sk := []byte("keyA")
-	lk := []byte("keyZ")
+	sk := makeTestIK("keyA", 10, binary.OpTypePut)
+	lk := makeTestIK("keyZ", 20, binary.OpTypePut)
 
 	meta := FileMetadata{
 		FileNum:        7,
@@ -147,16 +147,18 @@ func TestFixtureD_SingleAddFile(t *testing.T) {
 	// FileSize: 1024 -> 0x00 | (0x08 << 7) -> varint: [0x80, 0x08]
 	// SmallestSeq: 10 (0x0a)
 	// LargestSeq: 20 (0x14)
-	// SmallestKeyLen: 4 (0x04)
-	// SmallestKey: 'k', 'e', 'y', 'A' (4 bytes)
-	// LargestKeyLen: 4 (0x04)
-	// LargestKey: 'k', 'e', 'y', 'Z' (4 bytes)
-	// Total payload length: 1 + 1 + 2 + 1 + 1 + 1 + 4 + 1 + 4 = 16 bytes (0x10)
+	// SmallestKeyLen: 13 (0x0d)
+	// SmallestKey: 'k', 'e', 'y', 'A', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x01
+	// LargestKeyLen: 13 (0x0d)
+	// LargestKey: 'k', 'e', 'y', 'Z', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x01
+	// Total payload length: 1 + 1 + 2 + 1 + 1 + 1 + 13 + 1 + 13 = 34 bytes (0x22)
 	// Tag: 4 (0x04)
 	expectedBytes := []byte{
 		0x01,       // FormatVersion
-		0x04, 0x10, // Tag 4, Len 16
-		0x01, 0x07, 0x80, 0x08, 0x0a, 0x14, 0x04, 'k', 'e', 'y', 'A', 0x04, 'k', 'e', 'y', 'Z',
+		0x04, 0x22, // Tag 4, Len 34 (0x22)
+		0x01, 0x07, 0x80, 0x08, 0x0a, 0x14,
+		0x0d, 'k', 'e', 'y', 'A', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x01,
+		0x0d, 'k', 'e', 'y', 'Z', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x01,
 	}
 
 	encoded := edit.Encode()
@@ -184,8 +186,8 @@ func TestFixtureE_ComplexMixedEdit(t *testing.T) {
 	meta1 := FileMetadata{
 		FileNum:        20,
 		FileSize:       2048,
-		SmallestKey:    []byte("a"),
-		LargestKey:     []byte("b"),
+		SmallestKey:    makeTestIK("a", 100, binary.OpTypePut),
+		LargestKey:     makeTestIK("b", 200, binary.OpTypePut),
 		SmallestSeqNum: 100,
 		LargestSeqNum:  200,
 	}
@@ -347,16 +349,17 @@ func TestRoundTripMatrix(t *testing.T) {
 			},
 		},
 		{
-			name: "EmptyKeyMetadata",
+			name: "SingleKeyMetadata",
 			build: func() *VersionEdit {
 				e := NewVersionEdit()
+				k := makeTestIK("single-key", 5, binary.OpTypePut)
 				_ = e.AddFile(0, FileMetadata{
 					FileNum:        1,
-					FileSize:       0,
-					SmallestKey:    nil,
-					LargestKey:     nil,
-					SmallestSeqNum: 0,
-					LargestSeqNum:  0,
+					FileSize:       1024,
+					SmallestKey:    k,
+					LargestKey:     k,
+					SmallestSeqNum: 5,
+					LargestSeqNum:  5,
 				})
 				return e
 			},
@@ -415,8 +418,8 @@ func TestCorruption_TruncationAtEveryByte(t *testing.T) {
 	_ = edit.AddFile(2, FileMetadata{
 		FileNum:        25,
 		FileSize:       4096,
-		SmallestKey:    []byte("smallest"),
-		LargestKey:     []byte("largest"),
+		SmallestKey:    makeTestIK("alpha", 1, binary.OpTypePut),
+		LargestKey:     makeTestIK("omega", 500, binary.OpTypePut),
 		SmallestSeqNum: 1,
 		LargestSeqNum:  500,
 	})
@@ -605,17 +608,25 @@ func TestForwardCompatibility_UnknownTag(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 func TestMemoryOwnershipIsolation(t *testing.T) {
-	sk := []byte("orig-small")
-	lk := []byte("orig-large")
+	sk := makeTestIK("alpha", 1, binary.OpTypePut)
+	lk := makeTestIK("omega", 10, binary.OpTypePut)
 
 	meta := FileMetadata{
-		FileNum:     1,
-		SmallestKey: sk,
-		LargestKey:  lk,
+		FileNum:        1,
+		FileSize:       1024,
+		SmallestKey:    sk,
+		LargestKey:     lk,
+		SmallestSeqNum: 1,
+		LargestSeqNum:  10,
 	}
 
 	edit := NewVersionEdit()
-	_ = edit.AddFile(0, meta)
+	if err := edit.AddFile(0, meta); err != nil {
+		t.Fatal(err)
+	}
+
+	origSK := makeTestIK("alpha", 1, binary.OpTypePut)
+	origLK := makeTestIK("omega", 10, binary.OpTypePut)
 
 	// Mutate original keys
 	sk[0] = 'X'
@@ -623,17 +634,17 @@ func TestMemoryOwnershipIsolation(t *testing.T) {
 
 	// AddedFiles() should still have original values
 	adds := edit.AddedFiles()
-	if string(adds[0].Meta.SmallestKey) != "orig-small" {
+	if !bytes.Equal(adds[0].Meta.SmallestKey, origSK) {
 		t.Fatalf("AddFile aliased original SmallestKey slice!")
 	}
-	if string(adds[0].Meta.LargestKey) != "orig-large" {
+	if !bytes.Equal(adds[0].Meta.LargestKey, origLK) {
 		t.Fatalf("AddFile aliased original LargestKey slice!")
 	}
 
 	// Mutate returned slice from AddedFiles
 	adds[0].Meta.SmallestKey[0] = 'Z'
 	adds2 := edit.AddedFiles()
-	if string(adds2[0].Meta.SmallestKey) != "orig-small" {
+	if !bytes.Equal(adds2[0].Meta.SmallestKey, origSK) {
 		t.Fatalf("AddedFiles() leaked mutable internal reference!")
 	}
 
@@ -650,7 +661,7 @@ func TestMemoryOwnershipIsolation(t *testing.T) {
 	}
 
 	decAdds := decoded.AddedFiles()
-	if string(decAdds[0].Meta.SmallestKey) != "orig-small" {
+	if !bytes.Equal(decAdds[0].Meta.SmallestKey, origSK) {
 		t.Fatalf("DecodeVersionEdit aliased input byte buffer!")
 	}
 }
@@ -699,7 +710,14 @@ func TestVersionEdit_ResetAndClone(t *testing.T) {
 	e.SetNextFileNum(10)
 	e.SetLastSeqNum(20)
 	_ = e.DeleteFile(0, 1)
-	_ = e.AddFile(1, FileMetadata{FileNum: 2})
+	_ = e.AddFile(1, FileMetadata{
+		FileNum:        2,
+		FileSize:       1024,
+		SmallestKey:    makeTestIK("k1", 1, binary.OpTypePut),
+		LargestKey:     makeTestIK("k2", 2, binary.OpTypePut),
+		SmallestSeqNum: 1,
+		LargestSeqNum:  2,
+	})
 
 	clone := e.Clone()
 	if !e.Equal(clone) {
@@ -732,10 +750,24 @@ func TestVersionEdit_Validation(t *testing.T) {
 
 	// Oversized keys
 	hugeKey := make([]byte, binary.MaxEncodedInternalKeyLen+1)
-	if err := e.AddFile(0, FileMetadata{FileNum: 1, SmallestKey: hugeKey}); err == nil {
+	if err := e.AddFile(0, FileMetadata{
+		FileNum:        1,
+		FileSize:       1024,
+		SmallestKey:    hugeKey,
+		LargestKey:     makeTestIK("k", 1, binary.OpTypePut),
+		SmallestSeqNum: 1,
+		LargestSeqNum:  1,
+	}); err == nil {
 		t.Errorf("expected error on AddFile oversized SmallestKey")
 	}
-	if err := e.AddFile(0, FileMetadata{FileNum: 1, LargestKey: hugeKey}); err == nil {
+	if err := e.AddFile(0, FileMetadata{
+		FileNum:        1,
+		FileSize:       1024,
+		SmallestKey:    makeTestIK("k", 1, binary.OpTypePut),
+		LargestKey:     hugeKey,
+		SmallestSeqNum: 1,
+		LargestSeqNum:  1,
+	}); err == nil {
 		t.Errorf("expected error on AddFile oversized LargestKey")
 	}
 }
@@ -761,8 +793,8 @@ func FuzzDecodeVersionEdit(f *testing.F) {
 	_ = edit2.AddFile(2, FileMetadata{
 		FileNum:        5,
 		FileSize:       1024,
-		SmallestKey:    []byte("min"),
-		LargestKey:     []byte("max"),
+		SmallestKey:    makeTestIK("aaa", 1, binary.OpTypePut),
+		LargestKey:     makeTestIK("zzz", 10, binary.OpTypePut),
 		SmallestSeqNum: 1,
 		LargestSeqNum:  10,
 	})
@@ -783,6 +815,43 @@ func FuzzDecodeVersionEdit(f *testing.F) {
 				t.Fatalf("decoded must be nil on error")
 			}
 			return
+		}
+
+		// Verify invariants on all admitted AddFile records
+		for _, entry := range decoded.AddedFiles() {
+			if entry.Level >= NumLevels {
+				t.Fatalf("admitted invalid level: %d", entry.Level)
+			}
+			if entry.Meta.FileNum == 0 {
+				t.Fatalf("admitted zero FileNum")
+			}
+			if entry.Meta.FileSize == 0 {
+				t.Fatalf("admitted zero FileSize")
+			}
+			if entry.Meta.SmallestSeqNum > entry.Meta.LargestSeqNum {
+				t.Fatalf("admitted backwards sequence range: %d > %d", entry.Meta.SmallestSeqNum, entry.Meta.LargestSeqNum)
+			}
+			if err := binary.ValidateEncodedInternalKey(entry.Meta.SmallestKey); err != nil {
+				t.Fatalf("admitted invalid SmallestKey: %v", err)
+			}
+			if err := binary.ValidateEncodedInternalKey(entry.Meta.LargestKey); err != nil {
+				t.Fatalf("admitted invalid LargestKey: %v", err)
+			}
+			skUL := len(entry.Meta.SmallestKey) - binary.InternalKeyTrailerLen
+			ikS := binary.InternalKey{
+				UserKey: entry.Meta.SmallestKey[:skUL],
+				SeqNum:  binary.SeqNum(binary.GetUint64(entry.Meta.SmallestKey[skUL : skUL+8])),
+				OpType:  binary.OpType(entry.Meta.SmallestKey[skUL+8]),
+			}
+			lkUL := len(entry.Meta.LargestKey) - binary.InternalKeyTrailerLen
+			ikL := binary.InternalKey{
+				UserKey: entry.Meta.LargestKey[:lkUL],
+				SeqNum:  binary.SeqNum(binary.GetUint64(entry.Meta.LargestKey[lkUL : lkUL+8])),
+				OpType:  binary.OpType(entry.Meta.LargestKey[lkUL+8]),
+			}
+			if binary.CompareInternalKey(ikS, ikL) > 0 {
+				t.Fatalf("admitted backwards key range: SmallestKey sorts after LargestKey")
+			}
 		}
 
 		// If decode succeeded, re-encoding must succeed and be deterministic
@@ -809,8 +878,8 @@ func BenchmarkVersionEdit_Encode_Small(b *testing.B) {
 	_ = edit.AddFile(0, FileMetadata{
 		FileNum:        11,
 		FileSize:       4096,
-		SmallestKey:    []byte("user:000001"),
-		LargestKey:     []byte("user:000050"),
+		SmallestKey:    makeTestIK("user:000001", 100, binary.OpTypePut),
+		LargestKey:     makeTestIK("user:000050", 500, binary.OpTypePut),
 		SmallestSeqNum: 100,
 		LargestSeqNum:  500,
 	})
@@ -831,8 +900,8 @@ func BenchmarkVersionEdit_Decode_Small(b *testing.B) {
 	_ = edit.AddFile(0, FileMetadata{
 		FileNum:        11,
 		FileSize:       4096,
-		SmallestKey:    []byte("user:000001"),
-		LargestKey:     []byte("user:000050"),
+		SmallestKey:    makeTestIK("user:000001", 100, binary.OpTypePut),
+		LargestKey:     makeTestIK("user:000050", 500, binary.OpTypePut),
 		SmallestSeqNum: 100,
 		LargestSeqNum:  500,
 	})
@@ -858,8 +927,8 @@ func BenchmarkVersionEdit_Encode_Complex(b *testing.B) {
 		_ = edit.AddFile(uint32(i%NumLevels), FileMetadata{
 			FileNum:        uint64(i + 100),
 			FileSize:       uint64((i + 1) * 64 * 1024),
-			SmallestKey:    []byte(fmt.Sprintf("user:key:%06d", i*100)),
-			LargestKey:     []byte(fmt.Sprintf("user:key:%06d", i*100+99)),
+			SmallestKey:    makeTestIK(fmt.Sprintf("user:key:%06d", i*100), uint64(i*1000), binary.OpTypePut),
+			LargestKey:     makeTestIK(fmt.Sprintf("user:key:%06d", i*100+99), uint64(i*1000+999), binary.OpTypePut),
 			SmallestSeqNum: uint64(i * 1000),
 			LargestSeqNum:  uint64(i*1000 + 999),
 		})
@@ -882,8 +951,8 @@ func BenchmarkVersionEdit_Decode_Complex(b *testing.B) {
 		_ = edit.AddFile(uint32(i%NumLevels), FileMetadata{
 			FileNum:        uint64(i + 100),
 			FileSize:       uint64((i + 1) * 64 * 1024),
-			SmallestKey:    []byte(fmt.Sprintf("user:key:%06d", i*100)),
-			LargestKey:     []byte(fmt.Sprintf("user:key:%06d", i*100+99)),
+			SmallestKey:    makeTestIK(fmt.Sprintf("user:key:%06d", i*100), uint64(i*1000), binary.OpTypePut),
+			LargestKey:     makeTestIK(fmt.Sprintf("user:key:%06d", i*100+99), uint64(i*1000+999), binary.OpTypePut),
 			SmallestSeqNum: uint64(i * 1000),
 			LargestSeqNum:  uint64(i*1000 + 999),
 		})

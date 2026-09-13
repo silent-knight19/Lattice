@@ -523,6 +523,63 @@ Verification & Traceability Evidence:
   - Static Analysis: go vet ./... (clean), golangci-lint run ./... (0 issues), go mod verify (clean)
 ```
 
+### F-004 — VersionEdit AddFile Accepts Structurally & Semantically Invalid FileMetadata
+
+```text
+Title: VersionEdit AddFile accepts structurally and semantically invalid FileMetadata
+Severity: MEDIUM
+Confidence: CONFIRMED
+Category: VULNERABILITY / INPUT VALIDATION (Metadata Integrity / Manifest Boundary / Deserialization)
+Phase Introduced: Phase 06 (VersionEdit)
+Current Component: internal/version/version_edit.go (ValidateFileMetadata, AddFile, DecodeVersionEdit)
+Affected File: internal/version/version_edit.go
+
+Root Cause:
+  VersionEdit.AddFile() and DecodeVersionEdit() only validated high-level scalar limits (level < NumLevels,
+  len(key) <= MaxEncodedInternalKeyLen). Crucial domain invariants were omitted:
+  1. FileNum == 0 was accepted, admitting unassigned/sentinel file numbers.
+  2. FileSize == 0 was accepted, admitting zero-byte/truncated SSTables.
+  3. SmallestSeqNum > LargestSeqNum was accepted, admitting backwards sequence ranges.
+  4. SmallestKey and LargestKey were treated as arbitrary opaque bytes, without verifying they conform
+     to the canonical binary.InternalKey wire encoding (minimum 10 bytes, valid UserKey length [1, 65535],
+     valid OpType).
+  5. Backwards key ranges (SmallestKey > LargestKey under canonical storage engine comparator
+     binary.CompareInternalKey) were admitted without check.
+  6. The manifest decoder (DecodeVersionEdit) constructed FileMetadata directly from untrusted wire bytes
+     without semantic validation, allowing corrupt or malicious manifest records to bypass programmatic
+     checks and directly inject invalid state into VersionSet.
+
+Remediation Status: REMEDIATED (F-004 / SEC-004)
+Remediation Date: 2026-09-13
+Remediation Scope: internal/version/version_edit.go (ValidateFileMetadata, AddFile, DecodeVersionEdit), internal/errors/errors.go
+Remediation Strategy:
+  1. Centralized Canonical Admission Validator: ValidateFileMetadata(level uint32, meta FileMetadata) error
+     enforces all 7 established invariants:
+     - Level: 0 <= level < NumLevels (7) (*errors.InvalidLevelError)
+     - File Number: FileNum > 0 (errors.ErrInvalidFileNum)
+     - File Size: FileSize > 0 (errors.ErrInvalidFileSize)
+     - Sequence Range: SmallestSeqNum <= LargestSeqNum (errors.ErrInvalidSeqNumRange)
+     - Key Encodings: binary.ValidateEncodedInternalKey(SmallestKey) and (LargestKey)
+     - Key Range Ordering: zero-allocation internal key decoding compared via binary.CompareInternalKey(ikSmall, ikLarge) <= 0 (errors.ErrInvalidKeyRange)
+  2. Parity Across Admission Paths: Both AddFile and DecodeVersionEdit (TagAddFile handler) invoke
+     ValidateFileMetadata. Any semantically invalid record fails closed immediately with descriptive errors.
+  3. Atomicity & Memory Isolation: AddFile remains atomic (NumAddedFiles unchanged on error). Keys are
+     defensively cloned on input and output.
+Verification & Traceability Evidence:
+  - Valid Metadata: TestSEC004_ValidMetadata (levels 0..6, min 1-byte keys, single-key table, equal keys, max key size 65544)
+  - Invalid Scalars: TestSEC004_InvalidScalars (level >= 7, FileNum=0, FileSize=0, SmallestSeq > LargestSeq)
+  - Invalid Keys: TestSEC004_InvalidKeys (nil, empty, truncated <10 bytes, oversized, invalid OpType)
+  - Key Range Ordering: TestSEC004_KeyRangeOrdering (user-key backwards, sequence inversion on same user key, op-type inversion, identical key boundary)
+  - Atomicity: TestSEC004_Atomicity (NumAddedFiles unchanged, existing entries preserved on failure)
+  - Defensive Copying: TestSEC004_DefensiveCopying (caller buffer mutation isolation)
+  - Decoder Rejection: TestSEC004_DecoderRejection (raw wire-level corrupt payloads fail closed without panic)
+  - Adversarial Matrix: TestSEC004_AdversarialTable (complete matrix of single and multi-violation records)
+  - Admission Parity: TestSEC004_AdmissionParity (asserts exact pass/fail and sentinel parity between AddFile and Decode)
+  - Fuzzing: FuzzDecodeVersionEdit (1,424,975 executions in 11s, 0 crashes, all 7 invariants asserted on all admitted files)
+  - Full Suite: go test ./... (PASS), go test -race ./... (PASS, 0 races)
+  - Static Analysis: go vet ./... (clean), golangci-lint run ./... (0 issues), go mod verify (clean)
+```
+
 ### SEC-002 — SSTable staging parent unpinned; WithFile bypasses staging checks
 
 ```text

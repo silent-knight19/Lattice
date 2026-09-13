@@ -3061,4 +3061,29 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
+# 34. Manifest Integrity, Deserialization Boundaries & SSTable Metadata Validation (SEC-004)
+
+### 1. Why must VersionEdit validate semantic SSTable metadata rather than merely validate the binary TLV structure? (SEC-004 / F-004)
+* **Question**: In an LSM-tree storage engine, why is structural/syntactic validation of manifest TLV records (e.g. valid varints, matching payload lengths) insufficient on its own, and why must `VersionEdit` enforce semantic SSTable metadata invariants at the admission boundary?
+* **Answer**:
+  - **Structural vs. Semantic Validation Gap**:
+    - *Structural Validity*: Ensures only that the wire-format framing is well-formed—varints terminate, payload length matches declared TLV length, offsets stay within slice bounds. A payload containing `Level: 0, FileNum: 0, FileSize: 0, SmallestKey: [0x00], LargestKey: [0x00]` is 100% structurally valid TLV bytes.
+    - *Semantic Validity*: Ensures that the decoded data models a physically legal, mathematically consistent, finalized SSTable in the engine's domain model. In Lattice, an SSTable must have a non-zero positive file number (`FileNum > 0`), a non-zero physical size (`FileSize > 0`), a non-inverted sequence range (`SmallestSeqNum <= LargestSeqNum`), valid serialized `InternalKey`s, and a monotonic key range (`SmallestKey <= LargestKey` under the engine's canonical comparator).
+  - **The Manifest Trust Boundary**:
+    - The MANIFEST file is stored on persistent disk and replayed during recovery / startup. Disk corruption, bit-rot, torn block writes, or adversarial injection must be treated as an untrusted input boundary.
+    - If semantic validation is deferred until compaction, binary search, or table reading, invalid metadata silently poisons the in-memory `VersionSet`. Recovery completes "successfully", but the engine later crashes during background compactions, returns corrupted query results, or panics during range partitioning.
+  - **InternalKey Validation**:
+    - SSTable boundary keys in `FileMetadata` (`SmallestKey`, `LargestKey`) are not arbitrary byte slices. They are serialized `binary.InternalKey`s containing a `UserKey`, a Big-Endian 8-byte `SeqNum`, and a 1-byte `OpType` (trailer length = 9 bytes; min key length = 10 bytes).
+    - If opaque byte slices are admitted, downstream components (such as level binary search or file pruning) that parse trailers or decode sequence numbers will trigger slice-bounds panics (`len(key) < 10`) or encounter invalid operation types.
+  - **Key-Range Invariants & Comparator Consistency**:
+    - An SSTable cannot claim a backwards key range (`SmallestKey > LargestKey`). Admitting such a file breaks the fundamental LSM invariant that level files partition key space monotonically. Binary search across level files (`FindFile`) will branch in the wrong direction, rendering records permanently unreadable.
+    - Crucially, range comparison must use the engine's *canonical InternalKey comparator* (`binary.CompareInternalKey`), which orders by `UserKey ASC`, `SeqNum DESC` (newer sequences sort *before* older sequences), and `OpType DESC` (`Delete` sorts *before* `Put`). Comparing raw byte slices lexicographically would falsely reject valid files (e.g. where user keys match and `SmallestKey` has a higher sequence number than `LargestKey`).
+  - **Sequence-Range Invariants**:
+    - `SmallestSeqNum <= LargestSeqNum` guarantees that multi-version visibility and snapshot reads can accurately determine if any key in the SSTable could be visible to a snapshot without opening the physical file. A backwards sequence range corrupts pruning logic.
+  - **Fail-Closed Replay Behavior**:
+    - By enforcing `ValidateFileMetadata` at both the programmatic construction boundary (`AddFile`) and the manifest deserialization boundary (`DecodeVersionEdit`), invalid records are rejected immediately at admission.
+    - Manifest replay fails closed with descriptive errors (`ErrInvalidFileNum`, `ErrInvalidFileSize`, `ErrInvalidKeyRange`, `ErrInvalidSeqNumRange`) rather than booting with a corrupted version tree.
+
+---
+
 *End of Technical Interview Knowledge Base — Lattice v1.0.0-KNOWLEDGE-BASE*

@@ -80,8 +80,8 @@ func BenchmarkManifestWriter_LogEdit_Complex_Sync(b *testing.B) {
 		_ = edit.AddFile(lvl, FileMetadata{
 			FileNum:        uint64(lvl + 100),
 			FileSize:       1024 * 1024,
-			SmallestKey:    makeTestIK(fmt.Sprintf("bench_key_start_%d", lvl), 1000, binary.OpTypePut),
-			LargestKey:     makeTestIK(fmt.Sprintf("bench_key_end___%d", lvl), 2000, binary.OpTypePut),
+			SmallestKey:    makeTestIK(fmt.Sprintf("bench_key_a_%d", lvl), 1000, binary.OpTypePut),
+			LargestKey:     makeTestIK(fmt.Sprintf("bench_key_z_%d", lvl), 2000, binary.OpTypePut),
 			SmallestSeqNum: 1000,
 			LargestSeqNum:  2000,
 		})
@@ -120,8 +120,8 @@ func BenchmarkManifestWriter_LogEdit_Complex_NoSync(b *testing.B) {
 		_ = edit.AddFile(lvl, FileMetadata{
 			FileNum:        uint64(lvl + 100),
 			FileSize:       1024 * 1024,
-			SmallestKey:    makeTestIK(fmt.Sprintf("bench_key_start_%d", lvl), 1000, binary.OpTypePut),
-			LargestKey:     makeTestIK(fmt.Sprintf("bench_key_end___%d", lvl), 2000, binary.OpTypePut),
+			SmallestKey:    makeTestIK(fmt.Sprintf("bench_key_a_%d", lvl), 1000, binary.OpTypePut),
+			LargestKey:     makeTestIK(fmt.Sprintf("bench_key_z_%d", lvl), 2000, binary.OpTypePut),
 			SmallestSeqNum: 1000,
 			LargestSeqNum:  2000,
 		})
