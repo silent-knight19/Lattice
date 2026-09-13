@@ -730,6 +730,16 @@ This document tracks all **genuine architectural and operational limitations** o
   * Performance: **Optimal** (Streams records sequentially with bounded memory; replayed 100 historical edits in 101.2 µs/op and 1,000 edits in 710.1 µs/op).
   * Security: **Optimal** (Bounds untrusted length before allocation; borrowed descriptor eliminates TOCTOU reopening races; zero disk mutation on failure).
 
+### 45. Uncommitted WAL Recovery Scope & Orphaned File GC Decoupling (P07-S02-M01)
+* **Limitation**: In `P07-S02-M01`, `Engine.RecoverWAL()` discovers and replays uncommitted WAL records newer than the durable MANIFEST sequence checkpoint (`LastSeqNum`) into a fresh active MemTable with strict duplicate prevention and atomic batch handling, but scanning the database directory for orphaned `.tmp` staging files left by interrupted flushes or compactions is intentionally excluded and reserved for `P07-S02-M02` (`Engine.CleanOrphanedFiles()`).
+* **Why It Exists**: Hard scope boundary enforcement and architectural separation of concerns. MemTable restoration from uncommitted logs restores volatile in-memory state required for point lookups and sequential write continuation, whereas garbage-collecting unreferenced temporary files is an independent storage reclamation task. Coupling log replay with directory file purging would interleave write recovery with deletion passes.
+* **Impact**: Callers recover active MemTable state and monotonic sequence numbering, but crash-window temporary files (`.sst.tmp`, `CURRENT.tmp`, `MANIFEST.tmp`) may remain on disk until `P07-S02-M02` runs.
+* **Current Mitigation**: Uncommitted WAL records are filtered against the durable MANIFEST watermark (`SeqNum > LastSeqNum`), preventing duplicate insertion into MemTable. Latest-segment torn tails at EOF are cleanly truncated, historical segments fail closed, and the recovered MemTable is built in private memory before atomic publication under mutex.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Exact sequence-aware MemTable reconstruction; zero duplicate replay; fail-closed on corrupt logs).
+  * Performance: **Optimal** (~4.2 µs/record replayed, linear scaling, bounded memory allocation).
+  * Security: **Optimal** (CRC32 verified before filtering; streaming log consumption prevents DoS buffer exhaustion).
+
 ---
 
 *End of Known Limitations — To be updated continuously throughout implementation.*

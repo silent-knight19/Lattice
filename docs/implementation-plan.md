@@ -1864,10 +1864,54 @@ TOTAL: 184 Discrete, Testable Micro-Phases
 
 ### Sub-Phase 07.2: WAL Replay & MemTable Restoration
 * **P07-S02-M01: Uncommitted WAL Discovery & Replay**
-  * *Objective*: Scan `/wal/` for logs newer than the manifest checkpoint, replay valid records into active MemTable.
-  * *Changes*: `Engine.RecoverWAL() error`.
-  * *Tests*: Write 500 records, crash process without flush; reboot and verify all 500 records present in MemTable.
-  * *Completion*: WAL replay passing tests.
+  * *Objective*: Scan `/wal/` for logs newer than the manifest sequence checkpoint (`LastSeqNum`), validate physical log integrity, and replay uncommitted records into a fresh active MemTable during startup recovery.
+  * *Changes*:
+    - `internal/engine/engine.go`:
+      - Added `dbPath string`, `vset *version.VersionSet` fields to `Engine`.
+      - Added `EngineOptions` configuration struct and `NewEngineWithOptions(opts EngineOptions) *Engine` constructor.
+      - Added getter/setter accessors: `SetDBPath(path string)`, `DBPath() string`, `ActiveMemTable() *memtable.SkipList`, `ImmMemTables() []*memtable.SkipList`, `VersionSet() *version.VersionSet`, `NextSeqNum() binary.SeqNum`.
+      - Implemented `(e *Engine) RecoverWAL() error`: orchestrates manifest boot discovery (`DiscoverActiveManifest`), manifest replay (`ReplayManifest`), durable sequence watermark determination (`LastSeqNum`), and WAL recovery.
+      - Implemented `(e *Engine) RecoverWALFromCheckpoint(checkpoint binary.SeqNum) error`: recovers WAL records newer than a specified sequence watermark.
+      - Implemented `(e *Engine) RecoverWALWithManifestResult(res *version.ReplayResult) error`: composes directly with an existing `ReplayResult` from `P07-S01-M02` without re-reading the MANIFEST.
+      - Private in-memory reconstruction: builds a private `memtable.NewSkipList()` with atomic batch handling (`BATCH_START` to `BATCH_COMMIT`), MemTable rotation on `ErrMemTableFull`, and atomic pointer publication under mutex on success.
+    - `internal/engine/recovery_test.go`: 15 comprehensive unit & integration tests covering the complete acceptance matrix (A through O) under race detector.
+    - `internal/engine/recovery_bench_test.go`: Benchmarks for 100, 500, and 1,000 record recovery workloads.
+  * *Invariants Maintained*:
+    - *P07-S02-M01-INV-01*: WAL segments discovered and processed in strict numeric order ($1..N$). Segment gaps fail closed with `*errors.SegmentGapError`.
+    - *P07-S02-M01-INV-02*: Every WAL record framing and CRC32 are physically validated before checkpoint comparison.
+    - *P07-S02-M01-INV-03*: Only uncommitted WAL records (`SeqNum > manifestCheckpoint`) are inserted into the recovered MemTable.
+    - *P07-S02-M01-INV-04*: No already-durable record (`SeqNum <= manifestCheckpoint`) is replayed into the recovered MemTable (zero duplicate insertions).
+    - *P07-S02-M01-INV-05*: Global WAL sequence monotonicity is strictly enforced across all segments; sequence regressions fail closed with `*errors.SequenceOutOfOrderError`.
+    - *P07-S02-M01-INV-06*: Latest segment torn tail at EOF is safely truncated according to the established WAL recovery contract.
+    - *P07-S02-M01-INV-07*: Historical sealed segment corruption or torn tail fails closed without mutation.
+    - *P07-S02-M01-INV-08*: Recovered MemTable reflects exact sequence-aware logical state (tombstones for `RecordTypeDelete`, values for `RecordTypePut`).
+    - *P07-S02-M01-INV-09*: Failed recovery never publishes a partially reconstructed MemTable to the live engine; state remains untouched.
+    - *P07-S02-M01-INV-10*: Recovery does not mutate MANIFEST, CURRENT, or SSTable contents.
+    - *P07-S02-M01-INV-11*: Replay is bounded and streaming; does not buffer whole segments into memory.
+    - *P07-S02-M01-INV-12*: Recovered sequence state never moves backwards; monotonic sequence allocation continues from `max(checkpoint, wal.LastSeqNum)`.
+    - *P07-S02-M01-INV-13*: Descriptors and file resources are cleanly released on success and failure paths.
+    - *P07-S02-M01-INV-14*: Checkpoint filter is strictly based on durable logical sequence numbers, never filesystem timestamps or file modification times.
+  * *Tests*:
+    - `TestEngineRecoverWAL_A_EmptyWAL`: Clean directory with no WAL/MANIFEST recovers cleanly with empty MemTable.
+    - `TestEngineRecoverWAL_B_500Records`: Replays 500 uncommitted records and verifies 100% key-value retrievability.
+    - `TestEngineRecoverWAL_C_DuplicatePrevention`: Checkpoint at 500 with records 1..550 applies only 501..550 (50 items) without duplicates.
+    - `TestEngineRecoverWAL_D_MultiSegmentSuffix`: 3 segments with checkpoint at 180 replays 181..250 across segment boundaries.
+    - `TestEngineRecoverWAL_E_CorruptPreCheckpointRecord`: Pre-checkpoint record corruption on disk fails closed with `ErrChecksumMismatch`.
+    - `TestEngineRecoverWAL_F_CorruptPostCheckpointRecord`: Post-checkpoint record corruption fails closed with `ErrChecksumMismatch`.
+    - `TestEngineRecoverWAL_G_SequenceRegression`: Out-of-order sequence fails closed with `*errors.SequenceOutOfOrderError`.
+    - `TestEngineRecoverWAL_H_HistoricalTornTail`: Torn tail in sealed historical segment fails closed without truncation.
+    - `TestEngineRecoverWAL_I_LatestSegmentTornTail`: Torn tail in active latest segment is truncated and preceding records recovered.
+    - `TestEngineRecoverWAL_J_SegmentGapAndInvalidObject`: Segment gap and directory masquerade fail closed.
+    - `TestEngineRecoverWAL_K_MidReplayStateIsolation`: Mid-replay corruption preserves existing Engine data without partial publication.
+    - `TestEngineRecoverWAL_L_MixedPutDeleteTombstones`: Replay of PUT, DELETE, re-PUT, final DELETE matches reference model.
+    - `TestEngineRecoverWAL_M_BatchAtomicity`: Committed atomic batches are applied; uncommitted batches torn at EOF are dropped.
+    - `TestEngineRecoverWAL_N_SequenceContinuation`: Subsequent write after recovery allocates strictly monotonic `nextSeqNum`.
+    - `TestEngineRecoverWAL_O_DirectResultComposition`: Direct composition with `version.ReplayResult` avoids re-reading MANIFEST.
+  * *Benchmarks* (Apple M4, Darwin arm64):
+    - `BenchmarkEngineRecoverWAL_100Records`: 459.4 µs/op, 36.8 KB/op, 1,670 allocs/op (~2,176 replays/sec).
+    - `BenchmarkEngineRecoverWAL_500Records`: 1.97 ms/op, 153.2 KB/op, 8,070 allocs/op (~508 replays/sec).
+    - `BenchmarkEngineRecoverWAL_1000Records`: 4.21 ms/op, 298.6 KB/op, 16,070 allocs/op (~237 replays/sec, ~4.2 µs/record replayed).
+  * *Completion*: Complete and verified under `-race`, `go vet`, `golangci-lint`. P07-S02-M01 complete; P07-S02-M02 (Orphaned Temporary File Garbage Collector) remains next micro-phase.
 * **P07-S02-M02: Orphaned Temporary File Garbage Collector**
   * *Objective*: Scan directory on boot and remove unreferenced `.tmp` files left by interrupted compactions or flushes.
   * *Changes*: `Engine.CleanOrphanedFiles() error`.

@@ -119,7 +119,7 @@ func TestEngine_PutGetBackpressureEnforcement(t *testing.T) {
 	}
 
 	eng := engine.NewEngine(cfg)
-	defer eng.Close()
+	defer func() { _ = eng.Close() }()
 
 	ctx := context.Background()
 
