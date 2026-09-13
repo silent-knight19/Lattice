@@ -228,6 +228,10 @@ var (
 	// or modified to reference a different filesystem object during opening.
 	ErrSSTableObjectChanged = stdErrors.New("sstable file object swapped or replaced")
 
+	// ErrMissingSSTable indicates that an SSTable file referenced by the reconstructed
+	// Version does not exist on disk during startup recovery.
+	ErrMissingSSTable = stdErrors.New("referenced sstable file not found on disk")
+
 	// ErrWriterPoisoned indicates that an operation was attempted on a WAL writer
 	// that entered an unrecoverable poisoned state following a write or sync failure.
 	ErrWriterPoisoned = stdErrors.New("wal writer is poisoned")

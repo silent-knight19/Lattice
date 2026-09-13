@@ -128,3 +128,10 @@ func SetBootPostOpenHookForTesting(fn func(path string, f *os.File) error) func(
 		bootHookMu.Unlock()
 	}
 }
+
+// SetReplayLstatFnForTesting temporarily replaces replayLstatFn and returns a restore closure.
+func SetReplayLstatFnForTesting(fn func(name string) (os.FileInfo, error)) func() {
+	orig := replayLstatFn
+	replayLstatFn = fn
+	return func() { replayLstatFn = orig }
+}

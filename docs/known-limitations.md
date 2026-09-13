@@ -720,6 +720,18 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 44. Sequential VersionEdit Replay Scope & WAL Replay Decoupling (P07-S01-M02)
+* **Limitation**: In `P07-S01-M02`, `ReplayManifest` sequentially replays CRC-framed `VersionEdit` records from the pinned MANIFEST descriptor, reconstructs immutable `Version` level arrays ($L_0..L_6$) and monotonic scalars (`NextFileNum`, `LastSeqNum`), and validates that all final referenced SSTable files physically exist on disk as regular files (failing closed with `ErrMissingSSTable` if missing), but scanning `/wal/` for logs newer than the manifest checkpoint and replaying uncommitted WAL records into active MemTable are intentionally excluded and reserved for Sub-Phase 07.2 (`P07-S02-M01`).
+* **Why It Exists**: Hard scope boundary enforcement and architectural separation of concerns. Startup recovery establishes durable LSM-tree level structure from the MANIFEST before replaying volatile, uncommitted write log records into memory. Coupling manifest replay with WAL scanning would violate single-responsibility boundaries and create race hazards between version state installation and memtable recovery.
+* **Impact**: Callers receive a reconstructed `*ReplayResult` containing an immutable `*Version` (refCount = 1), updated `NextFileNum`, and `LastSeqNum`, but the engine's active MemTable is not populated until WAL recovery runs in `P07-S02-M01`.
+* **Current Mitigation**: `ReplayManifest` operates on an isolated in-memory reconstruction builder, ensuring zero state mutation or partial `VersionSet` publication if replay fails. Bounded 8-byte framing checks, untrusted length verification against `MaxVersionEditBytes` before memory allocation, CRC32-IEEE verification, and read-only physical SSTable checks ensure fail-closed crash recovery without altering persistent disk state.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Deterministic state reconstruction; strictly enforces non-overlapping key ranges on $L_1..L_6$ and regular-file existence on all referenced SSTables).
+  * Performance: **Optimal** (Streams records sequentially with bounded memory; replayed 100 historical edits in 101.2 µs/op and 1,000 edits in 710.1 µs/op).
+  * Security: **Optimal** (Bounds untrusted length before allocation; borrowed descriptor eliminates TOCTOU reopening races; zero disk mutation on failure).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*
 
 

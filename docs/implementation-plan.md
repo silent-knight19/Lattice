@@ -1823,10 +1823,44 @@ TOTAL: 184 Discrete, Testable Micro-Phases
     - `BenchmarkDiscoverActiveManifest_Empty`: 28.05 µs/op, 3,201 B/op, 27 allocs/op (~35.6k ops/sec).
   * *Completion*: Complete and verified under `-race`, `go vet`, `golangci-lint`. P07-S01-M01 complete; P07-S01-M02 (Sequential VersionEdit Replay Engine) remains next micro-phase.
 * **P07-S01-M02: Sequential VersionEdit Replay Engine**
-  * *Objective*: Replay `VersionEdit` records sequentially from manifest, reconstructing level arrays ($L_0..L_N$).
-  * *Invariants*: If any referenced `.sst` file is missing from disk, abort with `ErrMissingSSTable`.
-  * *Tests*: Replay 100 historical edits; verify reconstructed version matches expected level state.
-  * *Completion*: Replay engine verified.
+  * *Objective*: Replay `VersionEdit` records sequentially from manifest, reconstructing level arrays ($L_0..L_6$) and monotonic scalars.
+  * *Changes*:
+    - `internal/errors/errors.go`: Defined `ErrMissingSSTable`.
+    - `internal/version/replay.go`:
+      - Canonical SSTable helpers: `TableFilename(fileNum uint64) string` (`"%06d.sst"`), `TablePath(dbPath string, fileNum uint64) string`.
+      - Diagnostic error: `type ReplayError struct { ManifestNum uint64; RecordIndex int; Offset int64; Err error }`.
+      - Result container: `type ReplayResult struct { Version *Version; NextFileNum uint64; LastSeqNum binary.SeqNum; ValidRecords int; FinalOffset int64 }`.
+      - Replay engine: `ReplayManifest(discovered *DiscoveredManifest) (*ReplayResult, error)`.
+  * *Invariants*:
+    - *P07-S01-M02-INV-01*: MANIFEST records are replayed strictly in physical file order.
+    - *P07-S01-M02-INV-02*: A record is never applied before its framing and CRC are validated.
+    - *P07-S01-M02-INV-03*: A malformed/corrupt record causes deterministic fail-closed recovery.
+    - *P07-S01-M02-INV-04*: Replay never publishes partially reconstructed Version state.
+    - *P07-S01-M02-INV-05*: Every final referenced SSTable must exist as an expected regular file (`ErrMissingSSTable`).
+    - *P07-S01-M02-INV-06*: Historically deleted SSTables do not need to remain on disk.
+    - *P07-S01-M02-INV-07*: Final reconstructed Version contains exactly the state represented by the ordered VersionEdit sequence.
+    - *P07-S01-M02-INV-08*: Replay is deterministic for identical persistent inputs.
+    - *P07-S01-M02-INV-09*: Replay does not mutate CURRENT, MANIFEST, or SSTable files.
+    - *P07-S01-M02-INV-10*: A replay failure does not alter the live VersionSet.
+    - *P07-S01-M02-INV-11*: Replay uses bounded memory proportional to current reconstruction state, not complete MANIFEST size.
+    - *P07-S01-M02-INV-12*: The M01-pinned MANIFEST descriptor is reused rather than reopened by pathname.
+  * *Tests Added* (`internal/version/replay_test.go`, `replay_bench_test.go`):
+    - 100-historical-edit differential verification against independent reference oracle model.
+    - Empty manifest replay (0 records, 0-byte offset, clean EOF).
+    - Single AddFile and multi-level additions ($L_0..L_6$) with canonical internal key ordering.
+    - Monotonic scalars progression across multiple edits.
+    - Absent historically deleted SSTables (succeeds without error).
+    - Missing active SSTables (fails closed with `ErrMissingSSTable`).
+    - Active SSTable symlink/directory masquerades (fails closed with `ErrSSTableSymlink` / `NotADirectoryError`).
+    - Corruption matrix: bad CRC, truncated header, truncated payload, oversized payload length (>16 MiB), invalid VersionEdit payload, overlapping key ranges in $L_1..L_6$, duplicate FileNum across levels.
+    - State isolation: mid-replay failure leaves live VersionSet, CURRENT, MANIFEST, and SSTables unmodified.
+    - Descriptor reuse & ownership: borrows pinned descriptor from M01 without closing it.
+    - Determinism across repeated replays on unchanged disk state.
+    - Unreferenced extra SSTable files on disk ignored.
+  * *Measured Results* (Apple M4, Darwin arm64):
+    - `BenchmarkReplayManifest_100Edits`: 101.2 µs/op, 13,310 B/op, 337 allocs/op (~9,880 replays/sec, ~988k edits/sec).
+    - `BenchmarkReplayManifest_1000Edits`: 710.1 µs/op, 106,912 B/op, 3,037 allocs/op (~1,408 replays/sec, ~1.41M edits/sec).
+  * *Completion*: Complete and verified under `-race`, `go vet`, `golangci-lint`. P07-S01-M02 complete; P07-S02-M01 (Uncommitted WAL Discovery & Replay) remains next micro-phase.
 
 ### Sub-Phase 07.2: WAL Replay & MemTable Restoration
 * **P07-S02-M01: Uncommitted WAL Discovery & Replay**
