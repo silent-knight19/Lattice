@@ -79,6 +79,13 @@ func SetCurrentLstatFnForTesting(fn func(name string) (os.FileInfo, error)) func
 	return func() { currentLstatFn = orig }
 }
 
+// SyncDirForTesting exposes the real parent-directory sync barrier so
+// black-box regression tests can wrap currentSyncDirFn (to assert ordering
+// and call counts) while still performing the actual directory fsync.
+func SyncDirForTesting(dirPath string) error {
+	return syncDir(dirPath)
+}
+
 // SetCleanupFnForTesting attaches an arbitrary callback invoked on the final 1->0 Unref transition.
 func (v *Version) SetCleanupFnForTesting(fn func()) {
 	v.cleanupFn = fn

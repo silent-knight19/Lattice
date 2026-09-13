@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"github.com/silent-knight19/lattice/internal/errors"
 )
@@ -41,7 +42,7 @@ const (
 // Pluggable filesystem seams for deterministic fault-injection testing
 var (
 	currentWriteFn   = func(f *os.File, p []byte) (int, error) { return f.Write(p) }
-	currentSyncFn    = fdatasync
+	currentSyncFn    = currentFileSync
 	currentCloseFn   = func(f *os.File) error { return f.Close() }
 	currentRenameFn  = os.Rename
 	currentSyncDirFn = syncDir
@@ -49,6 +50,36 @@ var (
 	currentReadFn    = func(f *os.File, p []byte) (int, error) { return f.Read(p) }
 	currentLstatFn   = os.Lstat
 )
+
+// currentStrictSync selects the file-content durability barrier used by
+// SetCurrentManifest. Default false preserves the fast path (fdatasync on
+// Linux, f.Sync fallback elsewhere). When true, the barrier is a full
+// f.Sync (fsync), syncing both data and inode metadata at higher I/O cost.
+// The parent-directory barrier (syncDir) always runs after rename in both modes.
+var currentStrictSync atomic.Bool
+
+// currentFileSync implements the default currentSyncFn. It branches on
+// currentStrictSync so fault-injection tests can still replace currentSyncFn
+// wholesale via SetCurrentSyncFnForTesting without losing the strict-mode path.
+func currentFileSync(f *os.File) error {
+	if currentStrictSync.Load() {
+		return f.Sync()
+	}
+	return fdatasync(f)
+}
+
+// SetCurrentStrictSync enables (true) or disables (false) the full-fsync file
+// barrier for subsequent SetCurrentManifest calls. It is process-wide and
+// safe for concurrent use. Existing fault-injection seams are unaffected:
+// if a test replaces currentSyncFn, that replacement takes precedence until restored.
+func SetCurrentStrictSync(enabled bool) {
+	currentStrictSync.Store(enabled)
+}
+
+// CurrentStrictSync reports whether the full-fsync strict barrier is enabled.
+func CurrentStrictSync() bool {
+	return currentStrictSync.Load()
+}
 
 // syncDir flushes modified directory entries to stable storage media.
 // On Unix/Linux/Darwin, opening the directory descriptor and calling Sync() forces directory
@@ -156,8 +187,11 @@ func canonicalDirKey(dir string) string {
 //  6. Deterministic Serialization:
 //     Writes the canonical manifest filename followed by a newline: "MANIFEST-%06d\n".
 //  7. Hardware Durability Barrier:
-//     Synchronizes CURRENT.tmp via fdatasync() (or f.Sync() fallback) to ensure content
-//     pages are fully committed to physical non-volatile storage media.
+//     Synchronizes CURRENT.tmp via fdatasync() by default (or f.Sync() fallback
+//     on non-Linux, or full f.Sync()/fsync when SetCurrentStrictSync(true) is
+//     enabled) to ensure content pages are committed to non-volatile storage.
+//     Default fdatasync avoids syncing unchanged inode metadata for lower latency;
+//     strict mode pays full fsync cost for stronger metadata durability.
 //  8. File Descriptor Cleanup:
 //     Closes the temporary file handle prior to atomic replacement.
 //  9. Atomic Pointer Swap:
@@ -165,7 +199,10 @@ func canonicalDirKey(dir string) string {
 //     CURRENT exist in an empty, partially written, or torn state.
 //  10. Parent Directory Durability Barrier:
 //     Flushes the parent directory's modified entries to persistent storage, guaranteeing
-//     that the rename operation itself survives host power interruption.
+//     that the rename operation itself survives host power interruption. This barrier
+//     always runs after a successful rename in both default and strict modes; a
+//     failure returns ErrCurrentDirectorySync while leaving the renamed CURRENT intact
+//     (durability uncertain, pointer not torn).
 //  11. Failure Safety & Invariant:
 //     If any failure occurs prior to the atomic rename, CURRENT.tmp is unlinked and
 //     the pre-existing CURRENT pointer remains completely untouched.

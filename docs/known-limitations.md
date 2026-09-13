@@ -105,7 +105,7 @@ This document tracks all **genuine architectural and operational limitations** o
 * **Why It Exists**: To maintain broad binary compatibility with standard library encoders (`encoding/binary.PutUvarint`) and third-party tools that may emit non-canonical representations.
 * **Impact**: Two distinct byte sequences can decode to the same `uint64` value.
 * **How It Was Detected**: Architectural audit of Phase 01 binary primitives.
-* **Current Mitigation**: Lattice's encoder (`PutVarint64`) strictly emits minimal canonical forms; decoder strictly enforces the 10-byte bound and rejects integer overflow (`b > 1` on 10th byte).
+* **Current Mitigation**: Lattice's encoder (`PutVarint64`) strictly emits minimal canonical forms; decoder strictly enforces the 10-byte bound and rejects integer overflow (`b > 1` on 10th byte). IND-H-005 proof in `sec_ind_h005_test.go` verifies the audit's exact 1000×`0xFF` flood terminates promptly with `ErrVarintOverflow` (wall-clock guarded), plus continuation-flood lengths 1–64 and 32-bit floods. IND-L-001 proof in `sec_ind_l001_test.go` pins the approved dual policy: lenient decode accepts overlong forms with correct values while `GetVarint64Canonical` rejects them, with round-trip agreement on canonical inputs.
 * **Future Solution**: Provide a strict-mode decoder (`GetCanonicalVarint64`) if cryptographic or deterministic hashing requirements demand strict canonical representations.
 * **Dimensional Impact**:
   * Correctness: **None** (Values decode mathematically correctly).
@@ -187,7 +187,7 @@ This document tracks all **genuine architectural and operational limitations** o
 * **Why It Exists**: `P02-S04-M02` implements the core batch runner, dual batch limits, single-`fdatasync` synchronization barrier, error fan-out, and graceful lifecycle management. Introducing speculative timer delays or dynamic heuristics before the baseline coalescing pipeline was verified would add non-deterministic timing jitter and latency overhead to low-concurrency workloads.
 * **Impact**: Under purely serial, single-threaded write workloads with zero queue backlog, each task is dequeued immediately and forms a singleton batch with its own `Sync()` barrier. Throughput scales naturally under concurrent load when pending writes accumulate during disk sync.
 * **How It Was Detected**: Architectural design and performance profiling of cooperative group commit pipelines.
-* **Current Mitigation**: `TryDequeueBatch` drains all currently enqueued tasks in a single lock acquisition. When the runner is blocked in `Sync()`, concurrent producers accumulate in the queue, automatically forming dense batches for the subsequent iteration without artificial timer sleeps.
+* **Current Mitigation**: `TryDequeueBatch` drains all currently enqueued tasks in a single lock acquisition. When the runner is blocked in `Sync()`, concurrent producers accumulate in the queue, automatically forming dense batches for the subsequent iteration without artificial timer sleeps. IND-C-003 proof in `sec_ind_c003_test.go` verifies sync-barrier failure fans out as `*BatchSyncError` to every waiter (zero false durable acks) and poisons the writer fail-closed.
 * **Future Solution**: Introduce optional microsecond-level linger timeout (`LingerTimeout`) and adaptive batch sizing during single-node engine integration (Phase 10).
 * **Dimensional Impact**:
   * Correctness: **None** (Durability and serializability strictly preserved).
@@ -201,7 +201,7 @@ This document tracks all **genuine architectural and operational limitations** o
 * **Why It Exists**: In accordance with the security roadmap hierarchy, storage persistence (`SEC-03`) and in-memory core ordering/bounds primitives (`SEC-04`) are audited against implemented code. Network transport (Phase 11) and Raft consensus (Phase 13) do not yet exist in the codebase.
 * **Impact**: Storage, WAL, filesystem races, torn writes, malformed framing, permission boundaries, and in-memory InternalKey multi-version ordering/bounds are rigorously verified under adversarial tests. Network and cluster-level dynamic testing will activate when those subsystems are built.
 * **How It Was Detected**: Security roadmap staging and architecture boundaries.
-* **Current Mitigation**: Comprehensive dynamic test suites in `internal/wal` (`sec03_*_test.go`), `internal/binary` (`sec04_*_test.go`), native Go fuzzing, fault injection seams, and race detection.
+* **Current Mitigation**: Comprehensive dynamic test suites in `internal/wal` (`sec03_*_test.go`), `internal/binary` (`sec04_*_test.go`), native Go fuzzing, fault injection seams, and race detection. IND-M-004 proof in `sec_ind_m004_test.go` verifies truncated headers/bodies fail closed (`ErrHeaderTruncated`/`ErrUnexpectedEOF`) while 1-byte-fragmented valid records still decode exactly.
 * **Future Solution**: Execute `SEC-05` (network protocol fuzzing) and `SEC-06` (distributed consensus chaos testing) once networking and Raft are implemented.
 * **Dimensional Impact**:
   * Correctness: **None** (Existing subsystems verified).
@@ -323,7 +323,7 @@ This document tracks all **genuine architectural and operational limitations** o
 * **Why It Exists**: Following the micro-phase engineering discipline, index building and decoding are cleanly isolated from the 48-byte footer (P04-S02-M02) and file-level disk streaming/lookup (P04-S03-M01/M02).
 * **Impact**: Full SSTable point lookups from disk require subsequent micro-phases (P04-S02-M02 footer and P04-S03-M02 reader).
 * **How It Was Detected**: Architectural design and memory profiling of P04-S02-M01 sparse index structures.
-* **Current Mitigation**: Strict `BlockHandle` validation against physical file size (`ValidateAgainstFileSize`) to prevent out-of-bounds reads, compact 16-byte fixed handles, and 32-bit offset indexing.
+* **Current Mitigation**: Strict `BlockHandle` validation against physical file size (`ValidateAgainstFileSize`) to prevent out-of-bounds reads, compact 16-byte fixed handles, and 32-bit offset indexing. IND-H-001 proof in `sec_ind_h001_test.go` verifies the audit's exact wrapping scenario (offset=MaxUint64-10, size=20) is rejected with `ErrInvalidBlockHandle` by the overflow guard, plus the exact-fit boundary matrix.
 * **Future Solution**: P04-S02-M02 will implement the 48-byte footer pointing to the index block; P04-S03-M02 will integrate the reader; and Phase 10 will add evictable index block caching in the LRU block cache if needed for memory-constrained environments.
 * **Dimensional Impact**:
   * Correctness: **Optimal** (Deterministic, verified under race detector and fuzzing).
@@ -335,7 +335,7 @@ This document tracks all **genuine architectural and operational limitations** o
 * **Why It Exists**: Following the micro-phase engineering discipline, binary structure codecs are cleanly isolated from file system I/O, streaming abstractions, and full table lifecycle management.
 * **Impact**: End-to-end SSTable reading and point lookups from disk require subsequent micro-phases (P04-S03-M01 writer and P04-S03-M02 reader).
 * **How It Was Detected**: Architectural analysis of P04-S02-M02 footer codec and integration boundaries.
-* **Current Mitigation**: Comprehensive unit tests, independent binary oracle fixtures, fuzz testing (>5.9M iterations with 0 crashes), zero heap allocation execution, and explicit file boundary validation (`ValidateAgainstFileSize`).
+* **Current Mitigation**: Comprehensive unit tests, independent binary oracle fixtures, fuzz testing (>5.9M iterations with 0 crashes), zero heap allocation execution, and explicit file boundary validation (`ValidateAgainstFileSize`). IND-H-007 proof in `sec_ind_h007_test.go` verifies 0/1/15/16/47-byte files are rejected with `ErrInvalidFooterSize` (panic-guarded) and bad-magic 48-byte files fail closed.
 * **Future Solution**: Sub-Phase 04.3 (`P04-S03-M01` TableWriter and `P04-S03-M02` TableReader) will integrate the footer into end-to-end file creation and querying workflows.
 * **Dimensional Impact**:
   * Correctness: **Optimal** (Strict 48-byte framing, byte-for-byte exact independent oracle match, 0-padding invariant).
@@ -347,7 +347,7 @@ This document tracks all **genuine architectural and operational limitations** o
 * **Why It Exists**: Following the micro-phase engineering discipline, persistence assembly on the write path is cleanly isolated from random-access block seeking and query execution on the read path.
 * **Impact**: End-to-end point lookups (`Seek`) and reading data blocks directly from disk require the subsequent reader micro-phase (P04-S03-M02).
 * **How It Was Detected**: Architectural design and micro-phase boundaries of Phase 04 Sub-Phase 04.3.
-* **Current Mitigation**: Comprehensive forensic tests validating every byte offset and block CRC directly from disk, atomic staging and cleanup, and fuzz testing (1,474 full file cycles).
+* **Current Mitigation**: Comprehensive forensic tests validating every byte offset and block CRC directly from disk, atomic staging and cleanup, and fuzz testing (1,474 full file cycles). IND-H-002 proof in `sec_ind_h002_test.go` verifies single-file `link(2)+unlink` publication leaves zero `.tmp_*` orphans on success, on injected link failure, and when a destination appears mid-flush (fail-closed `ErrSSTableExists`, victim bytes preserved).
 * **Future Solution**: Sub-Phase 04.3 (`P04-S03-M02`) will implement `TableReader` with sparse index binary search, and Phase 05 will implement Bloom filter generation.
 * **Dimensional Impact**:
   * Correctness: **Optimal** (Atomic staging, directory sync, pre-existing file protection).
@@ -363,7 +363,7 @@ This document tracks all **genuine architectural and operational limitations** o
 * **Why It Exists**: Following the micro-phase engineering discipline, the persistent reader, sparse index search, and prefix-compressed data block decoder are cleanly implemented and validated in isolation before composing with probabilistic filters, caching layers, and multi-SSTable version sets.
 * **Impact**: Cold absent reads falling within block key ranges require 1 disk seek. Repeated reads incur disk I/O latency unless cached by OS page cache.
 * **How It Was Detected**: Architectural design and micro-phase boundaries of Phase 04 Sub-Phase 04.3.
-* **Current Mitigation**: The in-memory sparse `BlockIndex` immediately rejects any target key greater than all largest keys with zero data block disk I/O (~103.9 ns/op). Restart point binary search bounds forward scans to at most 16 records.
+* **Current Mitigation**: The in-memory sparse `BlockIndex` immediately rejects any target key greater than all largest keys with zero data block disk I/O (~103.9 ns/op). Restart point binary search bounds forward scans to at most 16 records. IND-M-003 proof in `sec_ind_m003_test.go` corrupts a real flushed data block (zero restart count, non-zero first offset with re-fixed CRC, stale-CRC torn write) proving each class fails closed with `ErrDataBlockCorrupted`/`ErrChecksumMismatch` under a panic guard.
 * **Future Solution**: Phase 05 will implement Bloom filters eliminating $>99\%$ of cold read disk I/Os; Phase 06 will integrate multi-SSTable `VersionSet` lookups; and Phase 10 will add an LRU block cache.
 * **Dimensional Impact**:
   * Correctness: **Optimal** (100% verified point lookup accuracy across 100,000 keys; strict multi-version and tombstone resolution; corruption protection).
@@ -373,7 +373,7 @@ This document tracks all **genuine architectural and operational limitations** o
 ### 27. Phase 04 Security Hardening and Deliberate Architectural Boundaries
 * **Limitation**: Following the Phase 04 security remediation audit:
   1. *Filesystem Security Baseline*: SSTable files are created with `0600` permissions and directories with `0700`, aligning with the WAL durability and confidentiality model.
-  2. *Secure Staging Lifecycle*: Staging files use randomized temporary paths created via `os.CreateTemp` with `O_CREATE|O_EXCL` semantics; symlinks are rejected and atomic publication fails closed with `ErrSSTableExists` if the destination path appears concurrently.
+  2. *Secure Staging Lifecycle*: Staging files use randomized temporary paths created via `os.CreateTemp` with `O_CREATE|O_EXCL` semantics; symlinks are rejected and atomic publication fails closed with `ErrSSTableExists` if the destination path appears concurrently. IND-H-006 proof in `sec_ind_h006_test.go` verifies predictable-name squats (regular or symlink) are ignored and rapid symlink churn during 10 flushes causes no stall, redirect, or victim modification.
   3. *Sparse Index Key Separation*: `BlockIndex.FindBlock` and `IndexBuilder.FindBlock` explicitly compare bare `targetUserKey` slices against `entry.UserKey()`, eliminating heuristic type guessing and preventing false `ErrKeyNotFound` errors for binary keys.
   4. *Representation Boundary Decoupling*: `MaxUserKeyLen` is bounded at 65,535 bytes, while `MaxEncodedInternalKeyLen` is bounded at 65,544 bytes ($65,535 + 9$).
   5. *Default Metadata Redaction*: `InternalKey.String()` is safe by default and returns redacted metadata. Explicit `DebugString()` is available for forensic inspection.
@@ -426,7 +426,7 @@ This document tracks all **genuine architectural and operational limitations** o
 * **Limitation**: In `P06-S01-M02`, `ManifestWriter` implements the durable append-only write path for CRC32-framed `VersionEdit` records with `fdatasync()` synchronization, but the active manifest pointer (`CURRENT`), multi-version reference counting (`VersionSet`), and startup recovery replay engine are intentionally excluded and reserved for subsequent phases.
 * **Why It Exists**: Hard scope boundary enforcement. Atomic pointer swaps (`CURRENT` via `P06-S02-M01`), `VersionSet` reference counting (`P06-S02-M02`), and recovery log replay (`P07-S01`) build directly on top of this established append-only log primitive.
 * **Impact**: MANIFEST files are durably written and framed with CRC32 integrity checks, but state reconstruction upon database startup will be completed in Phase 07.
-* **Current Mitigation**: Comprehensive independent test oracle and corruption test suite in `manifest_writer_test.go` verifying record framing, CRC32 protection, truncation detection, and bit-rot rejection across 50-edit sequences and restart reopens.
+* **Current Mitigation**: Comprehensive independent test oracle and corruption test suite in `manifest_writer_test.go` verifying record framing, CRC32 protection, truncation detection, and bit-rot rejection across 50-edit sequences and restart reopens. IND-C-002 proof in `sec_ind_c002_test.go` verifies the writer performs no rotation (no Stat → Remove → Rename path): decoy `MANIFEST.old/.tmp/.bak` symlinks are never followed or replaced and symlink-at-managed-path opens fail closed. IND-M-005 proof in `sec_ind_m005_test.go` verifies the log is always a complete CRC-valid watermark-ordered prefix across close/reopen, and that barrier failure poisons fail-closed with the record still fully framed (replay converges by idempotent re-application from the watermark; see `ManifestWriter` contract item 10).
 * **Dimensional Impact**:
   * Correctness: **Optimal** (Exact-byte fixtures, 100% test pass, poison state machine).
   * Performance: **Optimal** (~1,059 ns/op framing CPU latency; hardware NVMe flush dominates at ~3.6 ms).
@@ -438,7 +438,8 @@ This document tracks all **genuine architectural and operational limitations** o
 * **Limitation**: In `P06-S02-M01`, `SetCurrentManifest` establishes the atomic and crash-safe filesystem pointer swapping mechanism (`CURRENT.tmp` $\to$ `CURRENT`) with directory synchronization, but active manifest discovery, pointer parsing upon startup, and `VersionSet` version tracking are intentionally excluded and reserved for subsequent phases (`P06-S02-M02` and `P07-S01-M01`).
 * **Why It Exists**: Hard scope boundary enforcement. The storage engine requires an atomic, uncorruptible pointer primitive on disk before building high-level version reference counting (`VersionSet`) and crash recovery replay engines (`P07-S01`).
 * **Impact**: `CURRENT` can be safely created and atomically replaced on disk without risk of torn pointers, but automatic boot discovery and manifest replay will be implemented in Phase 07.
-* **Current Mitigation**: Comprehensive test suite in `current_test.go` simulating power interruptions across all failure points (write failure, short write, sync failure, close failure, rename failure, directory sync failure) proving that prior valid `CURRENT` files remain strictly intact.
+* **Current Mitigation**: Comprehensive test suite in `current_test.go` simulating power interruptions across all failure points (write failure, short write, sync failure, close failure, rename failure, directory sync failure) proving that prior valid `CURRENT` files remain strictly intact. `sec_ind_c001_test.go` (`TestINDC001_*`) proves the IND-C-001 ordering invariant (file-sync → rename → exactly-once parent dir-sync) and the dir-sync-failure contract (`ErrCurrentDirectorySync`, renamed pointer preserved, no staging residue).
+* **Durability Modes**: Default file barrier is `fdatasync` on Linux (`f.Sync` fallback elsewhere) for lower latency; `version.SetCurrentStrictSync(true)` opts into a full `f.Sync`/`fsync` file barrier at higher I/O cost. The parent-directory barrier always runs after rename in both modes.
 * **Dimensional Impact**:
   * Correctness: **Optimal** (Atomic rename atomicity guarantees zero torn pointers).
   * Performance: **Optimal** (~118 µs without sync; ~8.53 ms with double hardware barrier: file `fdatasync` + directory `fsync`).
@@ -462,7 +463,7 @@ This document tracks all **genuine architectural and operational limitations** o
 * **Limitation**: In `P06-S02-M03`, `Version` and `VersionSet` establish the in-memory metadata snapshot ownership layer with atomic reference counting (`Ref()`, `Unref()`, `TryRef()`) and an active circular doubly-linked version chain, but manifest log replaying (`Phase 07`), `VersionEdit` delta application to construct versions from disk, compaction scoring (`Phase 08`), and physical SSTable file unlinking are deliberately excluded.
 * **Why It Exists**: Strict architectural separation of concerns. Reference counting establishes the lifetime and pinning boundary for immutable metadata in RAM. Physical SSTable deletion is a dangerous disk-level operation that must only occur after the storage engine's compaction coordinator verifies that no live Version references the file.
 * **Impact**: Versions can be created, installed into `VersionSet`, pinned by concurrent readers, superseded by newer versions, and safely finalized (unlinked and cleared from memory) when reference counts hit 0, but disk recovery and physical file deletion will be wired in Phases 07 and 08.
-* **Current Mitigation**: Strict atomic compare-and-swap state transitions prevent resurrection from 0 and underflow on double Unref, while defensive cloning in `NewVersion` guarantees complete immutability. Compactor retention is simulated in unit tests proving that obsolete resources remain retained while older versions are pinned by readers.
+* **Current Mitigation**: Strict atomic compare-and-swap state transitions prevent resurrection from 0 and underflow on double Unref, while defensive cloning in `NewVersion` guarantees complete immutability. Compactor retention is simulated in unit tests proving that obsolete resources remain retained while older versions are pinned by readers. IND-H-003 proof in `sec_ind_h003_test.go` replays the audit's use-after-free interleaving (pin → supersede → use) proving the pinned version survives with exact refcount accounting and exactly-once cleanup, plus a pin-vs-install race under `-race`. IND-H-004 proof in `sec_ind_h004_test.go` shows no iterator-invalidation callback is needed because the pin is the guard: held `Files()` snapshots stay fully decodable across supersede, are defensively copied, and unpinned versions reclaim deterministically exactly once (never dangling). IND-H-008 proof in `sec_ind_h008_test.go` hand-encodes the audit's malicious wire bytes (smallest=100 > largest=50) proving decode rejects with `ErrInvalidSeqNumRange` and nil edit, with a valid control proving the harness.
 * **Dimensional Impact**:
   * Correctness: **Optimal** (Lock-free atomic pinning; 0 data races under `-race`).
   * Performance: **Optimal** (~7.8 ns/op `Ref`/`Unref`; ~7.8 ns/op `Current()` pinning; 0 heap allocs).
@@ -630,7 +631,8 @@ This document tracks all **genuine architectural and operational limitations** o
   - *Concurrent Maximum-Collision*: `TestSEC005_ConcurrentCollision` launches 50 concurrent goroutines against `MaxInt32 - 1`; exactly 1 acquires the reference, 49 fail cleanly, and final count is exactly `MaxInt32`.
   - *Concurrent Stress*: `TestSEC005_ConcurrentStress` exercises 3,200 mixed TryRef/Unref operations near the maximum boundary under `-race` with 0 races and exact count retention.
   - *Arithmetic Safety Property*: `TestSEC005_Property_ArithmeticSafety` validates mathematical invariants across all representative states.
-  - *Benchmarks*: `BenchmarkVersion_RefUnref` confirms 8.05 ns/op, 0 B/op, 0 allocs/op (zero measurable overhead).
+   - *Benchmarks*: `BenchmarkVersion_RefUnref` confirms 8.05 ns/op, 0 B/op, 0 allocs/op (zero measurable overhead).
+   - *IND-M-001 proof*: `sec_ind_m001_test.go` verifies 100k balanced Ref/Unref cycles never drift or wrap negative, and the MaxInt64 cap rejects (Ref panics, TryRef refuses) without wraparound while staying live under Unref.
 * **Remaining Scope Boundary**:
   - Remediates Version refcount overflow (F-005). Does not modify TableWriter symlink checks (F-006) or TableReader path checks (F-007).
 * **Dimensional Impact**:
@@ -691,7 +693,7 @@ This document tracks all **genuine architectural and operational limitations** o
   - *Missing File*: `TestSEC007_MissingFile_OrdinaryNotFound` preserves `os.IsNotExist`.
   - *Permission Failure*: `TestSEC007_PermissionFailure_Preserved` preserves `os.IsPermission`.
   - *Corruption Handlers*: `TestSEC007_MalformedSSTable_CorruptionPreserved` verifies truncated footers and bad magic are rejected cleanly.
-  - *Descriptor Leak Prevention*: `TestSEC007_DescriptorLeakPrevention` asserts 0 leaked descriptors across all failure paths.
+   - *Descriptor Leak Prevention*: `TestSEC007_DescriptorLeakPrevention` asserts 0 leaked descriptors across all failure paths. IND-M-002 proof in `sec_ind_m002_test.go` asserts `/dev/fd` count is unchanged across 400 validation-failed opens and 50 post-open-hook-failed opens.
   - *Concurrent Path Mutation*: `TestSEC007_ConcurrentPathMutation` runs concurrent goroutines swapping path between valid file, symlink, and evil payload while multiple readers query, confirming 0 races and 0 bad reads.
   - *Object Identity Matrix*: `TestSEC007_ObjectIdentityMatrix` verifies canonical absolute, relative, redundant separators, leaf symlinks, and intermediate symlinks.
   - *Fuzz Testing*: `FuzzNewTableReader_Paths` executed 1.47M+ iterations with 0 crashes, 0 panics, 0 descriptor leaks.

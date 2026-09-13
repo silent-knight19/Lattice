@@ -120,7 +120,7 @@ Many junior software engineering portfolios rely on superficial wrappers: deploy
 3. **Distributed Systems Invariants**: Master state machine replication, consensus safety invariants, term epochs, leader leases, quorum intersection math, and network failure modes.
 
 ### 3.2 Engineering & Production Goals
-1. **Deterministic Durability**: Zero data loss upon abrupt process termination (`SIGKILL`) or simulated power failures.
+1. **Deterministic Durability**: Zero data loss for acknowledged (synced) writes upon abrupt process termination (`SIGKILL`). Durability scope: Linux with a journaling filesystem after a successful `fdatasync()` barrier; subject to storage controller-cache behavior on true power loss and to the rotation dir-entry window documented in `docs/known-limitations.md` (#11, #13, #15). Darwin/Windows builds fall back to `f.Sync()`.
 2. **Predictable Tail Latency**: Prevent write stalls during background compaction through dynamic backpressure and rate-limiting heuristics.
 3. **Rigorous Testability**: Support deterministic crash injection, property-based storage invariants, fuzz testing of raw binary frames, and network partition chaos testing.
 4. **Transparent Benchmarkability**: Provide a high-throughput load generator outputting P50, P90, P99, and P99.9 latencies, allocations/op, and system call efficiency.
@@ -164,7 +164,7 @@ The engine exposes five canonical operations over TCP:
 2. **Key Constraints**: $1 \text{ byte} \le \text{Key Length} \le 65,535 \text{ bytes (64 KB)}$. Empty keys are rejected with `ErrEmptyKey`.
 3. **Value Constraints**: $0 \text{ bytes} \le \text{Value Length} \le 4,194,304 \text{ bytes (4 MB)}$. Zero-length values are legal (valueless markers).
 4. **Idempotent Batch Writes**: Batches are all-or-nothing. A crash during a batch application never applies partial updates.
-5. **Crash Recovery Guarantee**: When the server restarts after an ungraceful crash, the database recovers to the exact sequence of all acknowledged writes.
+5. **Crash Recovery Guarantee**: When the server restarts after an ungraceful crash, the database recovers to the exact sequence of all acknowledged (successfully synced) writes, subject to the durability scope in §3.2 and `docs/known-limitations.md` (#11, #15). Full startup replay wiring is Phase 07 scope.
 6. **Graceful Shutdown**: `SIGINT` / `SIGTERM` signals cause the engine to halt accepting new ingress network connections, flush the active MemTable, sync the `MANIFEST`, and cleanly close all file descriptors.
 
 ---
@@ -173,7 +173,7 @@ The engine exposes five canonical operations over TCP:
 
 ### 7.1 Durability Invariants
 * **Strict Durability Mode**: Every `PUT` / `BATCH` invokes `fdatasync()` on the WAL file descriptor before returning an acknowledgement to the client.
-* **Group Commit Mode (Default)**: Concurrently queued writes are batched into a single OS write and synchronous `fdatasync()`. Latency is bounded by a micro-timer ($\le 2 \text{ ms}$) or batch size threshold (e.g. 64 KB).
+* **Group Commit Mode (Default)**: Concurrently queued writes are batched into a single OS write and synchronous `fdatasync()`. Design-target latency bound: micro-timer ($\le 2 \text{ ms}$) or batch size threshold (e.g. 64 KB). Current implementation (`P02-S04`) coalesces on demand — draining up to 1024 tasks / 64 KiB with no linger timer — so serial workloads form singleton batches at raw sync latency; see `docs/known-limitations.md` (#13).
 
 ### 7.2 Read Invariants (Point-in-Time Consistency)
 * Reads observe monotonic progress: once a write $W_1$ is acknowledged, no subsequent read can observe a state prior to $W_1$.
@@ -405,7 +405,7 @@ sequenceDiagram
     Net->>Disp: Decode Frame & Validate
     Disp->>GC: Enqueue Write Task
 
-    Note over GC: Wait up to 2ms or<br/>batch size >= 64KB
+    Note over GC: Design target — wait up to 2ms or<br/>batch size >= 64KB (current: on-demand drain, see #13)
     GC->>WAL: Write Batched Binary Records
     WAL->>Disk: OS write() to Page Cache
     WAL->>Disk: fdatasync() flush to storage media
@@ -426,7 +426,7 @@ sequenceDiagram
 3. **Queue Enqueue**: The goroutine constructs a `writeTask` and enqueues it onto the lock-free Group Commit queue.
 4. **Cooperative Batching**: A designated leader goroutine drains up to $N=1024$ pending writes or $64\text{KB}$ of data from the queue into a contiguous memory buffer.
 5. **Sequential Log Append**: The leader calls `file.Write(coalescedBuffer)` on the active WAL file descriptor.
-6. **Hardware Barrier (`fdatasync`)**: The leader issues an OS system call `fdatasync()` ensuring all bytes leave the OS page cache and are safely committed to non-volatile physical storage.
+6. **Hardware Barrier (`fdatasync`)**: The leader issues an OS system call `fdatasync()` ensuring all bytes leave the OS page cache and reach the storage device (durable subject to device controller-cache behavior on true power loss; see §3.2 scope). On non-Linux platforms the barrier falls back to `f.Sync()`.
 7. **MemTable Insertion**: Upon sync return, the writes are inserted in ascending sequence number order into the concurrent SkipList.
 8. **Client Acknowledgement**: The leader signals completion to all follower goroutines via their individual response channels; each writes back a success frame to its respective TCP connection.
 
@@ -549,7 +549,7 @@ graph TD
 ### 17.1 `fsync()` vs `fdatasync()`
 * `fsync(fd)` flushes both modified file data and all associated inode metadata (file modification time, file size, access permissions). This frequently requires two separate physical head seeks or flash writes.
 * `fdatasync(fd)` flushes exclusively the modified data bytes and only updates inode metadata if the file length itself has changed.
-* **Lattice Decision**: Lattice utilizes `fdatasync()` for WAL appends. Since WAL files are pre-allocated in fixed chunks ($64\text{MB}$), the file length remains constant during logging, reducing I/O operations and disk latency.
+* **Lattice Decision**: Lattice utilizes `fdatasync()` for WAL appends. WAL segments currently grow via `O_APPEND` with rotation at a 64 MB threshold (`P02-S02`); fixed-chunk `fallocate()` pre-allocation (which would hold file length constant during logging and skip inode metadata syncs) remains a conditional future optimization, not current behavior. See `docs/known-limitations.md` (#15).
 
 ---
 
@@ -1004,13 +1004,13 @@ stateDiagram-v2
 
 | Failure Mode | Direct Impact | System Behavior & Automated Recovery Path | Data Loss Risk |
 | :--- | :--- | :--- | :--- |
-| **Process Crash (`SIGKILL`)** | Process terminates instantly; dirty memory buffers in RAM are erased. | On reboot, engine reads `CURRENT`, replays the active `MANIFEST` to reconstruct SSTables, and iterates the WAL to reconstruct un-flushed MemTable entries. | **Zero Data Loss** |
-| **Power Outage / Kernel Panic** | OS dirty page cache lost instantly; storage media write caches tested. | Pre-allocated WAL records that were acknowledged relied on explicit `fdatasync()`. Torn tail writes are detected via CRC32 check and truncated cleanly. | **Zero Data Loss** for acknowledged writes |
+| **Process Crash (`SIGKILL`)** | Process terminates instantly; dirty memory buffers in RAM are erased. | On reboot, engine reads `CURRENT`, replays the active `MANIFEST` to reconstruct SSTables, and iterates the WAL to reconstruct un-flushed MemTable entries (replay wiring: Phase 07). | **Zero Data Loss** for acknowledged (synced) writes; unacknowledged in-flight writes are lost |
+| **Power Outage / Kernel Panic** | OS dirty page cache lost instantly; storage media write caches tested. | WAL records that were acknowledged relied on explicit `fdatasync()`. Torn tail writes are detected via CRC32 check and truncated cleanly. | **Zero Data Loss** for acknowledged writes within the §3.2 scope (device controller cache and non-journaled filesystems excluded) |
 | **SSTable Disk Corruption** | Physical flash bit rot alters bytes within an SSTable data block. | Reader verifies block CRC32 before decompression. CRC mismatch triggers `ErrChecksumMismatch`. In V1.1, the corrupted block is recovered from a replica. | Isolated to unreadable key range |
-| **Crash During Compaction** | Compaction worker terminates mid-merge; partially written SSTables remain. | Partial SSTables are not referenced in the `MANIFEST`. On restart, the `MANIFEST` remains at its previous atomic `Version`; orphaned `.tmp` files are cleaned by GC. | **Zero Data Loss** |
-| **Follower Node Crash** | Cluster drops from $N=3$ to $N=2$ active nodes. | Leader continues servicing writes because $2 > \lfloor 3/2 \rfloor$ (majority quorum intact). Heartbeats retry connection to follower. | **Zero Data Loss** |
-| **Leader Node Crash** | Cluster loses active coordinator. | Heartbeats stop. Follower election timers expire ($150-300\text{ms}$). A follower with the most up-to-date log wins election and becomes new Leader. | **Zero Data Loss** |
-| **Network Partition (Split-Brain)** | Network splits into Minority ($N=1$) and Majority ($N=2$) partitions. | Minority leader cannot achieve quorum ($1 < 2$) on writes; writes stall or fail. Majority partition elects new leader and accepts writes safely. | **Zero Data Loss** |
+| **Crash During Compaction** | Compaction worker terminates mid-merge; partially written SSTables remain. | Partial SSTables are not referenced in the `MANIFEST`. On restart, the `MANIFEST` remains at its previous atomic `Version`; leftover staging files are removed by per-operation cleanup, with crash-window orphan sweeping at startup (Phase 07). | **Zero Data Loss** for committed state |
+| **Follower Node Crash** *(V1.1 Raft blueprint — not implemented)* | Cluster drops from $N=3$ to $N=2$ active nodes. | Leader continues servicing writes because $2 > \lfloor 3/2 \rfloor$ (majority quorum intact). Heartbeats retry connection to follower. | **Zero Data Loss** (design target) |
+| **Leader Node Crash** *(V1.1 Raft blueprint — not implemented)* | Cluster loses active coordinator. | Heartbeats stop. Follower election timers expire ($150-300\text{ms}$). A follower with the most up-to-date log wins election and becomes new Leader. | **Zero Data Loss** (design target) |
+| **Network Partition (Split-Brain)** *(V1.1 Raft blueprint — not implemented)* | Network splits into Minority ($N=1$) and Majority ($N=2$) partitions. | Minority leader cannot achieve quorum ($1 < 2$) on writes; writes stall or fail. Majority partition elects new leader and accepts writes safely. | **Zero Data Loss** (design target) |
 
 ---
 
@@ -1403,7 +1403,7 @@ This section provides a study guide designed to prepare you for technical interv
 > **Model Answer**: "Because SSTables store sorted keys, consecutive keys often share long common prefixes (e.g., `user:10001:profile` and `user:10001:settings`). By storing only the shared prefix length, unshared delta bytes, and value length, we substantially reduce the on-disk footprint and maximize the number of records fitting into a 4KB block. Every 16 records, a restart point with zero shared prefix is established to allow binary search without scanning from the start of the block."
 
 ##### Q9: What happens if the machine crashes while an SSTable is being written?
-> **Model Answer**: "SSTables are written with temporary filenames (e.g., `000042.sst.tmp`). Only after all data blocks, filter blocks, index blocks, and the 48-byte footer are written and synced to disk via `fdatasync()` is the file atomically renamed to `000042.sst`. Furthermore, the file is not recognized as part of the database state until an atomic `VersionEdit` record is appended and synced to the `MANIFEST` file. On startup, unreferenced `.tmp` files are identified and deleted by garbage collection."
+> **Model Answer**: "SSTables are staged via randomized `CreateTemp` files (e.g., `.tmp_000042.sst_*`). Only after all data blocks, filter blocks, index blocks, and the 48-byte footer are written and synced to disk via `fdatasync()` is the file atomically published via `link(2)+unlink` (which fails closed if the destination exists — never a replacing rename), followed by a parent-directory sync. Furthermore, the file is not recognized as part of the database state until a `VersionEdit` record is appended and synced to the `MANIFEST` file. Staging is cleaned up on every failure path; crash-window leftovers are swept at startup (Phase 07 scope)."
 
 ##### Q10: How does the sparse block index work in an SSTable?
 > **Model Answer**: "Instead of indexing every individual key, Lattice indexes only the last (largest) key of each 4KB data block along with its file offset and size. To look up a key, the reader loads the in-memory index block and executes a binary search to find the first block whose largest key is $\ge$ the target key. It then loads that single 4KB block and searches internally. This reduces the index memory footprint by over 95%."
@@ -1413,7 +1413,7 @@ This section provides a study guide designed to prepare you for technical interv
 #### Category 2: Operating Systems, I/O & Durability
 
 ##### Q11: Explain the exact behavior of `fsync()` vs `fdatasync()`.
-> **Model Answer**: "`fsync(fd)` flushes all modified in-core data pages to persistent storage along with all file metadata changes, such as modification timestamps and access permissions, which often forces two separate physical disk operations. `fdatasync(fd)` flushes only the modified data pages and only updates metadata if the physical file size has changed. Lattice uses `fdatasync()` for WAL appends on pre-allocated files, eliminating metadata write overhead."
+> **Model Answer**: "`fsync(fd)` flushes all modified in-core data pages to persistent storage along with all file metadata changes, such as modification timestamps and access permissions, which often forces two separate physical disk operations. `fdatasync(fd)` flushes only the modified data pages and only updates metadata if the physical file size has changed. Lattice uses `fdatasync()` for WAL appends (which currently grow via `O_APPEND` with rotation at 64 MB); fixed-chunk `fallocate()` pre-allocation that would hold file size constant is a future optimization, not current behavior."
 
 ##### Q12: What is Group Commit, and how does your implementation work?
 > **Model Answer**: "Calling `fdatasync()` for every individual write limits throughput to disk IOPS (typically $1\text{k}-5\text{k}$ writes/sec on NVMe). Group Commit amortizes this cost by coalescing concurrent write requests from multiple goroutines into a single batched `fdatasync()`. A leader goroutine drains the queue, copies pending records into a contiguous buffer, issues one sequential write, calls `fdatasync()`, and notifies all waiting goroutines. This boosts throughput to over $80\text{k}$ writes/sec while maintaining crash durability."
@@ -1425,13 +1425,13 @@ This section provides a study guide designed to prepare you for technical interv
 > **Model Answer**: "When an application writes to a file, the data initially enters the kernel page cache as dirty pages. The kernel flushes dirty pages lazily via background flusher threads. While this makes asynchronous writes fast, uncommitted pages are lost on power failure. Additionally, large sequential scans during compaction can pollute the page cache by evicting hot application blocks. Lattice uses `fdatasync()` on write paths for durability and issues `posix_fadvise(DONTNEED)` during compaction to prevent cache pollution."
 
 ##### Q15: Why pre-allocate WAL files instead of dynamically appending to them?
-> **Model Answer**: "Dynamic appends continuously alter the file size in the inode metadata, forcing the operating system to update both data blocks and inode structures. Pre-allocating files in fixed chunks ($64\text{MB}$) via `fallocate()` ensures that the file size remains constant during logging, allowing `fdatasync()` to write only data pages without triggering inode metadata syncs."
+> **Model Answer**: "Dynamic appends continuously alter the file size in the inode metadata, forcing the operating system to update both data blocks and inode structures. Pre-allocating files in fixed chunks ($64\text{MB}$) via `fallocate()` would ensure that the file size remains constant during logging, allowing `fdatasync()` to write only data pages without triggering inode metadata syncs. This is the design rationale and a future optimization: current WAL segments grow via `O_APPEND` with rotation at a 64 MB threshold (see `docs/known-limitations.md` #15)."
 
 ##### Q16: What is the role of the `MANIFEST` file, and why is it structured as an append-only log?
 > **Model Answer**: "The `MANIFEST` records the state transitions of the database: which SSTables were added or deleted at each level, the active sequence number, and the active WAL segment. Storing it as an append-only log of `VersionEdit` records makes state transitions atomic and crash-resilient. Rewriting the entire metadata state on every flush or compaction would risk corruption during crashes; with an append-only log, recovery simply replays the edits from start to finish."
 
 ##### Q17: What is the purpose of the `CURRENT` file?
-> **Model Answer**: "Over time, the `MANIFEST` log grows and is periodically rolled over into a new file. The `CURRENT` file is a small text pointer containing the filename of the active `MANIFEST`. When the database boots, it reads `CURRENT` first to determine which `MANIFEST` file to replay. Updates to `CURRENT` are written to a temporary file, flushed, and atomically swapped using `os.Rename()`."
+> **Model Answer**: "Over time, the `MANIFEST` log grows and is periodically rolled over into a new file. The `CURRENT` file is a small text pointer containing the filename of the active `MANIFEST`. When the database boots, it reads `CURRENT` first to determine which `MANIFEST` file to replay. Updates to `CURRENT` are written to a temporary file with `O_EXCL`, flushed via `fdatasync()` (full `fsync` opt-in available), and atomically swapped using `os.Rename()` followed by a parent-directory sync."
 
 ##### Q18: What are CPU memory barriers, and where are they relevant in Go?
 > **Model Answer**: "Modern CPUs execute instructions out of order and utilize store buffers, meaning memory writes made by one core may not be immediately visible to other cores in the same order. In Go, the `sync/atomic` package and synchronization primitives establish acquire-release memory barriers, ensuring that pointer assignments (such as swapping the active `Version`) are globally visible to reader goroutines without race conditions."
@@ -1566,7 +1566,7 @@ For an entry-level candidate targeting tier-1 technology companies (Google, Meta
 #### Option A: Storage Systems Focus
 > * **Lattice | Distributed Key-Value Storage Engine (Go)**
 >   * Engineered a persistent LSM-Tree storage engine from scratch in Go, achieving **$80\text{k}+$ write ops/sec** and **$120\text{k}+$ read ops/sec** on NVMe SSDs.
->   * Designed an append-only Write-Ahead Log (WAL) with cooperative **Group Commit** batching and `fdatasync()` boundaries, guaranteeing zero data loss across ungraceful process terminations.
+>   * Designed an append-only Write-Ahead Log (WAL) with cooperative **Group Commit** batching and `fdatasync()` boundaries, guaranteeing zero data loss for acknowledged (synced) writes across ungraceful process terminations (Linux/journaling FS scope; see `docs/known-limitations.md` #15).
 >   * Implemented custom immutable **SSTable file layouts** with two-level sparse block indexing, prefix compression, and **Murmur3 Bloom filters**, eliminating 99% of unnecessary disk I/O on cold lookups.
 >   * Built an asynchronous **Leveled Compaction subsystem** using a multi-way merge priority queue, bounding space amplification to $1.2\times$ and eliminating obsolete revisions and tombstones.
 

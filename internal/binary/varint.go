@@ -210,4 +210,3 @@ func GetVarint32Canonical(buf []byte) (uint32, int, error) {
 	}
 	return val, n, nil
 }
-

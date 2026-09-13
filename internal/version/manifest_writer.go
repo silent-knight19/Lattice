@@ -90,6 +90,24 @@ func ManifestPath(dbPath string, manifestNum uint64) string {
 //  8. Resource Ownership:
 //     Owns the underlying *os.File descriptor. Close() flushes, synchronizes, and cleanly
 //     closes the descriptor.
+//  9. No Rotation Path (IND-C-002):
+//     This type performs no MANIFEST rotation: there is no Stat -> Remove -> Rename
+//     sequence and no handling of MANIFEST.old / MANIFEST.tmp sibling paths. All
+//     writes go to the pinned open file descriptor, so a symlink planted at any
+//     sibling path cannot redirect appends. Future rotation (Phase 07+) MUST NOT
+//     introduce remove-then-rename; it must use exclusive creation (O_EXCL),
+//     link(2)+unlink publication with ErrExist fail-closed semantics, and a
+//     parent-directory sync — mirroring the SSTable TableWriter publication.
+//  10. Crash-Window Contract for Phase 07 Replay (IND-M-005):
+//     Each LogEdit is per-record atomic: the logical offset and record counter
+//     advance only after the full record is written AND the sync barrier succeeds.
+//     Any write/sync failure poisons the writer (fail-closed, no half-advanced
+//     state). The durable log is therefore always a complete, CRC-verified prefix
+//     of acknowledged edits. A crash between a MANIFEST append and the in-memory
+//     VersionSet update can leave at most the acknowledged-but-unapplied suffix;
+//     Phase 07 replay resolves it by re-applying from the last applied watermark
+//     and MUST be idempotent over that suffix (re-applying an already-applied
+//     edit must be a no-op, never a double-delete or duplicate-add).
 type ManifestWriter struct {
 	mu          sync.Mutex
 	file        *os.File
