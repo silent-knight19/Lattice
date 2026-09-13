@@ -153,7 +153,11 @@ func TestIND001_TornTailAtEOFRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenReader failed: %v", err)
 	}
-	defer func() { _ = reader.Close() }()
+	defer func() {
+		if err := reader.Close(); err != nil {
+			t.Errorf("reader Close failed: %v", err)
+		}
+	}()
 
 	replayed1, err := reader.Next()
 	if err != nil || !replayed1.Equal(r1) {
