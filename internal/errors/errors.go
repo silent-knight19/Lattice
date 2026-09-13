@@ -204,6 +204,12 @@ var (
 	// (e.g. granting group or other permissions, or execution bits).
 	ErrInsecureFileMode = stdErrors.New("insecure file mode: permissions must not grant group/other access or execute bits")
 
+	// ErrParentDirectorySymlink indicates that the SSTable parent directory (or an intermediate path component) is a symlink.
+	ErrParentDirectorySymlink = stdErrors.New("parent directory is a symlink")
+
+	// ErrParentDirectorySwapped indicates that the SSTable parent directory was replaced or redirected to a different object.
+	ErrParentDirectorySwapped = stdErrors.New("parent directory swapped or replaced")
+
 	// ErrWriterPoisoned indicates that an operation was attempted on a WAL writer
 	// that entered an unrecoverable poisoned state following a write or sync failure.
 	ErrWriterPoisoned = stdErrors.New("wal writer is poisoned")

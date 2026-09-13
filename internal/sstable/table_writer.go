@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/silent-knight19/lattice/internal/binary"
@@ -142,12 +143,17 @@ type TableWriter struct {
 	state writerState
 	err   error
 
+	parentDirFile *os.File
+	parentDirStat os.FileInfo
+
 	// Test seams for deterministic fault injection
-	writeFn   func(f *os.File, p []byte) (int, error)
-	syncFn    func(f *os.File) error
-	closeFn   func(f *os.File) error
-	syncDirFn func(dirPath string) error
-	linkFn    func(oldname, newname string) error
+	writeFn       func(f *os.File, p []byte) (int, error)
+	syncFn        func(f *os.File) error
+	closeFn       func(f *os.File) error
+	syncDirFn     func(dirPath string) error
+	syncDirFileFn func(f *os.File) error
+	linkFn        func(oldname, newname string) error
+	preLinkHookFn func() error
 }
 
 // NewTableWriter initializes a TableWriter to write an SSTable to dstPath using a secure staging file.
@@ -157,11 +163,13 @@ func NewTableWriter(dstPath string, opts TableWriterOptions) (*TableWriter, erro
 		return nil, os.ErrInvalid
 	}
 
+	cleanDst := filepath.Clean(dstPath)
+
 	// Reject overwriting an existing finalized SSTable or symlink
-	if _, err := os.Lstat(dstPath); err == nil {
+	if _, err := os.Lstat(cleanDst); err == nil {
 		return nil, errors.ErrSSTableExists
 	} else if !os.IsNotExist(err) {
-		return nil, fmt.Errorf("failed to check destination path %q: %w", dstPath, err)
+		return nil, fmt.Errorf("failed to check destination path %q: %w", cleanDst, err)
 	}
 
 	if opts.TargetBlockSize <= 0 {
@@ -178,25 +186,86 @@ func NewTableWriter(dstPath string, opts TableWriterOptions) (*TableWriter, erro
 		}
 	}
 
-	parentDir := filepath.Dir(dstPath)
+	parentDir := filepath.Dir(cleanDst)
+
+	// Validate intermediate path components that already exist
+	if err := validatePathNoSymlinks(parentDir); err != nil {
+		return nil, err
+	}
+
+	// Check if parentDir already exists as a symlink or non-directory
+	if fi, err := os.Lstat(parentDir); err == nil {
+		if !isSystemSymlinkPrefix(parentDir) && fi.Mode()&os.ModeSymlink != 0 {
+			return nil, errors.ErrParentDirectorySymlink
+		}
+		if !fi.IsDir() {
+			return nil, &errors.NotADirectoryError{Path: parentDir, Mode: fi.Mode()}
+		}
+	}
+
 	if err := os.MkdirAll(parentDir, DefaultDirMode); err != nil {
 		return nil, err
+	}
+
+	// Inspect created/existing parent directory with Lstat (no symlink following)
+	pLstat, err := os.Lstat(parentDir)
+	if err != nil {
+		return nil, err
+	}
+	if !isSystemSymlinkPrefix(parentDir) && pLstat.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.ErrParentDirectorySymlink
+	}
+	if !pLstat.IsDir() {
+		return nil, &errors.NotADirectoryError{Path: parentDir, Mode: pLstat.Mode()}
+	}
+
+	// Secure directory descriptor acquisition:
+	// Open the parent directory handle and verify via os.SameFile that the opened descriptor
+	// references the exact inode observed by Lstat (not an attacker-substituted symlink or file).
+	parentFile, err := os.Open(parentDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open parent directory %q: %w", parentDir, err)
+	}
+	parentStat, err := parentFile.Stat()
+	if err != nil {
+		_ = parentFile.Close()
+		return nil, fmt.Errorf("failed to stat open parent directory %q: %w", parentDir, err)
+	}
+	if !parentStat.IsDir() {
+		_ = parentFile.Close()
+		return nil, &errors.NotADirectoryError{Path: parentDir, Mode: parentStat.Mode()}
+	}
+	if !os.SameFile(parentStat, pLstat) {
+		_ = parentFile.Close()
+		return nil, errors.ErrParentDirectorySwapped
 	}
 
 	// Secure staging file creation:
 	// Use os.CreateTemp with O_CREATE|O_EXCL semantics in the same parent directory.
 	// This prevents predictable staging collisions, symlink hijacking, and TOCTOU overwrites.
-	file, err := os.CreateTemp(parentDir, fmt.Sprintf(".tmp_%s_*", filepath.Base(dstPath)))
+	file, err := os.CreateTemp(parentDir, fmt.Sprintf(".tmp_%s_*", filepath.Base(cleanDst)))
 	if err != nil {
+		_ = parentFile.Close()
 		return nil, err
 	}
 	tmpPath := file.Name()
+
+	// Verify that the created temporary file resides within the pinned parent directory
+	tmpDir := filepath.Dir(tmpPath)
+	tmpDirStat, err := os.Lstat(tmpDir)
+	if err != nil || !os.SameFile(parentStat, tmpDirStat) {
+		_ = file.Close()
+		_ = os.Remove(tmpPath)
+		_ = parentFile.Close()
+		return nil, errors.ErrParentDirectorySwapped
+	}
 
 	// Ensure permissions match opts.FileMode if caller specified custom mode
 	if opts.FileMode != DefaultFileMode {
 		if err := file.Chmod(opts.FileMode); err != nil {
 			_ = file.Close()
 			_ = os.Remove(tmpPath)
+			_ = parentFile.Close()
 			return nil, err
 		}
 	}
@@ -206,16 +275,19 @@ func NewTableWriter(dstPath string, opts TableWriterOptions) (*TableWriter, erro
 	if err != nil {
 		_ = file.Close()
 		_ = os.Remove(tmpPath)
+		_ = parentFile.Close()
 		return nil, err
 	}
 	if !fi.Mode().IsRegular() {
 		_ = file.Close()
 		_ = os.Remove(tmpPath)
+		_ = parentFile.Close()
 		return nil, fmt.Errorf("staging path is not a regular file")
 	}
 	if runtime.GOOS != "windows" && fi.Mode().Perm()&0077 != 0 {
 		_ = file.Close()
 		_ = os.Remove(tmpPath)
+		_ = parentFile.Close()
 		return nil, &errors.InsecureFileModeError{Mode: fi.Mode().Perm()}
 	}
 
@@ -223,11 +295,13 @@ func NewTableWriter(dstPath string, opts TableWriterOptions) (*TableWriter, erro
 	if err != nil {
 		_ = file.Close()
 		_ = os.Remove(tmpPath)
+		_ = parentFile.Close()
 		return nil, err
 	}
 	if lfi.Mode()&os.ModeSymlink != 0 || !os.SameFile(fi, lfi) {
 		_ = file.Close()
 		_ = os.Remove(tmpPath)
+		_ = parentFile.Close()
 		return nil, fmt.Errorf("staging path symlink detected")
 	}
 
@@ -235,14 +309,17 @@ func NewTableWriter(dstPath string, opts TableWriterOptions) (*TableWriter, erro
 	if err != nil {
 		_ = file.Close()
 		_ = os.Remove(tmpPath)
+		_ = parentFile.Close()
 		return nil, err
 	}
 
 	return &TableWriter{
 		opts:             opts,
-		dstPath:          dstPath,
+		dstPath:          cleanDst,
 		tmpPath:          tmpPath,
 		file:             file,
+		parentDirFile:    parentFile,
+		parentDirStat:    parentStat,
 		dataBlockBuilder: dataBuilder,
 		indexBuilder:     NewIndexBuilder(),
 		filterBuilder:    opts.FilterBuilder,
@@ -251,7 +328,8 @@ func NewTableWriter(dstPath string, opts TableWriterOptions) (*TableWriter, erro
 		writeFn:          defaultWrite,
 		syncFn:           defaultSync,
 		closeFn:          defaultClose,
-		syncDirFn:        syncDir,
+		syncDirFn:        nil,
+		syncDirFileFn:    syncDirFile,
 		linkFn:           os.Link,
 	}, nil
 }
@@ -592,16 +670,71 @@ func (w *TableWriter) Finish() (*SSTableMetadata, error) {
 
 	// 7. Atomic Publication & Directory Sync (if staging file was used)
 	if w.tmpPath != "" {
-		// Verify destination path does not already exist before atomic rename
+		if w.preLinkHookFn != nil {
+			if err := w.preLinkHookFn(); err != nil {
+				w.state = stateError
+				w.err = err
+				_ = w.cleanupStaging()
+				return nil, err
+			}
+		}
+
+		// Verify parent directory identity before publication
+		curParent := filepath.Dir(w.dstPath)
+		curParentStat, err := os.Lstat(curParent)
+		if err != nil {
+			w.state = stateError
+			w.err = fmt.Errorf("%w: failed to inspect parent directory %q: %v", errors.ErrParentDirectorySwapped, curParent, err)
+			_ = w.cleanupStaging()
+			return nil, w.err
+		}
+		if !isSystemSymlinkPrefix(curParent) && curParentStat.Mode()&os.ModeSymlink != 0 {
+			w.state = stateError
+			w.err = fmt.Errorf("%w: parent directory %q is a symlink", errors.ErrParentDirectorySymlink, curParent)
+			_ = w.cleanupStaging()
+			return nil, w.err
+		}
+		if !curParentStat.IsDir() {
+			w.state = stateError
+			w.err = fmt.Errorf("%w: parent path %q is not a directory", errors.ErrNotADirectory, curParent)
+			_ = w.cleanupStaging()
+			return nil, w.err
+		}
+		if w.parentDirStat != nil && !os.SameFile(w.parentDirStat, curParentStat) {
+			w.state = stateError
+			w.err = fmt.Errorf("%w: parent directory %q was swapped or redirected", errors.ErrParentDirectorySwapped, curParent)
+			_ = w.cleanupStaging()
+			return nil, w.err
+		}
+
+		// Verify intermediate path components have not been replaced with symlinks
+		if err := validatePathNoSymlinks(curParent); err != nil {
+			w.state = stateError
+			w.err = err
+			_ = w.cleanupStaging()
+			return nil, w.err
+		}
+
+		// Verify staging file directory identity
+		curTmpParent := filepath.Dir(w.tmpPath)
+		curTmpParentStat, err := os.Lstat(curTmpParent)
+		if err != nil || (w.parentDirStat != nil && !os.SameFile(w.parentDirStat, curTmpParentStat)) {
+			w.state = stateError
+			w.err = fmt.Errorf("%w: staging directory %q was swapped or redirected", errors.ErrParentDirectorySwapped, curTmpParent)
+			_ = w.cleanupStaging()
+			return nil, w.err
+		}
+
+		// Verify destination path does not already exist before atomic link
 		if _, err := os.Lstat(w.dstPath); err == nil {
 			w.state = stateError
 			w.err = errors.ErrSSTableExists
-			_ = os.Remove(w.tmpPath)
+			_ = w.cleanupStaging()
 			return nil, errors.ErrSSTableExists
 		} else if !os.IsNotExist(err) {
 			w.state = stateError
 			w.err = err
-			_ = os.Remove(w.tmpPath)
+			_ = w.cleanupStaging()
 			return nil, fmt.Errorf("failed to check destination path %q: %w", w.dstPath, err)
 		}
 
@@ -613,13 +746,13 @@ func (w *TableWriter) Finish() (*SSTableMetadata, error) {
 		// filesystem mount), cross-device (EXDEV) failures cannot occur. Therefore
 		// no fallback to os.Rename is needed or safe — Rename can silently replace
 		// an existing destination, violating the no-overwrite invariant.
-		err := w.linkFn(w.tmpPath, w.dstPath)
+		err = w.linkFn(w.tmpPath, w.dstPath)
 		if err == nil {
 			_ = os.Remove(w.tmpPath)
 		} else if os.IsExist(err) {
 			w.state = stateError
 			w.err = errors.ErrSSTableExists
-			_ = os.Remove(w.tmpPath)
+			_ = w.cleanupStaging()
 			return nil, errors.ErrSSTableExists
 		} else {
 			// Any other Link failure (permission denied, I/O error, etc.) is a real
@@ -627,16 +760,32 @@ func (w *TableWriter) Finish() (*SSTableMetadata, error) {
 			// reintroduce the TOCTOU race this code exists to prevent.
 			w.state = stateError
 			w.err = fmt.Errorf("atomic publication via link failed for %q: %w", w.dstPath, err)
-			_ = os.Remove(w.tmpPath)
+			_ = w.cleanupStaging()
 			return nil, w.err
 		}
 		// Publication succeeded: file is now at dstPath, staging path no longer exists
 		w.tmpPath = ""
 
-		if err := w.syncDirFn(filepath.Dir(w.dstPath)); err != nil {
+		// Directory durability sync:
+		// Synchronize the pinned parent directory descriptor directly.
+		var syncErr error
+		if w.syncDirFn != nil {
+			syncErr = w.syncDirFn(filepath.Dir(w.dstPath))
+		} else if w.parentDirFile != nil && w.syncDirFileFn != nil {
+			syncErr = w.syncDirFileFn(w.parentDirFile)
+		}
+		if syncErr != nil {
 			w.state = stateFinalized
-			w.err = err
-			return nil, fmt.Errorf("file published to %q but directory sync failed: %w", w.dstPath, err)
+			w.err = syncErr
+			if w.parentDirFile != nil {
+				_ = w.parentDirFile.Close()
+				w.parentDirFile = nil
+			}
+			return nil, fmt.Errorf("file published to %q but directory sync failed: %w", w.dstPath, syncErr)
+		}
+		if w.parentDirFile != nil {
+			_ = w.parentDirFile.Close()
+			w.parentDirFile = nil
 		}
 	}
 
@@ -671,6 +820,10 @@ func (w *TableWriter) Close() error {
 	defer w.mu.Unlock()
 
 	if w.state == stateFinalized {
+		if w.parentDirFile != nil {
+			_ = w.parentDirFile.Close()
+			w.parentDirFile = nil
+		}
 		return nil
 	}
 	if w.state == stateClosed {
@@ -681,7 +834,8 @@ func (w *TableWriter) Close() error {
 	return w.cleanupStaging()
 }
 
-// cleanupStaging closes the open file descriptor and removes the .tmp file if present.
+// cleanupStaging closes the open file descriptor, releases the pinned parent directory,
+// and removes the .tmp file if present.
 func (w *TableWriter) cleanupStaging() error {
 	var firstErr error
 	if w.file != nil {
@@ -691,11 +845,29 @@ func (w *TableWriter) cleanupStaging() error {
 		w.file = nil
 	}
 	if w.tmpPath != "" {
-		if err := os.Remove(w.tmpPath); err != nil && !os.IsNotExist(err) {
-			if firstErr == nil {
-				firstErr = err
+		// Only remove staging file if the parent directory has NOT been swapped
+		shouldRemove := true
+		if w.parentDirStat != nil {
+			curParent := filepath.Dir(w.tmpPath)
+			curParentStat, err := os.Lstat(curParent)
+			if err != nil || (!isSystemSymlinkPrefix(curParent) && curParentStat.Mode()&os.ModeSymlink != 0) || !os.SameFile(w.parentDirStat, curParentStat) {
+				shouldRemove = false
 			}
 		}
+		if shouldRemove {
+			if err := os.Remove(w.tmpPath); err != nil && !os.IsNotExist(err) {
+				if firstErr == nil {
+					firstErr = err
+				}
+			}
+		}
+		w.tmpPath = ""
+	}
+	if w.parentDirFile != nil {
+		if err := w.parentDirFile.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		w.parentDirFile = nil
 	}
 	return firstErr
 }
@@ -791,6 +963,80 @@ func syncDir(dirPath string) error {
 
 	if err := df.Sync(); err != nil && runtime.GOOS != "windows" {
 		return err
+	}
+	return nil
+}
+
+func syncDirFile(f *os.File) error {
+	if f == nil {
+		return os.ErrInvalid
+	}
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	return f.Sync()
+}
+
+func isSystemSymlinkPrefix(path string) bool {
+	if runtime.GOOS == "darwin" {
+		clean := filepath.Clean(path)
+		// Try direct match first
+		if clean == "/var" || clean == "/tmp" || clean == "/etc" {
+			return true
+		}
+		// For relative paths, resolve to absolute and check
+		abs, err := filepath.Abs(clean)
+		if err == nil {
+			if abs == "/var" || abs == "/tmp" || abs == "/etc" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// validatePathNoSymlinks inspects each existing path component from the root down to dir.
+// If any component is an unpermitted symbolic link, it returns an error wrapping ErrParentDirectorySymlink.
+// If any component is not a directory, it returns an error wrapping ErrNotADirectory.
+func validatePathNoSymlinks(dir string) error {
+	clean := filepath.Clean(dir)
+	if clean == "." || clean == "" {
+		return nil
+	}
+	vol := filepath.VolumeName(clean)
+	rest := clean[len(vol):]
+	if rest == "" || rest == string(filepath.Separator) {
+		return nil
+	}
+
+	parts := strings.Split(rest, string(filepath.Separator))
+	curr := vol
+	if strings.HasPrefix(rest, string(filepath.Separator)) {
+		curr += string(filepath.Separator)
+	}
+
+	for _, part := range parts {
+		if part == "" || part == "." {
+			continue
+		}
+		curr = filepath.Join(curr, part)
+		fi, err := os.Lstat(curr)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// Component does not exist yet (will be created by MkdirAll)
+				continue
+			}
+			return err
+		}
+		if isSystemSymlinkPrefix(curr) {
+			continue
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: path component %q is a symlink", errors.ErrParentDirectorySymlink, curr)
+		}
+		if !fi.IsDir() {
+			return fmt.Errorf("%w: path component %q is not a directory", errors.ErrNotADirectory, curr)
+		}
 	}
 	return nil
 }

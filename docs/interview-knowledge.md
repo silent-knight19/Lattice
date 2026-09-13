@@ -3117,4 +3117,26 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
+# 36. Parent Directory TOCTOU: Why Pathnames Are Not Filesystem Identities (SEC-006)
+
+### 1. Why is `filepath.Dir(dstPath)` insufficient to identify a parent directory across time, and how does this create a TOCTOU race in SSTable publication? (SEC-006 / F-006)
+* **Question**: In database storage engines, SSTable files are written to temporary staging paths and then atomically published to their final destination path. If the parent directory is referenced by `filepath.Dir(dstPath)` — a string — why is this unsafe for a multi-step publication pipeline (create temp, write data, close, link, fsync directory)?
+* **Answer**:
+  - **Pathnames Are Not Object Identities**: A pathname like `/db/sstables/level0/` is a human-readable string that the kernel resolves to an inode at each system call. Between two system calls (e.g. `os.CreateTemp(parentDir, ...)` and `os.Link(tmpPath, dstPath)`), an attacker or concurrent process can replace the directory object at that pathname:
+    1. Rename the original directory away: `os.Rename("/db/sstables/level0", "/db/sstables/level0_moved")`.
+    2. Create a symlink at the original path: `os.Symlink("/attacker_dir", "/db/sstables/level0")`.
+    3. The subsequent `os.Link(tmpPath, dstPath)` now resolves `dstPath` through the symlink to `/attacker_dir/table.sst`, publishing the SSTable into an attacker-controlled location.
+  - **The Staging → Publication → Sync Pipeline Has Multiple Resolution Points**: Each of these steps independently resolves the parent directory pathname:
+    1. `os.CreateTemp(parentDir, ...)` — resolves parentDir to create staging file.
+    2. `os.Link(tmpPath, dstPath)` — resolves `filepath.Dir(dstPath)` for the destination.
+    3. `syncDir(filepath.Dir(dstPath))` — resolves parentDir *again* to open and fsync.
+    4. `os.Remove(tmpPath)` on cleanup — resolves `filepath.Dir(tmpPath)`.
+    Any of these resolution points is a TOCTOU window.
+  - **The Solution: Object Identity Pinning**: Instead of re-resolving the pathname at each step, the writer opens a file descriptor to the parent directory at initialization (`os.Open(parentDir)` → `*os.File`), captures its `FileInfo` via `parentFile.Stat()`, and stores both. Before every security-sensitive operation, the writer re-inspects the current pathname with `os.Lstat`, asserts `os.SameFile(pinnedStat, currentStat)`, and only proceeds if the **same inode/device** is observed. If the directory was replaced, `os.SameFile` returns `false` and the operation fails closed.
+  - **Directory Sync via Pinned Descriptor**: The most elegant benefit is that `parentDirFile.Sync()` calls `fsync()` directly on the open directory file descriptor — it never re-resolves any pathname. This completely eliminates the TOCTOU window for directory synchronization.
+  - **Intermediate Path Component Validation**: A subtle attack vector is replacing an intermediate path component (e.g. `/db/sstables/` → symlink to `/attacker/sstables/`) rather than the leaf directory. The writer validates every path component from root to parent using `os.Lstat`, rejecting any unpermitted symlink, ensuring the entire path chain is under legitimate control.
+  - **Safe Cleanup Under Attack**: If the parent directory has been swapped, `os.Remove(tmpPath)` would delete a file inside the attacker's directory — potentially a critical system file with the same base name. The hardened `cleanupStaging()` verifies `os.SameFile` before any removal, refusing to operate on a redirected directory.
+
+---
+
 *End of Technical Interview Knowledge Base — Lattice v1.0.0-KNOWLEDGE-BASE*

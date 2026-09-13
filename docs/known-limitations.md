@@ -640,6 +640,28 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 41. TableWriter Parent-Directory Symlink / TOCTOU Race (SEC-006 / F-006) — REMEDIATED
+* **Limitation**: In prior implementations through Phase 06, `TableWriter` (`internal/sstable/table_writer.go`) operated exclusively on string pathnames for staging file creation, atomic publication, directory synchronization, and failure cleanup. The parent directory was referenced by `filepath.Dir(dstPath)` — a string re-resolved on every filesystem operation. Between `NewTableWriter` initialization and `Finish()` publication, an attacker or concurrent process could replace the parent directory path with a symlink or different directory object, redirect intermediate path components, or exploit cleanup operations targeting swapped directories.
+* **Root Cause**:
+  1. Treating pathname strings as stable filesystem identity references (violating TOCTOU invariant).
+  2. Re-resolving `filepath.Dir(w.dstPath)` at publication and sync time instead of pinning directory object identity.
+  3. Not validating intermediate path components for symlink injection.
+* **Remediation**:
+  1. *Parent Directory Descriptor Pinning*: `NewTableWriter` opens the parent directory, captures `parentDirFile *os.File` and `parentDirStat os.FileInfo`, validates `IsDir()` and `os.SameFile(parentStat, parentLstat)`.
+  2. *Intermediate Path Component Validation*: `validatePathNoSymlinks()` inspects every existing path component, rejecting unpermitted symlinks. macOS system symlinks (`/var`, `/tmp`, `/etc`) whitelisted.
+  3. *Pre-Publication Identity Re-Verification*: Before `linkFn`, re-verifies `os.SameFile(w.parentDirStat, curParentStat)` and intermediate components. Mismatches fail closed with `ErrParentDirectorySwapped`.
+  4. *Pinned Directory Sync*: Calls `w.parentDirFile.Sync()` directly on the pinned descriptor.
+  5. *Safe Cleanup*: `cleanupStaging()` verifies parent directory identity before `os.Remove`, refusing to delete files in swapped directories.
+* **Regression Coverage**: 11 targeted test cases including parent symlink rejection, parent directory replacement detection, symlink swap detection, intermediate symlink redirect, failure cleanup isolation, pinned directory sync verification, concurrent replacement race (15 iterations), and 9-scenario object identity matrix. All pass under `-race` detector.
+* **Remaining Scope Boundary**:
+  - Remediates TableWriter parent directory TOCTOU (F-006). Does not modify TableReader path checks (F-007).
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Every security-sensitive operation refers to pinned directory object identity).
+  * Performance: **Optimal** (One additional `os.Open` + `Stat` at construction; two `Lstat` + `SameFile` at publication).
+  * Security: **Optimal** (Eliminated parent directory TOCTOU, intermediate symlink redirect, and cleanup deletion in swapped directory vectors).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*
 
 

@@ -93,6 +93,8 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrNilVersion", errors.ErrNilVersion, "version cannot be nil"},
 		{"ErrDeadVersion", errors.ErrDeadVersion, "cannot operate on dead version: reference count is zero"},
 		{"ErrVersionAlreadyAppended", errors.ErrVersionAlreadyAppended, "version already belongs to a VersionSet"},
+		{"ErrParentDirectorySymlink", errors.ErrParentDirectorySymlink, "parent directory is a symlink"},
+		{"ErrParentDirectorySwapped", errors.ErrParentDirectorySwapped, "parent directory swapped or replaced"},
 	}
 
 	for _, tc := range sentinels {
