@@ -76,3 +76,31 @@ func (r *TableReader) SetReadAtFnForTesting(fn func(p []byte, off int64) (int, e
 func SearchDataBlockForTesting(blockBuf []byte, targetUserKey []byte, blockOffset uint64) ([]byte, error) {
 	return searchDataBlock(blockBuf, targetUserKey, blockOffset)
 }
+
+// SetPostOpenHookForTesting injects a test hook executed immediately after file open and before post-open validation.
+// Returns a cleanup function that restores the prior hook.
+func SetPostOpenHookForTesting(fn func() error) func() {
+	postOpenHookMu.Lock()
+	old := postOpenHookFn
+	postOpenHookFn = fn
+	postOpenHookMu.Unlock()
+	return func() {
+		postOpenHookMu.Lock()
+		postOpenHookFn = old
+		postOpenHookMu.Unlock()
+	}
+}
+
+// SetOpenFileFnForTesting replaces the low-level file open function for TableReader.
+// Returns a cleanup function that restores the prior open function.
+func SetOpenFileFnForTesting(fn func(name string) (*os.File, error)) func() {
+	postOpenHookMu.Lock()
+	old := openFileFn
+	openFileFn = fn
+	postOpenHookMu.Unlock()
+	return func() {
+		postOpenHookMu.Lock()
+		openFileFn = old
+		postOpenHookMu.Unlock()
+	}
+}

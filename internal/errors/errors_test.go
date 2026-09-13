@@ -95,6 +95,8 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrVersionAlreadyAppended", errors.ErrVersionAlreadyAppended, "version already belongs to a VersionSet"},
 		{"ErrParentDirectorySymlink", errors.ErrParentDirectorySymlink, "parent directory is a symlink"},
 		{"ErrParentDirectorySwapped", errors.ErrParentDirectorySwapped, "parent directory swapped or replaced"},
+		{"ErrSSTableSymlink", errors.ErrSSTableSymlink, "sstable file is a symlink"},
+		{"ErrSSTableObjectChanged", errors.ErrSSTableObjectChanged, "sstable file object swapped or replaced"},
 	}
 
 	for _, tc := range sentinels {

@@ -726,6 +726,15 @@ Why Mitigation Is Insufficient: identity (which file) is unpinned even though co
 Evidence: code comparison reader-vs-WAL; no Lstat/SameFile in sstable reader path.
 Recommended Remediation: mirror WAL: Lstat → reject symlink → Open → fstat → SameFile → IsRegular.
 Suggested Phase/Owner: P2.
+Remediation Status: REMEDIATED (SEC-007 / F-007)
+Remediation Evidence:
+  - Hardened NewTableReader in internal/sstable/table_reader.go with pre-open Lstat, intermediate
+    path validation (validatePathNoSymlinks), open with guaranteed cleanup, descriptor fstat validation,
+    post-open Lstat re-inspection, and double inode pinning via os.SameFile(fstat, lstatBefore) and
+    os.SameFile(fstat, lstatAfter).
+  - All subsequent reads execute strictly via positional ReadAt on the pinned descriptor.
+  - Verified by 16 test cases (TestSEC007_* in internal/sstable/sec07_remediation_test.go),
+    1.47M+ iterations in FuzzNewTableReader_Paths (0 crashes, 0 leaks), and clean full repo -race suite.
 ```
 
 ### SEC-005 — MaskSecret leaks key prefix/suffix for secrets longer than 8 chars

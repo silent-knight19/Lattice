@@ -7,11 +7,18 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
 	"github.com/silent-knight19/lattice/internal/filter"
+)
+
+var (
+	openFileFn     = func(name string) (*os.File, error) { return os.Open(name) }
+	postOpenHookFn func() error
+	postOpenHookMu sync.Mutex
 )
 
 // TableReader provides point-lookup access to an immutable, finalized SSTable file.
@@ -38,14 +45,110 @@ type TableReader struct {
 }
 
 // NewTableReader opens an SSTable file at path and initializes a TableReader.
+//
+// Security & TOCTOU Hardening (SEC-007 / F-007):
+//  1. Pre-open inspection: Inspects path with os.Lstat (without following symlinks),
+//     verifying that the target is an existing regular file, not a directory, and not a symlink.
+//  2. Intermediate path validation: validatePathNoSymlinks inspects all parent and ancestor path
+//     components down to filepath.Dir(path), rejecting unpermitted symlink redirection.
+//  3. Secure file open: Opens the descriptor via openFileFn (os.Open). A defer block guarantees
+//     immediate descriptor cleanup if subsequent post-open validation fails.
+//  4. Descriptor-based validation: Validates stat via file.Stat() (fstat on the opened descriptor),
+//     ensuring the opened object is a regular file and not a directory.
+//  5. Post-open pathname re-inspection: Re-inspects path via os.Lstat to ensure the pathname was
+//     not swapped with a symlink during or immediately after the open operation.
+//  6. Inode pinning & object identity invariance: Verifies that both os.SameFile(fstat, lstatBefore)
+//     and os.SameFile(fstat, lstatAfter) hold. This eliminates TOCTOU substitution races by ensuring
+//     the opened file descriptor refers to the exact same filesystem inode observed at the path before
+//     and after opening.
+//  7. Re-validation of intermediate components: Re-verifies ancestor components post-open.
+//  8. Descriptor-centric lifecycle: Once validated, the opened *os.File descriptor is passed to
+//     NewTableReaderWithFile. All subsequent point lookups, filter reads, and index reads execute
+//     exclusively via positional reads on the opened descriptor (file.ReadAt). The pathname is never
+//     re-opened or re-consulted.
 func NewTableReader(path string) (*TableReader, error) {
 	if path == "" {
 		return nil, os.ErrInvalid
 	}
-	file, err := os.Open(path)
+
+	// 1. Pre-open inspection of destination path without following symlinks
+	lstatBefore, err := os.Lstat(path)
 	if err != nil {
 		return nil, err
 	}
+	if lstatBefore.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("%w: sstable file %q is a symlink", errors.ErrSSTableSymlink, path)
+	}
+	if lstatBefore.IsDir() {
+		return nil, fmt.Errorf("%w: sstable path %q is not a regular file (directory)", errors.ErrNotADirectory, path)
+	}
+	if !lstatBefore.Mode().IsRegular() {
+		return nil, fmt.Errorf("sstable: %q is not a regular file (mode: %s)", path, lstatBefore.Mode())
+	}
+
+	// 2. Validate intermediate path components
+	dir := filepath.Dir(path)
+	if err := validatePathNoSymlinks(dir); err != nil {
+		return nil, err
+	}
+
+	// 3. Open file descriptor
+	file, err := openFileFn(path)
+	if err != nil {
+		return nil, err
+	}
+
+	// Guaranteed descriptor cleanup if subsequent post-open validation fails
+	var success bool
+	defer func() {
+		if !success {
+			_ = file.Close()
+		}
+	}()
+
+	// 4. Test seam hook for race / substitution injection
+	postOpenHookMu.Lock()
+	hook := postOpenHookFn
+	postOpenHookMu.Unlock()
+	if hook != nil {
+		if err := hook(); err != nil {
+			return nil, err
+		}
+	}
+
+	// 5. Inspect the opened descriptor directly (fstat)
+	fstat, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat opened sstable descriptor: %w", err)
+	}
+	if fstat.IsDir() {
+		return nil, fmt.Errorf("%w: sstable path %q is not a regular file (directory)", errors.ErrNotADirectory, path)
+	}
+	if !fstat.Mode().IsRegular() {
+		return nil, fmt.Errorf("sstable: %q is not a regular file (mode: %s)", path, fstat.Mode())
+	}
+
+	// 6. Post-open pathname re-inspection without following symlinks
+	lstatAfter, err := os.Lstat(path)
+	if err != nil {
+		return nil, fmt.Errorf("%w: sstable path %q could not be statted post-open: %w", errors.ErrSSTableObjectChanged, path, err)
+	}
+	if lstatAfter.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("%w: sstable file %q was replaced with a symlink", errors.ErrSSTableSymlink, path)
+	}
+
+	// 7. Inode pinning & object identity invariance
+	if !os.SameFile(fstat, lstatBefore) || !os.SameFile(fstat, lstatAfter) {
+		return nil, fmt.Errorf("%w: sstable file %q object identity mismatch", errors.ErrSSTableObjectChanged, path)
+	}
+
+	// 8. Re-validate intermediate components
+	if err := validatePathNoSymlinks(dir); err != nil {
+		return nil, err
+	}
+
+	// Hand over ownership of open file descriptor to NewTableReaderWithFile
+	success = true
 	return NewTableReaderWithFile(file)
 }
 
@@ -77,6 +180,9 @@ func NewTableReaderWithFile(file *os.File) (*TableReader, error) {
 	stat, err := file.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("failed to stat sstable file: %w", err)
+	}
+	if stat.IsDir() {
+		return nil, fmt.Errorf("%w: sstable %q is not a regular file (directory)", errors.ErrNotADirectory, file.Name())
 	}
 	if !stat.Mode().IsRegular() {
 		return nil, fmt.Errorf("sstable: %q is not a regular file (mode: %s)", file.Name(), stat.Mode())

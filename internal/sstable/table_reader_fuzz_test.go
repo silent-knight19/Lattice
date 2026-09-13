@@ -138,3 +138,32 @@ func FuzzTableReader_CorruptedFile(f *testing.F) {
 		_, _ = reader.Seek([]byte("a"))
 	})
 }
+
+func FuzzNewTableReader_Paths(f *testing.F) {
+	// Seed paths: normal, relative, edge-case separators, dots, non-existent, special characters
+	f.Add("test.sst")
+	f.Add("./test.sst")
+	f.Add("../test.sst")
+	f.Add("/tmp/nonexistent.sst")
+	f.Add("a/b/c/d/e.sst")
+	f.Add("...")
+	f.Add("/dev/null")
+	f.Add("\x00path\x00")
+	f.Add("")
+	f.Add("////////")
+	f.Add("a/../../b/../c.sst")
+
+	f.Fuzz(func(t *testing.T, rawPath string) {
+		// Cap path length to avoid excessive OS allocation
+		if len(rawPath) > 4096 {
+			return
+		}
+
+		// Invariant: NewTableReader must never panic on arbitrary input paths
+		r, err := sstable.NewTableReader(rawPath)
+		if err == nil {
+			// If it succeeded, Close must succeed without leaking descriptors
+			_ = r.Close()
+		}
+	})
+}

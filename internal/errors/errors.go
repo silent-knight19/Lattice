@@ -210,6 +210,13 @@ var (
 	// ErrParentDirectorySwapped indicates that the SSTable parent directory was replaced or redirected to a different object.
 	ErrParentDirectorySwapped = stdErrors.New("parent directory swapped or replaced")
 
+	// ErrSSTableSymlink indicates that an SSTable file path is a symbolic link.
+	ErrSSTableSymlink = stdErrors.New("sstable file is a symlink")
+
+	// ErrSSTableObjectChanged indicates that an SSTable file was swapped, replaced,
+	// or modified to reference a different filesystem object during opening.
+	ErrSSTableObjectChanged = stdErrors.New("sstable file object swapped or replaced")
+
 	// ErrWriterPoisoned indicates that an operation was attempted on a WAL writer
 	// that entered an unrecoverable poisoned state following a write or sync failure.
 	ErrWriterPoisoned = stdErrors.New("wal writer is poisoned")

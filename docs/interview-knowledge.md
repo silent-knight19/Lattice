@@ -3139,4 +3139,34 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
+# 37. TableReader Path & Symlink TOCTOU: Why the Opened File Descriptor Is Authoritative (SEC-007)
+
+### 1. Why is `os.Open(path)` followed by pathname-based validation vulnerable to TOCTOU, and why is the opened file descriptor the authoritative object? (SEC-007 / F-007)
+* **Question**: In database storage engines, a common pattern for opening an SSTable or database file is:
+  ```go
+  file, err := os.Open(path)
+  stat, err := file.Stat()
+  if !stat.Mode().IsRegular() { ... }
+  ```
+  Why is this naive pattern vulnerable to symbolic link and time-of-check-to-time-of-use (TOCTOU) substitution attacks, and how does descriptor-centric pinning solve it?
+* **Answer**:
+  - **The Symlink Following Hazard**: In standard POSIX and Go `os.Open(path)`, the OS kernel transparently follows symbolic links across every path component, including the terminal filename. If an attacker replaces `/db/tables/000001.sst` with a symlink pointing to an arbitrary file (e.g. `/attacker/evil.sst`), `os.Open` follows the symlink and opens the attacker's file. Subsequent `file.Stat()` executes `fstat(fd)` on the *target* file, which reports a regular file! The reader validates the structural bytes of whatever file was opened, completely blind to the fact that it was redirected via a symlink.
+  - **Intermediate Path Redirection**: The same hazard exists if an intermediate directory component (e.g. `/db/tables` -> symlink to `/attacker/tables`) is replaced. Standard pathname operations traverse through the symlink to the attacker's hierarchy.
+  - **In-Flight Object Substitution (TOCTOU)**: Between the moment the caller selects `path` and the reader finishes validation, an attacker can unlink the original file and create a new file with the same name (a different inode). If validation is performed against the pathname rather than the opened descriptor, the reader might validate one object while reading another.
+  - **The Dual-Sandwich Inode Correlation Solution (`os.SameFile`)**:
+    To eliminate all race windows without platform-specific open flags:
+    1. *Pre-open inspection*: Call `os.Lstat(path)` without following symlinks. Reject if `ModeSymlink != 0`, if it is a directory, or if it is non-regular (e.g. FIFOs, preventing denial-of-service hangs on open).
+    2. *Intermediate component check*: Walk the ancestor hierarchy from root down to `filepath.Dir(path)` with `os.Lstat`, verifying no component is an unpermitted symlink (`validatePathNoSymlinks`).
+    3. *Open the descriptor*: Call `os.Open(path)` to obtain `*os.File`.
+    4. *Descriptor stat*: Call `file.Stat()` (`fstat`) directly on the descriptor to verify it is regular.
+    5. *Post-open inspection*: Call `os.Lstat(path)` again to ensure the path was not changed to a symlink during `os.Open`.
+    6. *Double Inode Invariance*: Assert `os.SameFile(fstat, lstatBefore)` AND `os.SameFile(fstat, lstatAfter)`. This proves mathematically that:
+       - The descriptor refers to the exact inode that was inspected before open.
+       - The pathname still refers to the exact inode that was opened.
+       - If any substitution occurred before, during, or after open, an identity mismatch is caught and fails closed with `ErrSSTableObjectChanged` or `ErrSSTableSymlink`.
+  - **Descriptor-Centric Immutability**:
+    Once the reader securely takes ownership of `*os.File`, all point lookups (`Seek`), filter checks (`ReadFilterBlock`), and index reads MUST execute exclusively via positional `file.ReadAt(p, offset)` on the open descriptor. In POSIX/Unix, an open file descriptor points to the open file description / vnode in the kernel. Subsequent renames, unlinks, or symlink substitutions at `path` on disk have ZERO effect on ongoing reads. The reader continues reading from the legitimate, original filesystem object.
+
+---
+
 *End of Technical Interview Knowledge Base — Lattice v1.0.0-KNOWLEDGE-BASE*
