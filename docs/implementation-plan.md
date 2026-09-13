@@ -1717,7 +1717,31 @@ TOTAL: 184 Discrete, Testable Micro-Phases
     - `BenchmarkSetCurrentManifest_NoSync`: 118 µs/op, 2,559 B/op, 21 allocs/op (~8.4k ops/sec).
     - `BenchmarkSetCurrentManifest_Sync`: 8.53 ms/op (dominated by double physical hardware barrier: file `fdatasync` + parent directory `fsync`).
   * *Completion*: Complete and verified under `-race`, `go vet`, `golangci-lint`. P06-S02-M01 complete; P06-S02-M02 remains next micro-phase.
-* **P06-S02-M02: `VersionSet` & Version-Pinned Reference Counting**
+* **P06-S02-M02: CURRENT Pointer Reader & Validation**
+  * *Objective*: Implement read-only `CURRENT` pointer parser and resolver (`ReadCurrentManifest`, `ParseCurrentManifest`). Safely inspect directory and target object, reject symlinks and directories, enforce size ceiling ([16, 30] bytes), strictly validate canonical textual representation (`MANIFEST-%06d\n`), and parse `uint64` manifest number.
+  * *Invariants*:
+    - Bounded read: reads up to 31 bytes into a fixed stack buffer without heap allocations. Oversized files fail closed immediately.
+    - Strict canonical validation: rejects whitespace, CRLF, missing newline, non-digits, fewer than 6 digits, sequence 0, superfluous leading zeros (e.g. `MANIFEST-0000001\n`), and numbers exceeding `math.MaxUint64`.
+    - TOCTOU defense: confirms via `os.SameFile` that the open descriptor matches inspected disk inode. Under concurrent atomic renames, re-verifies post-open disk state with bounded retries.
+    - Error taxonomy: cleanly distinguishes missing `CURRENT` (`ErrCurrentNotFound`) from corruption (`ErrCurrentCorrupted`) and symlinks (`ErrCurrentSymlink`).
+    - Decoupling: strictly does not inspect, open, validate, or replay referenced `MANIFEST` files; recovery belongs to Phase 07.
+  * *Tests & Verification*:
+    - Exact-byte fixtures for canonical manifest IDs (1, 2, 42, 999999, 1000000, `MaxUint64`).
+    - Corruption matrix covering prefix corruption, non-digits, negative/plus signs, whitespace/tabs/double newlines, CRLF/null bytes, boundaries (0, <6 digits, superfluous leading zeros, >MaxUint64).
+    - Single-byte mutation suite verifying fail-closed behavior across all byte offsets.
+    - Round-trip tests with writer (`SetCurrentManifest` -> `ReadCurrentManifest`).
+    - 50 repeated sequential updates verifying reader tracking.
+    - Symlink & directory defense for both directory and `CURRENT` file.
+    - Size ceiling tests (15B, 31B, 1MB).
+    - Torn-write tests (truncated prefixes, missing newlines, trailing partial data).
+    - Fault-injection testing for open, read, close, and lstat failures using test seams.
+    - Concurrent reader/writer test (4 readers, 1 writer over 100 updates) verified race-free under `go test -race`.
+    - Native Go fuzzing (`FuzzParseCurrentManifest`): 2,357,723 executions, 0 crashes, verifying canonical round-trip invariant.
+  * *Measured Results* (Apple M4, Darwin arm64):
+    - `BenchmarkParseCurrentManifest`: 58.81 ns/op, 32 B/op, 2 allocs/op (~17M ops/sec pure CPU parsing).
+    - `BenchmarkReadCurrentManifest`: 12.23 µs/op, 1,224 B/op, 12 allocs/op (~81.7k ops/sec full OS pipeline).
+  * *Completion*: Complete and verified under `-race`, `go vet`, `golangci-lint`. P06-S02-M02 complete; P06-S02-M03 remains next micro-phase.
+* **P06-S02-M03: `VersionSet` & Version-Pinned Reference Counting**
   * *Objective*: Maintain linked list of active `Version` structs with atomic `Ref()` and `Unref()`.
   * *Changes*: `VersionSet.AppendVersion(v *Version)`, `Version.Ref()`, `Version.Unref()`.
   * *Invariants*: SSTable physical file descriptors are never closed while `v.refCount > 0`.

@@ -57,3 +57,24 @@ func SetCurrentSyncDirFnForTesting(fn func(dirPath string) error) func() {
 	currentSyncDirFn = fn
 	return func() { currentSyncDirFn = orig }
 }
+
+// SetCurrentOpenFnForTesting temporarily replaces currentOpenFn and returns a restore closure.
+func SetCurrentOpenFnForTesting(fn func(name string) (*os.File, error)) func() {
+	orig := currentOpenFn
+	currentOpenFn = fn
+	return func() { currentOpenFn = orig }
+}
+
+// SetCurrentReadFnForTesting temporarily replaces currentReadFn and returns a restore closure.
+func SetCurrentReadFnForTesting(fn func(f *os.File, p []byte) (int, error)) func() {
+	orig := currentReadFn
+	currentReadFn = fn
+	return func() { currentReadFn = orig }
+}
+
+// SetCurrentLstatFnForTesting temporarily replaces currentLstatFn and returns a restore closure.
+func SetCurrentLstatFnForTesting(fn func(name string) (os.FileInfo, error)) func() {
+	orig := currentLstatFn
+	currentLstatFn = fn
+	return func() { currentLstatFn = orig }
+}

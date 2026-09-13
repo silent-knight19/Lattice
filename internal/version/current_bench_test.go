@@ -43,3 +43,40 @@ func BenchmarkSetCurrentManifest_NoSync(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkParseCurrentManifest(b *testing.B) {
+	data := []byte("MANIFEST-000042\n")
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	var total uint64
+	for i := 0; i < b.N; i++ {
+		num, err := ParseCurrentManifest(data)
+		if err != nil {
+			b.Fatalf("ParseCurrentManifest failed: %v", err)
+		}
+		total += num
+	}
+	_ = total
+}
+
+func BenchmarkReadCurrentManifest(b *testing.B) {
+	dir := b.TempDir()
+	if err := SetCurrentManifest(dir, 42); err != nil {
+		b.Fatalf("SetCurrentManifest failed: %v", err)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	var total uint64
+	for i := 0; i < b.N; i++ {
+		num, err := ReadCurrentManifest(dir)
+		if err != nil {
+			b.Fatalf("ReadCurrentManifest failed: %v", err)
+		}
+		total += num
+	}
+	_ = total
+}

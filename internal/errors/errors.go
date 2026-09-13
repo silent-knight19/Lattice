@@ -265,6 +265,12 @@ var (
 
 	// ErrCurrentDirectorySync indicates that hardware synchronization of the parent directory failed following a CURRENT rename.
 	ErrCurrentDirectorySync = stdErrors.New("failed to synchronize parent directory for CURRENT")
+
+	// ErrCurrentNotFound indicates that the CURRENT pointer file does not exist in the database directory.
+	ErrCurrentNotFound = stdErrors.New("CURRENT file not found")
+
+	// ErrCurrentCorrupted indicates that the CURRENT pointer file content is malformed, truncated, oversized, or non-canonical.
+	ErrCurrentCorrupted = stdErrors.New("CURRENT file corrupted")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing

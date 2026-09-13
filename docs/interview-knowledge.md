@@ -2911,6 +2911,45 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
+# 31. Deep Systems Interview Questions & Answers: CURRENT Pointer Reader & Validation (P06-S02-M02)
+
+### 1. Why must `ReadCurrentManifest` enforce strict canonical parsing rather than tolerant normalization?
+* **Question**: Why does `ParseCurrentManifest` reject trailing spaces, CRLF (`\r\n`), missing newlines, lowercase prefixes, or superfluous leading zeros (e.g. `MANIFEST-0000001\n`) instead of silently trimming and normalizing?
+* **Answer**:
+  - **Zero Heuristics in Storage Engine Metadata**: `CURRENT` is written exclusively by the database engine's own atomic swapper, not human operators in a text editor. Any deviation from the canonical byte representation (`MANIFEST-%06d\n`) indicates external tampering, partial filesystem corruption, an aborted non-atomic write by an alien tool, or mismatched software versions.
+  - **Eliminating Semantic Drift**: Tolerant parsers create ambiguities where different components or tools interpret malformed files differently. By failing closed with `ErrCurrentCorrupted`, the engine halts immediately before trusting a potentially corrupted or attacker-crafted metadata pointer.
+  - **Idempotent Canonical Round-Trip**: The invariant enforced in Lattice is that any successfully parsed sequence number $N$ must satisfy `data == ManifestFilename(N) + "\n"`.
+
+### 2. How does `ReadCurrentManifest` defend against resource exhaustion (OOM) attacks on the filesystem?
+* **Question**: If an adversary replaces `CURRENT` with a multi-gigabyte sparse file or device node (e.g. `/dev/zero`), what prevents `ReadCurrentManifest` from allocating gigabytes in user space?
+* **Answer**:
+  - **Pre-Open Size Ceiling**: `os.Lstat` checks that `cInfo.Size()` is strictly within $[16, 30]$ bytes (16 bytes for `MANIFEST-000001\n`, 30 bytes for `math.MaxUint64` formatted as `MANIFEST-18446744073709551615\n`). If size violates bounds, the file is never opened.
+  - **Bounded Stack Buffer**: Even if a file's size changes post-check, the read operation uses a fixed 31-byte stack array (`var buf [MaxCurrentFileSize + 1]byte`).
+  - **Zero Heap Allocations**: The parser and read loop allocate zero dynamic memory on the heap, ensuring deterministic, OOM-proof execution under hostile conditions.
+
+### 3. How does `ReadCurrentManifest` safely handle concurrent atomic renames (`os.Rename`) without false-positive TOCTOU errors?
+* **Question**: If a background compaction or rollover thread executes `SetCurrentManifest` while a reader calls `ReadCurrentManifest`, the inode of `CURRENT` changes between `Lstat` and `Open`. How does the reader distinguish a legitimate atomic swap from an adversarial race?
+* **Answer**:
+  - **The Inode Change Phenomenon**: In POSIX filesystems, `os.Rename(CURRENT.tmp, CURRENT)` atomically replaces the dentry to point to the new inode. A concurrent reader calling `Lstat` followed by `Open` may inspect inode A and open inode B.
+  - **Post-Open Double Inspection**: When `!os.SameFile(cInfo, finfo)` is detected, the reader does not immediately error out. Instead, it re-inspects `currentPath` via `currentLstatFn(currentPath)`.
+  - **Symlink Check & Inode Confirmation**: If `postInfo` on disk is not a symlink and matches `finfo` (`os.SameFile(postInfo, finfo)`), the reader confirms that `f` references the legitimate, newly promoted `CURRENT` file!
+  - **Bounded Retry**: If intense concurrent contention causes repeated swaps, the reader retries up to 5 times to acquire a settled handle, failing closed only if the race cannot be resolved.
+
+### 4. Why is `ReadCurrentManifest` strictly decoupled from opening or replaying the `MANIFEST` file?
+* **Question**: Why does `ReadCurrentManifest` simply return `(uint64, error)` rather than opening the manifest, checking file existence, or decoding `VersionEdit` records?
+* **Answer**:
+  - **Single Responsibility Principle**: Pointer resolution (`CURRENT -> manifestNum`) is a distinct filesystem concern from log deserialization, record framing CRC validation, and state machine version reconstruction.
+  - **Decoupled Testability**: The pointer reader can be exhaustively tested and fuzzed with zero dependency on the format of manifest records, SSTables, or version trees.
+  - **Layered Recovery**: In Phase 07 (`P07-S01`), recovery coordinates multiple primitives: read pointer $\to$ locate manifest $\to$ replay delta stream $\to$ restore active levels. Mixing these layers into a single monolithic reader would prevent modular error recovery and complicate failure isolation.
+
+### 5. Why is manifest sequence number zero (`0`) strictly prohibited in Lattice?
+* **Question**: Why does `ParseCurrentManifest` reject `MANIFEST-000000\n` even though 0 is a valid 64-bit unsigned integer?
+* **Answer**:
+  - **Sentinel Reservation**: In Go and database systems, sequence number 0 is the zero value (`default`) indicating uninitialized state.
+  - **Physical Chronology**: Manifest sequence numbers represent discrete chronological generations of the metadata log. Numbering begins strictly at `1` (`MANIFEST-000001`), ensuring that an uninitialized `uint64` field cannot be mistaken for a valid active manifest log.
+
+---
+
 *End of Technical Interview Knowledge Base — Lattice v1.0.0-KNOWLEDGE-BASE*
 
 

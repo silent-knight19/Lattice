@@ -84,6 +84,8 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrInvalidManifestNum", errors.ErrInvalidManifestNum, "invalid manifest number: must be greater than zero"},
 		{"ErrCurrentSymlink", errors.ErrCurrentSymlink, "cannot write CURRENT over symbolic link"},
 		{"ErrCurrentDirectorySync", errors.ErrCurrentDirectorySync, "failed to synchronize parent directory for CURRENT"},
+		{"ErrCurrentNotFound", errors.ErrCurrentNotFound, "CURRENT file not found"},
+		{"ErrCurrentCorrupted", errors.ErrCurrentCorrupted, "CURRENT file corrupted"},
 	}
 
 	for _, tc := range sentinels {
