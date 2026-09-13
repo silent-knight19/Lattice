@@ -3000,6 +3000,33 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
+# 33. Deep Systems Security: Parser Integer-Overflow, Unsigned Wraparound & Safe Deserialization (SEC-001)
+
+### 1. Why is unsigned integer arithmetic in length calculations prone to exploitable overflow?
+* **Question**: In Go and other systems languages, unsigned integers wrap around modulo $2^N$ on overflow without triggering compiler warnings or runtime panics. How does this create security vulnerabilities in binary deserializers?
+* **Answer**:
+  - **Modular Wraparound Mechanics**: In Go, `uint64` arithmetic is evaluated modulo $2^{64}$. If untrusted user input specifies `keyLen = 2^64 - 6` (a valid 10-byte varint), computing `expectedLen := uint64(varintLen) + keyLen + BlockHandleSize` evaluates to:
+    $$10 + (2^{64} - 6) + 16 = 2^{64} + 20 \equiv 20 \pmod{2^{64}}$$
+  - **Bypassing Validation Equality**: If the entry slice in the input buffer is exactly 20 bytes long, the validation check `uint64(len(entrySlice)) == expectedLen` evaluates to `20 == 20` (`true`). The parser falsely concludes that the entry buffer matches the declared fields.
+  - **Negative Slicing Panic via Signed Conversion**: In 64-bit Go, converting `int(keyLen)` converts `18446744073709551610` (`0xFFFFFFFFFFFFFFFA`) into signed two's-complement integer `-6`. When computing slice endpoints `keyEnd := keyStart + int(keyLen)`, `10 + (-6)` yields `4`. Evaluating `entrySlice[10:4]` triggers `panic: slice bounds out of range [10:4]`, crashing the storage process.
+
+### 2. Why are subtraction-based bounds checks mathematically safer than addition-based checks?
+* **Question**: Why is `keyLen == len(entrySlice) - minEntryLen` (after checking `len(entrySlice) >= minEntryLen`) immune to integer overflow, whereas `keyLen + minEntryLen == len(entrySlice)` is vulnerable?
+* **Answer**:
+  - **Addition Risk**: In `keyLen + minEntryLen`, the untrusted operand `keyLen` can be up to $2^{64}-1$. Addition can exceed the maximum representable word size ($2^{64}-1$), wrapping to a small value that deceptively matches `len(entrySlice)`.
+  - **Subtraction Safety**: When subtracting trusted, pre-bounded quantities:
+    1. First assert `len(entrySlice) >= minEntryLen`. Because `len(entrySlice)` is bounded by available memory ($< 2^{31}-1$ or $< 2^{63}-1$), this check cannot wrap.
+    2. Compute `remainingForKey := uint64(len(entrySlice) - minEntryLen)`. Because the minuend is greater than or equal to the subtrahend, the result is strictly non-negative and bounded by `len(entrySlice)`.
+    3. Assert `keyLen == remainingForKey`. Here, `keyLen` is directly compared against a known-safe, bounded ceiling without participating in any addition. No overflow is mathematically possible.
+
+### 3. What is the mandatory ordering invariant for binary deserializers handling untrusted lengths?
+* **Question**: What sequence of operations must every binary parser follow when decoding attacker-controlled variable-length fields?
+* **Answer**:
+  - **Rule 1: Immediate Domain Invariant Validation**: Immediately after reading the length (e.g. varint `keyLen`), reject values outside the protocol domain (e.g. `keyLen == 0 || keyLen > MaxEncodedInternalKeyLen`) before any arithmetic or memory allocation.
+  - **Rule 2: Minimum Buffer Requirement**: Verify that the input slice is at least as large as the mandatory fixed headers and trailers before attempting to read payloads.
+  - **Rule 3: Bounded Arithmetic & Allocation**: Never use an untrusted length to allocate memory (`make([]byte, keyLen)`) or compute offsets until the length is mathematically proven to be $\le$ the remaining unconsumed bytes in the input buffer.
+  - **Rule 4: Conversion Safety**: Never convert an untrusted integer type (`uint64 -> int`) until the value is bounded within $[0, \text{math.MaxInt}]$ and proven representable on the target architecture.
+
+---
+
 *End of Technical Interview Knowledge Base — Lattice v1.0.0-KNOWLEDGE-BASE*
-
-

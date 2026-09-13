@@ -170,14 +170,27 @@ func DecodeMetaIndexBlock(data []byte) (map[string]BlockHandle, error) {
 			return nil, &errors.IndexBlockCorruptedError{Reason: "corrupted metaindex key length varint"}
 		}
 
-		// Entry layout: [Varint KeyLen] + [KeyBytes] + [16B BlockHandle]
-		expectedLen := uint64(varintLen) + keyLen + BlockHandleSize
-		if uint64(len(entrySlice)) != expectedLen {
+		// 1. Validate key length domain before arithmetic or conversion (eliminates integer overflow & zero-length keys)
+		if keyLen == 0 || keyLen > binary.MaxEncodedInternalKeyLen {
+			return nil, &errors.IndexBlockCorruptedError{Reason: "metaindex key length outside valid boundaries"}
+		}
+
+		// 2. Ensure entrySlice can accommodate at least the varint header and BlockHandle trailer
+		minEntryLen := varintLen + BlockHandleSize
+		if len(entrySlice) < minEntryLen {
+			return nil, &errors.IndexBlockCorruptedError{Reason: "metaindex entry buffer too small for header and handle"}
+		}
+
+		// 3. Overflow-safe length validation: verify keyLen matches available payload bytes via subtraction
+		remainingForKey := uint64(len(entrySlice) - minEntryLen)
+		if keyLen != remainingForKey {
 			return nil, &errors.IndexBlockCorruptedError{Reason: "metaindex entry size mismatch"}
 		}
 
+		// 4. Bounded integer conversion: keyLen is proven in [1, len(entrySlice)-minEntryLen]
+		keyLenInt := int(keyLen)
 		keyStart := varintLen
-		keyEnd := keyStart + int(keyLen)
+		keyEnd := keyStart + keyLenInt
 		keyStr := string(entrySlice[keyStart:keyEnd])
 
 		handleSlice := entrySlice[keyEnd : keyEnd+BlockHandleSize]

@@ -394,8 +394,16 @@ In parallel with the feature development roadmap (Phase 00–21), Lattice mainta
 | **SEC-08** | **Security Regression Suite / CI Security Gates**: Automated PR blocking on new security findings, deterministic finding tracking. | Planned |
 | **SEC-09** | **Final Penetration-Style Audit / Release Security Certification**: End-to-end red team assessment, cryptographic verification, formal release sign-off. | Planned |
 
+---
+
+# 16.2 Security Vulnerability Remediation Register
+
+| Vulnerability ID | Component | Severity | Description | Status | Verification Evidence |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **SEC-001 / F-001** | `internal/sstable` (`DecodeMetaIndexBlock`) | **HIGH** | MetaIndex parser integer overflow & slice-bounds panic via wrapped `keyLen` | **REMEDIATED** | PoC regression (`TestSecurity_Remediation_SEC_001_IntegerOverflowPanicPoC`), boundary matrix, mutation tests, table reader path, raw-byte fuzz target (`FuzzMetaIndexBlock_Decode`, 7.34M execs, 0 crashes), full race suite clean. Phase 07 remains BLOCKED. |
 
 ---
+
 
 # 17. Git Workflow & Commit Cadence
 

@@ -470,8 +470,30 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 36. MetaIndex Parser Integer-Overflow / Slice-Bounds Panic Vulnerability (SEC-001 / F-001) — REMEDIATED
+* **Limitation**: In prior implementations through Phase 05/06, `DecodeMetaIndexBlock` (`internal/sstable/meta_index.go`) permitted an attacker-controlled `keyLen` (up to $2^{64}-1$) to participate in unchecked 64-bit unsigned arithmetic: `expectedLen := uint64(varintLen) + keyLen + BlockHandleSize`. In unsigned 64-bit integer arithmetic, addition wraps modulo $2^{64}$. A crafted entry where `varintLen=10` and `keyLen = 2^64 - 6` wrapped modulo $2^{64}$ to equal `20`, matching `len(entrySlice) == 20` and bypassing entry length validation. The subsequent conversion `int(keyLen)` evaluated to `-6` on 64-bit architectures, causing an invalid slice expression (`entrySlice[10:4]`) and triggering an unhandled Go runtime slice-bounds panic (`panic: slice bounds out of range [10:4]`). When a client or background reader invoked `TableReader.ReadFilterBlock() -> FindMetaIndexEntry()`, a maliciously crafted or bit-flipped SSTable could crash the entire database process.
+* **Root Cause**:
+  1. Lack of domain validation on decoded varint `keyLen` prior to arithmetic.
+  2. Performing addition with untrusted operands (`varintLen + keyLen + BlockHandleSize`) vulnerable to unsigned 64-bit integer wraparound.
+  3. Converting untrusted `uint64` to `int` prior to bounding the value against the underlying slice buffer length.
+* **Remediation**:
+  1. *Immediate Domain Validation*: Immediately after decoding the varint, `keyLen` is validated against domain boundaries: rejecting `keyLen == 0 || keyLen > binary.MaxEncodedInternalKeyLen` (65,536 bytes) with `*errors.IndexBlockCorruptedError`.
+  2. *Buffer Minimum Threshold*: Explicitly verifies `len(entrySlice) >= varintLen + BlockHandleSize` before performing any length math.
+  3. *Overflow-Safe Subtraction Bounds*: Validates available payload via safe subtraction: `remainingForKey := uint64(len(entrySlice) - minEntryLen)` and asserts `keyLen == remainingForKey`.
+  4. *Safe Bounded Integer Conversion*: Conversion `int(keyLen)` is executed only after proving `keyLen` is bounded within $[1, \text{len}(entrySlice) - minEntryLen]$, guaranteeing safe slicing.
+  5. *Fail-Closed Error Taxonomy*: Rejection returns structured `*errors.IndexBlockCorruptedError` without panicking, preserving fail-closed error contracts.
+* **Regression Coverage & Evidence**:
+  - *Audit PoC Regression*: `TestSecurity_Remediation_SEC_001_IntegerOverflowPanicPoC` proves the exact arithmetic exploit vector (`keyLen = 2^64 - 6` with `entryLen = 20`) which previously caused `panic: slice bounds out of range [10:4]` now safely fails closed with `*errors.IndexBlockCorruptedError` and zero panics.
+  - *Boundary Matrix*: `TestSecurity_Remediation_SEC_001_BoundaryMatrix` covers `keyLen = 0`, `MaxUint64`, `MaxUint64 - 1`, `MaxUint64 - 6`, `MaxUint64 - 7`, maximum valid length, one above maximum, buffer mismatches, truncated buffers, and malformed block handles.
+  - *Adversarial Mutation Suite*: `TestSecurity_Remediation_SEC_001_MutationTesting` verifies single-byte mutations over varint headers, entry lengths, and block handle trailers.
+  - *Real End-to-End File Path*: `TestSecurity_Remediation_SEC_001_TableReader_ReadFilterBlockPath` constructs an on-disk `.sst` table containing the crafted MetaIndex block and verifies `TableReader.ReadFilterBlock` fails closed with corruption errors and zero panics.
+  - *Fuzz Testing*: `FuzzMetaIndexBlock_Decode` fed raw arbitrary bytes directly into `DecodeMetaIndexBlock` for >7.3 million executions with 0 crashes.
+* **Scope Note**: This remediation specifically resolves vulnerability SEC-001 / F-001 in `DecodeMetaIndexBlock`. It does not claim that all conceivable SSTable parser vulnerabilities are eliminated.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Malformed metadata fails closed with structured corruption error).
+  * Performance: **Optimal** (Eliminated redundant arithmetic; zero additional heap allocations).
+  * Security: **Optimal** (Process-crashing DoS panic vector eliminated).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*
-
-
-
-

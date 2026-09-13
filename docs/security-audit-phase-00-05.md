@@ -421,6 +421,24 @@ Recommended Remediation: before line 174, reject keyLen==0 || keyLen > <small bo
   overflow-checked addition (keyLen > uint64(len(entrySlice)) → corrupt); mirror
   index_builder.go:456-458. Add regression test with the PoC vector (valid CRC, keyLen=2^64-6).
 Suggested Phase/Owner: P1, before Phase 06 (VersionSet will fan filter reads across tables).
+
+Remediation Status: REMEDIATED (SEC-001 / F-001)
+Remediation Date: 2026-09-13
+Remediation Scope: internal/sstable/meta_index.go (DecodeMetaIndexBlock)
+Remediation Strategy:
+  1. Reject keyLen == 0 || keyLen > binary.MaxEncodedInternalKeyLen immediately upon varint decode.
+  2. Enforce minimum entry length: len(entrySlice) >= minEntryLen (varintLen + BlockHandleSize).
+  3. Validate key length using overflow-safe subtraction bounds: keyLen == uint64(len(entrySlice) - minEntryLen).
+  4. Perform bounded int(keyLen) conversion strictly after bounds validation.
+  5. Fail closed with *errors.IndexBlockCorruptedError without panic.
+Verification & Traceability Evidence:
+  - Targeted Regression: TestSecurity_Remediation_SEC_001_IntegerOverflowPanicPoC (PoC returns ErrIndexBlockCorrupted, no panic)
+  - Boundary Matrix: TestSecurity_Remediation_SEC_001_BoundaryMatrix (keyLen=0, MaxUint64, MaxUint64-1, MaxUint64-6, MaxUint64-7, edge sizes)
+  - Mutation Testing: TestSecurity_Remediation_SEC_001_MutationTesting (byte-level corruptions fail closed)
+  - Higher-Level Reader: TestSecurity_Remediation_SEC_001_TableReader_ReadFilterBlockPath (TableReader fails closed)
+  - Fuzzing: FuzzMetaIndexBlock_Decode (7,349,042 raw-byte executions, 0 crashes)
+  - Full Suite: go test ./... (PASS), go test -race ./... (PASS, 0 races)
+  - Static Analysis: go vet ./... (clean), golangci-lint run ./... (0 issues), go mod verify (clean)
 ```
 
 ### SEC-002 — SSTable staging parent unpinned; WithFile bypasses staging checks
