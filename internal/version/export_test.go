@@ -84,6 +84,12 @@ func (v *Version) SetCleanupFnForTesting(fn func()) {
 	v.cleanupFn = fn
 }
 
+// SetRefCountForTesting directly sets the atomic reference count of a Version for boundary testing.
+// This is strictly a test-only helper located in export_test.go and is not part of the production API.
+func (v *Version) SetRefCountForTesting(count int32) {
+	v.refCount.Store(count)
+}
+
 // ActiveCurrentLockCount returns the current number of allocated entries in the directory lock registry.
 func ActiveCurrentLockCount() int {
 	return currentDirLocks.activeLockCount()

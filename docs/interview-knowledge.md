@@ -2987,19 +2987,22 @@ Offset 68..71 (4B, CRC32-IEEE):
 * **Question**: What dangerous race condition occurs if `v.Ref()` is implemented with a naive `atomic.AddInt32(&v.refCount, 1)`?
 * **Answer**:
   - **The Dead-Object Resurrection Race**: Suppose thread A calls `Unref()`, dropping `refCount` from 1 to 0 and triggering `finalize()`/`cleanup()`. If thread B concurrently acquires a stale pointer to `v` and calls `Ref()`, a naive atomic add would increment `refCount` from 0 to 1, "resurrecting" a Version whose internal level slices have already been cleared or whose linked-list pointers have been unlinked!
-  - **CAS Loop Protection**: In Lattice, `v.Ref()` and `v.TryRef()` use an atomic compare-and-swap loop:
+  - **CAS Loop Protection**: In Lattice, `v.Ref()` and `v.TryRef()` use an atomic compare-and-swap loop that protects against both resurrection from zero and overflow beyond `math.MaxInt32`:
     ```go
     for {
         cur := v.refCount.Load()
         if cur <= 0 {
-            panic("cannot Ref dead Version: reference count is zero") // or return false
+            panic("cannot Ref dead Version: reference count is zero or negative") // or return false
+        }
+        if cur == math.MaxInt32 {
+            panic("cannot Ref Version: reference count exhausted at MaxInt32") // or return false
         }
         if v.refCount.CompareAndSwap(cur, cur+1) {
             return
         }
     }
     ```
-    If `cur <= 0`, CAS is never attempted, and the method panics/fails fast. Once a Version's reference count hits zero, it is dead permanently.
+    If `cur <= 0`, CAS is never attempted, and the method panics/fails fast. Once a Version's reference count hits zero, it is dead permanently. If `cur == math.MaxInt32`, the method fails fast before any addition occurs, preventing signed integer wraparound.
 
 ### 4. How does `VersionSet` prevent lock-inversion deadlocks during `AppendVersion`?
 * **Question**: When `vs.AppendVersion(v)` publishes a new version, why must `oldCurrent.Unref()` be called *outside* `vs.mu.Lock()`?
@@ -3083,6 +3086,34 @@ Offset 68..71 (4B, CRC32-IEEE):
   - **Fail-Closed Replay Behavior**:
     - By enforcing `ValidateFileMetadata` at both the programmatic construction boundary (`AddFile`) and the manifest deserialization boundary (`DecodeVersionEdit`), invalid records are rejected immediately at admission.
     - Manifest replay fails closed with descriptive errors (`ErrInvalidFileNum`, `ErrInvalidFileSize`, `ErrInvalidKeyRange`, `ErrInvalidSeqNumRange`) rather than booting with a corrupted version tree.
+
+---
+
+# 35. Atomic Reference Counting: Integer Overflow, Upper-Bound Proving & Arithmetic Safety (SEC-005)
+
+### 1. How can an atomic reference counter still overflow, and why must the maximum-value check occur before the CAS increment? (SEC-005 / F-005)
+* **Question**: In systems programming, developers often assume that using atomic primitives like Go's `atomic.Int32` or C++'s `std::atomic<int32_t>` guarantees full safety. How can an atomic reference counter still overflow, why is saturation counter-productive, and why must the maximum-value bound check occur *before* evaluating `cur + 1` in the compare-and-swap loop?
+* **Answer**:
+  - **Atomicity vs. Arithmetic Safety**:
+    - Hardware atomic primitives (like CMPXCHG / CAS) guarantee only **memory ordering and lost-update prevention**. They ensure that two threads reading value $X$ cannot both write $X+1$ and lose an increment.
+    - However, atomic primitives provide **zero arithmetic domain checking**. The CPU evaluates the expression `cur + 1` in software registers before passing the result to the atomic CAS instruction. In signed two's-complement 32-bit arithmetic, adding 1 to `math.MaxInt32` (`0x7FFFFFFF`, `2,147,483,647`) produces `math.MinInt32` (`0x80000000`, `-2,147,483,648`) without trapping or raising a signal. The atomic CAS then faithfully stores the negative value into memory!
+  - **The Severe Lifecycle Corruption Vector**:
+    - Once `refCount` becomes negative:
+      1. `TryRef()` checks `cur <= 0` and returns `false`, falsely treating an active Version holding live resources as dead.
+      2. `Ref()` panics with `"cannot Ref dead Version: reference count is zero or negative"`.
+      3. `Unref()` checks `cur <= 0` and panics with `"Version refCount underflow: double Unref"`.
+      4. Crucially, the final `1 -> 0` transition can never occur! The Version is stranded in memory and its unlinking hook `unlinkLocked()` and cleanup `cleanup()` never run, permanently leaking all associated SSTables on disk.
+  - **Why the Bound Check Must Precede Arithmetic**:
+    - In Go, writing `next := cur + 1; if next < 0 { fail() }` relies on undefined behavior or wraparound detection after an overflow has already occurred.
+    - Instead, establishing `if cur == math.MaxInt32 { return false }` *before* computing `cur + 1` provides a mathematical proof: since `1 <= cur < math.MaxInt32`, `cur + 1` is proven to reside within `[2, math.MaxInt32]`. The expression `cur + 1` can never evaluate to a negative value.
+  - **Why Saturation is an Anti-Pattern in Reference Counting**:
+    - Some naive designs implement saturating counters (`if cur == MaxInt32 { return true }`), leaving the count pegged at maximum while pretending the acquisition succeeded.
+    - Saturation completely breaks **exact ownership accounting**. If 10 callers saturate the counter, each believes it owns a reference and will later call `Unref()`. When 10 callers invoke `Unref()`, the counter is decremented 10 times below `MaxInt32`, even though the initial increments were never accounted for! This prematurely decrements the counter to 0 while other legitimate references are still outstanding, triggering use-after-free or premature SSTable deletion.
+    - Reference counting must remain **strictly bijective**: every successful acquisition corresponds to exactly one increment, and every release corresponds to exactly one decrement. When capacity is exhausted, acquisition MUST fail (`TryRef() == false`, `Ref()` panics).
+  - **Distinguishing Dead vs. Live-Exhausted States**:
+    - A dead Version (`refCount <= 0`) represents an object that has completed its lifecycle and whose resources are finalized. Attempting to acquire it is a violation of the **non-resurrection invariant**.
+    - A live-exhausted Version (`refCount == math.MaxInt32`) is still actively in use by queries and its resources are valid. Releasing a reference via `Unref()` (`MaxInt32 -> MaxInt32 - 1`) is completely legal.
+    - Reporting `"cannot Ref dead Version"` on an exhausted object is misleading and hinders diagnostics. `Ref()` panics with an explicit overflow message (`"reference count exhausted at MaxInt32"`), clearly isolating capacity limits from object lifecycle bugs.
 
 ---
 

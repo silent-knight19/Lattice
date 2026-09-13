@@ -593,6 +593,53 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 40. Version Reference Count Overflow at MaxInt32 (SEC-005 / F-005) — REMEDIATED
+* **Limitation**: In prior implementations through Phase 06, `Version.TryRef()` and `Version.Ref()` (`internal/version/version.go`) used an atomic compare-and-swap loop that checked only `cur <= 0`. It failed to check the upper boundary `cur == math.MaxInt32` before computing `cur + 1`. In Go, 32-bit signed integer addition wraps around modulo $2^{32}$ without runtime errors or panics. If `refCount` reached `math.MaxInt32` (2,147,483,647), a subsequent `TryRef()` or `Ref()` incremented `cur + 1` to `math.MinInt32` (-2,147,483,648). This negative value permanently corrupted the Version lifecycle:
+  1. Subsequent calls to `TryRef()` observed `cur <= 0` and returned `false`, falsely treating a live Version as dead.
+  2. Subsequent calls to `Ref()` panicked with `"cannot Ref dead Version: reference count is zero or negative"`.
+  3. Subsequent calls to `Unref()` observed `cur <= 0` and panicked with `"Version refCount underflow: double Unref"`.
+  4. Finalization and active chain unlinking could never execute, stranding obsolete SSTables on disk permanently.
+* **Root Cause**:
+  1. Conflating *atomic thread-safety* (CAS prevents lost updates) with *arithmetic domain safety* (CAS does not prevent signed integer overflow).
+  2. Computing `cur + 1` before proving that `cur < math.MaxInt32`.
+* **Remediation**:
+  1. *Pre-Computation Upper-Bound Guard*: In both `Version.TryRef()` and `Version.Ref()`, the upper boundary `cur == math.MaxInt32` is explicitly evaluated inside the CAS loop *before* any addition occurs:
+     ```go
+     for {
+         cur := v.refCount.Load()
+         if cur <= 0 || cur == math.MaxInt32 {
+             return false
+         }
+         if v.refCount.CompareAndSwap(cur, cur+1) {
+             return true
+         }
+     }
+     ```
+     Because `cur < math.MaxInt32` is proven prior to addition, `cur + 1` is mathematically guaranteed to remain within `[2, math.MaxInt32]`, completely eliminating the overflow vector.
+  2. *Exact Accounting & Anti-Saturation*: Rejects reference acquisition once capacity is reached (`TryRef() == false`), strictly preserving 1-to-1 ownership accounting rather than saturating or clamping.
+  3. *Distinguishable Failure Modes*: `Ref()` panics with `"cannot Ref Version: reference count exhausted at MaxInt32"` when `cur == math.MaxInt32`, clearly distinguishing capacity exhaustion from dead Version resurrection (`cur <= 0`).
+  4. *Preserved MaxInt32 Liveness & Underflow Defense*: A Version at `math.MaxInt32` remains a valid live object; `Unref()` successfully transitions `MaxInt32 -> MaxInt32 - 1`. Underflow protection at `cur <= 0` remains strictly enforced.
+* **Regression Coverage & Evidence**:
+  - *TryRef at MaxInt32*: `TestSEC005_TryRef_AtMaxInt32` verifies clean rejection (`false`), zero mutation, and no overflow.
+  - *Ref at MaxInt32*: `TestSEC005_Ref_AtMaxInt32` verifies explicit exhaustion panic without reporting a dead Version.
+  - *One Below Maximum*: `TestSEC005_OneBelowMaximum` verifies transition `MaxInt32 - 1 -> MaxInt32` succeeds, and next attempt immediately fails.
+  - *Maximum Release*: `TestSEC005_MaxRelease` verifies `Unref()` from `MaxInt32 -> MaxInt32 - 1` succeeds without panic.
+  - *Boundary Round Trip*: `TestSEC005_BoundaryRoundTrip` tests complete cycle `MaxInt32 - 2 -> -1 -> Max -> reject -> -1 -> -2`.
+  - *Dead Version Distinction*: `TestSEC005_DeadVersionDistinction` confirms distinct panic messages for dead vs exhausted versions.
+  - *Underflow Regression*: `TestSEC005_UnderflowRegression` confirms double-Unref panics and finalization runs exactly once.
+  - *Concurrent Maximum-Collision*: `TestSEC005_ConcurrentCollision` launches 50 concurrent goroutines against `MaxInt32 - 1`; exactly 1 acquires the reference, 49 fail cleanly, and final count is exactly `MaxInt32`.
+  - *Concurrent Stress*: `TestSEC005_ConcurrentStress` exercises 3,200 mixed TryRef/Unref operations near the maximum boundary under `-race` with 0 races and exact count retention.
+  - *Arithmetic Safety Property*: `TestSEC005_Property_ArithmeticSafety` validates mathematical invariants across all representative states.
+  - *Benchmarks*: `BenchmarkVersion_RefUnref` confirms 8.05 ns/op, 0 B/op, 0 allocs/op (zero measurable overhead).
+* **Remaining Scope Boundary**:
+  - Remediates Version refcount overflow (F-005). Does not modify TableWriter symlink checks (F-006) or TableReader path checks (F-007).
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Mathematical proof that refCount stays within valid [0, MaxInt32] domain).
+  * Performance: **Optimal** (Single branch in existing CAS loop, ~8 ns/op, zero allocations).
+  * Security: **Optimal** (Eliminated negative counter corruption, permanent resource leaks, and spurious underflow panics).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*
 
 

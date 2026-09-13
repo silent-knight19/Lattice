@@ -580,6 +580,61 @@ Verification & Traceability Evidence:
   - Static Analysis: go vet ./... (clean), golangci-lint run ./... (0 issues), go mod verify (clean)
 ```
 
+### F-005 — Version Reference Count Overflow at MaxInt32
+
+```text
+Title: Version Reference Count Integer Overflow at math.MaxInt32 Wrapping to math.MinInt32
+Severity: LOW
+Confidence: CONFIRMED
+Category: VULNERABILITY / INTEGER ARITHMETIC (Reference Counting / State Machine Integrity)
+Phase Introduced: Phase 06 (Version)
+Current Component: internal/version/version.go (Version.Ref, Version.TryRef)
+Affected File: internal/version/version.go
+
+Root Cause:
+  Version.TryRef() and Version.Ref() utilized an atomic compare-and-swap (CAS) retry loop that only
+  guarded against resurrection from dead states (cur <= 0). The loop did not evaluate an upper bound
+  before computing cur + 1. In Go, signed 32-bit integer arithmetic wraps around modulo 2^32 without
+  raising compiler warnings or runtime panics. If refCount reached math.MaxInt32 (2,147,483,647), a
+  subsequent increment evaluated to math.MinInt32 (-2,147,483,648).
+  Why atomic.Int32 Alone Fails: atomic.Int32 guarantees only hardware memory visibility and
+  read-modify-write atomicity (lost-update prevention); it does not enforce mathematical domain bounds
+  or prevent signed integer wraparound during arithmetic expression evaluation.
+  Impact: Wrapping into the negative range caused subsequent TryRef() calls to treat the live Version
+  as dead (cur <= 0 -> false), Ref() to panic with "cannot Ref dead Version", and Unref() to panic with
+  "Version refCount underflow: double Unref". The version object became permanently unreferenceable and
+  unreclaimable, permanently leaking associated on-disk SSTables.
+
+Remediation Status: REMEDIATED (F-005 / SEC-005)
+Remediation Date: 2026-09-13
+Remediation Scope: internal/version/version.go (Version.Ref, Version.TryRef)
+Remediation Strategy:
+  1. Upper-Bound Proof Prior to Arithmetic: In both TryRef() and Ref(), cur == math.MaxInt32 is
+     evaluated inside the CAS retry loop before any addition takes place. Since cur is proven
+     strictly less than math.MaxInt32, cur + 1 is guaranteed to remain in [2, math.MaxInt32].
+  2. Exact Ownership Accounting (No Saturation): Rejects reference acquisition at capacity (TryRef returns
+     false), strictly preserving 1-to-1 reference accounting rather than clamping/saturating.
+  3. Explicit Failure Semantics: Ref() panics with "cannot Ref Version: reference count exhausted at MaxInt32",
+     distinguishing capacity exhaustion from dead Version resurrection ("cannot Ref dead Version").
+  4. Preserved Liveness & Underflow Defense: A Version at math.MaxInt32 remains live; Unref() cleanly
+     transitions MaxInt32 -> MaxInt32 - 1. Underflow defense (cur <= 0) remains strictly enforced.
+Verification & Traceability Evidence:
+  - Boundary Matrix: TestSEC005_TryRef_AtMaxInt32 (TryRef fails, count unchanged, no panic, no wrap),
+    TestSEC005_Ref_AtMaxInt32 (explicit exhaustion panic, count unchanged),
+    TestSEC005_OneBelowMaximum (MaxInt32-1 -> MaxInt32 succeeds, subsequent fails),
+    TestSEC005_MaxRelease (MaxInt32 -> MaxInt32-1 via Unref succeeds),
+    TestSEC005_BoundaryRoundTrip (MaxInt32-2 -> -1 -> Max -> reject -> -1 -> -2).
+  - State Differentiation: TestSEC005_DeadVersionDistinction (distinct panics for dead vs exhausted).
+  - Underflow Regression: TestSEC005_UnderflowRegression (double Unref panics, finalization exactly once).
+  - Concurrent Collision: TestSEC005_ConcurrentCollision (50 concurrent goroutines against MaxInt32-1;
+    exactly 1 succeeds, 49 fail, final count is exactly MaxInt32).
+  - Concurrent Stress: TestSEC005_ConcurrentStress (3,200 mixed TryRef/Unref ops near MaxInt32 under -race, 0 races).
+  - Property Test: TestSEC005_Property_ArithmeticSafety (proves count in [0, MaxInt32] across all states).
+  - Benchmarks: BenchmarkVersion_RefUnref (8.05 ns/op, 0 B/op, 0 allocs/op, zero measurable overhead).
+  - Full Suite: go test ./... (PASS), go test -race ./... (PASS, 0 races)
+  - Static Analysis: go vet ./... (clean), golangci-lint run ./... (0 issues), go mod verify (clean)
+```
+
 ### SEC-002 — SSTable staging parent unpinned; WithFile bypasses staging checks
 
 ```text

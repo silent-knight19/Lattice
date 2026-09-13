@@ -2,6 +2,7 @@ package version
 
 import (
 	"bytes"
+	"math"
 	"sync/atomic"
 )
 
@@ -61,21 +62,34 @@ func NewVersion(levels [NumLevels][]FileMetadata) *Version {
 
 // Ref retains an existing live Version by incrementing its reference count.
 // It uses an atomic compare-and-swap loop to guarantee that a Version whose
-// reference count has already reached zero cannot be resurrected.
-// If the Version is dead (refCount <= 0), Ref panics.
+// reference count has already reached zero cannot be resurrected, and that
+// the reference count never overflows math.MaxInt32.
+// If the Version is dead (refCount <= 0), Ref panics with a dead Version message.
+// If the reference count has reached capacity (refCount == math.MaxInt32), Ref panics with
+// an overflow exhaustion message.
 func (v *Version) Ref() {
-	if !v.TryRef() {
-		panic("cannot Ref dead Version: reference count is zero or negative")
+	for {
+		cur := v.refCount.Load()
+		if cur <= 0 {
+			panic("cannot Ref dead Version: reference count is zero or negative")
+		}
+		if cur == math.MaxInt32 {
+			panic("cannot Ref Version: reference count exhausted at MaxInt32")
+		}
+		if v.refCount.CompareAndSwap(cur, cur+1) {
+			return
+		}
 	}
 }
 
 // TryRef attempts to retain the Version by atomically incrementing its reference count,
-// provided the Version is currently live (refCount > 0).
-// Returns true if successfully retained, or false if the Version is dead.
+// provided the Version is currently live (refCount > 0) and has not reached math.MaxInt32.
+// Returns true if successfully retained, or false if the Version is dead (refCount <= 0)
+// or reference count capacity is exhausted (refCount == math.MaxInt32).
 func (v *Version) TryRef() bool {
 	for {
 		cur := v.refCount.Load()
-		if cur <= 0 {
+		if cur <= 0 || cur == math.MaxInt32 {
 			return false
 		}
 		if v.refCount.CompareAndSwap(cur, cur+1) {
