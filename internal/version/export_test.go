@@ -83,3 +83,8 @@ func SetCurrentLstatFnForTesting(fn func(name string) (os.FileInfo, error)) func
 func (v *Version) SetCleanupFnForTesting(fn func()) {
 	v.cleanupFn = fn
 }
+
+// ActiveCurrentLockCount returns the current number of allocated entries in the directory lock registry.
+func ActiveCurrentLockCount() int {
+	return currentDirLocks.activeLockCount()
+}

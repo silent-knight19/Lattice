@@ -2,6 +2,7 @@ package version
 
 import (
 	"os"
+	"sync/atomic"
 	"testing"
 )
 
@@ -79,4 +80,27 @@ func BenchmarkReadCurrentManifest(b *testing.B) {
 		total += num
 	}
 	_ = total
+}
+
+func BenchmarkSetCurrentManifest_ConcurrentWriters(b *testing.B) {
+	dir := b.TempDir()
+
+	// Bypass actual hardware sync to measure lock contention, framing, and rename throughput
+	restoreSync := SetCurrentSyncFnForTesting(func(f *os.File) error { return nil })
+	defer restoreSync()
+	restoreDirSync := SetCurrentSyncDirFnForTesting(func(dirPath string) error { return nil })
+	defer restoreDirSync()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	var counter uint64
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			manifestNum := atomic.AddUint64(&counter, 1)
+			if err := SetCurrentManifest(dir, manifestNum); err != nil {
+				b.Fatalf("SetCurrentManifest failed: %v", err)
+			}
+		}
+	})
 }

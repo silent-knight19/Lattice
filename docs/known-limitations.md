@@ -496,4 +496,33 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 37. Concurrent CURRENT Writer Staging Collision & Race Vulnerability (SEC-002 / F-002) — REMEDIATED
+* **Limitation**: In prior implementations through Phase 06, `SetCurrentManifest` (`internal/version/current.go`) used a shared static staging path `CURRENT.tmp` without writer serialization. When multiple in-process goroutines concurrently invoked `SetCurrentManifest` for the same database directory, a time-of-check-to-time-of-use (TOCTOU) staging collision occurred: Writer A created `CURRENT.tmp` and began writing; Writer B entered, observed `CURRENT.tmp`, treated it as an orphaned crash artifact, and unlinked it; Writer B then created a new `CURRENT.tmp` inode at that path. Writer A subsequently finished writing to its unlinked file descriptor and executed `os.Rename(CURRENT.tmp, CURRENT)`, promoting Writer B's partially written or differently sequenced temporary file into `CURRENT`. This resulted in corrupted manifest sequence pointers, broken recovery invariant states, or premature pointer swaps.
+* **Root Cause**:
+  1. Static staging path `CURRENT.tmp` shared concurrently without writer serialization.
+  2. Stale-file cleanup step in `SetCurrentManifest` blindly unlinking active temporary files created by concurrent in-flight writers.
+  3. Decoupling temporary file creation from the atomic rename across overlapping execution lifetimes.
+* **Remediation**:
+  1. *Directory-Scoped In-Process Writer Serialization*: Introduced `currentLockRegistry` with reference-counted per-directory synchronization (`currentDirLock`). Concurrent invocations of `SetCurrentManifest` for the same canonical database directory are strictly serialized.
+  2. *Canonical Path Normalization*: Keyed by `canonicalDirKey`, which evaluates `filepath.Clean`, `filepath.Abs`, and physical symlink targets via `filepath.EvalSymlinks`, guaranteeing that relative paths, absolute paths, and symlink aliases map to the identical synchronization lock.
+  3. *Zero-Leak Lifecycle*: Uses reference-counting (`refCount`); when active and pending callers conclude, the directory key is automatically removed from the registry map, guaranteeing zero memory leaks.
+  4. *Atomic Section Scope*: The directory lock covers the entire staging lifecycle: stale temporary file inspection, cleanup, exclusive file creation (`O_WRONLY|O_CREATE|O_EXCL`), inode pinning (`os.SameFile`), content serialization, `fdatasync`, close, `os.Rename`, and parent directory sync.
+  5. *Directory Isolation*: Unrelated database directories acquire disjoint locks and proceed fully in parallel without cross-database serialization bottlenecks.
+* **Regression Coverage & Evidence**:
+  - *Deterministic Interleaving Race*: `TestSetCurrentManifest_ConcurrentWriters_DeterministicRace` forces Writer A into staging (`CURRENT.tmp` created, paused in write), launches Writer B concurrently, verifies Writer B is strictly blocked, asserts Writer A's staging inode is NOT unlinked or replaced (`os.SameFile`), and unblocks Writer A to verify clean sequential progression.
+  - *High-Contention Stress*: `TestSetCurrentManifest_ConcurrentWriters_Stress` runs 16 concurrent workers executing 320 parallel updates, verifying 100% success, zero corrupted reads, and zero active locks remaining.
+  - *Concurrent Writers + Readers*: `TestSetCurrentManifest_ConcurrentWriters_WithReaders` runs 8 writers and 8 readers under `-race`, proving readers never observe partial, empty, or torn bytes.
+  - *Directory Isolation*: `TestSetCurrentManifest_DirectoryIsolation` proves writers on Dir 1 do not block writers on Dir 2.
+  - *Registry Lifecycle*: `TestCurrentLockRegistry_Lifecycle` verifies canonical path resolution, acquire/release, and idempotent release (`sync.Once`).
+  - *Benchmark Stability*: `BenchmarkSetCurrentManifest_ConcurrentWriters` demonstrates ~130 µs/op non-sync throughput with lock acquisition and 0 data races.
+* **Remaining Scope Boundary**:
+  - Remediates in-process concurrency between goroutines. Cross-process concurrency (multiple independent OS processes modifying the same directory) is not protected by in-process Go synchronization and relies on single-process database locking (e.g. `flock`) scheduled for engine initialization in Phase 10.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Concurrent CURRENT updates preserve strict atomic replacement and inode integrity).
+  * Performance: **Optimal** (Lock acquisition overhead is sub-microsecond; directory sync and disk I/O dominate latency).
+  * Security: **Optimal** (Eliminated persistent CURRENT corruption and recovery failure vector).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*
+

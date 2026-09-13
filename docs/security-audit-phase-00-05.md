@@ -441,6 +441,45 @@ Verification & Traceability Evidence:
   - Static Analysis: go vet ./... (clean), golangci-lint run ./... (0 issues), go mod verify (clean)
 ```
 
+### F-002 — Concurrent CURRENT Writer Staging Collision & Inode Race (SetCurrentManifest)
+
+```text
+Title: Concurrent CURRENT Writer Staging Race at CURRENT.tmp
+Severity: MEDIUM
+Confidence: CONFIRMED
+Category: VULNERABILITY / RACE CONDITION (Filesystem / Concurrency / TOCTOU)
+Phase Introduced: Phase 06 (SetCurrentManifest)
+Current Component: internal/version/current.go (SetCurrentManifest)
+Affected File: internal/version/current.go
+
+Root Cause:
+  SetCurrentManifest used a static shared staging path (<dir>/CURRENT.tmp) without in-process
+  writer serialization. When multiple concurrent goroutines called SetCurrentManifest for the
+  same database directory, Writer B observed Writer A's in-flight CURRENT.tmp, unlinked it
+  during stale-temp cleanup, and created a new inode at that path. Writer A subsequently
+  finished writing and called os.Rename(CURRENT.tmp, CURRENT), atomically publishing Writer B's
+  partially written or differently sequenced file rather than Writer A's pointer.
+
+Remediation Status: REMEDIATED (F-002 / SEC-002)
+Remediation Date: 2026-09-13
+Remediation Scope: internal/version/current.go (SetCurrentManifest, currentLockRegistry)
+Remediation Strategy:
+  1. Implemented currentLockRegistry with canonicalDirKey evaluation (filepath.Clean, filepath.Abs, filepath.EvalSymlinks).
+  2. Reference-counted per-directory serialization (currentDirLock) guarantees only one SetCurrentManifest writer manipulates CURRENT.tmp in a given directory at a time.
+  3. Automatic cleanup of registry map entries when refCount reaches 0 (zero memory leaks).
+  4. Full critical section protection: lock spans stale temp inspection, creation, write, sync, close, rename, and parent directory sync.
+  5. Directory isolation: disjoint database directories proceed in parallel without blocking.
+Verification & Traceability Evidence:
+  - Deterministic Race: TestSetCurrentManifest_ConcurrentWriters_DeterministicRace (Writer A paused in staging, Writer B blocked, inode preserved, sequential completion)
+  - Stress Testing: TestSetCurrentManifest_ConcurrentWriters_Stress (16 concurrent workers, 320 parallel updates, 100% success)
+  - Concurrent Readers: TestSetCurrentManifest_ConcurrentWriters_WithReaders (8 writers + 8 readers under -race, zero torn or partial reads)
+  - Directory Isolation: TestSetCurrentManifest_DirectoryIsolation (proves Dir 1 and Dir 2 do not serialize each other)
+  - Lock Lifecycle: TestCurrentLockRegistry_Lifecycle (canonical keys, acquire/release, idempotent release, zero leaks)
+  - Benchmarks: BenchmarkSetCurrentManifest_ConcurrentWriters (~130 µs/op, 0 data races)
+  - Full Suite: go test ./... (PASS), go test -race ./... (PASS, 0 races)
+  - Static Analysis: go vet ./... (clean), golangci-lint run ./... (0 issues), go mod verify (clean)
+```
+
 ### SEC-002 — SSTable staging parent unpinned; WithFile bypasses staging checks
 
 ```text

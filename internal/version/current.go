@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 
 	"github.com/silent-knight19/lattice/internal/errors"
 )
@@ -67,6 +68,75 @@ func syncDir(dirPath string) error {
 	return nil
 }
 
+// currentDirLock tracks in-process serialization state for a single canonical database directory.
+type currentDirLock struct {
+	mu       sync.Mutex
+	refCount int
+}
+
+// currentLockRegistry manages directory-scoped locks with reference-counted cleanup to prevent memory leaks.
+type currentLockRegistry struct {
+	mu    sync.Mutex
+	locks map[string]*currentDirLock
+}
+
+var currentDirLocks = &currentLockRegistry{
+	locks: make(map[string]*currentDirLock),
+}
+
+// acquire obtains exclusive write ownership for the canonical database directory dir.
+// It returns a release function that must be called when the staging operation concludes.
+func (r *currentLockRegistry) acquire(dir string) func() {
+	r.mu.Lock()
+	entry, ok := r.locks[dir]
+	if !ok {
+		entry = &currentDirLock{}
+		r.locks[dir] = entry
+	}
+	entry.refCount++
+	r.mu.Unlock()
+
+	entry.mu.Lock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			entry.mu.Unlock()
+
+			r.mu.Lock()
+			entry.refCount--
+			if entry.refCount == 0 {
+				delete(r.locks, dir)
+			}
+			r.mu.Unlock()
+		})
+	}
+}
+
+// activeLockCount returns the current count of allocated directory lock entries.
+// Used exclusively for testing to verify zero memory leaks in the registry.
+func (r *currentLockRegistry) activeLockCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.locks)
+}
+
+// canonicalDirKey returns a normalized, evaluated path string suitable for use as a map key
+// in directory-scoped lock registries. It resolves relative paths to absolute paths, and evaluates
+// symbolic links if the directory path physically exists.
+func canonicalDirKey(dir string) string {
+	cleanDir := filepath.Clean(dir)
+	absDir, err := filepath.Abs(cleanDir)
+	if err != nil {
+		return cleanDir
+	}
+	realDir, err := filepath.EvalSymlinks(absDir)
+	if err != nil {
+		return absDir
+	}
+	return realDir
+}
+
 // SetCurrentManifest atomically and durably updates the CURRENT pointer file within dir
 // to point to the designated manifest number.
 //
@@ -108,6 +178,12 @@ func SetCurrentManifest(dir string, manifestNum uint64) error {
 	}
 
 	cleanDir := filepath.Clean(dir)
+
+	// In-process directory-scoped serialization (remediates F-002 / SEC-002):
+	// Guarantees only one SetCurrentManifest writer manipulates CURRENT.tmp in this directory at a time.
+	lockKey := canonicalDirKey(cleanDir)
+	releaseLock := currentDirLocks.acquire(lockKey)
+	defer releaseLock()
 
 	// 1. Verify parent directory exists, is a genuine directory, and is not a symlink
 	dirInfo, err := os.Lstat(cleanDir)

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/silent-knight19/lattice/internal/errors"
 )
@@ -1130,4 +1131,362 @@ func FuzzParseCurrentManifest(f *testing.F) {
 			}
 		}
 	})
+}
+
+// -----------------------------------------------------------------------------
+// SEC-002 / F-002 CONCURRENT WRITER REMEDIATION TESTS
+// -----------------------------------------------------------------------------
+
+// TestSetCurrentManifest_ConcurrentWriters_DeterministicRace simulates the exact F-002 race interleaving:
+// Writer A creates CURRENT.tmp and pauses in staging. Writer B concurrently calls SetCurrentManifest.
+// Verifies that Writer B is blocked by the directory lock, cannot delete or overwrite Writer A's
+// staging inode, and both writers complete sequentially without corrupting CURRENT or dropping writes.
+func TestSetCurrentManifest_ConcurrentWriters_DeterministicRace(t *testing.T) {
+	dir := t.TempDir()
+	tmpPath := filepath.Join(dir, CurrentTempFilename)
+
+	writerAInStaging := make(chan struct{})
+	writerACanProceed := make(chan struct{})
+
+	// Hook currentWriteFn: pause Writer A when writing manifest 100
+	restoreWrite := SetCurrentWriteFnForTesting(func(f *os.File, p []byte) (int, error) {
+		if string(p) == ManifestFilename(100)+"\n" {
+			close(writerAInStaging)
+			<-writerACanProceed
+		}
+		return f.Write(p)
+	})
+	defer restoreWrite()
+
+	// Launch Writer A
+	writerAErrCh := make(chan error, 1)
+	go func() {
+		writerAErrCh <- SetCurrentManifest(dir, 100)
+	}()
+
+	// Wait until Writer A has created CURRENT.tmp and paused
+	select {
+	case <-writerAInStaging:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timeout waiting for Writer A to enter staging")
+	}
+
+	// Verify Writer A's temporary file exists and record its inode
+	infoA, err := os.Lstat(tmpPath)
+	if err != nil {
+		t.Fatalf("expected CURRENT.tmp to exist for Writer A: %v", err)
+	}
+
+	// Launch Writer B concurrently
+	writerBErrCh := make(chan error, 1)
+	go func() {
+		writerBErrCh <- SetCurrentManifest(dir, 200)
+	}()
+
+	// Verify Writer B is blocked on the directory lock and cannot execute staging
+	select {
+	case errB := <-writerBErrCh:
+		t.Fatalf("Writer B completed prematurely while Writer A owned staging: %v", errB)
+	case <-time.After(100 * time.Millisecond):
+		// Expected: Writer B is blocked
+	}
+
+	// Verify Writer A's temporary file was NOT deleted or replaced by Writer B
+	infoCurrent, err := os.Lstat(tmpPath)
+	if err != nil {
+		t.Fatalf("Writer A's CURRENT.tmp was deleted by Writer B: %v", err)
+	}
+	if !os.SameFile(infoA, infoCurrent) {
+		t.Fatalf("Writer A's CURRENT.tmp inode was replaced by Writer B (F-002 race reproduced!)")
+	}
+
+	// Unblock Writer A
+	close(writerACanProceed)
+
+	// Wait for Writer A
+	select {
+	case errA := <-writerAErrCh:
+		if errA != nil {
+			t.Fatalf("Writer A failed: %v", errA)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timeout waiting for Writer A")
+	}
+
+	// Wait for Writer B
+	select {
+	case errB := <-writerBErrCh:
+		if errB != nil {
+			t.Fatalf("Writer B failed: %v", errB)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timeout waiting for Writer B")
+	}
+
+	// Final verification: Writer B ran after Writer A, so CURRENT must be 200
+	num, err := ReadCurrentManifest(dir)
+	if err != nil {
+		t.Fatalf("ReadCurrentManifest failed: %v", err)
+	}
+	if num != 200 {
+		t.Errorf("expected final manifest 200, got %d", num)
+	}
+
+	// Staging file must be cleanly cleaned up
+	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
+		t.Errorf("CURRENT.tmp still exists after completion")
+	}
+
+	// Lock registry must have zero active locks
+	if count := ActiveCurrentLockCount(); count != 0 {
+		t.Errorf("expected 0 active directory locks, got %d", count)
+	}
+}
+
+// TestSetCurrentManifest_ConcurrentWriters_Stress executes high-contention concurrent writes
+// across 16 parallel goroutines each executing multiple sequential manifest updates.
+func TestSetCurrentManifest_ConcurrentWriters_Stress(t *testing.T) {
+	dir := t.TempDir()
+
+	const numWriters = 16
+	const writesPerWorker = 20
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, numWriters*writesPerWorker)
+
+	for w := 0; w < numWriters; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for i := 1; i <= writesPerWorker; i++ {
+				manifestNum := uint64(workerID*1000 + i)
+				if err := SetCurrentManifest(dir, manifestNum); err != nil {
+					errCh <- fmt.Errorf("worker %d write %d (manifest %d) failed: %w", workerID, i, manifestNum, err)
+					return
+				}
+			}
+		}(w)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatalf("concurrent writer error: %v", err)
+	}
+
+	// Final read must succeed and return a valid manifest number
+	finalNum, err := ReadCurrentManifest(dir)
+	if err != nil {
+		t.Fatalf("final ReadCurrentManifest failed: %v", err)
+	}
+	if finalNum == 0 {
+		t.Fatalf("final manifest number was 0")
+	}
+
+	// Verify content on disk matches canonical encoding byte-for-byte
+	content, err := os.ReadFile(filepath.Join(dir, CurrentFilename))
+	if err != nil {
+		t.Fatalf("failed to read CURRENT: %v", err)
+	}
+	expected := ManifestFilename(finalNum) + "\n"
+	if string(content) != expected {
+		t.Errorf("CURRENT content mismatch: got %q, want %q", string(content), expected)
+	}
+
+	// Verify temporary file is cleaned up
+	if _, err := os.Stat(filepath.Join(dir, CurrentTempFilename)); !os.IsNotExist(err) {
+		t.Errorf("CURRENT.tmp still exists after stress test")
+	}
+
+	// Verify zero memory leaks
+	if count := ActiveCurrentLockCount(); count != 0 {
+		t.Errorf("expected 0 active directory locks, got %d", count)
+	}
+}
+
+// TestSetCurrentManifest_ConcurrentWriters_WithReaders runs concurrent writers and readers
+// simultaneously under -race, ensuring readers never observe torn, partial, or corrupted CURRENT bytes.
+func TestSetCurrentManifest_ConcurrentWriters_WithReaders(t *testing.T) {
+	dir := t.TempDir()
+
+	if err := SetCurrentManifest(dir, 1); err != nil {
+		t.Fatalf("initial SetCurrentManifest failed: %v", err)
+	}
+
+	const numWriters = 8
+	const numReaders = 8
+	const writesPerWorker = 25
+
+	var wg sync.WaitGroup
+	stopReaders := make(chan struct{})
+
+	readerErrs := make(chan error, numReaders)
+	for r := 0; r < numReaders; r++ {
+		wg.Add(1)
+		go func(readerID int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stopReaders:
+					return
+				default:
+					manifestNum, err := ReadCurrentManifest(dir)
+					if err != nil {
+						readerErrs <- fmt.Errorf("reader %d failed: %w", readerID, err)
+						return
+					}
+					if manifestNum == 0 {
+						readerErrs <- fmt.Errorf("reader %d observed manifest 0", readerID)
+						return
+					}
+				}
+			}
+		}(r)
+	}
+
+	writerErrs := make(chan error, numWriters)
+	var writersWg sync.WaitGroup
+	for w := 0; w < numWriters; w++ {
+		writersWg.Add(1)
+		go func(workerID int) {
+			defer writersWg.Done()
+			for i := 1; i <= writesPerWorker; i++ {
+				manifestNum := uint64(workerID*1000 + i)
+				if err := SetCurrentManifest(dir, manifestNum); err != nil {
+					writerErrs <- fmt.Errorf("writer %d write %d failed: %w", workerID, i, err)
+					return
+				}
+			}
+		}(w)
+	}
+
+	writersWg.Wait()
+	close(stopReaders)
+	wg.Wait()
+
+	close(readerErrs)
+	for err := range readerErrs {
+		t.Fatalf("concurrent reader error: %v", err)
+	}
+	close(writerErrs)
+	for err := range writerErrs {
+		t.Fatalf("concurrent writer error: %v", err)
+	}
+
+	finalNum, err := ReadCurrentManifest(dir)
+	if err != nil {
+		t.Fatalf("final ReadCurrentManifest failed: %v", err)
+	}
+	if finalNum == 0 {
+		t.Fatalf("final manifest number was 0")
+	}
+
+	if count := ActiveCurrentLockCount(); count != 0 {
+		t.Errorf("expected 0 active directory locks, got %d", count)
+	}
+}
+
+// TestSetCurrentManifest_DirectoryIsolation verifies that writers to distinct database directories
+// operate independently without blocking or serializing one another.
+func TestSetCurrentManifest_DirectoryIsolation(t *testing.T) {
+	dir1 := t.TempDir()
+	dir2 := t.TempDir()
+
+	dir1InStaging := make(chan struct{})
+	dir1CanProceed := make(chan struct{})
+
+	cleanDir1 := filepath.Clean(dir1)
+
+	restoreWrite := SetCurrentWriteFnForTesting(func(f *os.File, p []byte) (int, error) {
+		if filepath.Dir(f.Name()) == cleanDir1 {
+			close(dir1InStaging)
+			<-dir1CanProceed
+		}
+		return f.Write(p)
+	})
+	defer restoreWrite()
+
+	dir1ErrCh := make(chan error, 1)
+	go func() {
+		dir1ErrCh <- SetCurrentManifest(dir1, 100)
+	}()
+
+	select {
+	case <-dir1InStaging:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timeout waiting for Dir 1 staging")
+	}
+
+	// Writer in Dir 2 must NOT be blocked by Dir 1
+	dir2Done := make(chan error, 1)
+	go func() {
+		dir2Done <- SetCurrentManifest(dir2, 200)
+	}()
+
+	select {
+	case err := <-dir2Done:
+		if err != nil {
+			t.Fatalf("Dir 2 write failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Dir 2 was blocked by Dir 1 (directory isolation failure!)")
+	}
+
+	num2, err := ReadCurrentManifest(dir2)
+	if err != nil || num2 != 200 {
+		t.Fatalf("Dir 2 read failed: num=%d, err=%v", num2, err)
+	}
+
+	close(dir1CanProceed)
+	if err := <-dir1ErrCh; err != nil {
+		t.Fatalf("Dir 1 write failed: %v", err)
+	}
+
+	num1, err := ReadCurrentManifest(dir1)
+	if err != nil || num1 != 100 {
+		t.Fatalf("Dir 1 read failed: num=%d, err=%v", num1, err)
+	}
+
+	if count := ActiveCurrentLockCount(); count != 0 {
+		t.Errorf("expected 0 active directory locks, got %d", count)
+	}
+}
+
+// TestCurrentLockRegistry_Lifecycle verifies canonical key derivation, acquire/release,
+// zero leaks, and release idempotence.
+func TestCurrentLockRegistry_Lifecycle(t *testing.T) {
+	dir := t.TempDir()
+
+	// 1. Verify canonical key resolution for relative vs absolute paths
+	relDir := "."
+	absRel, err := filepath.Abs(relDir)
+	if err != nil {
+		t.Fatalf("filepath.Abs failed: %v", err)
+	}
+	realRel, err := filepath.EvalSymlinks(absRel)
+	if err != nil {
+		t.Fatalf("filepath.EvalSymlinks failed: %v", err)
+	}
+	if k1, k2 := canonicalDirKey(relDir), canonicalDirKey(realRel); k1 != k2 {
+		t.Errorf("canonicalDirKey mismatch: got %q vs %q", k1, k2)
+	}
+
+	// 2. Verify acquire and idempotent release
+	unlock1 := currentDirLocks.acquire(dir)
+	if count := currentDirLocks.activeLockCount(); count != 1 {
+		t.Errorf("expected 1 active lock, got %d", count)
+	}
+
+	// Release first time
+	unlock1()
+	if count := currentDirLocks.activeLockCount(); count != 0 {
+		t.Errorf("expected 0 active locks after release, got %d", count)
+	}
+
+	// Release second time (idempotent via sync.Once)
+	unlock1()
+	if count := currentDirLocks.activeLockCount(); count != 0 {
+		t.Errorf("expected 0 active locks after second release, got %d", count)
+	}
 }

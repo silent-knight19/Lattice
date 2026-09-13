@@ -2909,6 +2909,23 @@ Offset 68..71 (4B, CRC32-IEEE):
   - **Log Compaction & Rollover**: Over weeks of operation, a `MANIFEST` accumulates thousands of historical edits. To prevent unbounded recovery time on startup, the engine rolls over: it snapshots the active `Version` into a fresh `MANIFEST-000002` and deletes `MANIFEST-000001`.
   - **Indirection & O(1) Switching**: The `CURRENT` file acts as a single level of indirection. Switching the entire database to a new manifest snapshot is an instantaneous $O(1)$ atomic file rename of `CURRENT`, decoupling log growth from active state identification.
 
+### 9. Why is a fixed staging filename (`CURRENT.tmp`) unsafe under concurrent writers, and how does directory-scoped serialization eliminate the race? (SEC-002 / F-002)
+* **Question**: What exact race condition occurs when multiple concurrent goroutines call `SetCurrentManifest(dir, ...)` using a static `CURRENT.tmp` staging path, and how does Lattice eliminate it without leaking memory?
+* **Answer**:
+  - **The Unlinked Inode / Staging Hijack Race**:
+    1. Writer A creates `CURRENT.tmp` exclusively and begins serializing manifest 100.
+    2. Writer B enters `SetCurrentManifest(dir, 200)`. During its initial stale temporary file cleanup, Writer B observes `CURRENT.tmp`, assumes it is an orphaned crash artifact, and unlinks it (`os.Remove`).
+    3. Writer B creates a *new* `CURRENT.tmp` inode and begins writing manifest 200.
+    4. Writer A finishes writing to its now-unlinked file descriptor, syncs, closes, and executes `os.Rename("CURRENT.tmp", "CURRENT")`.
+    5. Because `os.Rename` operates on directory path strings rather than open file descriptors, Writer A renames **Writer B's** partially written or differently sequenced temporary file into `CURRENT`! Writer A's own data is completely lost, and `CURRENT` now points to Writer B's file prematurely.
+  - **Why Per-Directory Serialization Solves It**:
+    - By wrapping the staging lifecycle in an in-process directory-scoped lock (`currentLockRegistry`), Writer B is strictly blocked until Writer A has completed its staging, write, sync, close, atomic rename, and directory sync.
+    - Writer B can never observe, unlink, or overwrite Writer A's in-flight staging object.
+  - **Path Canonicalization & Zero-Leak Invariants**:
+    - The lock registry keys on `canonicalDirKey(dir)` which resolves `filepath.Clean`, `filepath.Abs`, and physical symlink targets via `filepath.EvalSymlinks`, ensuring that relative, absolute, and symlinked directory paths map to the same lock.
+    - Locks are reference-counted (`refCount`). When all concurrent operations on a directory finish, the entry is automatically removed from the registry map, guaranteeing zero memory leaks.
+    - Distinct database directories acquire disjoint locks and proceed concurrently without cross-database serialization bottlenecks.
+
 ---
 
 # 31. Deep Systems Interview Questions & Answers: CURRENT Pointer Reader & Validation (P06-S02-M02)
