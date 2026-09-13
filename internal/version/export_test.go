@@ -86,7 +86,7 @@ func (v *Version) SetCleanupFnForTesting(fn func()) {
 
 // SetRefCountForTesting directly sets the atomic reference count of a Version for boundary testing.
 // This is strictly a test-only helper located in export_test.go and is not part of the production API.
-func (v *Version) SetRefCountForTesting(count int32) {
+func (v *Version) SetRefCountForTesting(count int64) {
 	v.refCount.Store(count)
 }
 

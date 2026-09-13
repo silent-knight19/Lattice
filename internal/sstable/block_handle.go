@@ -75,6 +75,13 @@ func (h BlockHandle) Validate() error {
 			Reason: "block size must be greater than zero",
 		}
 	}
+	if h.Size > uint64(math.MaxInt) {
+		return &errors.InvalidBlockHandleError{
+			Offset: h.Offset,
+			Size:   h.Size,
+			Reason: "block size exceeds architecture integer bounds",
+		}
+	}
 	if h.Offset > math.MaxUint64-h.Size {
 		return &errors.InvalidBlockHandleError{
 			Offset: h.Offset,

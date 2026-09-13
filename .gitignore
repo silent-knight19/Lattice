@@ -63,3 +63,7 @@ ehthumbs.db
 
 # Local Version Control / Checkpointing
 .itehaas/
+
+# Documents & Post-Mortem PDFs
+*.pdf
+The Lattice Storage Engine Post-Mortem*.pdf

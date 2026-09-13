@@ -303,12 +303,34 @@ func SetCurrentManifest(dir string, manifestNum uint64) error {
 		return fmt.Errorf("current: close of %s failed: %w", tmpPath, err)
 	}
 
-	// 8. Atomically replace CURRENT with CURRENT.tmp
+	// 8a. Pre-rename verification: ensure currentPath is not a symlink immediately before rename
+	if cInfo, err := currentLstatFn(currentPath); err == nil {
+		if cInfo.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: target %s is a symlink before rename", errors.ErrCurrentSymlink, currentPath)
+		}
+	}
+
+	// 8b. Atomically replace CURRENT with CURRENT.tmp
 	if err := currentRenameFn(tmpPath, currentPath); err != nil {
 		return fmt.Errorf("current: rename %s to %s failed: %w", tmpPath, currentPath, err)
 	}
 
-	// Atomic rename succeeded! Staging file is now at currentPath; cleanup is disengaged
+	// 8c. Post-rename TOCTOU defense (IND-005): verify currentPath inode matches finfo and is regular
+	postStat, err := currentLstatFn(currentPath)
+	if err != nil {
+		return fmt.Errorf("current: failed to stat %s post-rename: %w", currentPath, err)
+	}
+	if postStat.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: target %s was replaced with a symlink post-rename", errors.ErrCurrentSymlink, currentPath)
+	}
+	if !postStat.Mode().IsRegular() {
+		return fmt.Errorf("current: target %s is not a regular file post-rename", currentPath)
+	}
+	if !os.SameFile(finfo, postStat) {
+		return fmt.Errorf("%w: CURRENT file object identity mismatch post-rename", os.ErrInvalid)
+	}
+
+	// Atomic rename verified! Staging file is now safely at currentPath; cleanup is disengaged
 	needsCleanup = false
 
 	// 9. Parent directory durability barrier

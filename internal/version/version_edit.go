@@ -226,25 +226,23 @@ func ValidateFileMetadata(level uint32, meta FileMetadata) error {
 		return err
 	}
 
-	skUserLen := len(meta.SmallestKey) - binary.InternalKeyTrailerLen
-	ikSmall := binary.InternalKey{
-		UserKey: meta.SmallestKey[:skUserLen],
-		SeqNum:  binary.SeqNum(binary.GetUint64(meta.SmallestKey[skUserLen : skUserLen+8])),
-		OpType:  binary.OpType(meta.SmallestKey[skUserLen+8]),
-	}
-
-	lkUserLen := len(meta.LargestKey) - binary.InternalKeyTrailerLen
-	ikLarge := binary.InternalKey{
-		UserKey: meta.LargestKey[:lkUserLen],
-		SeqNum:  binary.SeqNum(binary.GetUint64(meta.LargestKey[lkUserLen : lkUserLen+8])),
-		OpType:  binary.OpType(meta.LargestKey[lkUserLen+8]),
-	}
+	ikSmall := decodeInternalKeyNoAlloc(meta.SmallestKey)
+	ikLarge := decodeInternalKeyNoAlloc(meta.LargestKey)
 
 	if binary.CompareInternalKey(ikSmall, ikLarge) > 0 {
 		return errors.ErrInvalidKeyRange
 	}
 
 	return nil
+}
+
+func decodeInternalKeyNoAlloc(data []byte) binary.InternalKey {
+	userLen := len(data) - binary.InternalKeyTrailerLen
+	return binary.InternalKey{
+		UserKey: data[:userLen],
+		SeqNum:  binary.SeqNum(binary.GetUint64(data[userLen : userLen+8])),
+		OpType:  binary.OpType(data[userLen+8]),
+	}
 }
 
 // AddFile records an SSTable addition at the designated level with the provided metadata.
@@ -268,14 +266,118 @@ func (e *VersionEdit) AddFile(level uint32, meta FileMetadata) error {
 
 // DeleteFile records an SSTable deletion from the designated level.
 // Level must satisfy 0 <= level < NumLevels (7).
+// FileNum must satisfy fileNum > 0 (zero is reserved as an unassigned sentinel).
 func (e *VersionEdit) DeleteFile(level uint32, fileNum uint64) error {
 	if level >= NumLevels {
 		return &errors.InvalidLevelError{Level: level, MaxLevel: NumLevels - 1}
+	}
+	if fileNum == 0 {
+		return errors.ErrInvalidFileNum
 	}
 	e.deletedFiles = append(e.deletedFiles, DeleteFileEntry{
 		Level:   level,
 		FileNum: fileNum,
 	})
+	return nil
+}
+
+// Validate verifies that the VersionEdit satisfies all structural and semantic invariants:
+//  1. Valid LSM levels: all added and deleted files must have level < NumLevels (7).
+//  2. Valid file numbers: all added and deleted files must have fileNum > 0.
+//  3. Valid file sizes: all added files must have fileSize > 0.
+//  4. Sequence number range: all added files must satisfy SmallestSeqNum <= LargestSeqNum.
+//  5. Internal key validity and range: all added files must satisfy ValidateFileMetadata.
+//  6. Uniqueness:
+//     - No duplicate (level, fileNum) entries in deletedFiles.
+//     - No duplicate (level, fileNum) entries in addedFiles, and no duplicate fileNum across different levels.
+//  7. Mutual exclusion: a file cannot be both added and deleted at the same level in the same edit.
+//  8. Monotonic, non-overlapping key ranges for Level >= 1:
+//     - For levels 1 through 6, added files within each level must have non-overlapping key ranges.
+//  9. Sequence number consistency with LastSeqNum:
+//     - If hasLastSeqNum is set, all added files must have LargestSeqNum <= uint64(lastSeqNum).
+func (e *VersionEdit) Validate() error {
+	if e == nil {
+		return nil
+	}
+
+	type levelFileKey struct {
+		level   uint32
+		fileNum uint64
+	}
+
+	// 1. Validate deleted files
+	deletedSet := make(map[levelFileKey]struct{}, len(e.deletedFiles))
+	for _, d := range e.deletedFiles {
+		if d.Level >= NumLevels {
+			return &errors.InvalidLevelError{Level: d.Level, MaxLevel: NumLevels - 1}
+		}
+		if d.FileNum == 0 {
+			return errors.ErrInvalidFileNum
+		}
+		k := levelFileKey{level: d.Level, fileNum: d.FileNum}
+		if _, exists := deletedSet[k]; exists {
+			return fmt.Errorf("%w: duplicate DeleteFile entry for level %d, file %d", errors.ErrCorruptedVersionEdit, d.Level, d.FileNum)
+		}
+		deletedSet[k] = struct{}{}
+	}
+
+	// 2. Validate added files
+	addedSet := make(map[levelFileKey]struct{}, len(e.addedFiles))
+	addedFileNums := make(map[uint64]uint32, len(e.addedFiles)) // fileNum -> level
+	for _, a := range e.addedFiles {
+		if err := ValidateFileMetadata(a.Level, a.Meta); err != nil {
+			return err
+		}
+
+		k := levelFileKey{level: a.Level, fileNum: a.Meta.FileNum}
+		if _, exists := addedSet[k]; exists {
+			return fmt.Errorf("%w: duplicate AddFile entry for level %d, file %d", errors.ErrCorruptedVersionEdit, a.Level, a.Meta.FileNum)
+		}
+		addedSet[k] = struct{}{}
+
+		if prevLevel, exists := addedFileNums[a.Meta.FileNum]; exists {
+			return fmt.Errorf("%w: file %d added to multiple levels (%d and %d)", errors.ErrCorruptedVersionEdit, a.Meta.FileNum, prevLevel, a.Level)
+		}
+		addedFileNums[a.Meta.FileNum] = a.Level
+
+		// Mutual exclusion: cannot add and delete same file at same level
+		if _, exists := deletedSet[k]; exists {
+			return fmt.Errorf("%w: file %d cannot be both added and deleted at level %d in the same edit", errors.ErrCorruptedVersionEdit, a.Meta.FileNum, a.Level)
+		}
+
+		// Sequence number bound against LastSeqNum (if set)
+		if e.hasLastSeqNum && a.Meta.LargestSeqNum > uint64(e.lastSeqNum) {
+			return fmt.Errorf("%w: added file %d largest seqNum %d exceeds edit lastSeqNum %d", errors.ErrCorruptedVersionEdit, a.Meta.FileNum, a.Meta.LargestSeqNum, e.lastSeqNum)
+		}
+	}
+
+	// 3. Monotonic, non-overlapping key ranges for levels 1..6
+	for lvl := uint32(1); lvl < NumLevels; lvl++ {
+		var levelFiles []FileMetadata
+		for _, a := range e.addedFiles {
+			if a.Level == lvl {
+				levelFiles = append(levelFiles, a.Meta)
+			}
+		}
+		if len(levelFiles) <= 1 {
+			continue
+		}
+
+		slices.SortFunc(levelFiles, func(a, b FileMetadata) int {
+			ikA := decodeInternalKeyNoAlloc(a.SmallestKey)
+			ikB := decodeInternalKeyNoAlloc(b.SmallestKey)
+			return binary.CompareInternalKey(ikA, ikB)
+		})
+
+		for i := 0; i < len(levelFiles)-1; i++ {
+			prevLargest := decodeInternalKeyNoAlloc(levelFiles[i].LargestKey)
+			currSmallest := decodeInternalKeyNoAlloc(levelFiles[i+1].SmallestKey)
+			if bytes.Compare(prevLargest.UserKey, currSmallest.UserKey) >= 0 || binary.CompareInternalKey(prevLargest, currSmallest) >= 0 {
+				return fmt.Errorf("%w: overlapping key ranges at level %d between file %d and file %d", errors.ErrInvalidKeyRange, lvl, levelFiles[i].FileNum, levelFiles[i+1].FileNum)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -634,6 +736,9 @@ func DecodeVersionEdit(data []byte) (*VersionEdit, error) {
 					Reason: "trailing bytes in DeleteFile payload",
 				}
 			}
+			if fNum == 0 {
+				return nil, errors.ErrInvalidFileNum
+			}
 			edit.deletedFiles = append(edit.deletedFiles, DeleteFileEntry{
 				Level:   uint32(lvl),
 				FileNum: fNum,
@@ -750,6 +855,10 @@ func DecodeVersionEdit(data []byte) (*VersionEdit, error) {
 		default:
 			// Forward compatibility: safely skip unknown tags with valid lengths per Section 17.
 		}
+	}
+
+	if err := edit.Validate(); err != nil {
+		return nil, err
 	}
 
 	return edit, nil

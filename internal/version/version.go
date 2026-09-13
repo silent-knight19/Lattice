@@ -20,7 +20,7 @@ import (
 type Version struct {
 	id        uint64
 	levels    [NumLevels][]FileMetadata
-	refCount  atomic.Int32
+	refCount  atomic.Int64
 	vset      *VersionSet
 	next      *Version
 	prev      *Version
@@ -63,9 +63,9 @@ func NewVersion(levels [NumLevels][]FileMetadata) *Version {
 // Ref retains an existing live Version by incrementing its reference count.
 // It uses an atomic compare-and-swap loop to guarantee that a Version whose
 // reference count has already reached zero cannot be resurrected, and that
-// the reference count never overflows math.MaxInt32.
+// the reference count never overflows math.MaxInt64.
 // If the Version is dead (refCount <= 0), Ref panics with a dead Version message.
-// If the reference count has reached capacity (refCount == math.MaxInt32), Ref panics with
+// If the reference count has reached capacity (refCount == math.MaxInt64), Ref panics with
 // an overflow exhaustion message.
 func (v *Version) Ref() {
 	for {
@@ -73,8 +73,8 @@ func (v *Version) Ref() {
 		if cur <= 0 {
 			panic("cannot Ref dead Version: reference count is zero or negative")
 		}
-		if cur == math.MaxInt32 {
-			panic("cannot Ref Version: reference count exhausted at MaxInt32")
+		if cur == math.MaxInt64 {
+			panic("cannot Ref Version: reference count exhausted at MaxInt64")
 		}
 		if v.refCount.CompareAndSwap(cur, cur+1) {
 			return
@@ -83,13 +83,13 @@ func (v *Version) Ref() {
 }
 
 // TryRef attempts to retain the Version by atomically incrementing its reference count,
-// provided the Version is currently live (refCount > 0) and has not reached math.MaxInt32.
+// provided the Version is currently live (refCount > 0) and has not reached math.MaxInt64.
 // Returns true if successfully retained, or false if the Version is dead (refCount <= 0)
-// or reference count capacity is exhausted (refCount == math.MaxInt32).
+// or reference count capacity is exhausted (refCount == math.MaxInt64).
 func (v *Version) TryRef() bool {
 	for {
 		cur := v.refCount.Load()
-		if cur <= 0 || cur == math.MaxInt32 {
+		if cur <= 0 || cur == math.MaxInt64 {
 			return false
 		}
 		if v.refCount.CompareAndSwap(cur, cur+1) {
@@ -154,7 +154,7 @@ func (v *Version) ID() uint64 {
 }
 
 // RefCount returns the current atomic reference count of the Version.
-func (v *Version) RefCount() int32 {
+func (v *Version) RefCount() int64 {
 	return v.refCount.Load()
 }
 

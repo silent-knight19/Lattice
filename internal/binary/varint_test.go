@@ -713,3 +713,90 @@ func BenchmarkRoundTripVarint64(b *testing.B) {
 	sinkVarintVal = val
 	sinkVarintN = n
 }
+
+// ============================================================================
+// IND-008: Varint32 Symmetry, Boundary & Invariant Tests
+// ============================================================================
+
+func TestVarint32_SymmetryAndBoundaries(t *testing.T) {
+	testValues := []uint32{
+		0,
+		1,
+		127,
+		128,
+		255,
+		16383,
+		16384,
+		2097151,
+		2097152,
+		268435455,
+		268435456,
+		math.MaxInt32 - 1,
+		math.MaxInt32,
+		uint32(math.MaxInt32) + 1,
+		math.MaxUint32 - 1,
+		math.MaxUint32,
+	}
+
+	buf := make([]byte, binary.MaxVarintLen32)
+
+	for _, val := range testValues {
+		expectedLen := binary.VarintLen32(val)
+		if expectedLen < 1 || expectedLen > binary.MaxVarintLen32 {
+			t.Fatalf("invalid VarintLen32 for %d: %d", val, expectedLen)
+		}
+
+		n := binary.PutVarint32(buf, val)
+		if n != expectedLen {
+			t.Fatalf("PutVarint32 length mismatch for %d: got %d, want %d", val, n, expectedLen)
+		}
+
+		decoded, consumed, err := binary.GetVarint32(buf[:n])
+		if err != nil {
+			t.Fatalf("GetVarint32 failed for %d: %v", val, err)
+		}
+		if consumed != n {
+			t.Fatalf("GetVarint32 consumed bytes mismatch for %d: got %d, want %d", val, consumed, n)
+		}
+		if decoded != val {
+			t.Fatalf("GetVarint32 value mismatch: got %d, want %d", decoded, val)
+		}
+
+		// Also verify canonical decoder
+		canonicalDecoded, canonConsumed, err := binary.GetVarint32Canonical(buf[:n])
+		if err != nil {
+			t.Fatalf("GetVarint32Canonical failed for %d: %v", val, err)
+		}
+		if canonConsumed != n || canonicalDecoded != val {
+			t.Fatalf("GetVarint32Canonical mismatch for %d: got (%d, %d), want (%d, %d)", val, canonicalDecoded, canonConsumed, val, n)
+		}
+	}
+}
+
+func TestVarint32_Errors(t *testing.T) {
+	// 1. Truncated empty
+	if _, _, err := binary.GetVarint32([]byte{}); !stdErrors.Is(err, errors.ErrVarintTruncated) {
+		t.Fatalf("expected ErrVarintTruncated for empty buffer, got: %v", err)
+	}
+
+	// 2. Truncated continuation bit set
+	if _, _, err := binary.GetVarint32([]byte{0x80}); !stdErrors.Is(err, errors.ErrVarintTruncated) {
+		t.Fatalf("expected ErrVarintTruncated for buffer ending with continuation bit, got: %v", err)
+	}
+
+	// 3. Overflow: 5th byte has bits > 0x0F set (e.g. 0x10)
+	overflowBuf := []byte{0x80, 0x80, 0x80, 0x80, 0x10}
+	if _, _, err := binary.GetVarint32(overflowBuf); !stdErrors.Is(err, errors.ErrVarintOverflow) {
+		t.Fatalf("expected ErrVarintOverflow for 5th byte > 0x0F, got: %v", err)
+	}
+
+	// 4. Non-canonical: 0 encoded as 2 bytes [0x80, 0x00]
+	nonCanonical := []byte{0x80, 0x00}
+	val, n, err := binary.GetVarint32(nonCanonical)
+	if err != nil || val != 0 || n != 2 {
+		t.Fatalf("GetVarint32 non-canonical decode unexpected result: val=%d, n=%d, err=%v", val, n, err)
+	}
+	if _, _, err := binary.GetVarint32Canonical(nonCanonical); !stdErrors.Is(err, errors.ErrVarintNonCanonical) {
+		t.Fatalf("expected ErrVarintNonCanonical, got: %v", err)
+	}
+}

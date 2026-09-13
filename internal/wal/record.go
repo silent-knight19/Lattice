@@ -423,11 +423,12 @@ func DecodeRecord(r io.Reader) (Record, error) {
 		}
 	}
 
-	// Read KeyBytes
-	var key []byte
+	// PHASE 1: Two-Phase Staging (IND-001)
+	// Read Key payload into temporary staging slice
+	var keyStaging []byte
 	if keyLen > 0 {
-		key = make([]byte, keyLen)
-		if err := readFullOrUnexpectedEOF(r, key); err != nil {
+		keyStaging = make([]byte, keyLen)
+		if err := readFullOrUnexpectedEOF(r, keyStaging); err != nil {
 			return Record{}, err
 		}
 	}
@@ -447,7 +448,7 @@ func DecodeRecord(r io.Reader) (Record, error) {
 		}
 	}
 
-	// Validate ValueLength against record type constraints before allocating
+	// Validate ValueLength against record type constraints
 	switch header.Type {
 	case RecordTypeDelete:
 		if valLen > 0 {
@@ -465,25 +466,25 @@ func DecodeRecord(r io.Reader) (Record, error) {
 		}
 	}
 
-	// Read ValueBytes
-	var val []byte
+	// Read Value payload into temporary staging slice
+	var valStaging []byte
 	if valLen > 0 {
-		val = make([]byte, valLen)
-		if err := readFullOrUnexpectedEOF(r, val); err != nil {
+		valStaging = make([]byte, valLen)
+		if err := readFullOrUnexpectedEOF(r, valStaging); err != nil {
 			return Record{}, err
 		}
 	}
 
-	// Reconstruct CRC32-IEEE across all bytes following CRC field:
-	// headerBuf[4:21] (17B) + keyLenBuf (2B) + key + valLenBuf (4B) + val
+	// PHASE 2: Reconstruct CRC32-IEEE across all bytes following CRC field:
+	// headerBuf[4:21] (17B) + keyLenBuf (2B) + keyStaging + valLenBuf (4B) + valStaging
 	crc := crc32.Update(0, crc32.IEEETable, headerBuf[4:HeaderSize])
 	crc = crc32.Update(crc, crc32.IEEETable, keyLenBuf[:])
 	if keyLen > 0 {
-		crc = crc32.Update(crc, crc32.IEEETable, key)
+		crc = crc32.Update(crc, crc32.IEEETable, keyStaging)
 	}
 	crc = crc32.Update(crc, crc32.IEEETable, valLenBuf[:])
 	if valLen > 0 {
-		crc = crc32.Update(crc, crc32.IEEETable, val)
+		crc = crc32.Update(crc, crc32.IEEETable, valStaging)
 	}
 
 	if crc != header.CRC {
@@ -493,13 +494,14 @@ func DecodeRecord(r io.Reader) (Record, error) {
 		}
 	}
 
+	// Atomic validation complete: CRC is valid and record is intact. Commit caller-owned slices.
 	return Record{
 		CRC:       header.CRC,
 		Type:      header.Type,
 		SeqNum:    header.SeqNum,
 		Timestamp: header.Timestamp,
-		Key:       key,
-		Value:     val,
+		Key:       keyStaging,
+		Value:     valStaging,
 	}, nil
 }
 

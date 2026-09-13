@@ -9,6 +9,9 @@ import (
 // MaxVarintLen64 is the maximum number of bytes required to encode a uint64 varint.
 const MaxVarintLen64 = 10
 
+// MaxVarintLen32 is the maximum number of bytes required to encode a uint32 varint.
+const MaxVarintLen32 = 5
+
 // VarintLen returns the exact number of bytes required to encode v as a 7-bit varint.
 // It returns a value between 1 and 10.
 func VarintLen(v uint64) int {
@@ -16,6 +19,15 @@ func VarintLen(v uint64) int {
 		return 1
 	}
 	return (bits.Len64(v) + 6) / 7
+}
+
+// VarintLen32 returns the exact number of bytes required to encode v as a 32-bit 7-bit varint.
+// It returns a value between 1 and 5.
+func VarintLen32(v uint32) int {
+	if v == 0 {
+		return 1
+	}
+	return (bits.Len32(v) + 6) / 7
 }
 
 // PutVarint64 encodes a uint64 into buf using unsigned 7-bit variable-length encoding.
@@ -119,3 +131,83 @@ func GetVarint64Canonical(buf []byte) (uint64, int, error) {
 	}
 	return val, n, nil
 }
+
+// PutVarint32 encodes a uint32 into buf using unsigned 7-bit variable-length encoding.
+// It returns the number of bytes written (1 <= n <= 5).
+//
+// Buffer contract:
+//   - Requires len(buf) >= VarintLen32(v).
+//   - If len(buf) < VarintLen32(v) or buf == nil, it panics with a runtime bounds error.
+//   - Trailing bytes beyond the encoded length are untouched.
+//   - Zero heap allocations.
+func PutVarint32(buf []byte, v uint32) int {
+	needed := VarintLen32(v)
+	_ = buf[needed-1]
+
+	i := 0
+	for v >= 0x80 {
+		buf[i] = byte(v) | 0x80
+		v >>= 7
+		i++
+	}
+	buf[i] = byte(v)
+	return i + 1
+}
+
+// GetVarint32 decodes a uint32 from buf using unsigned 7-bit variable-length encoding.
+// It returns the decoded value, the number of bytes consumed, and an error if decoding failed.
+//
+// Return contract:
+//   - On success: returns (value, bytesConsumed, nil), where 1 <= bytesConsumed <= 5.
+//   - On truncation: returns (0, 0, errors.ErrVarintTruncated) when buf is empty or
+//     terminates while the continuation bit (0x80) is still set.
+//   - On overflow: returns (0, 0, errors.ErrVarintOverflow) when the varint exceeds
+//     5 bytes or the 5th byte contains payload bits exceeding 32 bits (> 0x0F).
+//   - Zero heap allocations.
+func GetVarint32(buf []byte) (uint32, int, error) {
+	if len(buf) == 0 {
+		return 0, 0, errors.ErrVarintTruncated
+	}
+
+	if buf[0] < 0x80 {
+		return uint32(buf[0]), 1, nil
+	}
+
+	var val uint32
+	var shift uint
+
+	for i := 0; i < len(buf); i++ {
+		b := buf[i]
+		if i == 4 {
+			// 5th byte: 4 payload bits max (4 * 7 = 28, 32 - 28 = 4).
+			// If b > 0x0F, either continuation bit (0x80) or overflow bits (0x70) are set.
+			if b > 0x0F {
+				return 0, 0, errors.ErrVarintOverflow
+			}
+			val |= uint32(b) << shift
+			return val, 5, nil
+		}
+
+		val |= uint32(b&0x7F) << shift
+		if b < 0x80 {
+			return val, i + 1, nil
+		}
+		shift += 7
+	}
+
+	return 0, 0, errors.ErrVarintTruncated
+}
+
+// GetVarint32Canonical decodes a uint32 from buf using unsigned 7-bit variable-length encoding,
+// strictly enforcing canonical minimal-byte representations.
+func GetVarint32Canonical(buf []byte) (uint32, int, error) {
+	val, n, err := GetVarint32(buf)
+	if err != nil {
+		return 0, 0, err
+	}
+	if VarintLen32(val) != n {
+		return 0, 0, errors.ErrVarintNonCanonical
+	}
+	return val, n, nil
+}
+

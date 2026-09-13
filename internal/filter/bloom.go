@@ -391,17 +391,24 @@ func DecodeFilterBlock(data []byte) (*BloomFilter, error) {
 	bitCountOffset := len(data) - FilterBlockTrailerSize
 	bitCount := binary.GetUint64(data[bitCountOffset : bitCountOffset+8])
 
+	// Anti-DoS Defense (IND-007): Strictly bound bitCount before arithmetic
 	maxBits := uint64(MaxKeyCount) * uint64(BitsPerKey)
-	if bitCount > maxBits {
+	if bitCount > maxBits || bitCount > uint64(MaxBitsetBytes)*8 || bitCount > math.MaxUint64-7 {
 		return nil, &errors.FilterBlockCorruptedError{
-			Reason: "bit count exceeds maximum key capacity",
+			Reason: "bit count exceeds maximum allowed capacity or overflows arithmetic",
 		}
 	}
 
 	// 4. Validate bitset byte length against declared bitCount
 	var expectedBytes int
 	if bitCount > 0 {
-		expectedBytes = int((bitCount + 7) / 8)
+		byteCount64 := (bitCount + 7) / 8
+		if byteCount64 > uint64(MaxBitsetBytes) || byteCount64 > uint64(math.MaxInt) {
+			return nil, &errors.FilterBlockCorruptedError{
+				Reason: "calculated bitset byte length exceeds maximum allowed size",
+			}
+		}
+		expectedBytes = int(byteCount64)
 	}
 
 	actualBitsetBytes := len(data) - FilterBlockTrailerSize

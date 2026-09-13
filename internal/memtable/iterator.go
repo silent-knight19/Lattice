@@ -70,6 +70,10 @@ func (it *Iterator) Next() bool {
 	if it == nil {
 		return false
 	}
+	if it.sl != nil {
+		it.sl.mu.RLock()
+		defer it.sl.mu.RUnlock()
+	}
 	switch it.state {
 	case stateUnpositioned:
 		if it.sl == nil {
@@ -111,8 +115,12 @@ func (it *Iterator) Next() bool {
 // The returned InternalKey owns its UserKey slice, guaranteeing callers mutating
 // the returned key slice cannot corrupt internal SkipList state (enforcing SEC-MEM-INV-01).
 func (it *Iterator) Key() binary.InternalKey {
-	if !it.Valid() {
+	if it == nil || !it.Valid() {
 		return binary.InternalKey{}
+	}
+	if it.sl != nil {
+		it.sl.mu.RLock()
+		defer it.sl.mu.RUnlock()
 	}
 	return it.curr.key.Clone()
 }
@@ -125,8 +133,12 @@ func (it *Iterator) Key() binary.InternalKey {
 // The returned slice is a newly allocated defensive copy, guaranteeing callers mutating
 // the returned slice cannot corrupt internal SkipList state.
 func (it *Iterator) Value() []byte {
-	if !it.Valid() {
+	if it == nil || !it.Valid() {
 		return nil
+	}
+	if it.sl != nil {
+		it.sl.mu.RLock()
+		defer it.sl.mu.RUnlock()
 	}
 	return it.curr.getValue()
 }
@@ -156,6 +168,9 @@ func (it *Iterator) Seek(userKey []byte) error {
 		it.state = stateExhausted
 		return err
 	}
+
+	it.sl.mu.RLock()
+	defer it.sl.mu.RUnlock()
 
 	curr := it.sl.head
 	h := int(it.sl.height.Load())
@@ -195,6 +210,10 @@ func (it *Iterator) SeekToFirst() {
 		it.state = stateExhausted
 		return
 	}
+
+	it.sl.mu.RLock()
+	defer it.sl.mu.RUnlock()
+
 	it.curr = it.sl.head.forward[0].Load()
 	if it.curr != nil {
 		it.state = statePositioned
@@ -225,6 +244,9 @@ func (it *Iterator) SeekInternalKey(target binary.InternalKey) error {
 		it.state = stateExhausted
 		return err
 	}
+
+	it.sl.mu.RLock()
+	defer it.sl.mu.RUnlock()
 
 	curr := it.sl.head
 	h := int(it.sl.height.Load())
