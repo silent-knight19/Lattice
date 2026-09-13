@@ -219,6 +219,21 @@ var (
 
 	// ErrFilterFinished indicates that mutation was attempted on an already finished/sealed filter block builder.
 	ErrFilterFinished = stdErrors.New("filter block builder is finished")
+
+	// ErrInvalidLevel indicates that an LSM-tree level index violates the architectural bounds [0, NumLevels-1].
+	ErrInvalidLevel = stdErrors.New("invalid level")
+
+	// ErrCorruptedVersionEdit indicates that a serialized VersionEdit record failed structural or boundary validation.
+	ErrCorruptedVersionEdit = stdErrors.New("version edit corrupted")
+
+	// ErrTruncatedVersionEdit indicates that a buffer ended prematurely while decoding a VersionEdit record.
+	ErrTruncatedVersionEdit = stdErrors.New("version edit truncated")
+
+	// ErrUnsupportedVersionEdit indicates that a VersionEdit specifies an unrecognized format version byte.
+	ErrUnsupportedVersionEdit = stdErrors.New("unsupported version edit format")
+
+	// ErrDuplicateScalarField indicates that a scalar field was encountered more than once in a single VersionEdit record.
+	ErrDuplicateScalarField = stdErrors.New("duplicate scalar field in version edit")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing
@@ -754,4 +769,104 @@ func (e *WALWriterPoisonedError) Unwrap() error {
 		return nil
 	}
 	return e.Reason
+}
+
+// InvalidLevelError provides structured context when an LSM-tree level index violates architectural bounds.
+// It matches ErrInvalidLevel when interrogated with errors.Is().
+type InvalidLevelError struct {
+	Level    uint32
+	MaxLevel uint32
+}
+
+func (e *InvalidLevelError) Error() string {
+	if e == nil {
+		return ErrInvalidLevel.Error()
+	}
+	return fmt.Sprintf("invalid level %d: must be in range [0, %d]", e.Level, e.MaxLevel)
+}
+
+// Is reports whether this error matches target sentinel ErrInvalidLevel.
+func (e *InvalidLevelError) Is(target error) bool {
+	return target == ErrInvalidLevel
+}
+
+// CorruptedVersionEditError provides structured diagnostics when a serialized VersionEdit is corrupted.
+// It matches ErrCorruptedVersionEdit when interrogated with errors.Is().
+type CorruptedVersionEditError struct {
+	Offset int64
+	Reason string
+}
+
+func (e *CorruptedVersionEditError) Error() string {
+	if e == nil {
+		return ErrCorruptedVersionEdit.Error()
+	}
+	if e.Offset >= 0 {
+		return fmt.Sprintf("corrupted version edit at offset %d: %s", e.Offset, e.Reason)
+	}
+	return fmt.Sprintf("corrupted version edit: %s", e.Reason)
+}
+
+// Is reports whether this error matches target sentinel ErrCorruptedVersionEdit.
+func (e *CorruptedVersionEditError) Is(target error) bool {
+	return target == ErrCorruptedVersionEdit
+}
+
+// TruncatedVersionEditError provides structured context when a VersionEdit buffer ends prematurely.
+// It matches ErrTruncatedVersionEdit when interrogated with errors.Is().
+type TruncatedVersionEditError struct {
+	Expected int
+	Actual   int
+}
+
+func (e *TruncatedVersionEditError) Error() string {
+	if e == nil {
+		return ErrTruncatedVersionEdit.Error()
+	}
+	return fmt.Sprintf("version edit buffer truncated: expected at least %d bytes, got %d", e.Expected, e.Actual)
+}
+
+// Is reports whether this error matches target sentinel ErrTruncatedVersionEdit.
+func (e *TruncatedVersionEditError) Is(target error) bool {
+	return target == ErrTruncatedVersionEdit
+}
+
+// UnsupportedVersionEditError provides structured context when a VersionEdit specifies an unknown format version.
+// It matches ErrUnsupportedVersionEdit when interrogated with errors.Is().
+type UnsupportedVersionEditError struct {
+	Version byte
+}
+
+func (e *UnsupportedVersionEditError) Error() string {
+	if e == nil {
+		return ErrUnsupportedVersionEdit.Error()
+	}
+	return fmt.Sprintf("unsupported version edit format version: 0x%02x", e.Version)
+}
+
+// Is reports whether this error matches target sentinel ErrUnsupportedVersionEdit.
+func (e *UnsupportedVersionEditError) Is(target error) bool {
+	return target == ErrUnsupportedVersionEdit
+}
+
+// DuplicateScalarFieldError provides structured context when a scalar field is duplicated in a VersionEdit record.
+// It matches ErrDuplicateScalarField when interrogated with errors.Is().
+type DuplicateScalarFieldError struct {
+	Tag       uint64
+	FieldName string
+}
+
+func (e *DuplicateScalarFieldError) Error() string {
+	if e == nil {
+		return ErrDuplicateScalarField.Error()
+	}
+	if e.FieldName != "" {
+		return fmt.Sprintf("duplicate scalar field %q (tag %d) in version edit", e.FieldName, e.Tag)
+	}
+	return fmt.Sprintf("duplicate scalar field with tag %d in version edit", e.Tag)
+}
+
+// Is reports whether this error matches target sentinel ErrDuplicateScalarField.
+func (e *DuplicateScalarFieldError) Is(target error) bool {
+	return target == ErrDuplicateScalarField
 }

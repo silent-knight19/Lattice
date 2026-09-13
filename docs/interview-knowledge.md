@@ -579,10 +579,25 @@
 
 ### Subsystem Interview Questions
 * **Basic**: What is the purpose of the `MANIFEST` file?
-* **Intermediate**: How does the `CURRENT` file prevent corruption during startup?
-* **Deep**: How does Lattice allow background compactions to delete SSTables while concurrent readers are actively reading from them?
+  > **Model Answer**: "The `MANIFEST` file records the historical sequence of state transitions (`VersionEdit` deltas) applied to the database. Instead of rewriting a massive monolithic metadata snapshot upon every MemTable flush or compaction, Lattice appends compact, immutable `VersionEdit` records. Replaying the manifest sequentially from start to finish reconstructs the active LSM-tree `Version` (the exact set of SSTables at every level $L_0..L_6$). Storing edits as an append-only log makes state transitions atomic and crash-resilient."
+
+* **Intermediate**: How is a `VersionEdit` structured and serialized, and why do you use a Tag-Length-Value (TLV) binary format instead of JSON or `encoding/gob`?
+  > **Model Answer**: "A `VersionEdit` represents an atomic metadata delta containing `AddFile(level, meta)`, `DeleteFile(level, fileNum)`, and optional scalar updates (`NextFileNum`, `LastSeqNum`). We reject JSON due to high serialization overhead, floating-point parsing ambiguity, non-deterministic map iteration, and large allocations. We reject `encoding/gob` because it is Go-specific, non-deterministic, and leaks struct memory layouts into persistent disk logs. Instead, Lattice uses an explicit, architecture-independent binary TLV format: a 1-byte format version followed by canonical `[ Tag (varint) | Length (varint) | Payload ]` records. Tag-Length-Value framing enables safe forward compatibility: unrecognized future tags can be safely skipped by validating their length and advancing the parser offset, without risking silent corruption."
+
+* **Deep**: Why must scalar presence (`NextFileNum`, `LastSeqNum`) be represented distinctly from zero values in `VersionEdit`?
+  > **Model Answer**: "In Go, uninitialized numeric fields default to zero. If presence were inferred via `val != 0`, it would create two severe defects: first, valid zero values (such as initial sequence number `0` or file number `0` during database bootstrapping) would be treated as absent and silently discarded; second, an edit intending to mutate only file deletions would inadvertently emit unwanted updates if zero were overloaded. Lattice enforces explicit presence tracking (`hasNextFileNum`, `hasLastSeqNum`). This guarantees that 'field absent' (delta does not touch the counter) is strictly distinguishable from 'field present with value 0', which is mathematically essential for state machine replay."
+
+* **Deep**: Which SSTable metadata fields are persistent in `AddFile`, and which fields are runtime-only?
+  > **Model Answer**: "An SSTable `AddFile` record persists only immutable structural identity: `Level` (0..6), `FileNum`, `FileSize`, `SmallestKey` (InternalKey), `LargestKey` (InternalKey), `SmallestSeqNum`, and `LargestSeqNum`. These fields are strictly required by the `VersionSet` to perform binary search lookups, determine key overlap across levels, and score compactions without opening physical files. All runtime artifacts—such as OS file descriptors, `TableReader` instances, block caches, staging paths, mutexes, and in-memory Bloom filter bitsets—are excluded from the persistent manifest. Internal block handles (such as `IndexHandle` and `FilterHandle`) are embedded directly in the SSTable's 48-byte trailer footer, keeping `VersionEdit` records minimal and decoupled from physical block layouts."
+
+* **"Did You Actually Build This?"**: How does your `VersionEdit` decoder prevent denial-of-service memory exhaustion when parsing corrupted or adversarial manifest logs?
+  > **Model Answer**: "The decoder enforces strict defensive boundaries before allocating any heap memory. First, the total edit size is capped at 16 MiB (`MaxVersionEditBytes`). Second, each TLV field payload length is bounded to 1 MiB (`MaxFieldPayloadLen`), and the parser verifies that `declaredLength <= remainingBytes` before attempting to read. Third, variable-length key payloads in `AddFile` are checked against `binary.MaxEncodedInternalKeyLen` (65,544 bytes); claiming a 2GB key immediately fails closed with `ErrKeyTooLarge` without calling `make([]byte)`. Fourth, level numbers are strictly validated against `[0, NumLevels-1]`, and duplicate scalar tags are rejected. Finally, all extracted key byte slices are defensively cloned using `bytes.Clone()` so that subsequent mutations to transient read buffers never corrupt in-memory version state."
+
 * **Follow-up**: What happens if the database crashes after writing a new SSTable but before appending the `VersionEdit` to the `MANIFEST`?
+  > **Model Answer**: "The SSTable file on disk is an unreferenced orphan. Because it was never committed to the `MANIFEST` via a `VersionEdit`, startup recovery completely ignores it. During recovery, the engine cleans up unreferenced `.sst` and `.tmp` files. Because the immutable MemTable is not discarded until the `VersionEdit` is synced to the manifest, the un-flushed data remains safely recoverable from the active WAL log."
+
 * **"Did You Actually Build This?"**: Walk me through the exact garbage collection lifecycle of an obsolete SSTable file from the moment compaction finishes until the physical file is unlinked.
+
 
 ---
 

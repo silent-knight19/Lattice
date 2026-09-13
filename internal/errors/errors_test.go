@@ -69,6 +69,11 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrFilterBlockCorrupted", errors.ErrFilterBlockCorrupted, "filter block corrupted: invalid bit count, size, or metadata"},
 		{"ErrUnsupportedHashCount", errors.ErrUnsupportedHashCount, "unsupported filter hash count: must be 7"},
 		{"ErrFilterFinished", errors.ErrFilterFinished, "filter block builder is finished"},
+		{"ErrInvalidLevel", errors.ErrInvalidLevel, "invalid level"},
+		{"ErrCorruptedVersionEdit", errors.ErrCorruptedVersionEdit, "version edit corrupted"},
+		{"ErrTruncatedVersionEdit", errors.ErrTruncatedVersionEdit, "version edit truncated"},
+		{"ErrUnsupportedVersionEdit", errors.ErrUnsupportedVersionEdit, "unsupported version edit format"},
+		{"ErrDuplicateScalarField", errors.ErrDuplicateScalarField, "duplicate scalar field in version edit"},
 	}
 
 	for _, tc := range sentinels {
@@ -1520,5 +1525,187 @@ func TestFilterBlockCorruptedError(t *testing.T) {
 	}
 	if !nilErr.Is(errors.ErrFilterBlockCorrupted) {
 		t.Errorf("nil *FilterBlockCorruptedError must match ErrFilterBlockCorrupted via Is")
+	}
+}
+
+func TestInvalidLevelError(t *testing.T) {
+	err := &errors.InvalidLevelError{Level: 7, MaxLevel: 6}
+
+	if !stdErrors.Is(err, errors.ErrInvalidLevel) {
+		t.Errorf("InvalidLevelError must match ErrInvalidLevel via errors.Is")
+	}
+	if stdErrors.Is(err, errors.ErrKeyNotFound) {
+		t.Errorf("InvalidLevelError must not match ErrKeyNotFound")
+	}
+
+	wrapped := fmt.Errorf("validate: %w", err)
+	if !stdErrors.Is(wrapped, errors.ErrInvalidLevel) {
+		t.Errorf("wrapped InvalidLevelError must match ErrInvalidLevel")
+	}
+
+	var extracted *errors.InvalidLevelError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("failed to extract *InvalidLevelError from wrapped chain")
+	}
+	if extracted.Level != 7 || extracted.MaxLevel != 6 {
+		t.Errorf("extracted mismatch: got %+v", extracted)
+	}
+
+	expectedMsg := "invalid level 7: must be in range [0, 6]"
+	if err.Error() != expectedMsg {
+		t.Errorf("error message mismatch: got %q, want %q", err.Error(), expectedMsg)
+	}
+
+	var nilErr *errors.InvalidLevelError
+	if nilErr.Error() != errors.ErrInvalidLevel.Error() {
+		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrInvalidLevel.Error())
+	}
+	if !nilErr.Is(errors.ErrInvalidLevel) {
+		t.Errorf("nil *InvalidLevelError must match ErrInvalidLevel via Is")
+	}
+}
+
+func TestCorruptedVersionEditError(t *testing.T) {
+	err := &errors.CorruptedVersionEditError{Offset: 42, Reason: "invalid tag"}
+
+	if !stdErrors.Is(err, errors.ErrCorruptedVersionEdit) {
+		t.Errorf("CorruptedVersionEditError must match ErrCorruptedVersionEdit via errors.Is")
+	}
+
+	wrapped := fmt.Errorf("decode: %w", err)
+	if !stdErrors.Is(wrapped, errors.ErrCorruptedVersionEdit) {
+		t.Errorf("wrapped CorruptedVersionEditError must match ErrCorruptedVersionEdit")
+	}
+
+	var extracted *errors.CorruptedVersionEditError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("failed to extract *CorruptedVersionEditError from wrapped chain")
+	}
+	if extracted.Offset != 42 || extracted.Reason != "invalid tag" {
+		t.Errorf("extracted mismatch: got %+v", extracted)
+	}
+
+	if !strings.Contains(err.Error(), "corrupted version edit at offset 42: invalid tag") {
+		t.Errorf("unexpected error message: %q", err.Error())
+	}
+
+	errNoOffset := &errors.CorruptedVersionEditError{Offset: -1, Reason: "missing footer"}
+	if !strings.Contains(errNoOffset.Error(), "corrupted version edit: missing footer") {
+		t.Errorf("unexpected error message without offset: %q", errNoOffset.Error())
+	}
+
+	var nilErr *errors.CorruptedVersionEditError
+	if nilErr.Error() != errors.ErrCorruptedVersionEdit.Error() {
+		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrCorruptedVersionEdit.Error())
+	}
+	if !nilErr.Is(errors.ErrCorruptedVersionEdit) {
+		t.Errorf("nil *CorruptedVersionEditError must match ErrCorruptedVersionEdit via Is")
+	}
+}
+
+func TestTruncatedVersionEditError(t *testing.T) {
+	err := &errors.TruncatedVersionEditError{Expected: 10, Actual: 4}
+
+	if !stdErrors.Is(err, errors.ErrTruncatedVersionEdit) {
+		t.Errorf("TruncatedVersionEditError must match ErrTruncatedVersionEdit via errors.Is")
+	}
+
+	wrapped := fmt.Errorf("decode: %w", err)
+	if !stdErrors.Is(wrapped, errors.ErrTruncatedVersionEdit) {
+		t.Errorf("wrapped TruncatedVersionEditError must match ErrTruncatedVersionEdit")
+	}
+
+	var extracted *errors.TruncatedVersionEditError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("failed to extract *TruncatedVersionEditError from wrapped chain")
+	}
+	if extracted.Expected != 10 || extracted.Actual != 4 {
+		t.Errorf("extracted mismatch: got %+v", extracted)
+	}
+
+	expectedMsg := "version edit buffer truncated: expected at least 10 bytes, got 4"
+	if err.Error() != expectedMsg {
+		t.Errorf("unexpected error message: got %q, want %q", err.Error(), expectedMsg)
+	}
+
+	var nilErr *errors.TruncatedVersionEditError
+	if nilErr.Error() != errors.ErrTruncatedVersionEdit.Error() {
+		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrTruncatedVersionEdit.Error())
+	}
+	if !nilErr.Is(errors.ErrTruncatedVersionEdit) {
+		t.Errorf("nil *TruncatedVersionEditError must match ErrTruncatedVersionEdit via Is")
+	}
+}
+
+func TestUnsupportedVersionEditError(t *testing.T) {
+	err := &errors.UnsupportedVersionEditError{Version: 0x99}
+
+	if !stdErrors.Is(err, errors.ErrUnsupportedVersionEdit) {
+		t.Errorf("UnsupportedVersionEditError must match ErrUnsupportedVersionEdit via errors.Is")
+	}
+
+	wrapped := fmt.Errorf("decode: %w", err)
+	if !stdErrors.Is(wrapped, errors.ErrUnsupportedVersionEdit) {
+		t.Errorf("wrapped UnsupportedVersionEditError must match ErrUnsupportedVersionEdit")
+	}
+
+	var extracted *errors.UnsupportedVersionEditError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("failed to extract *UnsupportedVersionEditError from wrapped chain")
+	}
+	if extracted.Version != 0x99 {
+		t.Errorf("extracted mismatch: got %+v", extracted)
+	}
+
+	expectedMsg := "unsupported version edit format version: 0x99"
+	if err.Error() != expectedMsg {
+		t.Errorf("unexpected error message: got %q, want %q", err.Error(), expectedMsg)
+	}
+
+	var nilErr *errors.UnsupportedVersionEditError
+	if nilErr.Error() != errors.ErrUnsupportedVersionEdit.Error() {
+		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrUnsupportedVersionEdit.Error())
+	}
+	if !nilErr.Is(errors.ErrUnsupportedVersionEdit) {
+		t.Errorf("nil *UnsupportedVersionEditError must match ErrUnsupportedVersionEdit via Is")
+	}
+}
+
+func TestDuplicateScalarFieldError(t *testing.T) {
+	err := &errors.DuplicateScalarFieldError{Tag: 1, FieldName: "NextFileNum"}
+
+	if !stdErrors.Is(err, errors.ErrDuplicateScalarField) {
+		t.Errorf("DuplicateScalarFieldError must match ErrDuplicateScalarField via errors.Is")
+	}
+
+	wrapped := fmt.Errorf("decode: %w", err)
+	if !stdErrors.Is(wrapped, errors.ErrDuplicateScalarField) {
+		t.Errorf("wrapped DuplicateScalarFieldError must match ErrDuplicateScalarField")
+	}
+
+	var extracted *errors.DuplicateScalarFieldError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("failed to extract *DuplicateScalarFieldError from wrapped chain")
+	}
+	if extracted.Tag != 1 || extracted.FieldName != "NextFileNum" {
+		t.Errorf("extracted mismatch: got %+v", extracted)
+	}
+
+	expectedMsg := `duplicate scalar field "NextFileNum" (tag 1) in version edit`
+	if err.Error() != expectedMsg {
+		t.Errorf("unexpected error message: got %q, want %q", err.Error(), expectedMsg)
+	}
+
+	errNoName := &errors.DuplicateScalarFieldError{Tag: 2}
+	if !strings.Contains(errNoName.Error(), "duplicate scalar field with tag 2 in version edit") {
+		t.Errorf("unexpected error message without field name: %q", errNoName.Error())
+	}
+
+	var nilErr *errors.DuplicateScalarFieldError
+	if nilErr.Error() != errors.ErrDuplicateScalarField.Error() {
+		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrDuplicateScalarField.Error())
+	}
+	if !nilErr.Is(errors.ErrDuplicateScalarField) {
+		t.Errorf("nil *DuplicateScalarFieldError must match ErrDuplicateScalarField via Is")
 	}
 }
