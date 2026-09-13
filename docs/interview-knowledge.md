@@ -3015,6 +3015,21 @@ Offset 68..71 (4B, CRC32-IEEE):
   - **Compactor File Retention Auditing**: When a compaction produces an obsolete SSTable, the engine must verify that the file is not referenced by *any* live version in the active chain before physically unlinking it from the filesystem.
   - **O(1) Self-Unlinking**: By using a circular doubly-linked list with sentinel `dummy`, any version whose reference count hits 0 can unlink itself in $O(1)$ time (`v.prev.next = v.next; v.next.prev = v.prev`) without scanning an array.
 
+### 6. Why is returning raw `*Version` pointers from `ActiveVersions()` unsafe, and how does pin-before-unlock fix the lifetime race? (SEC-003 / F-003)
+* **Question**: Why is returning raw `*Version` pointers from `VersionSet.ActiveVersions()` a use-after-lifetime bug, and how does the pin-before-unlock pattern establish a safe ownership contract?
+* **Answer**:
+  - **VersionSet Ownership vs Caller Ownership**: When a `Version` is in the active chain, its initial reference is owned by the `VersionSet` (or outstanding reader pins). Returning raw `*Version` pointers without incrementing their reference counts creates pointers with *zero* caller ownership.
+  - **The Post-Unlock Finalization Race**: While `ActiveVersions()` held `vs.mu.RLock()`, the active chain could not be modified. But the microsecond `vs.mu.RUnlock()` was dropped:
+    1. A background thread could call `AppendVersion()`, superseding the active version.
+    2. `AppendVersion()` drops the `VersionSet`'s ownership reference via `oldCurrent.Unref()`.
+    3. If no other client was holding a pin from `Current()`, the superseded version's `refCount` transitioned to 0!
+    4. Transitioning to 0 triggered `finalize()`, unlinking the node from the chain and invoking `cleanup()`, which sets `levels[i] = nil`.
+    5. The caller received a slice of finalized, dead `*Version` pointers whose metadata was wiped. If the caller attempted to read files or call `Ref()`, it crashed with nil slices or panicked with `"cannot Ref dead Version: reference count is zero"`.
+  - **Pin-Before-Unlock Semantics**: Under `vs.mu.RLock()`, `ActiveVersions()` atomically increments each live version's reference count via `cur.TryRef()` before appending it to the result. By pinning *before* dropping `vs.mu`, the version's reference count is at least 2 (VersionSet + caller). Even if `AppendVersion` supersedes it immediately after unlock, `oldCurrent.Unref()` drops `refCount` from 2 to 1, NOT 0. The caller is guaranteed exclusive ownership of its reference until it calls `Unref()`.
+  - **Why `Current()` and `ActiveVersions()` Have Different Caller-Lifetime Semantics**:
+    - In `Current()`, `vs.current` is guaranteed to have `refCount >= 1` under `vs.mu.RLock()` because the `VersionSet` itself holds the active ownership reference for `vs.current` until replacement under `vs.mu.Lock()`. Therefore `Current()` can directly call `Ref()`.
+    - In `ActiveVersions()`, the chain contains older superseded versions whose `VersionSet` references have already been dropped and are only kept alive by outstanding reader pins. If a reader concurrently calls `Unref()`, the refcount can drop to 0 while `finalize()` waits for `vs.mu.Lock()`. An older node in the chain can temporarily have `refCount == 0` while awaiting unlinking. Therefore `ActiveVersions()` must use `TryRef()`: if a version has already reached 0, it is dead and cannot be resurrected (Invariant D), so it is safely omitted from the returned slice.
+
 ---
 
 # 33. Deep Systems Security: Parser Integer-Overflow, Unsigned Wraparound & Safe Deserialization (SEC-001)

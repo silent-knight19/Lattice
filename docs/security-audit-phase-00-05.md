@@ -480,6 +480,49 @@ Verification & Traceability Evidence:
   - Static Analysis: go vet ./... (clean), golangci-lint run ./... (0 issues), go mod verify (clean)
 ```
 
+### F-003 — Unsafe VersionSet.ActiveVersions() Lifetime Semantics
+
+```text
+Title: ActiveVersions() Returns Unpinned Version Pointers Subject to Immediate Post-Unlock Finalization
+Severity: MEDIUM
+Confidence: CONFIRMED
+Category: VULNERABILITY / RACE CONDITION (Reference Counting / Object Lifetime / Concurrency)
+Phase Introduced: Phase 06 (VersionSet)
+Current Component: internal/version/version_set.go (ActiveVersions)
+Affected File: internal/version/version_set.go
+
+Root Cause:
+  VersionSet.ActiveVersions() traversed the active circular doubly-linked list under vs.mu.RLock()
+  and returned a slice of raw *Version pointers without incrementing their reference counts.
+  Immediately upon dropping vs.mu.RUnlock(), another goroutine could invoke AppendVersion(),
+  causing the VersionSet to release its ownership reference to the superseded version.
+  If no reader held a pinned reference via Current(), the version's reference count dropped
+  from 1 to 0, triggering finalize() and cleanup() (which zeros metadata levels).
+  The caller received pointers to unlinked, finalized objects whose metadata access could race
+  or return nil, and calling Ref() on the returned pointer triggered a non-resurrection panic.
+
+Remediation Status: REMEDIATED (F-003 / SEC-003)
+Remediation Date: 2026-09-13
+Remediation Scope: internal/version/version_set.go (ActiveVersions, ActiveCount)
+Remediation Strategy:
+  1. Pin-Before-Unlock: While holding vs.mu.RLock(), ActiveVersions() atomically pins each live
+     Version via cur.TryRef() before appending it to the result slice.
+  2. Caller Ownership Contract: Callers receive pinned *Version references and own one reference
+     per element. Callers MUST call Unref() exactly once on each returned Version when finished.
+  3. Non-Resurrection Filtering: If cur.TryRef() returns false (version is dead and awaiting unlinking
+     by finalize()), it is omitted from the result, preventing resurrection of finalized objects.
+  4. ActiveCount Alignment: ActiveCount() verifies cur.refCount.Load() > 0 to count only live versions.
+Verification & Traceability Evidence:
+  - Ownership Contract: TestVersionSet_ActiveVersions_OwnershipContract (verifies all returned versions are pinned, remain alive and readable after superseding and reader unrefs, and clean up cleanly when unreferenced)
+  - Deterministic Race: TestVersionSet_ActiveVersions_DeterministicLifetimeRace (reproduces F-003 by appending 10 replacement versions while caller holds snapshot, proving snapshot remains alive until caller unrefs)
+  - Finalization Protection: TestVersionSet_ActiveVersions_FinalizationProtection (verifies finalize() cannot run while snapshot pin exists, and proves Ref() panics on dead version while TryRef() safely fails)
+  - Concurrency Stress: TestVersionSet_ActiveVersions_ConcurrentStress (high-contention appenders, active readers, and current readers under -race, 0 races, 0 panics)
+  - Randomized Lifecycle: TestVersionSet_ActiveVersions_RandomizedLifecycle (30 iterations of creation, snapshotting, and out-of-order unrefs)
+  - Benchmarks: BenchmarkVersionSet_ActiveVersions_Single (12.08 ns/op, 8 B/op) and BenchmarkVersionSet_ActiveVersions_Multiple (26.62 ns/op, 64 B/op)
+  - Full Suite: go test ./... (PASS), go test -race ./... (PASS, 0 races)
+  - Static Analysis: go vet ./... (clean), golangci-lint run ./... (0 issues), go mod verify (clean)
+```
+
 ### SEC-002 — SSTable staging parent unpinned; WithFile bypasses staging checks
 
 ```text

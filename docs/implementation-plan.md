@@ -402,6 +402,8 @@ In parallel with the feature development roadmap (Phase 00–21), Lattice mainta
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **SEC-001 / F-001** | `internal/sstable` (`DecodeMetaIndexBlock`) | **HIGH** | MetaIndex parser integer overflow & slice-bounds panic via wrapped `keyLen` | **REMEDIATED** | PoC regression (`TestSecurity_Remediation_SEC_001_IntegerOverflowPanicPoC`), boundary matrix, mutation tests, table reader path, raw-byte fuzz target (`FuzzMetaIndexBlock_Decode`, 7.34M execs, 0 crashes), full race suite clean. Phase 07 remains BLOCKED. |
 | **SEC-002 / F-002** | `internal/version` (`SetCurrentManifest`) | **MEDIUM** | Concurrent CURRENT writer staging collision & unlinked inode race at `CURRENT.tmp` | **REMEDIATED** | Deterministic race test (`TestSetCurrentManifest_ConcurrentWriters_DeterministicRace`), 16-worker stress test (`TestSetCurrentManifest_ConcurrentWriters_Stress`), concurrent writers+readers test (`TestSetCurrentManifest_ConcurrentWriters_WithReaders`), directory isolation test, benchmarks (~130 µs/op), full race suite clean. Phase 07 remains BLOCKED. |
+| **SEC-003 / F-003** | `internal/version` (`ActiveVersions`) | **MEDIUM** | Unsafe `ActiveVersions()` lifetime race returning unpinned version pointers subject to post-unlock finalization | **REMEDIATED** | Ownership contract test (`TestVersionSet_ActiveVersions_OwnershipContract`), deterministic race test (`TestVersionSet_ActiveVersions_DeterministicLifetimeRace`), finalization protection test, concurrent stress test, randomized lifecycle test, benchmarks (~12-26 ns/op), full race suite clean. Phase 07 remains BLOCKED. |
+
 
 ---
 

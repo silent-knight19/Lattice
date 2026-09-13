@@ -524,5 +524,33 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 38. Unsafe `VersionSet.ActiveVersions()` Lifetime Semantics (SEC-003 / F-003) — REMEDIATED
+* **Limitation**: In prior implementations through Phase 06, `ActiveVersions()` (`internal/version/version_set.go`) traversed the active circular doubly-linked version chain under `vs.mu.RLock()` and appended raw `*Version` pointers without incrementing their reference counts. Once `vs.mu.RUnlock()` was dropped, the returned pointers were not owned by the caller. If another goroutine called `AppendVersion()`, the VersionSet released its ownership reference to superseded versions (`oldCurrent.Unref()`). When a superseded version had no outstanding reader pins from `Current()`, its reference count transitioned to zero, triggering immediate finalization (`finalize()`, which nils out `v.levels`) and unlinking from the chain while the caller was still holding and inspecting the returned `*Version` pointer. Attempting to inspect metadata could result in nil-pointer or empty slice access, racing with cleanup, and attempting to retain the version via `v.Ref()` panicked due to non-resurrection enforcement (`refCount <= 0`).
+* **Root Cause**:
+  1. `ActiveVersions()` returning unpinned pointers, decoupling slice membership from reference-counted object lifetime.
+  2. Failure to transfer a caller-owned reference prior to dropping the structural read lock `vs.mu`.
+  3. Window between `oldCurrent.Unref()` and `finalize()` unlinking allowing dead versions (`refCount == 0`) to be observed in the chain.
+* **Remediation**:
+  1. *Pin-Before-Unlock Pattern*: While holding `vs.mu.RLock()`, `ActiveVersions()` walks the active chain and attempts atomic pinning on each node via `cur.TryRef()`.
+  2. *Caller Ownership Contract*: Callers now receive pinned `*Version` references and own one reference per returned element. Callers MUST call `Unref()` exactly once on every returned version when finished.
+  3. *Dead Node Filtering & Non-Resurrection*: If `cur.TryRef()` returns `false` (because `refCount <= 0` pending unlinking in `finalize()`), the node is omitted from the result, preventing resurrection of finalized versions.
+  4. *ActiveCount Synchronization*: `ActiveCount()` verifies `cur.refCount.Load() > 0`, ensuring only live versions are counted.
+* **Regression Coverage & Evidence**:
+  - *Ownership Contract*: `TestVersionSet_ActiveVersions_OwnershipContract` verifies all returned pointers are pinned (`refCount` incremented), remain alive and readable after being superseded and after reader pins are dropped, and clean up cleanly when unreferenced.
+  - *Deterministic Lifetime Race*: `TestVersionSet_ActiveVersions_DeterministicLifetimeRace` reproduces F-003 by publishing 10 replacement versions while a caller retains a snapshot, proving the snapshot remains alive and metadata intact until caller `Unref()`.
+  - *Finalization Protection*: `TestVersionSet_ActiveVersions_FinalizationProtection` verifies `finalize()` cannot run while an active snapshot pin exists, and confirms `Ref()` panics on dead versions while `TryRef()` safely fails.
+  - *Concurrent Stress*: `TestVersionSet_ActiveVersions_ConcurrentStress` runs concurrent appenders, active readers, and current readers under `-race`, verifying 0 data races, 0 panics, and 0 memory leaks.
+  - *Randomized Lifecycle*: `TestVersionSet_ActiveVersions_RandomizedLifecycle` exercises repeated cycles of version creation, snapshot retention, and out-of-order unrefs.
+  - *Benchmarks*: `BenchmarkVersionSet_ActiveVersions_Single` (12.08 ns/op, 8 B/op) and `BenchmarkVersionSet_ActiveVersions_Multiple` (26.62 ns/op, 64 B/op) confirm negligible atomic overhead.
+* **Remaining Scope Boundary**:
+  - Remediates `ActiveVersions()` lifetime semantics. Does not modify `VersionEdit` validation (F-004) or refcount overflow handling (F-005).
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Callers have guaranteed object lifetimes for all inspected version snapshots).
+  * Performance: **Optimal** (~12-26 ns/op per call, sub-nanosecond per version pin).
+  * Security: **Optimal** (Eliminated use-after-lifetime and panic race vectors).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*
+
 

@@ -3,6 +3,7 @@ package version
 import (
 	"bytes"
 	stdErrors "errors"
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -531,4 +532,444 @@ func TestVersion_DeterministicRandomLifecycle(t *testing.T) {
 			t.Fatalf("iteration %d: expected refCount = 0, got %d", i, v.RefCount())
 		}
 	}
+}
+
+// -----------------------------------------------------------------------------
+// SEC-003 / F-003: ActiveVersions() Lifetime & Pinning Tests
+// -----------------------------------------------------------------------------
+
+// TestVersionSet_ActiveVersions_OwnershipContract verifies that ActiveVersions()
+// returns caller-pinned *Version pointers that remain valid, alive, and readable
+// even after being superseded in the VersionSet, and that calling Unref() exactly once
+// on every returned element permits eventual cleanup.
+func TestVersionSet_ActiveVersions_OwnershipContract(t *testing.T) {
+	vs := NewVersionSet()
+
+	// 1. Empty VersionSet returns nil
+	if av := vs.ActiveVersions(); av != nil {
+		t.Fatalf("expected nil from empty VersionSet, got %v", av)
+	}
+
+	// 2. Install V1, pin it with reader P1
+	var v1Cleaned bool
+	v1 := NewVersion([NumLevels][]FileMetadata{
+		0: {makeSampleFileMetadata(1, "a", "m")},
+	})
+	v1.SetCleanupFnForTesting(func() {
+		v1Cleaned = true
+	})
+	if err := vs.AppendVersion(v1); err != nil {
+		t.Fatalf("AppendVersion(v1) failed: %v", err)
+	}
+	p1 := vs.Current()
+
+	// 3. Install V2, pin it with reader P2
+	var v2Cleaned bool
+	v2 := NewVersion([NumLevels][]FileMetadata{
+		0: {makeSampleFileMetadata(2, "n", "z")},
+	})
+	v2.SetCleanupFnForTesting(func() {
+		v2Cleaned = true
+	})
+	if err := vs.AppendVersion(v2); err != nil {
+		t.Fatalf("AppendVersion(v2) failed: %v", err)
+	}
+	p2 := vs.Current()
+
+	// 4. Install V3 (current)
+	var v3Cleaned bool
+	v3 := NewVersion([NumLevels][]FileMetadata{
+		1: {makeSampleFileMetadata(3, "a", "z")},
+	})
+	v3.SetCleanupFnForTesting(func() {
+		v3Cleaned = true
+	})
+	if err := vs.AppendVersion(v3); err != nil {
+		t.Fatalf("AppendVersion(v3) failed: %v", err)
+	}
+
+	// Active chain now contains V1 (pinned by p1), V2 (pinned by p2), V3 (current).
+	// Invariant A: Call ActiveVersions() - every returned element must be pinned.
+	// Initial refCounts before call:
+	// V1: 1 (p1)
+	// V2: 1 (p2)
+	// V3: 1 (vs.current)
+	active := vs.ActiveVersions()
+	if len(active) != 3 {
+		t.Fatalf("expected 3 active versions, got %d", len(active))
+	}
+
+	// After ActiveVersions(), refCounts must each have incremented by 1:
+	if v1.RefCount() != 2 {
+		t.Errorf("expected v1 refCount = 2, got %d", v1.RefCount())
+	}
+	if v2.RefCount() != 2 {
+		t.Errorf("expected v2 refCount = 2, got %d", v2.RefCount())
+	}
+	if v3.RefCount() != 2 {
+		t.Errorf("expected v3 refCount = 2, got %d", v3.RefCount())
+	}
+
+	// Invariant B: Caller can safely inspect all metadata on the returned snapshots
+	if n := active[0].NumFiles(0); n != 1 {
+		t.Errorf("expected active[0] NumFiles(0) == 1, got %d", n)
+	}
+	if n := active[1].NumFiles(0); n != 1 {
+		t.Errorf("expected active[1] NumFiles(0) == 1, got %d", n)
+	}
+	if n := active[2].NumFiles(1); n != 1 {
+		t.Errorf("expected active[2] NumFiles(1) == 1, got %d", n)
+	}
+
+	// Invariant C: Superseding current and releasing old reader pins does NOT invalidate active snapshots
+	// Drop p1 and p2
+	p1.Unref()
+	p2.Unref()
+	// Supersede V3 with V4
+	v4 := NewVersion([NumLevels][]FileMetadata{})
+	if err := vs.AppendVersion(v4); err != nil {
+		t.Fatalf("AppendVersion(v4) failed: %v", err)
+	}
+
+	// At this point:
+	// - p1 and p2 released their references to V1 and V2
+	// - VersionSet released its reference to V3
+	// BUT because `active` retains one reference to V1, V2, and V3:
+	// None of them are finalized or cleaned up!
+	if v1Cleaned || v2Cleaned || v3Cleaned {
+		t.Fatalf("premature cleanup: v1=%v, v2=%v, v3=%v", v1Cleaned, v2Cleaned, v3Cleaned)
+	}
+	if v1.RefCount() != 1 || v2.RefCount() != 1 || v3.RefCount() != 1 {
+		t.Fatalf("expected refCounts = 1, got v1=%d, v2=%d, v3=%d",
+			v1.RefCount(), v2.RefCount(), v3.RefCount())
+	}
+
+	// Invariant D: Caller releases references exactly once
+	for i, v := range active {
+		v.Unref()
+		if v.RefCount() != 0 {
+			t.Errorf("expected active[%d] refCount = 0 after unref, got %d", i, v.RefCount())
+		}
+	}
+
+	// Invariant E: All 3 versions are now cleaned up
+	if !v1Cleaned || !v2Cleaned || !v3Cleaned {
+		t.Fatalf("expected all versions cleaned up after active unrefs: v1=%v, v2=%v, v3=%v",
+			v1Cleaned, v2Cleaned, v3Cleaned)
+	}
+
+	// Invariant F: ActiveCount in vs is now 1 (only V4)
+	if vs.ActiveCount() != 1 {
+		t.Errorf("expected ActiveCount = 1 (V4), got %d", vs.ActiveCount())
+	}
+}
+
+// TestVersionSet_ActiveVersions_DeterministicLifetimeRace reproduces the exact F-003 race scenario:
+// Caller holds a snapshot from ActiveVersions while another goroutine publishes new versions,
+// dropping VersionSet references and ensuring the snapshot remains valid until caller unrefs.
+func TestVersionSet_ActiveVersions_DeterministicLifetimeRace(t *testing.T) {
+	vs := NewVersionSet()
+
+	var v1Cleaned bool
+	v1 := NewVersion([NumLevels][]FileMetadata{
+		0: {makeSampleFileMetadata(100, "k1", "k2")},
+	})
+	v1.SetCleanupFnForTesting(func() {
+		v1Cleaned = true
+	})
+	if err := vs.AppendVersion(v1); err != nil {
+		t.Fatalf("AppendVersion(v1) failed: %v", err)
+	}
+
+	// Caller obtains pinned snapshot of active versions
+	snapshot := vs.ActiveVersions()
+	if len(snapshot) != 1 || snapshot[0] != v1 {
+		t.Fatalf("unexpected snapshot: %v", snapshot)
+	}
+	if v1.RefCount() != 2 {
+		t.Fatalf("expected v1 refCount = 2 (1 in vs, 1 in snapshot), got %d", v1.RefCount())
+	}
+
+	// Concurrently or in interleaved sequence, publisher appends 10 new versions
+	const newVersions = 10
+	for i := 1; i <= newVersions; i++ {
+		vn := NewVersion([NumLevels][]FileMetadata{
+			0: {makeSampleFileMetadata(uint64(100+i), "k1", "k2")},
+		})
+		if err := vs.AppendVersion(vn); err != nil {
+			t.Fatalf("AppendVersion failed: %v", err)
+		}
+	}
+
+	// V1 was superseded in VersionSet. VersionSet dropped its reference.
+	// In the vulnerable code, V1's refcount would be 0, v1Cleaned would be true,
+	// and snapshot[0].levels would be nilled out!
+	// With the fix:
+	if v1Cleaned {
+		t.Fatalf("F-003 VULNERABILITY DETECTED: v1 was finalized while caller still held snapshot pointer!")
+	}
+	if v1.RefCount() != 1 {
+		t.Fatalf("expected v1 refCount = 1 held by snapshot, got %d", v1.RefCount())
+	}
+
+	// Verify metadata remains 100% readable without panics or data races
+	files := snapshot[0].Files(0)
+	if len(files) != 1 || files[0].FileNum != 100 {
+		t.Fatalf("unexpected files in snapshot: %v", files)
+	}
+
+	// Now caller finishes with snapshot
+	snapshot[0].Unref()
+
+	// V1 must now be finalized
+	if !v1Cleaned {
+		t.Fatalf("expected v1 to be cleaned up after snapshot unref")
+	}
+	if v1.RefCount() != 0 {
+		t.Fatalf("expected v1 refCount = 0, got %d", v1.RefCount())
+	}
+}
+
+// TestVersionSet_ActiveVersions_FinalizationProtection verifies that Version.finalize()
+// cannot run while an ActiveVersions pin exists, and that attempting to Ref a dead version panics
+// while TryRef safely fails.
+func TestVersionSet_ActiveVersions_FinalizationProtection(t *testing.T) {
+	vs := NewVersionSet()
+
+	var finalizations int32
+	v := NewVersion([NumLevels][]FileMetadata{})
+	v.SetCleanupFnForTesting(func() {
+		atomic.AddInt32(&finalizations, 1)
+	})
+	if err := vs.AppendVersion(v); err != nil {
+		t.Fatalf("AppendVersion failed: %v", err)
+	}
+
+	active := vs.ActiveVersions()
+	if len(active) != 1 {
+		t.Fatalf("expected 1 active version, got %d", len(active))
+	}
+
+	// Supersede v in VersionSet
+	vNext := NewVersion([NumLevels][]FileMetadata{})
+	if err := vs.AppendVersion(vNext); err != nil {
+		t.Fatalf("AppendVersion(vNext) failed: %v", err)
+	}
+
+	// Finalization must NOT have occurred
+	if count := atomic.LoadInt32(&finalizations); count != 0 {
+		t.Fatalf("expected 0 finalizations while pinned by active, got %d", count)
+	}
+
+	// Unref caller's pin
+	active[0].Unref()
+
+	// Finalization must have occurred exactly once
+	if count := atomic.LoadInt32(&finalizations); count != 1 {
+		t.Fatalf("expected exactly 1 finalization, got %d", count)
+	}
+
+	// Attempting to Ref a dead version must panic (Invariant D - non-resurrection)
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatalf("expected Ref() on dead version to panic, but it did not")
+		}
+	}()
+	v.Ref()
+}
+
+// TestVersionSet_ActiveVersions_ConcurrentStress tests high concurrency with
+// simultaneous Appends, ActiveVersions snapshots, Current reads, and Unrefs.
+func TestVersionSet_ActiveVersions_ConcurrentStress(t *testing.T) {
+	vs := NewVersionSet()
+
+	// Initial version
+	v0 := NewVersion([NumLevels][]FileMetadata{})
+	if err := vs.AppendVersion(v0); err != nil {
+		t.Fatalf("AppendVersion failed: %v", err)
+	}
+
+	const numAppenders = 4
+	const numActiveReaders = 4
+	const numCurrentReaders = 4
+	const opsPerWorker = 100
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, (numAppenders+numActiveReaders+numCurrentReaders)*opsPerWorker)
+
+	// Appender goroutines
+	for a := 0; a < numAppenders; a++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for i := 0; i < opsPerWorker; i++ {
+				vn := NewVersion([NumLevels][]FileMetadata{
+					0: {makeSampleFileMetadata(uint64(workerID*1000+i+1), "a", "z")},
+				})
+				if err := vs.AppendVersion(vn); err != nil {
+					errCh <- fmt.Errorf("appender %d op %d failed: %w", workerID, i, err)
+					return
+				}
+			}
+		}(a)
+	}
+
+	// ActiveVersions reader goroutines
+	for ar := 0; ar < numActiveReaders; ar++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for i := 0; i < opsPerWorker; i++ {
+				active := vs.ActiveVersions()
+				if len(active) == 0 {
+					errCh <- fmt.Errorf("active reader %d op %d observed empty active list", workerID, i)
+					return
+				}
+				for _, v := range active {
+					if v.ID() == 0 {
+						errCh <- fmt.Errorf("active reader %d observed version with ID 0", workerID)
+						return
+					}
+					// Verify metadata is readable
+					_ = v.NumFiles(0)
+					_ = v.Files(0)
+					v.Unref()
+				}
+			}
+		}(ar)
+	}
+
+	// Current reader goroutines
+	for cr := 0; cr < numCurrentReaders; cr++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for i := 0; i < opsPerWorker; i++ {
+				cur := vs.Current()
+				if cur == nil {
+					errCh <- fmt.Errorf("current reader %d observed nil Current", workerID)
+					return
+				}
+				if cur.ID() == 0 {
+					errCh <- fmt.Errorf("current reader %d observed version with ID 0", workerID)
+					return
+				}
+				_ = cur.NumFiles(0)
+				cur.Unref()
+			}
+		}(cr)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatalf("concurrent stress failure: %v", err)
+	}
+
+	// Final verification
+	finalCur := vs.Current()
+	if finalCur == nil {
+		t.Fatalf("final Current() returned nil")
+	}
+	finalCur.Unref()
+
+	// Active count must be 1 (only current remaining)
+	if count := vs.ActiveCount(); count != 1 {
+		t.Errorf("expected final ActiveCount = 1, got %d", count)
+	}
+}
+
+// TestVersionSet_ActiveVersions_RandomizedLifecycle exercises repeated randomized
+// cycles of installations, snapshot retentions, and out-of-order unrefs.
+func TestVersionSet_ActiveVersions_RandomizedLifecycle(t *testing.T) {
+	rng := rand.New(rand.NewSource(1337))
+	vs := NewVersionSet()
+
+	v0 := NewVersion([NumLevels][]FileMetadata{})
+	if err := vs.AppendVersion(v0); err != nil {
+		t.Fatalf("initial append failed: %v", err)
+	}
+
+	const iterations = 30
+	var retainedSnapshots [][]*Version
+
+	for iter := 0; iter < iterations; iter++ {
+		// 1. Maybe install 1-3 new versions
+		toInstall := rng.Intn(3) + 1
+		for i := 0; i < toInstall; i++ {
+			vn := NewVersion([NumLevels][]FileMetadata{})
+			if err := vs.AppendVersion(vn); err != nil {
+				t.Fatalf("iter %d append failed: %v", iter, err)
+			}
+		}
+
+		// 2. Snapshot active versions
+		snap := vs.ActiveVersions()
+		if len(snap) == 0 {
+			t.Fatalf("iter %d: expected non-empty snapshot", iter)
+		}
+		// Verify all elements in snapshot are alive and valid
+		for _, v := range snap {
+			if v.RefCount() <= 0 {
+				t.Fatalf("iter %d: observed non-positive refCount in snapshot: %d", iter, v.RefCount())
+			}
+			_ = v.NumFiles(0)
+		}
+
+		retainedSnapshots = append(retainedSnapshots, snap)
+
+		// 3. Maybe release a random retained snapshot
+		if len(retainedSnapshots) > 0 && rng.Float32() < 0.6 {
+			idx := rng.Intn(len(retainedSnapshots))
+			releaseSnap := retainedSnapshots[idx]
+			// Remove from slice
+			retainedSnapshots = append(retainedSnapshots[:idx], retainedSnapshots[idx+1:]...)
+
+			for _, v := range releaseSnap {
+				v.Unref()
+			}
+		}
+	}
+
+	// Drain all remaining retained snapshots
+	for _, snap := range retainedSnapshots {
+		for _, v := range snap {
+			v.Unref()
+		}
+	}
+
+	// After all retained snapshots are drained, ActiveCount must be 1 (only current)
+	if count := vs.ActiveCount(); count != 1 {
+		t.Errorf("expected final ActiveCount = 1, got %d", count)
+	}
+}
+
+// TestVersionSet_ActiveVersions_DeadNodeSkipped verifies that a node whose refCount
+// has dropped to zero (awaiting unlink in finalize()) is skipped by ActiveVersions()
+// and not returned or resurrected.
+func TestVersionSet_ActiveVersions_DeadNodeSkipped(t *testing.T) {
+	vs := NewVersionSet()
+
+	v1 := NewVersion([NumLevels][]FileMetadata{})
+	if err := vs.AppendVersion(v1); err != nil {
+		t.Fatalf("AppendVersion(v1) failed: %v", err)
+	}
+
+	v2 := NewVersion([NumLevels][]FileMetadata{})
+	if err := vs.AppendVersion(v2); err != nil {
+		t.Fatalf("AppendVersion(v2) failed: %v", err)
+	}
+
+	// V1 was superseded and had no readers, so its refCount dropped to 0 and it was unlinked.
+	// ActiveVersions must only return V2.
+	active := vs.ActiveVersions()
+	if len(active) != 1 {
+		t.Fatalf("expected 1 active version (v2), got %d", len(active))
+	}
+	if active[0] != v2 {
+		t.Errorf("expected active[0] == v2, got %v", active[0])
+	}
+	active[0].Unref()
 }

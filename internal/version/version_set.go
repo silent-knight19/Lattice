@@ -106,26 +106,43 @@ func (vs *VersionSet) Current() *Version {
 	return vs.current
 }
 
-// ActiveVersions returns a slice of all live Version pointers currently retained in the active chain.
+// ActiveVersions returns a slice of all live Version snapshots currently retained in the active chain.
+//
+// Ownership & Concurrency Contract:
+// Every returned *Version is pinned with an incremented reference count owned by the caller.
+// The caller owns one reference to each returned *Version and MUST call Unref() exactly once
+// on every element in the returned slice when finished.
+//
+// Thread-Safety & Non-Resurrection:
+// While holding vs.mu.RLock(), ActiveVersions walks the active chain and attempts atomic pinning
+// via TryRef(). Only versions that are live (refCount > 0) are pinned and appended. Any node in
+// the active chain whose reference count has already transitioned to zero (awaiting unlinking by
+// finalize()) is safely omitted to prevent resurrection of dead versions.
+// If the VersionSet is empty or contains no live versions, ActiveVersions returns nil.
 func (vs *VersionSet) ActiveVersions() []*Version {
 	vs.mu.RLock()
 	defer vs.mu.RUnlock()
 
 	var result []*Version
 	for cur := vs.dummy.next; cur != &vs.dummy; cur = cur.next {
-		result = append(result, cur)
+		if cur.TryRef() {
+			result = append(result, cur)
+		}
 	}
 	return result
 }
 
 // ActiveCount returns the count of live Version snapshots currently retained in the active chain.
+// Nodes whose reference count has transitioned to zero (awaiting unlinking) are not counted.
 func (vs *VersionSet) ActiveCount() int {
 	vs.mu.RLock()
 	defer vs.mu.RUnlock()
 
 	var count int
 	for cur := vs.dummy.next; cur != &vs.dummy; cur = cur.next {
-		count++
+		if cur.refCount.Load() > 0 {
+			count++
+		}
 	}
 	return count
 }
