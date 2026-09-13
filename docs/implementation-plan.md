@@ -1959,6 +1959,51 @@ TOTAL: 184 Discrete, Testable Micro-Phases
     - `BenchmarkCleanOrphanedFiles_10000Entries`: 35.33 ms/op, 1.77 MB/op, 22,028 allocs/op (~28 ops/sec for scanning 10,000 files and unlinking 500 orphans).
   * *Completion*: Complete and verified under `-race`, `go vet`, `golangci-lint`. Phase 07 (Crash Recovery & Integrity Verification) fully completed!
 
+* **P07-SEC-REMED: Phase 07 Security & Correctness Hardening Remediation**
+  * *Status*: **COMPLETE**
+  * *Objective*: Remediate confirmed Phase 07 security/correctness audit findings across recovery lifecycle isolation, cleaner directory TOCTOU, CURRENT writer parent pinning, Version ownership, MANIFEST replay resource budgets, and cleaner durability visibility.
+  * *Changes*:
+    - `internal/errors/errors.go`:
+      - Sentinels: `ErrRecoveryInProgress`, `ErrRecoveryAlreadyComplete`, `ErrRecoveryInvalidState`, `ErrManifestReplayLimit`.
+      - Structured error: `ManifestReplayLimitError` tracking `Resource`, `Current`, `Limit`, `Offset`, `Record`.
+    - `internal/version/version_set.go`:
+      - `HasCurrent() bool`: atomic inspection of active version presence without incrementing ref count or leaking pins.
+    - `internal/version/manifest_reader.go`:
+      - `decodeOneManifestRecordBounded()`: checks stream bounds before allocating payload buffers.
+    - `internal/version/replay.go`:
+      - Global replay budgets: `MaxManifestReplayBytes` (64 MiB), `MaxManifestReplayRecords` (100,000 edits), `MaxManifestLiveFiles` (100,000 files).
+      - `versionBuilder.applyEdit()`: enforces live file budget before map entry allocations.
+    - `internal/engine/unlink_darwin.go`, `unlink_linux.go`, `unlink_fallback.go`:
+      - Descriptor-relative `unlinkAt()` utilizing native `unlinkat` on Unix platforms (Darwin raw syscall 472, Linux `SYS_UNLINKAT`).
+    - `internal/engine/cleaner.go`:
+      - Swapped pathname `os.Remove()` for descriptor-anchored `unlinkAt(dirFile, name)`.
+      - Updated `CleanOrphanReport` with `DirectorySyncFailed` and `SyncError`; accurate preservation of `FilesCleaned`.
+    - `internal/version/current_ops_darwin.go`, `current_ops_linux.go`, `current_ops_fallback.go`:
+      - Descriptor-anchored `createTempAt()`, `renameAt()`, and `removeAt()`.
+    - `internal/version/current.go`:
+      - `SetCurrentManifest`: parent directory descriptor pinning, descriptor-anchored temporary creation, sync, and atomic rename.
+    - `internal/engine/engine.go`:
+      - Explicit 4-state lifecycle machine (`engineStateNotRecovering`, `engineStateRecovering`, `engineStateRecovered`, `engineStateClosed`).
+      - Mutating operations (`Put`, `Delete`, `Get`) reject writes during recovery with `ErrRecoveryInProgress`.
+      - `beginRecovery()` enforces startup boundary (`activeMem.Len() == 0`, `len(immMems) == 0`, `nextSeqNum == 0`, `!vset.HasCurrent()`).
+      - Monotonic watermark preserved: `NextSeqNum()` watermark and `nextSeqNum.Add(1)` write allocation.
+      - Publication under `e.mu.Lock()` with `Close()` race abort safety and Version unref.
+    - Tests Added:
+      - `internal/engine/sec_p07_lifecycle_test.go`: Lifecycle state transitions, mutation rejection during recovery, rejection after mutation, double recovery rejection, close race abort, sequence watermark preservation, version ownership transfer.
+      - `internal/engine/sec_p07_cleaner_test.go`: Parent directory replacement, symlink parent substitution, hard-link candidate preservation, candidate symlink rejection, sync failure visibility.
+      - `internal/engine/cleaner_fuzz_test.go`: Fuzzing orphan filename allowlist grammar.
+      - `internal/version/sec_p07_current_test.go`: Parent swap before temp creation, parent swap before rename, symlink target/temp defense, concurrent writers stress.
+      - `internal/version/sec_p07_replay_limits_test.go`: Replay record count budget, live files budget, add/delete churn, stream byte budget, overflow boundaries, builder isolation.
+      - `internal/version/replay_fuzz_test.go`: Fuzzing replay resource budgets against arbitrary byte streams.
+  * *Invariants & Security Guarantees*:
+    - *SEC-P07-01*: Recovery cannot overwrite concurrent writes or live pre-existing state; cannot publish into a closed engine.
+    - *SEC-P07-02*: Cleaner deletion anchored to parent directory descriptor via `unlinkat`; decoy victim files untouched.
+    - *SEC-P07-03*: CURRENT creation, sync, and rename anchored to parent directory descriptor via `openat`/`renameat`.
+    - *SEC-P07-04*: Version reference counts balanced: `HasCurrent()` eliminates unreleased pin leaks; failed installs unref cleanly.
+    - *SEC-P07-05*: Replay budgets enforced prior to allocation; streaming memory consumption bounded.
+    - *SEC-P07-06*: Cleaner directory-sync failures explicitly visible without corrupting deletion counts.
+  * *Completion*: 100% tests green, race detector clean, 0 data races, cross-platform verified (Darwin arm64/amd64, Linux arm64/amd64, Windows fallback). Phase 08 remains NOT started.
+
 ---
 
 # Phase 08: Leveled Compaction Subsystem

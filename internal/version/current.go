@@ -41,14 +41,18 @@ const (
 
 // Pluggable filesystem seams for deterministic fault-injection testing
 var (
-	currentWriteFn   = func(f *os.File, p []byte) (int, error) { return f.Write(p) }
-	currentSyncFn    = currentFileSync
-	currentCloseFn   = func(f *os.File) error { return f.Close() }
-	currentRenameFn  = os.Rename
-	currentSyncDirFn = syncDir
-	currentOpenFn    = func(name string) (*os.File, error) { return os.Open(name) }
-	currentReadFn    = func(f *os.File, p []byte) (int, error) { return f.Read(p) }
-	currentLstatFn   = os.Lstat
+	currentWriteFn        = func(f *os.File, p []byte) (int, error) { return f.Write(p) }
+	currentSyncFn         = currentFileSync
+	currentCloseFn        = func(f *os.File) error { return f.Close() }
+	currentRenameFn       = os.Rename
+	currentRenameAtFn     = renameAt
+	currentCreateTempAtFn = createTempAt
+	currentSyncDirFn      = syncDir
+	currentOpenFn         = func(name string) (*os.File, error) { return os.Open(name) }
+	currentReadFn         = func(f *os.File, p []byte) (int, error) { return f.Read(p) }
+	currentLstatFn        = os.Lstat
+	isRenameFnOverridden  atomic.Bool
+	isSyncDirFnOverridden atomic.Bool
 )
 
 // currentStrictSync selects the file-content durability barrier used by
@@ -223,7 +227,7 @@ func SetCurrentManifest(dir string, manifestNum uint64) error {
 	defer releaseLock()
 
 	// 1. Verify parent directory exists, is a genuine directory, and is not a symlink
-	dirInfo, err := os.Lstat(cleanDir)
+	dirInfo, err := currentLstatFn(cleanDir)
 	if err != nil {
 		return fmt.Errorf("current: failed to inspect directory %s: %w", cleanDir, err)
 	}
@@ -237,11 +241,26 @@ func SetCurrentManifest(dir string, manifestNum uint64) error {
 		}
 	}
 
+	// Open and pin parent directory descriptor to eliminate parent TOCTOU races (SEC-P07-03)
+	parentDirFile, err := os.Open(cleanDir)
+	if err != nil {
+		return fmt.Errorf("current: failed to open directory %s: %w", cleanDir, err)
+	}
+	defer func() { _ = parentDirFile.Close() }()
+
+	parentStat, err := parentDirFile.Stat()
+	if err != nil {
+		return fmt.Errorf("current: failed to stat open directory %s: %w", cleanDir, err)
+	}
+	if !os.SameFile(dirInfo, parentStat) {
+		return fmt.Errorf("%w: parent directory swapped during open", os.ErrInvalid)
+	}
+
 	currentPath := filepath.Join(cleanDir, CurrentFilename)
 	tmpPath := filepath.Join(cleanDir, CurrentTempFilename)
 
 	// 2. Symlink & object defense on target currentPath
-	if cInfo, err := os.Lstat(currentPath); err == nil {
+	if cInfo, err := currentLstatFn(currentPath); err == nil {
 		if cInfo.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("%w: target %s is a symlink", errors.ErrCurrentSymlink, currentPath)
 		}
@@ -256,7 +275,7 @@ func SetCurrentManifest(dir string, manifestNum uint64) error {
 	}
 
 	// 3. Symlink defense on tmpPath and cleanup of stale regular file
-	if tInfo, err := os.Lstat(tmpPath); err == nil {
+	if tInfo, err := currentLstatFn(tmpPath); err == nil {
 		if tInfo.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("%w: temporary file path %s is a symlink", errors.ErrCurrentSymlink, tmpPath)
 		}
@@ -266,26 +285,25 @@ func SetCurrentManifest(dir string, manifestNum uint64) error {
 				Mode: tInfo.Mode(),
 			}
 		}
-		// Stale regular file left over from a prior interrupted write: clean up
-		if err := os.Remove(tmpPath); err != nil {
+		// Stale regular file left over from a prior interrupted write: clean up anchored to parent descriptor
+		if err := removeAt(parentDirFile, CurrentTempFilename); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("current: failed to remove stale temporary file %s: %w", tmpPath, err)
 		}
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("current: failed to inspect temporary file %s: %w", tmpPath, err)
 	}
 
-	// 4. Create CURRENT.tmp with O_WRONLY | O_CREATE | os.O_EXCL and 0600 mode
-	flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL
-	f, err := os.OpenFile(tmpPath, flags, CurrentFileMode)
+	// 4. Create CURRENT.tmp anchored to the pinned parent directory descriptor (SEC-P07-03)
+	f, err := currentCreateTempAtFn(parentDirFile, CurrentTempFilename, CurrentFileMode)
 	if err != nil {
 		return fmt.Errorf("current: failed to create temporary file %s: %w", tmpPath, err)
 	}
 
-	// Track cleanup responsibility: if anything fails before rename, unlink tmpPath
+	// Track cleanup responsibility: if anything fails before rename, unlink CurrentTempFilename
 	needsCleanup := true
 	defer func() {
 		if needsCleanup {
-			_ = os.Remove(tmpPath)
+			_ = removeAt(parentDirFile, CurrentTempFilename)
 		}
 	}()
 
@@ -299,7 +317,7 @@ func SetCurrentManifest(dir string, manifestNum uint64) error {
 		_ = f.Close()
 		return fmt.Errorf("current: temporary path is not a regular file: %w", os.ErrInvalid)
 	}
-	postInfo, err := os.Lstat(tmpPath)
+	postInfo, err := currentLstatFn(tmpPath)
 	if err != nil {
 		_ = f.Close()
 		return fmt.Errorf("current: failed to lstat temporary file: %w", err)
@@ -347,9 +365,15 @@ func SetCurrentManifest(dir string, manifestNum uint64) error {
 		}
 	}
 
-	// 8b. Atomically replace CURRENT with CURRENT.tmp
-	if err := currentRenameFn(tmpPath, currentPath); err != nil {
-		return fmt.Errorf("current: rename %s to %s failed: %w", tmpPath, currentPath, err)
+	// 8b. Atomically replace CURRENT with CURRENT.tmp anchored to parent directory descriptor (SEC-P07-03)
+	if isRenameFnOverridden.Load() {
+		if err := currentRenameFn(tmpPath, currentPath); err != nil {
+			return fmt.Errorf("current: rename %s to %s failed: %w", tmpPath, currentPath, err)
+		}
+	} else {
+		if err := currentRenameAtFn(parentDirFile, CurrentTempFilename, CurrentFilename); err != nil {
+			return fmt.Errorf("current: rename %s to %s failed: %w", CurrentTempFilename, CurrentFilename, err)
+		}
 	}
 
 	// 8c. Post-rename TOCTOU defense (IND-005): verify currentPath inode matches finfo and is regular
@@ -370,9 +394,15 @@ func SetCurrentManifest(dir string, manifestNum uint64) error {
 	// Atomic rename verified! Staging file is now safely at currentPath; cleanup is disengaged
 	needsCleanup = false
 
-	// 9. Parent directory durability barrier
-	if err := currentSyncDirFn(cleanDir); err != nil {
-		return fmt.Errorf("%w: directory %s: %w", errors.ErrCurrentDirectorySync, cleanDir, err)
+	// 9. Parent directory durability barrier anchored to parent descriptor
+	if isSyncDirFnOverridden.Load() {
+		if err := currentSyncDirFn(cleanDir); err != nil {
+			return fmt.Errorf("%w: directory %s: %w", errors.ErrCurrentDirectorySync, cleanDir, err)
+		}
+	} else {
+		if err := parentDirFile.Sync(); err != nil && runtime.GOOS != "windows" {
+			return fmt.Errorf("%w: directory %s: %w", errors.ErrCurrentDirectorySync, cleanDir, err)
+		}
 	}
 
 	return nil

@@ -3209,4 +3209,88 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
+# 38. Recovery Lifecycle Isolation, Version Ownership, and Filesystem TOCTOU Hardening (P07-SEC-REMED)
+
+### 1. Why must crash recovery be lifecycle-isolated from concurrent mutations, and why can recovery not run after live writes have begun? (SEC-P07-01)
+* **Question**: In many storage engine implementations, `RecoverWAL()` is implemented as an independent method that reads logs from disk and populates an active MemTable. Why is allowing concurrent `Put`/`Delete` operations during recovery, or invoking recovery after live writes have occurred, a fatal architectural defect?
+* **Answer**:
+  - **State Overwrite Hazard**: Recovery reconstructs engine state out of uncommitted on-disk logs. When publication occurs, the engine performs `e.activeMem = recoveryMem`. If mutations were permitted concurrently during log replay, or prior to recovery initiation, those live mutations reside in the pre-recovery MemTable. When `activeMem` is overwritten by `recoveryMem`, every live write produced in the interim is silently destroyed without error.
+  - **The Four-State Lifecycle Machine**:
+    To eliminate this, Lattice introduces an explicit deterministic lifecycle gate:
+    `NOT_RECOVERING` $\to$ `RECOVERING` $\to$ `RECOVERED` (or `CLOSED`).
+    Mutating methods (`Put`, `Delete`, `Get`) inspect the state under the engine mutex; while `state == RECOVERING`, mutations fail immediately with `ErrRecoveryInProgress`.
+  - **Safe Startup Boundary**:
+    Recovery is strictly a startup bootstrap operation. Before beginning recovery, `beginRecovery()` enforces that the engine is in a pristine startup state:
+    `e.activeMem.Len() == 0`, `len(e.immMems) == 0`, `e.nextSeqNum.Load() == 0`, and `!e.vset.HasCurrent()`.
+    If any live mutation or published version exists, recovery fails closed with `ErrRecoveryInvalidState`. This guarantees that recovery can never overwrite live state.
+  - **Close Synchronization**:
+    If `Close()` races with recovery, publication is aborted under lock (`e.closed.Load() || e.state == engineStateClosed`), the reconstructed version is safely unreferenced, and no recovered state is published into a closed engine.
+
+### 2. Why was the audit's proposed sequence-number "off-by-one" fix rejected?
+* **Question**: The Phase 07 audit suggested modifying the recovered sequence counter initialization to `e.nextSeqNum.Store(highestSeq + 1)`. Why was this rejected as a semantic regression?
+* **Answer**:
+  - **The Watermark Invariant**: In Lattice, `nextSeqNum` represents the *highest assigned sequence number* (the sequence watermark), and `e.NextSeqNum()` exposes this exact watermark.
+  - **The Allocation Contract**: For each new write operation, the sequencer executes:
+    `seq := binary.SeqNum(e.nextSeqNum.Add(1))`
+  - If recovery were to store `highestSeq + 1` into `nextSeqNum`, the subsequent write would allocate `highestSeq + 2`, leaving an artificial hole in sequence numbers and corrupting the watermark contract.
+  - Lattice preserves the correct semantic: `highestSeq` is stored into `nextSeqNum`, ensuring that `NextSeqNum() == highestSeq` and the first post-recovery write receives `highestSeq + 1`.
+
+### 3. Why is pathname-based unlinking (`os.Remove`) vulnerable to TOCTOU directory substitution races, and how does descriptor-relative `unlinkat` remediate it? (SEC-P07-02)
+* **Question**: The orphan cleaner inspects the database directory and identifies staging files (`.tmp_*.sst_*`). If it ultimately invokes `os.Remove(candidatePath)`, why does directory descriptor pinning fail to protect the deletion?
+* **Answer**:
+  - **The Path Re-Resolution Gap**: `os.Remove(path)` takes a string pathname. The kernel resolves that pathname from scratch down the directory hierarchy. Even if the cleaner opened and pinned the directory object earlier, passing a string path to `os.Remove` bypasses the pinned descriptor entirely!
+  - **The Attack Vector**: An attacker renames the database directory and swaps in a victim directory between `ReadDir` and `os.Remove`. The pathname now resolves to a file inside the victim directory, deleting an arbitrary user file.
+  - **The Descriptor-Relative Solution**:
+    On Unix systems, deletion is executed via:
+    `unlinkat(dirFD, candidateName, 0)`
+    Because `unlinkat` takes the file descriptor of the already-validated directory object, the kernel resolves the entry strictly within that pinned directory vnode. Substituting or renaming the parent pathname on disk has zero effect on `unlinkat`.
+
+### 4. Why does naive post-rename verification fail to protect `CURRENT` file replacement, and how does descriptor-anchored `renameat` solve it? (SEC-P07-03)
+* **Question**: When atomically updating `CURRENT`, why is checking `os.SameFile` on the parent directory *after* renaming insufficient, and how do descriptor-anchored operations prevent parent substitution?
+* **Answer**:
+  - **The Post-Rename Check Fallacy**: If `CURRENT.tmp` is created and renamed using pathname operations (`os.OpenFile(dir/CURRENT.tmp)`, `os.Rename(...)`), and the parent directory was swapped to an attacker directory before the operation, the file creation and rename *have already taken place* inside the attacker directory before the post-rename check runs. Checking after the fact detects the attack only after unauthorized file mutation has already occurred!
+  - **Descriptor-Anchored Pipeline**:
+    The parent directory descriptor is opened and verified once (`parentDirFile`). All subsequent operations are executed relative to `parentDirFile.Fd()`:
+    1. `openat(parentFD, "CURRENT.tmp", O_WRONLY|O_CREATE|O_EXCL, 0600)`
+    2. `fstat` & `write` & `fdatasync` through the open temp descriptor
+    3. `renameat(parentFD, "CURRENT.tmp", parentFD, "CURRENT")`
+    4. `parentDirFile.Sync()`
+    At no point is the parent pathname re-resolved from strings. All mutations are physically confined to the verified directory inode.
+
+### 5. How are Version reference ownership leaks prevented during recovery publication? (SEC-P07-04)
+* **Question**: In recovery publication, `VersionSet.AppendVersion(replayRes.Version)` is called. Why does testing `vset.Current() == nil` leak references, and why is explicit ownership transfer necessary?
+* **Answer**:
+  - **Pinning Semantics of `Current()`**: `vset.Current()` returns a pinned `*Version` with an incremented reference count (`v.Ref()`), requiring the caller to invoke `Unref()`. Calling `vset.Current() == nil` and discarding the non-nil pointer leaks an unreleased reference pin forever.
+  - **The Solution (`HasCurrent`)**:
+    `vset.HasCurrent() bool` inspects `vs.current != nil` under `vs.mu.RLock()` without incrementing reference counts.
+  - **Explicit Ownership Transfer**:
+    When `AppendVersion(v)` is called:
+    - If it succeeds: `VersionSet` assumes ownership of the version's initial reference.
+    - If it fails: `AppendVersion` does not take ownership; the caller must explicitly call `v.Unref()` to free the uninstalled version.
+    - If recovery fails or aborts before publication: `replayRes.Version.Unref()` is guaranteed on all error return paths.
+
+### 6. Why must MANIFEST replay enforce pre-allocation resource budgets for stream bytes, records, and live files? (SEC-P07-05)
+* **Question**: While individual `VersionEdit` records are bounded by `MaxVersionEditBytes`, why does replay remain vulnerable without global replay budgets?
+* **Answer**:
+  - **Amplification and Heap Exhaustion**: A malicious or runaway MANIFEST could contain millions of valid small records or an enormous file size. Replaying without global bounds allows an attacker to exhaust memory through cumulative object allocations or excessive record processing time.
+  - **Enforce-Before-Allocate Budgets**:
+    Lattice establishes three explicit budgets:
+    1. `MaxManifestReplayBytes` (64 MiB): Cumulative physical bytes read from the stream. Bounded record decoding verifies that `offset + header + payloadLen <= MaxManifestReplayBytes` before allocating the payload byte slice.
+    2. `MaxManifestReplayRecords` (100,000 edits): Maximum sequential record count evaluated before decoding each record.
+    3. `MaxManifestLiveFiles` (100,000 files): Maximum active live files permitted in the reconstructed Version.
+  - **Safe Add/Delete Churn**: The live file budget tracks *active* files (`currentFiles - deletions + additions <= limit`), permitting extensive valid compaction and deletion churn without falsely rejecting long-lived databases.
+
+### 7. Why must cleaner directory-sync errors be distinguished from unlink failures? (SEC-P07-06)
+* **Question**: If orphan cleanup deletes 5 files from disk, but `dirFile.Sync()` returns an I/O error, why should `FilesCleaned` not be reset to 0?
+* **Answer**:
+  - **Physical Reality vs. Durability Status**: The physical `unlink` operations succeeded—the kernel modified the directory structure in the page cache and freed the inode directory entries. Claiming `FilesCleaned == 0` is physically false.
+  - **Explicit Status Separation**:
+    `CleanOrphanReport` maintains:
+    - `FilesCleaned`: exact count of successfully unlinked files.
+    - `DirectorySyncFailed: true`: explicitly marks that directory metadata synchronization failed.
+    - `SyncError`: captures the exact underlying I/O error.
+    - `report.Error()`: propagates the sync failure so the caller knows durability was not confirmed, while preserving accurate accounting and allowing idempotent retries.
+
+---
+
 *End of Technical Interview Knowledge Base — Lattice v1.0.0-KNOWLEDGE-BASE*

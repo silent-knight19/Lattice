@@ -323,6 +323,22 @@ var (
 
 	// ErrVersionAlreadyAppended indicates that a Version was attempted to be appended to a VersionSet when it already belongs to one.
 	ErrVersionAlreadyAppended = stdErrors.New("version already belongs to a VersionSet")
+
+	// ErrRecoveryInProgress indicates that startup crash recovery is actively executing
+	// and concurrent mutations or second recovery invocations are prohibited.
+	ErrRecoveryInProgress = stdErrors.New("recovery is already in progress")
+
+	// ErrRecoveryAlreadyComplete indicates that startup crash recovery has already completed
+	// and cannot be re-executed on an active engine instance.
+	ErrRecoveryAlreadyComplete = stdErrors.New("recovery has already completed")
+
+	// ErrRecoveryInvalidState indicates that recovery was attempted on an engine that already
+	// contains live uncommitted in-memory mutations or prior active state.
+	ErrRecoveryInvalidState = stdErrors.New("cannot recover engine with active uncommitted state")
+
+	// ErrManifestReplayLimit indicates that MANIFEST replay exceeded global resource bounds
+	// (replayed bytes, record count, or live file count).
+	ErrManifestReplayLimit = stdErrors.New("manifest replay resource limit exceeded")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing
@@ -1030,4 +1046,27 @@ func (e *MemTableFullError) Error() string {
 // Is reports whether this error matches target sentinel ErrMemTableFull.
 func (e *MemTableFullError) Is(target error) bool {
 	return target == ErrMemTableFull
+}
+
+// ManifestReplayLimitError provides structured context when MANIFEST replay exceeds resource limits.
+// It matches ErrManifestReplayLimit when interrogated with errors.Is().
+type ManifestReplayLimitError struct {
+	Resource string // "bytes", "records", or "live_files"
+	Current  uint64
+	Limit    uint64
+	Offset   int64
+	Record   int
+}
+
+func (e *ManifestReplayLimitError) Error() string {
+	if e == nil {
+		return ErrManifestReplayLimit.Error()
+	}
+	return fmt.Sprintf("manifest replay limit exceeded for %s: current %d exceeds limit %d at record %d (offset %d)",
+		e.Resource, e.Current, e.Limit, e.Record, e.Offset)
+}
+
+// Is reports whether this error matches target sentinel ErrManifestReplayLimit.
+func (e *ManifestReplayLimitError) Is(target error) bool {
+	return target == ErrManifestReplayLimit
 }

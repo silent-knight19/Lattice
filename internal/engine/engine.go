@@ -16,6 +16,32 @@ import (
 	"github.com/silent-knight19/lattice/internal/wal"
 )
 
+type engineState uint32
+
+const (
+	engineStateNotRecovering engineState = iota
+	engineStateRecovering
+	engineStateRecovered
+	engineStateClosed
+)
+
+var (
+	recoveryPrePublishHookMu sync.Mutex
+	recoveryPrePublishHook   func(*Engine)
+)
+
+// SetRecoveryPrePublishHookForTesting registers a testing hook called right before recovery acquires mu.Lock() to publish.
+func SetRecoveryPrePublishHookForTesting(hook func(*Engine)) func() {
+	recoveryPrePublishHookMu.Lock()
+	recoveryPrePublishHook = hook
+	recoveryPrePublishHookMu.Unlock()
+	return func() {
+		recoveryPrePublishHookMu.Lock()
+		recoveryPrePublishHook = nil
+		recoveryPrePublishHookMu.Unlock()
+	}
+}
+
 // Engine coordinates the active MemTable, immutable flush candidates,
 // VersionSet snapshot management, and backpressure gating (SEC-003).
 type Engine struct {
@@ -26,6 +52,7 @@ type Engine struct {
 	backpressure *BackpressureController
 	nextSeqNum   atomic.Uint64
 	closed       atomic.Bool
+	state        engineState
 	vset         *version.VersionSet
 }
 
@@ -145,9 +172,13 @@ func (e *Engine) Put(ctx context.Context, key, val []byte) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.closed.Load() {
+	if e.closed.Load() || e.state == engineStateClosed {
 		e.backpressure.Release(estBytes)
 		return errors.ErrWriterClosed
+	}
+	if e.state == engineStateRecovering {
+		e.backpressure.Release(estBytes)
+		return errors.ErrRecoveryInProgress
 	}
 
 	seq := binary.SeqNum(e.nextSeqNum.Add(1))
@@ -206,9 +237,13 @@ func (e *Engine) Delete(ctx context.Context, key []byte) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.closed.Load() {
+	if e.closed.Load() || e.state == engineStateClosed {
 		e.backpressure.Release(estBytes)
 		return errors.ErrWriterClosed
+	}
+	if e.state == engineStateRecovering {
+		e.backpressure.Release(estBytes)
+		return errors.ErrRecoveryInProgress
 	}
 
 	seq := binary.SeqNum(e.nextSeqNum.Add(1))
@@ -254,6 +289,10 @@ func (e *Engine) Get(key []byte) ([]byte, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
+	if e.state == engineStateRecovering {
+		return nil, errors.ErrRecoveryInProgress
+	}
+
 	// 1. Search active MemTable
 	val, err := e.activeMem.SearchConcurrent(key)
 	if err == nil {
@@ -279,13 +318,48 @@ func (e *Engine) Close() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.closed.Swap(true) {
+	e.closed.Store(true)
+	if e.state == engineStateClosed {
 		return nil
 	}
+	e.state = engineStateClosed
 
 	e.activeMem.Freeze()
 	e.backpressure.Close()
 	return nil
+}
+
+func (e *Engine) beginRecovery() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.closed.Load() || e.state == engineStateClosed {
+		return errors.ErrWriterClosed
+	}
+	if e.state == engineStateRecovering {
+		return errors.ErrRecoveryInProgress
+	}
+	if e.state == engineStateRecovered {
+		return errors.ErrRecoveryAlreadyComplete
+	}
+	// SEC-P07-01: Prohibit recovery if engine contains live mutations or uncommitted state
+	if e.activeMem.Len() > 0 || len(e.immMems) > 0 || e.nextSeqNum.Load() > 0 {
+		return errors.ErrRecoveryInvalidState
+	}
+	if e.vset != nil && e.vset.HasCurrent() {
+		return errors.ErrRecoveryInvalidState
+	}
+
+	e.state = engineStateRecovering
+	return nil
+}
+
+func (e *Engine) abortRecovery() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.state == engineStateRecovering {
+		e.state = engineStateNotRecovering
+	}
 }
 
 // RecoverWAL executes startup crash recovery by:
@@ -313,12 +387,13 @@ func (e *Engine) RecoverWAL() error {
 	if e == nil {
 		return errors.ErrNilReceiver
 	}
-	if e.closed.Load() {
-		return errors.ErrWriterClosed
+	if err := e.beginRecovery(); err != nil {
+		return err
 	}
 
 	dbPath := e.DBPath()
 	if dbPath == "" {
+		e.abortRecovery()
 		return fmt.Errorf("%w: engine dbPath cannot be empty", os.ErrInvalid)
 	}
 
@@ -330,12 +405,13 @@ func (e *Engine) RecoverWAL() error {
 	// Step 1: Discover and replay active MANIFEST to establish the durable checkpoint
 	disc, err := version.DiscoverActiveManifest(dbPath)
 	if err != nil {
-		if stdErrors.Is(err, errors.ErrCurrentNotFound) || stdErrors.Is(err, errors.ErrManifestNotFound) || stdErrors.Is(err, os.ErrNotExist) {
-			// Clean fresh database environment: no MANIFEST or CURRENT exists yet.
+		if stdErrors.Is(err, errors.ErrCurrentNotFound) {
+			// Clean fresh database environment: no CURRENT exists yet.
 			// Durable sequence checkpoint defaults to 0.
 			checkpoint = 0
 		} else {
 			// Any directory corruption or ambiguous state fails closed immediately
+			e.abortRecovery()
 			return fmt.Errorf("engine: failed to discover active manifest: %w", err)
 		}
 	} else {
@@ -343,6 +419,7 @@ func (e *Engine) RecoverWAL() error {
 
 		res, replayErr := version.ReplayManifest(disc)
 		if replayErr != nil {
+			e.abortRecovery()
 			return fmt.Errorf("engine: failed to replay manifest: %w", replayErr)
 		}
 		replayRes = res
@@ -368,12 +445,13 @@ func (e *Engine) RecoverWALFromCheckpoint(checkpoint binary.SeqNum) error {
 	if e == nil {
 		return errors.ErrNilReceiver
 	}
-	if e.closed.Load() {
-		return errors.ErrWriterClosed
+	if err := e.beginRecovery(); err != nil {
+		return err
 	}
 
 	dbPath := e.DBPath()
 	if dbPath == "" {
+		e.abortRecovery()
 		return fmt.Errorf("%w: engine dbPath cannot be empty", os.ErrInvalid)
 	}
 
@@ -389,15 +467,22 @@ func (e *Engine) RecoverWALWithManifestResult(res *version.ReplayResult) error {
 	if e == nil {
 		return errors.ErrNilReceiver
 	}
-	if e.closed.Load() {
-		return errors.ErrWriterClosed
-	}
 	if res == nil {
 		return fmt.Errorf("%w: replay result cannot be nil", os.ErrInvalid)
+	}
+	if err := e.beginRecovery(); err != nil {
+		if res.Version != nil {
+			res.Version.Unref()
+		}
+		return err
 	}
 
 	dbPath := e.DBPath()
 	if dbPath == "" {
+		if res.Version != nil {
+			res.Version.Unref()
+		}
+		e.abortRecovery()
 		return fmt.Errorf("%w: engine dbPath cannot be empty", os.ErrInvalid)
 	}
 
@@ -463,6 +548,7 @@ func (e *Engine) recoverWALInternal(dbPath string, checkpoint binary.SeqNum, rep
 		if replayRes != nil && replayRes.Version != nil {
 			replayRes.Version.Unref()
 		}
+		e.abortRecovery()
 		return fmt.Errorf("engine: wal recovery failed: %w", err)
 	}
 
@@ -470,15 +556,29 @@ func (e *Engine) recoverWALInternal(dbPath string, checkpoint binary.SeqNum, rep
 	_ = inBatch
 	batchBuffer = nil
 
+	recoveryPrePublishHookMu.Lock()
+	hook := recoveryPrePublishHook
+	recoveryPrePublishHookMu.Unlock()
+	if hook != nil {
+		hook(e)
+	}
+
 	// State publication atomicity: publish under e.mu.Lock()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// 1. Install active and immutable MemTables
-	e.activeMem = recoveryMem
-	if len(recoveryImm) > 0 {
-		e.immMems = append(e.immMems, recoveryImm...)
+	// If engine was closed while recovery was running, abort publication without mutating engine state
+	if e.closed.Load() || e.state == engineStateClosed {
+		if replayRes != nil && replayRes.Version != nil {
+			replayRes.Version.Unref()
+		}
+		e.state = engineStateClosed
+		return errors.ErrWriterClosed
 	}
+
+	// 1. Install active and immutable MemTables (replace, do not append to prevent accumulation)
+	e.activeMem = recoveryMem
+	e.immMems = recoveryImm
 
 	// 2. Monotonic sequence counter advancement: max(current, checkpoint, wal.LastSeqNum)
 	highestSeq := uint64(checkpoint)
@@ -490,10 +590,14 @@ func (e *Engine) recoverWALInternal(dbPath string, checkpoint binary.SeqNum, rep
 		e.nextSeqNum.Store(highestSeq)
 	}
 
-	// 3. Install reconstructed Version into VersionSet (if supplied and not yet installed)
+	// 3. Install reconstructed Version into VersionSet (SEC-P07-04)
 	if replayRes != nil && replayRes.Version != nil {
-		if e.vset != nil && e.vset.Current() == nil {
-			_ = e.vset.AppendVersion(replayRes.Version)
+		if e.vset != nil && !e.vset.HasCurrent() {
+			if err := e.vset.AppendVersion(replayRes.Version); err != nil {
+				replayRes.Version.Unref()
+				e.state = engineStateNotRecovering
+				return fmt.Errorf("engine: failed to install reconstructed version: %w", err)
+			}
 		} else {
 			replayRes.Version.Unref()
 		}
@@ -507,6 +611,9 @@ func (e *Engine) recoverWALInternal(dbPath string, checkpoint binary.SeqNum, rep
 		}
 		e.backpressure.RecordUsage(totalBytes)
 	}
+
+	// 5. State transition to recovered
+	e.state = engineStateRecovered
 
 	return nil
 }

@@ -752,6 +752,25 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 47. Phase 07 Security Remediation & Filesystem Boundaries (P07-SEC-REMED)
+* **Remediation & Architectural Hardening**:
+  Following the exhaustive Phase 07 security and correctness audit, six confirmed security and lifecycle findings (`SEC-P07-01` through `SEC-P07-06`) were remediated:
+  1. **Recovery Lifecycle Isolation (`SEC-P07-01`)**: Implemented explicit deterministic four-state lifecycle gate (`NOT_RECOVERING`, `RECOVERING`, `RECOVERED`, `CLOSED`). Prohibits concurrent mutations (`Put`, `Delete`, `Get` return `ErrRecoveryInProgress` while recovering). Rejects recovery calls if the engine already contains live in-memory mutations (`ErrRecoveryInvalidState`), preventing silent state overwrite. Rejects double recovery after successful completion (`ErrRecoveryAlreadyComplete`). Aborts publication cleanly if `Close()` races with recovery, releasing the reconstructed Version without publishing into a closed engine. Preserves `nextSeqNum` as the sequence watermark with `nextSeqNum.Add(1)` allocation.
+  2. **Cleaner Descriptor-Relative Deletion (`SEC-P07-02`)**: Replaced pathname-based deletion in orphan cleanup with descriptor-relative `unlinkat` anchored to the opened directory descriptor on Unix-like platforms (Darwin raw syscall 472, Linux `SYS_UNLINKAT`), eliminating parent pathname replacement TOCTOU races. Preserves the full multi-tier allowlist, direct-child check, and symlink rejection layers.
+  3. **CURRENT Writer Parent Descriptor Pinning (`SEC-P07-03`)**: Hardened `SetCurrentManifest` to anchor temporary file creation and atomic replacement directly to the validated parent directory file descriptor (`openat`/`createTempAt` and `renameat`). Replaces naive post-rename path checking with descriptor-relative operations.
+  4. **Version Reference Ownership in Recovery (`SEC-P07-04`)**: Added `VersionSet.HasCurrent()` to check presence without leaking pinned caller references. Explicitly unrefs the reconstructed Version if `AppendVersion` fails or if recovery is aborted, maintaining exact bijective reference counting.
+  5. **MANIFEST Replay Resource Budgets (`SEC-P07-05`)**: Introduced explicit, configurable replay budgets: `MaxManifestReplayBytes` (64 MiB), `MaxManifestReplayRecords` (100,000 edits), and `MaxManifestLiveFiles` (100,000 live files). Bounded header decoding checks remaining stream bytes before allocating payload buffers. Live file count is validated during `applyEdit` before map allocations, preventing memory exhaustion while permitting valid add/delete churn.
+  6. **Cleaner Directory-Sync Visibility (`SEC-P07-06`)**: Updated `CleanOrphanReport` with `DirectorySyncFailed` and `SyncError`. If physical unlinks succeed but directory synchronization fails, `FilesCleaned` preserves the accurate deletion count while reporting the durability error explicitly via `report.Error()`.
+* **Platform-Dependent Filesystem Guarantees**:
+  - *Unix (Darwin / Linux)*: Native descriptor-relative system calls (`unlinkat`, `renameat`, `openat`) provide race-free directory operations anchored to verified file descriptors.
+  - *Windows*: Standard Go `os` pathname operations are utilized as fallback. On Windows platforms, directory-relative unlink/rename syscalls are not exposed by the standard Go runtime without external packages; atomic directory pinning is narrower and relies on file locks and pre-open inspection.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Exact sequence watermark semantics preserved; version reference accounting balanced).
+  * Performance: **Optimal** (Descriptor-relative syscalls eliminate repeated pathname resolution; zero heap allocation on bounded checks).
+  * Security: **Optimal** (TOCTOU parent substitution eliminated on Unix; replay DoS bounded before allocation; lifecycle mutations serialized).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*
 
 

@@ -18,7 +18,42 @@ const (
 	// TableFilenamePattern defines the standard zero-padded 6-digit SSTable filename format.
 	// Example: 000001.sst
 	TableFilenamePattern = "%06d.sst"
+
+	// MaxManifestReplayBytes defines the global maximum physical byte stream budget
+	// permitted during MANIFEST replay (64 MiB). This bounds the physical data read
+	// and processed before failing closed against replay resource exhaustion.
+	MaxManifestReplayBytes int64 = 64 * 1024 * 1024
+
+	// MaxManifestReplayRecords defines the maximum count of VersionEdit records
+	// permitted during a single sequential MANIFEST replay pass (100,000 edits).
+	MaxManifestReplayRecords = 100000
+
+	// MaxManifestLiveFiles defines the maximum count of live SSTable files permitted
+	// across all levels in the reconstructed Version (100,000 active files).
+	MaxManifestLiveFiles = 100000
 )
+
+// Pluggable replay limits for testing boundary conditions
+var (
+	manifestReplayMaxBytes   = MaxManifestReplayBytes
+	manifestReplayMaxRecords = MaxManifestReplayRecords
+	manifestReplayMaxFiles   = MaxManifestLiveFiles
+)
+
+// SetManifestReplayLimitsForTesting configures custom limits for testing and returns a restore function.
+func SetManifestReplayLimitsForTesting(maxBytes int64, maxRecords int, maxFiles int) func() {
+	prevBytes := manifestReplayMaxBytes
+	prevRecords := manifestReplayMaxRecords
+	prevFiles := manifestReplayMaxFiles
+	manifestReplayMaxBytes = maxBytes
+	manifestReplayMaxRecords = maxRecords
+	manifestReplayMaxFiles = maxFiles
+	return func() {
+		manifestReplayMaxBytes = prevBytes
+		manifestReplayMaxRecords = prevRecords
+		manifestReplayMaxFiles = prevFiles
+	}
+}
 
 // TableFilename returns the canonical SSTable filename for a given sequential file number.
 // In accordance with Lattice architecture, the filename is formatted as "%06d.sst" with 6 zero-padded digits.
@@ -104,6 +139,14 @@ func newVersionBuilder() *versionBuilder {
 	return b
 }
 
+func (b *versionBuilder) liveFileCount() int {
+	total := 0
+	for lvl := 0; lvl < NumLevels; lvl++ {
+		total += len(b.levels[lvl])
+	}
+	return total
+}
+
 // applyEdit applies a validated VersionEdit delta to the in-memory reconstruction state.
 func (b *versionBuilder) applyEdit(edit *VersionEdit) error {
 	if edit == nil {
@@ -117,7 +160,35 @@ func (b *versionBuilder) applyEdit(edit *VersionEdit) error {
 		}
 	}
 
-	// 2. Process file additions
+	// 2. Validate live file budget before allocating additions
+	currentFiles := b.liveFileCount()
+	newAdditions := 0
+	for _, a := range edit.AddedFiles() {
+		if a.Level < NumLevels {
+			if _, exists := b.levels[a.Level][a.Meta.FileNum]; !exists {
+				newAdditions++
+			}
+		}
+	}
+	if currentFiles+newAdditions > manifestReplayMaxFiles {
+		var curFiles, limFiles uint64
+		if currentFiles > 0 {
+			curFiles += uint64(currentFiles)
+		}
+		if newAdditions > 0 {
+			curFiles += uint64(newAdditions)
+		}
+		if manifestReplayMaxFiles > 0 {
+			limFiles = uint64(manifestReplayMaxFiles)
+		}
+		return &errors.ManifestReplayLimitError{
+			Resource: "live_files",
+			Current:  curFiles,
+			Limit:    limFiles,
+		}
+	}
+
+	// 3. Process file additions
 	for _, a := range edit.AddedFiles() {
 		if a.Level >= NumLevels {
 			return &errors.InvalidLevelError{Level: a.Level, MaxLevel: NumLevels - 1}
@@ -137,7 +208,7 @@ func (b *versionBuilder) applyEdit(edit *VersionEdit) error {
 		b.levels[a.Level][a.Meta.FileNum] = a.Meta.Clone()
 	}
 
-	// 3. Monotonic scalar progression
+	// 4. Monotonic scalar progression
 	if nextNum, ok := edit.NextFileNum(); ok {
 		if nextNum > b.nextFileNum {
 			b.nextFileNum = nextNum
@@ -187,7 +258,63 @@ func ReplayManifest(discovered *DiscoveredManifest) (*ReplayResult, error) {
 
 	// Stream and replay all records sequentially from offset 0
 	for {
-		payload, recordLen, err := decodeOneManifestRecord(discovered.File, offset)
+		if recordIndex >= manifestReplayMaxRecords {
+			// Check if at clean EOF
+			var peek [ManifestHeaderSize]byte
+			n, peekErr := readFullAt(discovered.File, peek[:], offset)
+			if peekErr != nil && stdErrors.Is(peekErr, io.EOF) && n == 0 {
+				break
+			}
+			var limRec uint64
+			if manifestReplayMaxRecords > 0 {
+				limRec = uint64(manifestReplayMaxRecords)
+			}
+			return nil, &ReplayError{
+				ManifestNum: discovered.ManifestNum,
+				RecordIndex: recordIndex,
+				Offset:      offset,
+				Err: &errors.ManifestReplayLimitError{
+					Resource: "records",
+					Current:  uint64(recordIndex) + 1,
+					Limit:    limRec,
+					Offset:   offset,
+					Record:   recordIndex,
+				},
+			}
+		}
+
+		maxRemaining := manifestReplayMaxBytes - offset
+		if maxRemaining < int64(ManifestHeaderSize) {
+			var peek [1]byte
+			n, _ := readFullAt(discovered.File, peek[:], offset)
+			if n == 0 {
+				break
+			}
+			var curBytes, limBytes uint64
+			if offset > 0 {
+				curBytes = uint64(offset)
+			}
+			if n > 0 {
+				curBytes += uint64(n)
+			}
+			if manifestReplayMaxBytes > 0 {
+				limBytes = uint64(manifestReplayMaxBytes)
+			}
+			return nil, &ReplayError{
+				ManifestNum: discovered.ManifestNum,
+				RecordIndex: recordIndex,
+				Offset:      offset,
+				Err: &errors.ManifestReplayLimitError{
+					Resource: "bytes",
+					Current:  curBytes,
+					Limit:    limBytes,
+					Offset:   offset,
+					Record:   recordIndex,
+				},
+			}
+		}
+
+		payload, recordLen, err := decodeOneManifestRecordBounded(discovered.File, offset, maxRemaining)
 		if err != nil {
 			if stdErrors.Is(err, io.EOF) {
 				// Clean EOF between complete records

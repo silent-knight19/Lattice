@@ -19,19 +19,35 @@ type CleanOrphanReport struct {
 
 	// Failures maps candidate relative filename to the specific error encountered during deletion or inspection.
 	Failures map[string]error
+
+	// DirectorySyncFailed indicates that hardware synchronization of the parent directory failed following unlinking.
+	DirectorySyncFailed bool
+
+	// SyncError records the underlying error encountered during parent directory synchronization.
+	SyncError error
 }
 
-// Error formats any deletion failures encountered into an aggregate error message.
+// Error formats any deletion or directory synchronization failures encountered into an aggregate error message.
 // Returns nil if no failures occurred.
 func (r CleanOrphanReport) Error() error {
-	if len(r.Failures) == 0 {
+	if len(r.Failures) == 0 && !r.DirectorySyncFailed {
 		return nil
 	}
-	var errMsgs []string
-	for name, err := range r.Failures {
-		errMsgs = append(errMsgs, fmt.Sprintf("%s: %v", name, err))
+	if len(r.Failures) == 0 && r.DirectorySyncFailed {
+		return fmt.Errorf("directory synchronization failed: %w", r.SyncError)
 	}
-	return fmt.Errorf("clean orphaned files encountered %d failure(s): %s", len(r.Failures), strings.Join(errMsgs, "; "))
+	var parts []string
+	if len(r.Failures) > 0 {
+		var errMsgs []string
+		for name, err := range r.Failures {
+			errMsgs = append(errMsgs, fmt.Sprintf("%s: %v", name, err))
+		}
+		parts = append(parts, fmt.Sprintf("clean orphaned files encountered %d failure(s): %s", len(r.Failures), strings.Join(errMsgs, "; ")))
+	}
+	if r.DirectorySyncFailed {
+		parts = append(parts, fmt.Sprintf("directory synchronization failed: %v", r.SyncError))
+	}
+	return fmt.Errorf("%s", strings.Join(parts, "; "))
 }
 
 // IsOrphanStagingFile reports whether a directory entry name strictly conforms to the
@@ -202,8 +218,8 @@ func CleanOrphanedFilesDir(dbPath string) (CleanOrphanReport, error) {
 		}
 
 		// Step 4: Safely unlink validated regular file candidate (INV-05, INV-10)
-		// os.Remove operates strictly on the directory entry without following symlinks.
-		if removeErr := os.Remove(candidatePath); removeErr != nil { // #nosec G703, G304 - candidatePath is verified direct child
+		// unlinkAt operates strictly anchored to the pinned directory file descriptor (SEC-P07-02).
+		if removeErr := unlinkAt(dirFile, name); removeErr != nil {
 			if !os.IsNotExist(removeErr) {
 				report.Failures[name] = removeErr
 				continue
@@ -214,12 +230,28 @@ func CleanOrphanedFilesDir(dbPath string) (CleanOrphanReport, error) {
 		}
 	}
 
-	// Step 5: Best-effort directory durability sync if mutations occurred
+	// Step 5: Directory durability sync if mutations occurred (SEC-P07-06)
 	if report.FilesCleaned > 0 {
-		_ = dirFile.Sync()
+		if syncErr := cleanerSyncDirFn(dirFile); syncErr != nil {
+			report.DirectorySyncFailed = true
+			report.SyncError = syncErr
+		}
 	}
 
 	return report, report.Error()
+}
+
+var cleanerSyncDirFn = func(f *os.File) error {
+	return f.Sync()
+}
+
+// SetCleanerSyncDirFnForTesting overrides cleanerSyncDirFn for testing directory sync failures.
+func SetCleanerSyncDirFnForTesting(fn func(*os.File) error) func() {
+	prev := cleanerSyncDirFn
+	cleanerSyncDirFn = fn
+	return func() {
+		cleanerSyncDirFn = prev
+	}
 }
 
 // CleanOrphanedFiles scans the database directory and removes unreferenced crash-window

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 
@@ -147,6 +148,12 @@ func scanManifest(path string, allowTruncate bool) (ManifestReadResult, error) {
 // EOF; (nil, 0, ErrManifestHeaderTruncated/PayloadTruncated) on torn tail;
 // (nil, 0, ChecksumMismatchError/ManifestCorruptedError) on corruption.
 func decodeOneManifestRecord(f *os.File, offset int64) ([]byte, int64, error) {
+	return decodeOneManifestRecordBounded(f, offset, math.MaxInt64)
+}
+
+// decodeOneManifestRecordBounded reads a single framed record enforcing a remaining byte limit.
+// It verifies that the record will fit within maxRemainingBytes before allocating the payload slice.
+func decodeOneManifestRecordBounded(f *os.File, offset int64, maxRemainingBytes int64) ([]byte, int64, error) {
 	var header [ManifestHeaderSize]byte
 	n, err := readFullAt(f, header[:], offset)
 	if err != nil {
@@ -163,6 +170,26 @@ func decodeOneManifestRecord(f *os.File, offset int64) ([]byte, int64, error) {
 			Reason: fmt.Sprintf("payload length %d exceeds maximum %d", payloadLen, MaxVersionEditBytes),
 		}
 	}
+	totalRecordLen := int64(ManifestHeaderSize) + int64(payloadLen)
+	if totalRecordLen > maxRemainingBytes {
+		var curBytes, limBytes uint64
+		if offset > 0 {
+			curBytes = uint64(offset)
+			limBytes = uint64(offset)
+		}
+		if totalRecordLen > 0 {
+			curBytes += uint64(totalRecordLen)
+		}
+		if maxRemainingBytes > 0 {
+			limBytes += uint64(maxRemainingBytes)
+		}
+		return nil, 0, &errors.ManifestReplayLimitError{
+			Resource: "bytes",
+			Current:  curBytes,
+			Limit:    limBytes,
+			Offset:   offset,
+		}
+	}
 	payload := make([]byte, payloadLen)
 	if _, err := readFullAt(f, payload, offset+ManifestHeaderSize); err != nil {
 		return nil, 0, errors.ErrManifestPayloadTruncated
@@ -177,7 +204,7 @@ func decodeOneManifestRecord(f *os.File, offset int64) ([]byte, int64, error) {
 			Actual:   crc,
 		}
 	}
-	return payload, int64(ManifestHeaderSize) + int64(payloadLen), nil
+	return payload, totalRecordLen, nil
 }
 
 func readFullAt(f *os.File, buf []byte, off int64) (int, error) {

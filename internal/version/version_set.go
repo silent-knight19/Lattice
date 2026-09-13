@@ -106,6 +106,14 @@ func (vs *VersionSet) Current() *Version {
 	return vs.current
 }
 
+// HasCurrent reports whether an active Version snapshot is currently published in the VersionSet.
+// Unlike Current(), HasCurrent does NOT increment reference counts or pin the version.
+func (vs *VersionSet) HasCurrent() bool {
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
+	return vs.current != nil
+}
+
 // ActiveVersions returns a slice of all live Version snapshots currently retained in the active chain.
 //
 // Ownership & Concurrency Contract:

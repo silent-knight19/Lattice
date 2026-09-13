@@ -48,14 +48,46 @@ func SetCurrentCloseFnForTesting(fn func(f *os.File) error) func() {
 func SetCurrentRenameFnForTesting(fn func(oldpath, newpath string) error) func() {
 	orig := currentRenameFn
 	currentRenameFn = fn
-	return func() { currentRenameFn = orig }
+	isRenameFnOverridden.Store(true)
+	return func() {
+		currentRenameFn = orig
+		isRenameFnOverridden.Store(false)
+	}
 }
 
 // SetCurrentSyncDirFnForTesting temporarily replaces currentSyncDirFn and returns a restore closure.
 func SetCurrentSyncDirFnForTesting(fn func(dirPath string) error) func() {
 	orig := currentSyncDirFn
 	currentSyncDirFn = fn
-	return func() { currentSyncDirFn = orig }
+	isSyncDirFnOverridden.Store(true)
+	return func() {
+		currentSyncDirFn = orig
+		isSyncDirFnOverridden.Store(false)
+	}
+}
+
+// SetCurrentRenameAtFnForTesting temporarily replaces currentRenameAtFn and returns a restore closure.
+func SetCurrentRenameAtFnForTesting(fn func(dirFile *os.File, oldName, newName string) error) func() {
+	orig := currentRenameAtFn
+	currentRenameAtFn = fn
+	return func() { currentRenameAtFn = orig }
+}
+
+// RenameAt exports renameAt for testing.
+func RenameAt(dirFile *os.File, oldName, newName string) error {
+	return renameAt(dirFile, oldName, newName)
+}
+
+// SetCurrentCreateTempAtFnForTesting temporarily replaces currentCreateTempAtFn and returns a restore closure.
+func SetCurrentCreateTempAtFnForTesting(fn func(dirFile *os.File, name string, perm os.FileMode) (*os.File, error)) func() {
+	orig := currentCreateTempAtFn
+	currentCreateTempAtFn = fn
+	return func() { currentCreateTempAtFn = orig }
+}
+
+// CreateTempAt exports createTempAt for testing.
+func CreateTempAt(dirFile *os.File, name string, perm os.FileMode) (*os.File, error) {
+	return createTempAt(dirFile, name, perm)
 }
 
 // SetCurrentOpenFnForTesting temporarily replaces currentOpenFn and returns a restore closure.
