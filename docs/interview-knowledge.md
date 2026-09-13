@@ -2769,4 +2769,82 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
+# 29. Systems Questions on Append-Only MANIFEST Log Persistence & CRC32 Framing (P06-S01-M02)
+
+### 1. Why is VersionEdit serialization separate from MANIFEST record framing?
+* **Question**: In Lattice's manifest subsystem, why is `VersionEdit.Encode()` completely decoupled from the physical `MANIFEST` record framing header?
+* **Answer**:
+  - **Separation of Concerns**: `VersionEdit` represents a logical, atomic metadata delta (which SSTables were added or deleted, next file number, last sequence number). Its codec is responsible only for translating that logical state into a deterministic canonical TLV byte sequence.
+  - **Transport & Storage Agnosticism**: A serialized `VersionEdit` payload could theoretically be transmitted across a network Raft stream, embedded in diagnostic dumps, or written to disk. The `MANIFEST` writer, conversely, is a storage container concern: it manages physical record boundaries, CRC32 checksums, sequential file offset tracking, and hardware synchronization barriers (`fdatasync`).
+  - **Subsystem Decoupling**: If the on-disk MANIFEST framing format evolves (e.g. adding compression, block chunking, or encryption), `VersionEdit` requires zero modifications. Conversely, adding new TLV tags to `VersionEdit` does not alter the 8-byte container framing layout `[ CRC32 (4B) | PayloadLength (4B) ]`.
+
+### 2. Why is CRC32 placed in the MANIFEST record framing header rather than inside the VersionEdit payload?
+* **Question**: Why does the 4-byte CRC32 checksum live in the outer MANIFEST record header rather than inside the serialized `VersionEdit` binary structure?
+* **Answer**:
+  - **Whole-Record Integrity**: Placing CRC32 in the 8-byte framing header (`[ CRC32 (4B) | PayloadLength (4B) ]`) allows the checksum to cover both the 4-byte `PayloadLength` field and the entire `VersionEdit` payload (`record[4:]`). If CRC were placed inside the payload, the outer container would have no mechanism to detect a corrupted `PayloadLength` field before attempting to allocate memory or read bytes from disk.
+  - **Zero-Payload-Inspection Fast Validation**: Storage engines and recovery parsers can verify physical record integrity, framing validity, and bit rot without decoding or allocating high-level `VersionEdit` Go structs.
+  - **Layering Purity**: Checksums belong to the transport/persistence layer, not the domain model.
+
+### 3. What exactly does `fdatasync()` guarantee in this design?
+* **Question**: What precise durability guarantees are provided by `fdatasync()` in `ManifestWriter.LogEdit`, and how does it differ from `fsync()`?
+* **Answer**:
+  - **POSIX fdatasync(2) Contract**: `fdatasync(fd)` flushes all modified in-core data buffers (page cache pages) associated with the file descriptor down to non-volatile storage media. Unlike `fsync(2)`, `fdatasync` forces metadata updates (such as file size) only if they are strictly required to retrieve the written data pages; it does not force synchronization of unchanged or non-essential inode metadata (e.g. access timestamp `atime` or modification timestamp `mtime`).
+  - **Disk I/O Latency Reduction**: Eliminating unnecessary inode metadata write operations avoids an extra random write to the filesystem journal/metadata block, significantly reducing sync latency on spinning disks and enterprise flash.
+  - **Hardware Durability Barrier**: In Lattice, `LogEdit` guarantees that once it returns `nil`, the record bytes have crossed the operating system page cache boundary and have been flushed to the non-volatile media controller write cache/flash storage.
+
+### 4. What happens if the write succeeds to the OS cache but `fdatasync()` fails?
+* **Question**: If `os.File.Write()` successfully transfers bytes into the kernel page cache but the subsequent `fdatasync()` system call returns an error (e.g. `EIO` or timeout), what state is the writer left in, and what should the caller assume?
+* **Answer**:
+  - **Caller Assumption**: The caller MUST assume the write failed. The transaction is uncommitted.
+  - **Ambiguous Physical State**: The operating system page cache contains dirty pages that the storage hardware failed to persist. Some blocks may have reached physical flash while others were discarded. Userland cannot perform a transactional rollback of bytes already accepted by the kernel page cache.
+  - **Poison State Machine**: `ManifestWriter` transitions into an unrecoverable **poisoned state** (`w.poisoned = true`, preserving `w.poisonErr`).
+  - **Fail-Closed Enforcement**: All subsequent calls to `LogEdit`, `Sync`, or `Close` immediately return `ErrManifestWriterPoisoned` wrapping the original root cause. This prevents the writer from appending further records on top of an unverified, potentially torn state.
+
+### 5. Why can an unexpected power cut or OS crash leave a partial record at the tail of the MANIFEST?
+* **Question**: Why does crash-safety analysis assume that an ungraceful crash can leave an incomplete record at the tail of the MANIFEST file?
+* **Answer**:
+  - **Non-Atomic Sector Writes**: File appends write through the operating system page cache to physical storage media in 512-byte or 4,096-byte hardware sector/block units. A 16 KB record spans multiple sectors.
+  - **Asynchronous Flush & Power Loss**: If power is cut while the storage drive controller is actively programming flash pages, earlier sectors of the record may be committed while trailing sectors remain unwritten or filled with zeros (torn write).
+  - **Detection via Header & CRC**: The 8-byte header `[ CRC (4B) | Length (4B) ]` ensures that recovery parsers immediately detect torn writes: either the header itself is truncated (< 8B), the file terminates before `Length` bytes are read, or the computed CRC over the partial data mismatches `CRC32`.
+
+### 6. Why is an append-only log architecture fundamentally safer than rewriting database metadata in-place?
+* **Question**: Why do production LSM engines (like LevelDB, RocksDB, and Lattice) use an append-only `MANIFEST` log instead of periodically rewriting a centralized `metadata.json` or `schema.db` file?
+* **Answer**:
+  - **Atomic Crash-Safety**: In an in-place overwrite model, a power loss midway through rewriting corrupts the entire metadata file, destroying the mapping of all SSTables and causing catastrophic total database loss.
+  - **No Write Amplification on Flushes**: A MemTable flush or compaction adds only 1 or 2 SSTables. An append-only log records this delta in a tiny ~100-byte `VersionEdit` record. Rewriting a complete metadata catalog containing 100,000 SSTables on every flush would introduce catastrophic write amplification and stall the storage engine.
+  - **Historical Auditability & Monotonic Recovery**: An append-only log preserves the exact chronological sequence of state transitions, enabling deterministic forward replay from any valid checkpoint.
+
+### 7. How are MANIFEST record boundaries determined without delimiters?
+* **Question**: How does a reader identify where one MANIFEST record ends and the next begins without delimiter markers or newlines?
+* **Answer**:
+  - **Explicit Length-Prefixed Framing**: Every record is prefixed by a fixed 8-byte framing header. Bytes 4..7 contain the Big-Endian 32-bit unsigned `PayloadLength` ($N$).
+  - **Strict Byte-Count Boundaries**: A reader reads exactly 8 bytes to decode $N$. It then reads exactly $N$ payload bytes (`io.ReadFull`). The boundary of record $k$ is precisely `offset + 8 + N`. The next record begins at byte `offset + 8 + N`.
+  - **Self-Delimiting Stream**: Because $N$ is protected by the CRC32 checksum, bit-rot in the length field cannot cause the reader to silently skip records or desynchronize from the framing stream without triggering an immediate checksum mismatch error.
+
+### 8. How does `ManifestWriter` prevent accidentally truncating or destroying an existing MANIFEST file?
+* **Question**: What filesystem flags, modes, and security verifications prevent `ManifestWriter` from accidentally zeroing an existing MANIFEST on restart?
+* **Answer**:
+  - **No `O_TRUNC`**: `OpenManifestWriter` uses strictly `os.O_WRONLY | os.O_CREATE | os.O_APPEND`. The `os.O_TRUNC` flag is completely absent from all writer code paths.
+  - **Exclusive Creation for Fresh Logs**: `CreateManifestWriter` uses `os.O_EXCL | os.O_CREATE`. If the file already exists, the kernel atomically rejects the open call with `os.ErrExist` (`ErrManifestExists`), preventing overwrite.
+  - **Offset Inspection**: Upon opening an existing file, `OpenManifestWriter` inspects `finfo.Size()` to anchor its internal write offset to the exact end of the existing file.
+  - **Symlink Defense & Inode Pinning**: `os.Lstat` pre-checks reject symlinks and directories, and post-open `os.SameFile` verifies that the open file descriptor matches the inode on disk, preventing symlink redirection attacks.
+
+### 9. How should concurrent `LogEdit` calls be coordinated?
+* **Question**: What is the concurrency contract of `ManifestWriter`, and why does it serialize writes internally?
+* **Answer**:
+  - **Concurrency Contract**: `ManifestWriter` is safe for concurrent use across multiple goroutines.
+  - **Internal Mutex Serialization**: An internal `sync.Mutex` serializes calls to `LogEdit`, `Sync`, and `Close`.
+  - **Interleaving Defense**: If two goroutines concurrently called `w.file.Write()` without synchronization, their raw bytes and headers would interleave on disk, corrupting both records and rendering the MANIFEST unparseable.
+  - **Deterministic Append Ordering**: The mutex guarantees that each `VersionEdit` is serialized, framed, written to disk, and synchronized via `fdatasync()` atomically before the next edit begins writing.
+
+### 10. Why is CRC32 an integrity checksum rather than an authentication mechanism?
+* **Question**: Why must systems engineers never describe CRC32 as an authentication or security mechanism against malicious actors?
+* **Answer**:
+  - **Linear Mathematical Property**: CRC32 is a linear cyclic code over Galois Field $\text{GF}(2)$. It possesses the property that $\text{CRC}(A \oplus B) = \text{CRC}(A) \oplus \text{CRC}(B) \oplus C$.
+  - **Trivial Malleability**: CRC32 has no cryptographic secret key. Any adversary who can modify bytes in the MANIFEST file can recompute the valid CRC32 for the modified payload in nanoseconds and overwrite the 4-byte checksum field.
+  - **Intended Threat Model**: In storage engines, CRC32 is designed solely to detect **accidental physical corruption**: drive controller bit flips, cable transmission noise, flash cell charge decay, and partial/torn sector writes. Tamper-proofing requires cryptographic message authentication codes (HMAC) or digital signatures.
+
+---
+
 *End of Technical Interview Knowledge Base — Lattice v1.0.0-KNOWLEDGE-BASE*
+

@@ -234,6 +234,28 @@ var (
 
 	// ErrDuplicateScalarField indicates that a scalar field was encountered more than once in a single VersionEdit record.
 	ErrDuplicateScalarField = stdErrors.New("duplicate scalar field in version edit")
+
+	// ErrManifestWriterClosed indicates that an append or sync operation was attempted on a closed MANIFEST writer.
+	ErrManifestWriterClosed = stdErrors.New("manifest writer is closed")
+
+	// ErrManifestWriterPoisoned indicates that an operation was attempted on a MANIFEST writer
+	// that entered an unrecoverable poisoned state following a write or sync failure.
+	ErrManifestWriterPoisoned = stdErrors.New("manifest writer is poisoned")
+
+	// ErrManifestCorrupted indicates that a MANIFEST record failed checksum verification or framing constraints.
+	ErrManifestCorrupted = stdErrors.New("manifest record corrupted")
+
+	// ErrManifestTruncated indicates that a MANIFEST record or header was truncated or incomplete.
+	ErrManifestTruncated = stdErrors.New("manifest record truncated")
+
+	// ErrManifestExists indicates that a MANIFEST file already exists at the target path and cannot be overwritten.
+	ErrManifestExists = stdErrors.New("manifest file already exists")
+
+	// ErrManifestHeaderTruncated indicates that a MANIFEST record header buffer is shorter than 8 bytes.
+	ErrManifestHeaderTruncated = stdErrors.New("manifest header truncated: buffer smaller than 8 bytes")
+
+	// ErrManifestPayloadTruncated indicates that a MANIFEST record payload ended prematurely before its specified length.
+	ErrManifestPayloadTruncated = stdErrors.New("manifest payload truncated: buffer smaller than payload length")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing
@@ -869,4 +891,56 @@ func (e *DuplicateScalarFieldError) Error() string {
 // Is reports whether this error matches target sentinel ErrDuplicateScalarField.
 func (e *DuplicateScalarFieldError) Is(target error) bool {
 	return target == ErrDuplicateScalarField
+}
+
+// ManifestWriterPoisonedError provides structured context when an operation is rejected on a poisoned MANIFEST writer.
+// It matches ErrManifestWriterPoisoned when interrogated with errors.Is().
+type ManifestWriterPoisonedError struct {
+	Path   string
+	Reason error
+}
+
+func (e *ManifestWriterPoisonedError) Error() string {
+	if e == nil {
+		return ErrManifestWriterPoisoned.Error()
+	}
+	if e.Reason != nil {
+		return fmt.Sprintf("manifest writer at %q is poisoned: %v", e.Path, e.Reason)
+	}
+	return fmt.Sprintf("manifest writer at %q is poisoned", e.Path)
+}
+
+// Is reports whether this error matches target sentinel ErrManifestWriterPoisoned.
+func (e *ManifestWriterPoisonedError) Is(target error) bool {
+	return target == ErrManifestWriterPoisoned
+}
+
+// Unwrap returns the underlying error that caused the writer to be poisoned.
+func (e *ManifestWriterPoisonedError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Reason
+}
+
+// ManifestCorruptedError provides structured diagnostics when a MANIFEST record fails framing or checksum checks.
+// It matches ErrManifestCorrupted when interrogated with errors.Is().
+type ManifestCorruptedError struct {
+	Offset int64
+	Reason string
+}
+
+func (e *ManifestCorruptedError) Error() string {
+	if e == nil {
+		return ErrManifestCorrupted.Error()
+	}
+	if e.Offset >= 0 {
+		return fmt.Sprintf("manifest record corrupted at offset %d: %s", e.Offset, e.Reason)
+	}
+	return fmt.Sprintf("manifest record corrupted: %s", e.Reason)
+}
+
+// Is reports whether this error matches target sentinel ErrManifestCorrupted.
+func (e *ManifestCorruptedError) Is(target error) bool {
+	return target == ErrManifestCorrupted
 }

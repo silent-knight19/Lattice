@@ -1641,11 +1641,51 @@ TOTAL: 184 Discrete, Testable Micro-Phases
   * *Tests*: Round-trip matrix, exact-byte fixtures (A–F), independent oracle, truncation at every byte, duplicate scalar rejection, invalid level rejection, memory isolation, decoder fuzzing (849k+ execs), and benchmarks (~83–142 ns/op).
   * *Completion*: Complete and verified under `-race`, `go vet`, `golangci-lint`. P06-S01-M01 complete; P06-S01-M02 remains next micro-phase.
 * **P06-S01-M02: Append-Only MANIFEST Log Writer**
-  * *Objective*: Append serialized `VersionEdit` records to `MANIFEST-000001` with CRC32 framing.
-  * *Changes*: `ManifestWriter.LogEdit(edit VersionEdit) error`.
-  * *Invariants*: Manifest updates are flushed via `fdatasync()`.
-  * *Tests*: Append 50 edits; verify file contents and CRC integrity.
-  * *Completion*: Manifest logging tested.
+  * *Status*: **COMPLETE**
+  * *Objective*: Append serialized `VersionEdit` records to `MANIFEST-000001` with CRC32 framing and hardware durability synchronization.
+  * *Binary Wire Format*:
+    - Fixed 8-byte Header: `[ CRC32-IEEE (4B, Big-Endian) | PayloadLength (4B, Big-Endian) ]`
+    - Payload: `[ VersionEdit Binary Serialization (PayloadLength bytes) ]`
+    - CRC32-IEEE covers `PayloadLength (4B) + VersionEdit Payload (N B)` (i.e. `record[4:]`), guarding both payload bit-rot and header length corruption.
+    - Bounded: Min record size 9 bytes (empty edit: 8B header + 1B `0x01`), max record size $8 + 16\text{ MiB} = 16,777,224$ bytes.
+  * *API & Types Implemented*:
+    - `ManifestWriter`: sequential append-only writer with thread-safety and fail-closed poison state machine.
+    - `ManifestHeaderSize = 8`, `ManifestFilenamePrefix = "MANIFEST-"`, `ManifestFilenamePattern = "MANIFEST-%06d"`, `ManifestFileMode = 0600`.
+    - `ManifestFilename(fileNum uint64) string`: canonical filename formatting (`MANIFEST-%06d`).
+    - `ManifestPath(dbPath string, fileNum uint64) string`: platform-aware path construction.
+    - `OpenManifestWriter(path string) (*ManifestWriter, error)`: opens or creates with `O_WRONLY | O_CREATE | O_APPEND` (0600), preserving existing contents and verifying inode identity.
+    - `CreateManifestWriter(path string) (*ManifestWriter, error)`: atomic exclusive creation with `O_WRONLY | O_CREATE | O_EXCL | O_APPEND` (0600), rejecting pre-existing files with `ErrManifestExists`.
+    - `NewManifestWriter(file *os.File) (*ManifestWriter, error)`: wraps pre-opened descriptor.
+    - `(w *ManifestWriter) LogEdit(edit VersionEdit) error`: serializes, frames with CRC32, appends, and flushes via `fdatasync()`.
+    - `(w *ManifestWriter) LogEditPtr(edit *VersionEdit) error`: zero-copy pointer variant with nil validation.
+    - `(w *ManifestWriter) Sync() error`: explicit durability barrier.
+    - `(w *ManifestWriter) Close() error`: idempotent flush, sync, and descriptor close.
+    - `(w *ManifestWriter) Path() string`, `Offset() int64`, `RecordCount() uint64`, `IsClosed() bool`, `IsPoisoned() bool`.
+    - Platform-specific `fdatasync`: `internal/version/sync_linux.go` (`syscall.Fdatasync`) and `internal/version/sync_fallback.go` (`f.Sync()`).
+    - Sentinels & structured errors: `ErrManifestWriterClosed`, `ErrManifestWriterPoisoned`, `ErrManifestCorrupted`, `ErrManifestTruncated`, `ErrManifestExists`, `ErrManifestHeaderTruncated`, `ErrManifestPayloadTruncated`, `ManifestWriterPoisonedError`, `ManifestCorruptedError`.
+  * *Invariants*:
+    - *Hardware Durability*: `LogEdit` returns nil if and only if all bytes were written and `fdatasync` succeeded.
+    - *Append-Only Non-Destructive*: Opened strictly with `O_APPEND`; never uses `O_TRUNC`; prior records are never overwritten.
+    - *Fail-Closed Poison State*: If write or sync fails, writer transitions to poisoned state and all subsequent operations immediately return `ErrManifestWriterPoisoned`.
+    - *Concurrency Ordering*: Protected by internal mutex; concurrent `LogEdit` calls append with strict atomic record boundaries without interleaving.
+    - *Filesystem Hardening*: Lstat pre-inspection rejects symlinks and directories; post-open `os.SameFile` verifies inode to prevent TOCTOU substitution.
+  * *Tests Added* (`internal/version/manifest_writer_test.go`, `manifest_writer_bench_test.go`):
+    - Test Oracle: independent `decodeManifestRecord` reading header, validating length, reading payload, and independently calculating CRC32.
+    - Exact-Byte Fixtures: Fixture A (empty edit: `a83ef6ca0000000101`) and Fixture B (scalars: `aec64660000000070101012a020164`), verified against independent Python/zlib calculation.
+    - Lifecycle: create, append, sync, close, append after close returns `ErrManifestWriterClosed`, double close is idempotent.
+    - Reopen & Append: 50 edits split across 5 sessions with open/append/close cycles; all 50 records verified intact.
+    - Sequential 50 Edits: 50 distinct edits with scalar, add, and delete entries; every record validated independently.
+    - Fault Injection: simulated write errors, 0-byte short writes, sync failures, and close errors; verified writer poisoning and fail-closed behavior.
+    - Corruption Matrix: header truncation (0..7B), payload truncation, CRC bit-flips, payload bit-flips, length mutation.
+    - Security: symlink and directory rejection tests.
+    - Concurrency: 10 goroutines appending concurrently; verified 50 valid atomic records without corruption.
+    - Native Fuzzing: `FuzzManifestRecordDecode` running 1.95M+ executions in 10s with 0 failures.
+  * *Measured Results* (Apple M4, Darwin arm64):
+    - `BenchmarkManifestWriter_LogEdit_Small_NoSync`: 1,059 ns/op, 24 B/op, 2 allocs/op (~944k ops/sec framing throughput).
+    - `BenchmarkManifestWriter_LogEdit_Small_Sync`: 3.59 ms/op (dominated by physical NVMe SSD flush latency).
+    - `BenchmarkManifestWriter_LogEdit_Complex_NoSync`: 2,045 ns/op, 3,176 B/op, 17 allocs/op (~489k ops/sec).
+    - `BenchmarkManifestWriter_LogEdit_Complex_Sync`: 3.77 ms/op.
+  * *Completion*: Complete and verified under `-race`, `go vet`, `golangci-lint`. P06-S01-M02 complete; P06-S02-M01 remains next micro-phase.
 
 ### Sub-Phase 06.2: CURRENT Pointer & VersionSet Invariants
 * **P06-S02-M01: Atomic CURRENT Pointer File Swapper**

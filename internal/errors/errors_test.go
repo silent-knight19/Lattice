@@ -74,6 +74,13 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrTruncatedVersionEdit", errors.ErrTruncatedVersionEdit, "version edit truncated"},
 		{"ErrUnsupportedVersionEdit", errors.ErrUnsupportedVersionEdit, "unsupported version edit format"},
 		{"ErrDuplicateScalarField", errors.ErrDuplicateScalarField, "duplicate scalar field in version edit"},
+		{"ErrManifestWriterClosed", errors.ErrManifestWriterClosed, "manifest writer is closed"},
+		{"ErrManifestWriterPoisoned", errors.ErrManifestWriterPoisoned, "manifest writer is poisoned"},
+		{"ErrManifestCorrupted", errors.ErrManifestCorrupted, "manifest record corrupted"},
+		{"ErrManifestTruncated", errors.ErrManifestTruncated, "manifest record truncated"},
+		{"ErrManifestExists", errors.ErrManifestExists, "manifest file already exists"},
+		{"ErrManifestHeaderTruncated", errors.ErrManifestHeaderTruncated, "manifest header truncated: buffer smaller than 8 bytes"},
+		{"ErrManifestPayloadTruncated", errors.ErrManifestPayloadTruncated, "manifest payload truncated: buffer smaller than payload length"},
 	}
 
 	for _, tc := range sentinels {
@@ -1707,5 +1714,96 @@ func TestDuplicateScalarFieldError(t *testing.T) {
 	}
 	if !nilErr.Is(errors.ErrDuplicateScalarField) {
 		t.Errorf("nil *DuplicateScalarFieldError must match ErrDuplicateScalarField via Is")
+	}
+}
+
+func TestManifestWriterPoisonedError(t *testing.T) {
+	rootCause := stdErrors.New("disk I/O failure")
+	err := &errors.ManifestWriterPoisonedError{
+		Path:   "/var/data/MANIFEST-000001",
+		Reason: rootCause,
+	}
+
+	if !stdErrors.Is(err, errors.ErrManifestWriterPoisoned) {
+		t.Errorf("ManifestWriterPoisonedError must match ErrManifestWriterPoisoned via errors.Is")
+	}
+
+	wrapped := fmt.Errorf("storage: %w", err)
+	if !stdErrors.Is(wrapped, errors.ErrManifestWriterPoisoned) {
+		t.Errorf("wrapped ManifestWriterPoisonedError must match ErrManifestWriterPoisoned")
+	}
+
+	var extracted *errors.ManifestWriterPoisonedError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("failed to extract *ManifestWriterPoisonedError from wrapped chain")
+	}
+	if extracted.Path != "/var/data/MANIFEST-000001" {
+		t.Errorf("extracted Path mismatch: got %q", extracted.Path)
+	}
+	if !stdErrors.Is(extracted, rootCause) {
+		t.Errorf("extracted error must unwrap to root cause")
+	}
+
+	expectedMsg := `manifest writer at "/var/data/MANIFEST-000001" is poisoned: disk I/O failure`
+	if err.Error() != expectedMsg {
+		t.Errorf("unexpected error message: got %q, want %q", err.Error(), expectedMsg)
+	}
+
+	errNoReason := &errors.ManifestWriterPoisonedError{Path: "/var/data/MANIFEST-000001"}
+	if errNoReason.Error() != `manifest writer at "/var/data/MANIFEST-000001" is poisoned` {
+		t.Errorf("unexpected error message without reason: %q", errNoReason.Error())
+	}
+
+	var nilErr *errors.ManifestWriterPoisonedError
+	if nilErr.Error() != errors.ErrManifestWriterPoisoned.Error() {
+		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrManifestWriterPoisoned.Error())
+	}
+	if !nilErr.Is(errors.ErrManifestWriterPoisoned) {
+		t.Errorf("nil *ManifestWriterPoisonedError must match ErrManifestWriterPoisoned via Is")
+	}
+	if nilErr.Unwrap() != nil {
+		t.Errorf("nil *ManifestWriterPoisonedError Unwrap must return nil")
+	}
+}
+
+func TestManifestCorruptedError(t *testing.T) {
+	err := &errors.ManifestCorruptedError{
+		Offset: 128,
+		Reason: "CRC32 checksum mismatch",
+	}
+
+	if !stdErrors.Is(err, errors.ErrManifestCorrupted) {
+		t.Errorf("ManifestCorruptedError must match ErrManifestCorrupted via errors.Is")
+	}
+
+	wrapped := fmt.Errorf("recovery: %w", err)
+	if !stdErrors.Is(wrapped, errors.ErrManifestCorrupted) {
+		t.Errorf("wrapped ManifestCorruptedError must match ErrManifestCorrupted")
+	}
+
+	var extracted *errors.ManifestCorruptedError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("failed to extract *ManifestCorruptedError from wrapped chain")
+	}
+	if extracted.Offset != 128 || extracted.Reason != "CRC32 checksum mismatch" {
+		t.Errorf("extracted mismatch: got %+v", extracted)
+	}
+
+	expectedMsg := "manifest record corrupted at offset 128: CRC32 checksum mismatch"
+	if err.Error() != expectedMsg {
+		t.Errorf("unexpected error message: got %q, want %q", err.Error(), expectedMsg)
+	}
+
+	errNoOffset := &errors.ManifestCorruptedError{Offset: -1, Reason: "header truncated"}
+	if errNoOffset.Error() != "manifest record corrupted: header truncated" {
+		t.Errorf("unexpected error message without offset: %q", errNoOffset.Error())
+	}
+
+	var nilErr *errors.ManifestCorruptedError
+	if nilErr.Error() != errors.ErrManifestCorrupted.Error() {
+		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrManifestCorrupted.Error())
+	}
+	if !nilErr.Is(errors.ErrManifestCorrupted) {
+		t.Errorf("nil *ManifestCorruptedError must match ErrManifestCorrupted via Is")
 	}
 }
