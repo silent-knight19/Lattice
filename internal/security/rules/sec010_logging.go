@@ -72,12 +72,27 @@ func (r *Sec010Logging) Run(ctx *model.AuditContext) ([]model.Finding, error) {
 			}
 
 			for _, arg := range call.Args {
-				if ident, ok := arg.(*ast.Ident); ok {
-					identLower := strings.ToLower(strings.ReplaceAll(ident.Name, "_", ""))
+				var targetNames []string
+				switch a := arg.(type) {
+				case *ast.Ident:
+					targetNames = append(targetNames, a.Name)
+				case *ast.SelectorExpr:
+					targetNames = append(targetNames, a.Sel.Name)
+				case *ast.KeyValueExpr:
+					if kIdent, ok := a.Key.(*ast.Ident); ok {
+						targetNames = append(targetNames, kIdent.Name)
+					}
+					if kLit, ok := a.Key.(*ast.BasicLit); ok {
+						targetNames = append(targetNames, strings.Trim(kLit.Value, "\""))
+					}
+				}
+
+				for _, rawName := range targetNames {
+					identLower := strings.ToLower(strings.ReplaceAll(rawName, "_", ""))
 					for _, stem := range sensitiveStems {
 						if strings.Contains(identLower, stem) {
 							line := NodeLine(ctx.Fset, arg)
-							title := fmt.Sprintf("Sensitive variable %s passed to %s.%s", ident.Name, pkgName, funcName)
+							title := fmt.Sprintf("Sensitive variable %s passed to %s.%s", rawName, pkgName, funcName)
 
 							finding := model.Finding{
 								ID:             model.GenerateFindingID(r.ID(), relPath, line, title),
@@ -88,16 +103,17 @@ func (r *Sec010Logging) Run(ctx *model.AuditContext) ([]model.Finding, error) {
 								Component:      "Logging",
 								File:           relPath,
 								Line:           line,
-								Description:    fmt.Sprintf("Logging call %s.%s appears to log sensitive variable %s directly.", pkgName, funcName, ident.Name),
+								Description:    fmt.Sprintf("Logging call %s.%s appears to log sensitive variable %s directly.", pkgName, funcName, rawName),
 								Preconditions:  "Operator or attacker has access to application standard output or log streams.",
 								AttackPath:     "Information disclosure through persistent log files or monitoring collectors.",
 								Impact:         "Credential leakage and confidentiality compromise.",
-								Evidence:       fmt.Sprintf("%s.%s(..., %s)", pkgName, funcName, ident.Name),
+								Evidence:       fmt.Sprintf("%s.%s(..., %s)", pkgName, funcName, rawName),
 								Reproduction:   fmt.Sprintf("Inspect %s at line %d.", relPath, line),
 								Recommendation: "Use Lattice's internal/logger with Redactable or masked attributes.",
 								Status:         model.StatusOpen,
 							}
 							findings = append(findings, finding)
+							break
 						}
 					}
 				}

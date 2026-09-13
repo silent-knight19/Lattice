@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"math/bits"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -556,6 +557,7 @@ func TestByteSize_ConcurrentObservation(t *testing.T) {
 					return
 				}
 				prev = bs
+				runtime.Gosched()
 			}
 		}()
 	}

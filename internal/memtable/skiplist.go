@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
@@ -40,9 +41,10 @@ type SkipList struct {
 	head     *skipListNode
 	height   atomic.Int32
 	rnd      *HeightGenerator
-	count    atomic.Int64
-	byteSize atomic.Uint64
-	frozen   atomic.Bool
+	count           atomic.Int64
+	byteSize        atomic.Uint64
+	frozen          atomic.Bool
+	activeIterators atomic.Int64
 }
 
 // NewSkipList creates a new SkipList backed by the default
@@ -119,6 +121,35 @@ func (s *SkipList) IsEmpty() bool {
 		return true
 	}
 	return s.count.Load() == 0
+}
+
+// ActiveIterators returns the number of active, unclosed iterators currently open on this SkipList.
+func (s *SkipList) ActiveIterators() int64 {
+	if s == nil {
+		return 0
+	}
+	return s.activeIterators.Load()
+}
+
+// DrainActiveIterators waits until all active iterators are closed or timeout expires.
+// If timeout is 0 or negative, it waits without deadline until active iterators drop to 0.
+// Returns true if all iterators were drained, false if the timeout expired.
+func (s *SkipList) DrainActiveIterators(timeout time.Duration) bool {
+	if s == nil {
+		return true
+	}
+	var deadline time.Time
+	hasDeadline := timeout > 0
+	if hasDeadline {
+		deadline = time.Now().Add(timeout)
+	}
+	for s.activeIterators.Load() > 0 {
+		if hasDeadline && time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(500 * time.Microsecond)
+	}
+	return true
 }
 
 // Freeze permanently transitions the SkipList from ACTIVE to FROZEN.
@@ -282,7 +313,10 @@ func (s *SkipList) insertInternal(key binary.InternalKey, value []byte, forcedHe
 		}
 	}
 
-	// 6. SEC-003: enforce memory ceiling before allocating.
+	// 6. SEC-003: enforce memory byte and entry ceilings before allocating.
+	if s.count.Load() >= MaxMemTableEntries {
+		return &errors.MemTableFullError{Current: s.byteSize.Load(), Needed: 0, Max: MaxMemTableSize}
+	}
 	entryBytes := nodeMemoryBytes(len(key.UserKey), len(value), nodeHeight)
 	if cur := s.byteSize.Load(); cur >= MaxMemTableSize || entryBytes > MaxMemTableSize-cur {
 		return &errors.MemTableFullError{Current: cur, Needed: entryBytes, Max: MaxMemTableSize}

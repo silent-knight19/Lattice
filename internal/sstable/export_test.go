@@ -104,3 +104,10 @@ func SetOpenFileFnForTesting(fn func(name string) (*os.File, error)) func() {
 		postOpenHookMu.Unlock()
 	}
 }
+
+// SetFooterForTesting replaces the footer in TableReader for testing edge-case corrupted footers.
+func SetFooterForTesting(r *TableReader, f Footer) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.footer = f
+}

@@ -34,6 +34,11 @@ const (
 	// sparse index block on disk (8 MiB). Any BlockHandle advertising a Size exceeding
 	// this ceiling is rejected immediately prior to buffer allocation to prevent memory exhaustion DoS.
 	MaxIndexBlockSize = 8 * 1024 * 1024
+
+	// MaxBlockSize is the absolute maximum allowable physical byte size for any SSTable block (64 MiB).
+	// Any block header, decompression size, or handle advertising a Size exceeding this ceiling is
+	// rejected immediately prior to buffer allocation to prevent memory exhaustion DoS (VULN-001).
+	MaxBlockSize = 64 * 1024 * 1024
 )
 
 // BlockBuilder constructs prefix-compressed SSTable data blocks from consecutive sorted records.

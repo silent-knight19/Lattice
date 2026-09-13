@@ -45,7 +45,11 @@ type Options struct {
 // RecordWireSize returns the exact physical serialized wire length in bytes of a Record.
 // Wire size = MinRecordSize (27) + len(Key) + len(Value).
 func RecordWireSize(rec Record) int64 {
-	return int64(MinRecordSize + len(rec.Key) + len(rec.Value))
+	wireLen := uint64(MinRecordSize) + uint64(len(rec.Key)) + uint64(len(rec.Value))
+	if wireLen > MaxRecordLength || wireLen > uint64(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	return int64(wireLen)
 }
 
 // ParseSegmentID parses a canonical WAL segment filename (e.g. "wal_000000000001.log")

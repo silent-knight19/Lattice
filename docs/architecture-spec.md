@@ -1166,10 +1166,44 @@ All fixed-width binary fields (CRC32, lengths, sequence numbers) are encoded in 
 
 # 39. Security, Boundaries & Transport Hygiene
 
-Lattice is engineered as an internal infrastructure data tier:
-1. **Frame Bomb Protection**: Max payload length is strictly capped at $5\text{MB}$. Inbound frames exceeding this limit trigger immediate socket termination, protecting against allocation exploits.
-2. **Buffer Sanitization**: Internal byte buffers drawn from `sync.Pool` are scrubbed before reuse to prevent cross-request memory bleeding.
-3. **Mandatory Raft mTLS**: All Raft cluster traffic (`:9098`) uses mutual TLS 1.3 in every environment (dev, staging, prod). Plaintext connections are rejected by default; peers must present allowlisted node IDs (see `cluster_peers`) with client-certificate verification. Rogue nodes without an allowlisted cert cannot join or disrupt elections.
+Lattice is engineered as an enterprise-grade internal data tier with rigorous defense-in-depth boundaries across transport, consensus, and storage layers:
+
+### 39.1 Mandatory Transport Encryption & Authentication (mTLS)
+1. **Client Transport (`:9099`)**:
+   - **Production Standard**: Mandates TLS 1.3 with strong cipher suites (`TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`). Deprecated protocols (TLS 1.0, 1.1, 1.2) and insecure cipher suites are rejected fail-closed during handshake negotiation.
+   - **Mutual Authentication (mTLS)**: Supports client certificate authentication with root CA verification for zero-trust service mesh deployments.
+   - **Insecure Fallback Scoping**: Unencrypted plaintext TCP is strictly forbidden in production and permitted exclusively on loopback interfaces (`127.0.0.1`, `::1`) for local unit testing, requiring explicit `--insecure-transport` configuration flag.
+
+2. **Raft Consensus Transport (`:9098`)**:
+   - **Universal mTLS**: All peer-to-peer Raft cluster communication mandates mutual TLS 1.3 across *all* environments (including staging, development, and testing). Assuming unencrypted Raft is safe in development is prohibited.
+   - **Node Identity Pinning**: Each cluster node presents an X.509 certificate whose Subject Alternative Name (SAN) or Common Name (CN) is strictly matched against the authorized `cluster_peers` allowlist in configuration. Unregistered or forged certificates are dropped immediately before processing any consensus frames.
+
+### 39.2 Pre-Allocation Frame Bounding & DoS Defenses
+1. **Zero-Allocation Length Header Validation**:
+   - The wire framing parser enforces a strict $5\text{MB}$ ($5,242,880$ bytes) frame ceiling immediately upon reading the 4-byte length prefix.
+   - **Pre-Allocation Invariant**: Validation occurs *before* allocating any receive buffers or calling `sync.Pool`. If `payload_len > 5,242,880` or `payload_len < 0`, the server closes the TCP connection immediately with zero heap allocation, eliminating frame-bomb memory exhaustion attacks.
+2. **Per-Client Token-Bucket Rate Limiting**:
+   - Inbound client connections are metered via a per-client token-bucket rate limiter (configurable default: 10,000 req/sec sustained, 20,000 burst) based on peer IP / certificate identity. Excess requests are throttled with backpressure delays or rejected with `ErrWriteThrottled`.
+3. **Slowloris Connection Defenses**:
+   - Maximum concurrent connection ceiling ($4,096$).
+   - Read/write deadlines are set on all connections (`SetReadDeadline(5s)`). Inactive sockets or slow drip attacks are forcibly aborted.
+
+### 39.3 Raft Consensus Security, Replay Defense & Stale-Leader Fencing
+1. **Replay Protection**:
+   - Every Raft RPC (`RequestVote`, `AppendEntries`) includes a cryptographically secure 64-bit random nonce and monotonically increasing sequence number.
+   - Peers maintain a bounded sliding-window cache of recently observed nonces per node. Duplicate or replayed messages from network sniffing are dropped immediately without triggering term changes or election timer resets.
+2. **Stale-Leader Fencing & Quorum Leases**:
+   - Network-partitioned stale leaders are prevented from committing writes or serving stale reads.
+   - Before serving linearizable read requests (`ReadIndex`), leaders must confirm leadership by successfully exchanging heartbeats with a quorum of peers within the current leader lease interval.
+   - Followers include their last log term and index in all vote responses; leaders periodically heartbeat higher terms to rapidly isolate and demote stale leaders.
+
+### 39.4 Multi-Tenant Resource Isolation & Strict Data Separation
+1. **Compaction & Cache Resource Fair-Sharing**:
+   - Cross-tenant resource starvation is mitigated through weighted fair-share scheduling for background compactions and tiered block cache allocation.
+   - Heavy write tenants are throttled via the engine's memory backpressure controller (`internal/engine/backpressure.go`), preventing one tenant from exhausting I/O bandwidth or evicting shared cache blocks.
+2. **Strict Logical Namespace Separation**:
+   - Key prefixes (`<tenant-id>:<namespace>:<user-key>`) are validated at the earliest ingestion point in the engine.
+   - Storage abstractions enforce isolation barriers preventing cross-tenant key scans or unauthorized cross-namespace access.
 
 ---
 

@@ -215,6 +215,21 @@ func TestRule_SECURITY_012_Alloc(t *testing.T) {
 	}
 }
 
+func TestRule_SECURITY_010_Logging(t *testing.T) {
+	rule := NewSec010Logging()
+	testdata := getTestdataPath(t)
+	safeFile := filepath.Join(testdata, "safe", "clean_storage.go")
+
+	ctxSafe := model.NewAuditContext(testdata, []string{safeFile})
+	findings, err := rule.Run(ctxSafe)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(findings) != 0 {
+		t.Errorf("expected 0 logging findings in safe file, got %d", len(findings))
+	}
+}
+
 func TestRule_EdgecasesResilience(t *testing.T) {
 	testdata := getTestdataPath(t)
 	edgecasesDir := filepath.Join(testdata, "edgecases")

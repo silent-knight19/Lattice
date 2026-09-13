@@ -2,6 +2,7 @@ package memtable
 
 import (
 	"bytes"
+	"sync"
 
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
@@ -29,10 +30,14 @@ const (
 //     internal SkipList state.
 //   - Physical Sequence: Exposes all physical entries in canonical order (UserKey ASC, SeqNum DESC,
 //     OpType DESC). Tombstones (OpTypeDelete) are yielded with Value() == nil.
+//   - Thread-Safety: Methods on Iterator are protected by an internal RWMutex guarding iterator
+//     state against concurrent Next() and Close() data races (VULN-005).
 type Iterator struct {
-	sl    *SkipList
-	curr  *skipListNode
-	state iteratorState
+	mu     sync.RWMutex
+	sl     *SkipList
+	curr   *skipListNode
+	state  iteratorState
+	closed bool
 }
 
 // NewIterator creates a new forward iterator over the SkipList.
@@ -44,6 +49,7 @@ func (s *SkipList) NewIterator() *Iterator {
 	if s == nil {
 		return nil
 	}
+	s.activeIterators.Add(1)
 	return &Iterator{
 		sl:    s,
 		curr:  nil,
@@ -56,7 +62,9 @@ func (it *Iterator) Valid() bool {
 	if it == nil {
 		return false
 	}
-	return it.state == statePositioned && it.curr != nil
+	it.mu.RLock()
+	defer it.mu.RUnlock()
+	return !it.closed && it.state == statePositioned && it.curr != nil
 }
 
 // Next advances the iterator to the next entry in the SkipList.
@@ -70,16 +78,20 @@ func (it *Iterator) Next() bool {
 	if it == nil {
 		return false
 	}
-	if it.sl != nil {
-		it.sl.mu.RLock()
-		defer it.sl.mu.RUnlock()
+	it.mu.Lock()
+	defer it.mu.Unlock()
+
+	if it.closed || it.sl == nil {
+		it.state = stateExhausted
+		it.curr = nil
+		return false
 	}
+
+	it.sl.mu.RLock()
+	defer it.sl.mu.RUnlock()
+
 	switch it.state {
 	case stateUnpositioned:
-		if it.sl == nil {
-			it.state = stateExhausted
-			return false
-		}
 		it.curr = it.sl.head.forward[0].Load()
 		if it.curr != nil {
 			it.state = statePositioned
@@ -115,7 +127,13 @@ func (it *Iterator) Next() bool {
 // The returned InternalKey owns its UserKey slice, guaranteeing callers mutating
 // the returned key slice cannot corrupt internal SkipList state (enforcing SEC-MEM-INV-01).
 func (it *Iterator) Key() binary.InternalKey {
-	if it == nil || !it.Valid() {
+	if it == nil {
+		return binary.InternalKey{}
+	}
+	it.mu.RLock()
+	defer it.mu.RUnlock()
+
+	if it.closed || it.state != statePositioned || it.curr == nil {
 		return binary.InternalKey{}
 	}
 	if it.sl != nil {
@@ -133,7 +151,13 @@ func (it *Iterator) Key() binary.InternalKey {
 // The returned slice is a newly allocated defensive copy, guaranteeing callers mutating
 // the returned slice cannot corrupt internal SkipList state.
 func (it *Iterator) Value() []byte {
-	if it == nil || !it.Valid() {
+	if it == nil {
+		return nil
+	}
+	it.mu.RLock()
+	defer it.mu.RUnlock()
+
+	if it.closed || it.state != statePositioned || it.curr == nil {
 		return nil
 	}
 	if it.sl != nil {
@@ -158,7 +182,10 @@ func (it *Iterator) Seek(userKey []byte) error {
 	if it == nil {
 		return errors.ErrNilReceiver
 	}
-	if it.sl == nil {
+	it.mu.Lock()
+	defer it.mu.Unlock()
+
+	if it.closed || it.sl == nil {
 		it.curr = nil
 		it.state = stateExhausted
 		return errors.ErrIteratorClosed
@@ -205,7 +232,10 @@ func (it *Iterator) SeekToFirst() {
 	if it == nil {
 		return
 	}
-	if it.sl == nil {
+	it.mu.Lock()
+	defer it.mu.Unlock()
+
+	if it.closed || it.sl == nil {
 		it.curr = nil
 		it.state = stateExhausted
 		return
@@ -229,7 +259,10 @@ func (it *Iterator) SeekInternalKey(target binary.InternalKey) error {
 	if it == nil {
 		return errors.ErrNilReceiver
 	}
-	if it.sl == nil {
+	it.mu.Lock()
+	defer it.mu.Unlock()
+
+	if it.closed || it.sl == nil {
 		it.curr = nil
 		it.state = stateExhausted
 		return errors.ErrIteratorClosed
@@ -281,7 +314,17 @@ func (it *Iterator) Close() {
 	if it == nil {
 		return
 	}
+	it.mu.Lock()
+	defer it.mu.Unlock()
+
+	if it.closed {
+		return
+	}
+	it.closed = true
+	if it.sl != nil {
+		it.sl.activeIterators.Add(-1)
+		it.sl = nil
+	}
 	it.curr = nil
-	it.sl = nil
 	it.state = stateExhausted
 }

@@ -201,4 +201,49 @@
 
 ---
 
+### Threat 13: Cleartext Transport Eavesdropping & Tampering (Transport Layer)
+* **Asset**: Data in transit (user keys, values, and authentication credentials).
+* **Threat**: Cleartext TCP transmission over port 9099 enables network eavesdroppers and man-in-the-middle attackers to snoop queries, capture user data, or inject malicious payloads.
+* **Attack Surface**: Client TCP wire listener (`:9099`).
+* **Impact**: Critical (Total loss of confidentiality and integrity of network data).
+* **Likelihood**: High on shared or untrusted networks.
+* **Mitigation**:
+  1. Mandatory TLS 1.3 with client certificate verification (mTLS) for all production client endpoints. Cleartext TCP is prohibited and restricted to loopback development (`127.0.0.1`) with explicit `--insecure-transport` opt-in.
+  2. Strict pre-allocation frame boundary validation: the 5MB payload limit is verified immediately upon reading the 4-byte length header, before allocating receive memory buffers, dropping the connection on violation.
+  3. Token-bucket rate limiting per client IP/certificate to prevent low-and-slow DoS attacks.
+* **Automated Test**: Handshake tests asserting TLS 1.0-1.2 and plaintext connections are rejected in production mode; frame parser fuzz tests with oversized length headers verifying zero allocations.
+* **Residual Risk**: Low with mTLS and pre-allocation checks enforced.
+
+---
+
+### Threat 14: Raft Consensus Replay Attacks, Rogue Node Injection & Stale Leader Split-Brain
+* **Asset**: Distributed state machine consensus, replicated log integrity, and cluster availability.
+* **Threat**: An attacker replays captured Raft RPCs (e.g. `RequestVote`, `AppendEntries`), attempts rogue node joining, or a partitioned stale leader accepts writes, corrupting the replicated log or causing split-brain.
+* **Attack Surface**: Raft peer-to-peer transport listener (`:9098`).
+* **Impact**: Critical (Cluster split-brain, state machine corruption, unauthorized peer joining).
+* **Likelihood**: High in multi-node clusters without strong cryptographic peer isolation.
+* **Mitigation**:
+  1. Universal mTLS 1.3 across all environments (dev, staging, prod) on port 9098 with certificate SAN matching against the static `cluster_peers` allowlist.
+  2. Cryptographic nonces and monotonic sequence numbers on every RPC with a sliding-window recent-message cache to detect and drop replayed messages.
+  3. Stale leader fencing via quorum lease checks before committing writes or serving linearizable reads (`ReadIndex`), and inclusion of followers' last log term in vote grants.
+* **Automated Test**: Chaos partition injection tests asserting stale leaders cannot commit writes; replay attack injection tests verifying cached nonces drop replayed RPCs.
+* **Residual Risk**: Negligible.
+
+---
+
+### Threat 15: Cross-Tenant Resource Starvation & Data Leakage (Engine, Compaction, Cache)
+* **Asset**: Multi-tenant resource fairness (CPU, disk I/O, cache) and namespace data isolation.
+* **Threat**: An abusive or high-write tenant generates excessive write volume, monopolizing background compaction workers, evicting other tenants' hot blocks from the shared block cache, or accessing other namespaces via key scan overflows.
+* **Attack Surface**: Storage engine, shared compaction scheduler, shared LRU block cache.
+* **Impact**: High (Denial of service for benign tenants, potential cross-tenant information exposure).
+* **Likelihood**: Medium in multi-tenant environments.
+* **Mitigation**:
+  1. Memory backpressure controller (`internal/engine/backpressure.go`) throttling heavy writers when high/hard memory watermarks are reached.
+  2. Weighted fair-share compaction scheduling and tiered block cache quotas per tenant/namespace.
+  3. Strict prefix validation and namespace access barriers enforced at the earliest engine ingestion layer.
+* **Automated Test**: Multi-tenant write saturation tests verifying low-write tenants maintain bounded latency and unevicted cache reservations under high-write neighbor activity.
+* **Residual Risk**: Low.
+
+---
+
 *End of Security Threat Model — Lattice v1.0.0-THREAT-MODEL*

@@ -695,6 +695,13 @@ func (r *TableReader) ReadFilterBlock() (*filter.BloomFilter, error) {
 		// Empty MetaIndex block (entryCount = 0)
 		return nil, nil
 	}
+	if metaHandle.Size > MaxIndexBlockSize || metaHandle.Size > MaxBlockSize || metaHandle.Size > math.MaxInt || metaHandle.Offset > math.MaxInt64 {
+		return nil, &errors.InvalidBlockHandleError{
+			Offset: metaHandle.Offset,
+			Size:   metaHandle.Size,
+			Reason: "metaindex handle size exceeds maximum block capacity or architecture integer bounds",
+		}
+	}
 
 	// Read MetaIndex block from disk
 	metaBuf := make([]byte, int(metaHandle.Size))

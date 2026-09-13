@@ -343,12 +343,34 @@ func NewTableWriterWithFile(file *os.File, opts TableWriterOptions) (*TableWrite
 	if file == nil {
 		return nil, errors.ErrNilReceiver
 	}
-	if fi, err := file.Stat(); err != nil {
+	fi, err := file.Stat()
+	if err != nil {
 		return nil, err
-	} else if fi.IsDir() {
+	}
+	if fi.IsDir() {
 		return nil, &errors.NotADirectoryError{Path: file.Name(), Mode: fi.Mode()}
-	} else if !fi.Mode().IsRegular() {
+	}
+	if !fi.Mode().IsRegular() {
 		return nil, fmt.Errorf("sstable: %q is not a regular file (mode: %s): %w", file.Name(), fi.Mode(), os.ErrInvalid)
+	}
+	if runtime.GOOS != "windows" && fi.Mode().Perm()&0077 != 0 {
+		return nil, &errors.InsecureFileModeError{Mode: fi.Mode().Perm()}
+	}
+
+	cleanPath := filepath.Clean(file.Name())
+	if cleanPath != "" && cleanPath != "." && cleanPath != "/" {
+		if lfi, err := os.Lstat(cleanPath); err == nil {
+			if lfi.Mode()&os.ModeSymlink != 0 {
+				return nil, fmt.Errorf("sstable: %q is a symlink: %w", cleanPath, os.ErrInvalid)
+			}
+			if !os.SameFile(fi, lfi) {
+				return nil, fmt.Errorf("sstable: %q descriptor/lstat mismatch: %w", cleanPath, os.ErrInvalid)
+			}
+			parentDir := filepath.Dir(cleanPath)
+			if err := validatePathNoSymlinks(parentDir); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	if opts.TargetBlockSize <= 0 {
@@ -444,10 +466,13 @@ func (w *TableWriter) Add(key binary.InternalKey, value []byte) error {
 		return err
 	}
 
-	// Add user key to filter builder if configured
+	// Add user key to filter builder if configured (VULN-003 / SEC-008 remediation)
 	if w.filterBuilder != nil {
 		if err := w.filterBuilder.AddKey(key.UserKey); err != nil {
-			return fmt.Errorf("failed adding key to filter builder: %w", err)
+			w.state = stateError
+			w.err = fmt.Errorf("failed adding key to filter builder: %w", err)
+			_ = w.cleanupStaging()
+			return w.err
 		}
 	}
 

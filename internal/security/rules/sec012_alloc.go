@@ -112,8 +112,8 @@ func (r *Sec012Alloc) Run(ctx *model.AuditContext) ([]model.Finding, error) {
 						// Check if 1st arg is []byte
 						if sliceType, isSlice := call.Args[0].(*ast.ArrayType); isSlice {
 							if eltIdent, isElt := sliceType.Elt.(*ast.Ident); isElt && eltIdent.Name == "byte" {
-								// Check if 2nd arg is variable (not constant basic lit)
-								if _, isLit := call.Args[1].(*ast.BasicLit); !isLit {
+								// Check if 2nd arg is constant (literal or const binary expr like 10<<20)
+								if !isConstantExpr(call.Args[1]) {
 									line := NodeLine(ctx.Fset, call)
 									title := fmt.Sprintf("Unbounded slice allocation in %s", fn.Name.Name)
 
@@ -149,4 +149,20 @@ func (r *Sec012Alloc) Run(ctx *model.AuditContext) ([]model.Finding, error) {
 	}
 
 	return findings, nil
+}
+
+// isConstantExpr checks whether an AST expression represents a constant literal or binary expression.
+func isConstantExpr(expr ast.Expr) bool {
+	switch e := expr.(type) {
+	case *ast.BasicLit:
+		return true
+	case *ast.BinaryExpr:
+		return isConstantExpr(e.X) && isConstantExpr(e.Y)
+	case *ast.ParenExpr:
+		return isConstantExpr(e.X)
+	case *ast.UnaryExpr:
+		return isConstantExpr(e.X)
+	default:
+		return false
+	}
 }

@@ -66,11 +66,5 @@ func MaskSecret(secret string) string {
 	h := sha256.Sum256([]byte(s))
 	hashPrefix := hex.EncodeToString(h[:3])
 
-	if n <= 8 {
-		return fmt.Sprintf("***[REDACTED len=%d sha256=%s]***", n, hashPrefix)
-	}
-
-	prefix := s[:3]
-	suffix := s[n-2:]
-	return fmt.Sprintf("%s***%s [REDACTED len=%d sha256=%s]", prefix, suffix, n, hashPrefix)
+	return fmt.Sprintf("***[REDACTED len=%d sha256=%s]***", n, hashPrefix)
 }

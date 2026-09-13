@@ -4,6 +4,7 @@ import (
 	stdErrors "errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 
@@ -180,6 +181,9 @@ func (r *WALReader) Next() (Record, error) {
 
 	// Advance offset by exact physical record length
 	recLen := int64(MinRecordSize + len(rec.Key) + len(rec.Value))
+	if r.offset > math.MaxInt64-recLen {
+		return Record{}, fmt.Errorf("wal: reader offset %d overflows int64 with record length %d", r.offset, recLen)
+	}
 	r.offset += recLen
 
 	return rec, nil

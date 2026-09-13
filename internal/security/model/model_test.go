@@ -122,8 +122,8 @@ func TestMaskSecret_NeverLeaksRaw(t *testing.T) {
 	if !strings.Contains(masked, "REDACTED") {
 		t.Errorf("masked output should indicate REDACTED: %s", masked)
 	}
-	if !strings.HasPrefix(masked, "sup***") {
-		t.Errorf("masked output should show prefix: %s", masked)
+	if strings.Contains(masked, "sup") || strings.Contains(masked, "90") {
+		t.Errorf("masked output must NOT reveal prefix or suffix: %s", masked)
 	}
 
 	// Short secret

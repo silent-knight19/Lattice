@@ -4,6 +4,7 @@ import (
 	stdErrors "errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 
@@ -135,6 +136,9 @@ func recoverSegmentWithSeams(
 		rec, decodeErr := DecodeRecord(f)
 		if decodeErr == nil {
 			recLen := int64(MinRecordSize + len(rec.Key) + len(rec.Value))
+			if validOffset > math.MaxInt64-recLen {
+				return res, fmt.Errorf("wal: recovery offset %d overflows int64 with record length %d", validOffset, recLen)
+			}
 			validOffset += recLen
 			validCount++
 			continue

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
@@ -180,6 +181,12 @@ func DecodeHeader(buf []byte) (RecordHeader, error) {
 // MinRecordSize is the minimum serialized size in bytes of any valid WAL record:
 // HeaderSize (21B) + KeyLength (2B) + ValueLength (4B) = 27 bytes (e.g. for batch markers).
 const MinRecordSize = HeaderSize + 2 + 4
+
+// MaxRecordLength is the absolute maximum physical wire size in bytes of any valid WAL record.
+// MinRecordSize (27) + MaxKeyLen (65,535) + MaxValueLen (4,194,304) = 4,259,866 bytes (~4.06 MiB).
+// Any length or composite payload length exceeding this ceiling is rejected immediately
+// before memory allocation to prevent integer overflow and OOM DoS (VULN-002).
+const MaxRecordLength = uint64(MinRecordSize) + uint64(binary.MaxKeyLen) + uint64(binary.MaxValueLen)
 
 // Record represents a complete Write-Ahead Log entry comprising the physical framing header,
 // operation metadata, user key, and payload value.
@@ -445,6 +452,15 @@ func DecodeRecord(r io.Reader) (Record, error) {
 		return Record{}, &errors.ValueTooLargeError{
 			ValueSize: valLen,
 			MaxSize:   binary.MaxValueLen,
+		}
+	}
+
+	// VULN-002: Unified unsigned wire length overflow check before allocating
+	totalWireLen := uint64(MinRecordSize) + uint64(keyLen) + uint64(valLen)
+	if totalWireLen > MaxRecordLength || totalWireLen > uint64(math.MaxInt) {
+		return Record{}, &errors.InvalidRecordPayloadError{
+			Type:   byte(header.Type),
+			Reason: "total record wire size exceeds MaxRecordLength or architecture bounds",
 		}
 	}
 

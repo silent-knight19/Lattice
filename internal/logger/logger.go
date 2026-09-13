@@ -2,10 +2,12 @@ package logger
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"reflect"
+	"regexp"
 	"strings"
 	"unicode"
 )
@@ -96,6 +98,8 @@ const RedactedPlaceholder = "[REDACTED]"
 var defaultSensitiveKeys = map[string]struct{}{
 	"password":      {},
 	"passwd":        {},
+	"pass":          {},
+	"passphrase":    {},
 	"secret":        {},
 	"token":         {},
 	"auth":          {},
@@ -107,6 +111,15 @@ var defaultSensitiveKeys = map[string]struct{}{
 	"credentials":   {},
 	"access_token":  {},
 	"refresh_token": {},
+	"session":       {},
+	"session_id":    {},
+	"sessionid":     {},
+	"cookie":        {},
+	"card":          {},
+	"cvv":           {},
+	"ssn":           {},
+	"salt":          {},
+	"nonce":         {},
 }
 
 // Config specifies configuration options for initializing a Logger.
@@ -291,6 +304,7 @@ func isSensitiveKey(key string, exactMap map[string]struct{}) bool {
 	if strings.Contains(canonical, "password") ||
 		strings.Contains(canonical, "passwd") ||
 		strings.Contains(canonical, "pass_word") ||
+		strings.Contains(canonical, "passphrase") ||
 		strings.Contains(stripped, "password") ||
 		strings.Contains(stripped, "passwd") ||
 		strings.Contains(canonical, "secret") ||
@@ -300,8 +314,16 @@ func isSensitiveKey(key string, exactMap map[string]struct{}) bool {
 		strings.Contains(canonical, "api_key") ||
 		strings.Contains(canonical, "apikey") ||
 		strings.Contains(canonical, "authorization") ||
+		strings.Contains(canonical, "session_id") ||
+		strings.Contains(canonical, "sessionid") ||
 		strings.HasSuffix(canonical, "_token") ||
 		canonical == "token" ||
+		canonical == "cookie" ||
+		canonical == "card" ||
+		canonical == "cvv" ||
+		canonical == "ssn" ||
+		canonical == "salt" ||
+		canonical == "nonce" ||
 		isAuth(canonical) {
 		return true
 	}
@@ -309,16 +331,157 @@ func isSensitiveKey(key string, exactMap map[string]struct{}) bool {
 	return false
 }
 
+var (
+	sensitiveKVRegex = regexp.MustCompile(`(?i)\b(password|passwd|secret|token|credential|api_key|apikey|private_key|authorization|auth_token|access_token|refresh_token)\b\s*[:=]\s*([^\s,;\"'}{]+)`)
+	bearerRegex      = regexp.MustCompile(`(?i)\b(Bearer\s+)([^\s,;\"'}{]+)`)
+)
+
+func scrubString(s string) string {
+	if s == "" {
+		return ""
+	}
+	s = sensitiveKVRegex.ReplaceAllString(s, "$1="+RedactedPlaceholder)
+	s = bearerRegex.ReplaceAllString(s, "${1}"+RedactedPlaceholder)
+	return s
+}
+
+// scrubValue recursively traverses nested maps, slices, structs, and custom Stringers
+// to ensure no secrets or sensitive keys are logged at any depth (SEC-005, VULN-004).
+func scrubValue(v any, redactedMap map[string]struct{}) any {
+	if v == nil {
+		return nil
+	}
+
+	// Precedence 1: Evaluate custom Redactable implementations directly
+	if r, ok := v.(Redactable); ok {
+		if safeVal, safe := safeRedact(r); safe {
+			return safeVal
+		}
+	}
+
+	// Errors: evaluate Error() string and scrub inline credentials
+	if err, ok := v.(error); ok {
+		return scrubString(err.Error())
+	}
+
+	// fmt.Stringer implementations (handles custom types/Stringers that might expose secrets)
+	if s, ok := v.(fmt.Stringer); ok {
+		return scrubString(s.String())
+	}
+
+	// Concrete map[string]any fast path
+	if m, ok := v.(map[string]any); ok {
+		scrubbed := make(map[string]any, len(m))
+		for k, val := range m {
+			if isSensitiveKey(k, redactedMap) {
+				scrubbed[k] = RedactedPlaceholder
+			} else {
+				scrubbed[k] = scrubValue(val, redactedMap)
+			}
+		}
+		return scrubbed
+	}
+
+	// Concrete map[string]string fast path
+	if m, ok := v.(map[string]string); ok {
+		scrubbed := make(map[string]any, len(m))
+		for k, val := range m {
+			if isSensitiveKey(k, redactedMap) {
+				scrubbed[k] = RedactedPlaceholder
+			} else {
+				scrubbed[k] = scrubString(val)
+			}
+		}
+		return scrubbed
+	}
+
+	// Strings: scrub inline credentials
+	if s, ok := v.(string); ok {
+		return scrubString(s)
+	}
+
+	val := reflect.ValueOf(v)
+	switch val.Kind() {
+	case reflect.Pointer, reflect.Interface:
+		if val.IsNil() {
+			return nil
+		}
+		return scrubValue(val.Elem().Interface(), redactedMap)
+
+	case reflect.Map:
+		if val.IsNil() {
+			return nil
+		}
+		scrubbed := make(map[string]any, val.Len())
+		for _, key := range val.MapKeys() {
+			kStr := fmt.Sprintf("%v", key.Interface())
+			if isSensitiveKey(kStr, redactedMap) {
+				scrubbed[kStr] = RedactedPlaceholder
+			} else {
+				scrubbed[kStr] = scrubValue(val.MapIndex(key).Interface(), redactedMap)
+			}
+		}
+		return scrubbed
+
+	case reflect.Slice, reflect.Array:
+		if val.Kind() == reflect.Slice && val.IsNil() {
+			return nil
+		}
+		if b, ok := v.([]byte); ok {
+			return b
+		}
+		n := val.Len()
+		scrubbed := make([]any, n)
+		for i := 0; i < n; i++ {
+			scrubbed[i] = scrubValue(val.Index(i).Interface(), redactedMap)
+		}
+		return scrubbed
+
+	case reflect.Struct:
+		// Errors or custom Stringers
+		if s, ok := v.(fmt.Stringer); ok {
+			return scrubString(s.String())
+		}
+		t := val.Type()
+		scrubbed := make(map[string]any, t.NumField())
+		for i := 0; i < t.NumField(); i++ {
+			field := t.Field(i)
+			if !field.IsExported() {
+				continue
+			}
+			fieldName := field.Name
+			tag := field.Tag.Get("json")
+			if tag != "" {
+				parts := strings.Split(tag, ",")
+				if parts[0] == "-" {
+					continue
+				}
+				if parts[0] != "" {
+					fieldName = parts[0]
+				}
+			}
+			if isSensitiveKey(fieldName, redactedMap) {
+				scrubbed[fieldName] = RedactedPlaceholder
+			} else {
+				scrubbed[fieldName] = scrubValue(val.Field(i).Interface(), redactedMap)
+			}
+		}
+		return scrubbed
+	}
+
+	return v
+}
+
 // makeReplaceAttr builds an attribute replacement function that masks sensitive keys
-// and supports custom Redactable types.
+// and recursively traverses nested structures.
 //
 // Security Precedence:
 //  1. Empty attributes are preserved/dropped by slog.
-//  2. Sensitive attribute keys ALWAYS take precedence over custom Redactable values.
+//  2. Sensitive attribute keys ALWAYS take precedence over values.
 //     If an attribute key is classified as sensitive, the entire value is immediately replaced
-//     with RedactedPlaceholder without invoking Redact().
-//  3. For non-sensitive keys, if the value implements Redactable, safeRedact is evaluated.
-//  4. All other attributes remain unchanged.
+//     with RedactedPlaceholder without evaluating custom logic.
+//  3. For non-sensitive keys, scrubValue performs deep traversal over nested maps, slices,
+//     structs, and Redactable types, ensuring nested secrets are masked regardless of depth.
 func makeReplaceAttr(customRedacted []string) func(groups []string, a slog.Attr) slog.Attr {
 	redactedMap := make(map[string]struct{}, len(defaultSensitiveKeys)+len(customRedacted))
 	for k := range defaultSensitiveKeys {
@@ -337,19 +500,29 @@ func makeReplaceAttr(customRedacted []string) func(groups []string, a slog.Attr)
 		}
 
 		// Precedence 1: Sensitive attribute key always wins.
-		// Immediately mask with RedactedPlaceholder without evaluating custom Redact() logic.
 		if isSensitiveKey(a.Key, redactedMap) {
 			return slog.String(a.Key, RedactedPlaceholder)
 		}
 
-		// Precedence 2: For non-sensitive keys, evaluate custom Redactable implementations.
-		if r, ok := a.Value.Any().(Redactable); ok {
-			if safeVal, safe := safeRedact(r); safe {
-				return slog.Any(a.Key, safeVal)
+		// Precedence 2: Slog group
+		if a.Value.Kind() == slog.KindGroup {
+			attrs := a.Value.Group()
+			scrubbedAttrs := make([]slog.Attr, len(attrs))
+			for i, attr := range attrs {
+				if isSensitiveKey(attr.Key, redactedMap) {
+					scrubbedAttrs[i] = slog.String(attr.Key, RedactedPlaceholder)
+				} else {
+					scrubbedAttrs[i] = slog.Any(attr.Key, scrubValue(attr.Value.Any(), redactedMap))
+				}
+			}
+			return slog.Attr{
+				Key:   a.Key,
+				Value: slog.GroupValue(scrubbedAttrs...),
 			}
 		}
 
-		return a
+		// Precedence 3: Deep recursive scrubbing for nested structures
+		return slog.Any(a.Key, scrubValue(a.Value.Any(), redactedMap))
 	}
 }
 

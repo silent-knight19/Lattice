@@ -100,6 +100,9 @@ func DecodeMetaIndexBlock(data []byte) (map[string]BlockHandle, error) {
 	if len(data) < MetaIndexTrailerSize {
 		return nil, errors.ErrIndexBlockTruncated
 	}
+	if len(data) > MaxIndexBlockSize {
+		return nil, &errors.IndexBlockCorruptedError{Reason: "metaindex block size exceeds MaxIndexBlockSize"}
+	}
 
 	// 1. Verify CRC32-IEEE checksum
 	checksumOffset := len(data) - 4
@@ -123,6 +126,10 @@ func DecodeMetaIndexBlock(data []byte) (map[string]BlockHandle, error) {
 	}
 
 	// 3. Verify offsets bounds
+	maxMetaEntries := uint64(len(data)) / (BlockHandleSize + 1)
+	if uint64(entryCount) > maxMetaEntries {
+		return nil, &errors.IndexBlockCorruptedError{Reason: "metaindex entry count exceeds block capacity"}
+	}
 	offsetsByteLen := uint64(entryCount) * 4
 	if offsetsByteLen+uint64(MetaIndexTrailerSize) > uint64(len(data)) {
 		return nil, &errors.IndexBlockCorruptedError{Reason: "metaindex entry count exceeds block capacity"}

@@ -384,6 +384,9 @@ func DecodeBlockIndex(data []byte) (*BlockIndex, error) {
 	if len(data) < IndexTrailerSize {
 		return nil, errors.ErrIndexBlockTruncated
 	}
+	if len(data) > MaxIndexBlockSize {
+		return nil, &errors.IndexBlockCorruptedError{Reason: "index block size exceeds MaxIndexBlockSize"}
+	}
 
 	// 1. Verify CRC32-IEEE checksum
 	expectedCRC := binary.GetUint32(data[len(data)-4:])
@@ -408,6 +411,10 @@ func DecodeBlockIndex(data []byte) (*BlockIndex, error) {
 	// 3. Verify offsets trailer bounds
 	if uint64(entryCount) > uint64(math.MaxInt) {
 		return nil, errors.ErrIndexBlockCorrupted
+	}
+	maxEntries := uint64(len(data)) / (BlockHandleSize + 1)
+	if uint64(entryCount) > maxEntries {
+		return nil, &errors.IndexBlockCorruptedError{Reason: "index entry count exceeds physical block capacity"}
 	}
 	offsetsByteLen := uint64(entryCount) * 4
 	if offsetsByteLen+uint64(IndexTrailerSize) > uint64(len(data)) {

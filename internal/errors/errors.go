@@ -141,6 +141,13 @@ var (
 	// would exceed MaxMemTableSize. Caller should freeze/flush to disk.
 	ErrMemTableFull = stdErrors.New("memtable is full")
 
+	// ErrMemoryLimitExceeded indicates that a write was rejected or timed out because total
+	// engine memory reached the hard ceiling (SEC-003 backpressure enforcement).
+	ErrMemoryLimitExceeded = stdErrors.New("engine memory limit exceeded: write backpressure triggered")
+
+	// ErrWriteThrottled indicates that an operation was rejected due to backpressure rate limits.
+	ErrWriteThrottled = stdErrors.New("engine write throttled under backpressure")
+
 	// ErrIteratorClosed indicates that an operation was attempted on a closed iterator.
 	ErrIteratorClosed = stdErrors.New("iterator is closed")
 

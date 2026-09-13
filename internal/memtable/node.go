@@ -30,6 +30,10 @@ const (
 	// would exceed this ceiling; caller should Freeze and flush to disk.
 	// Matches memtable_size_bytes in docs/architecture-spec.md.
 	MaxMemTableSize = uint64(64 << 20)
+
+	// MaxMemTableEntries caps the total number of entries in a single MemTable (1 million records).
+	// Prevents unbounded node allocation overhead under workloads with many microscopic keys (SEC-003).
+	MaxMemTableEntries = int64(1_000_000)
 )
 
 // nodeValue wraps a byte slice in an immutable container to enable lock-free atomic value
