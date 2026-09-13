@@ -139,7 +139,8 @@ func OpenManifestWriter(path string) (*ManifestWriter, error) {
 
 	cleanPath := filepath.Clean(path)
 
-	// Pre-open inspection: reject symlinks and directories
+	// Pre-open inspection: reject symlinks and directories (SEC-WAL-01: pin inode).
+	var preInfo os.FileInfo
 	if info, err := os.Lstat(cleanPath); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
 			return nil, fmt.Errorf("manifest: cannot open symlink %s: %w", cleanPath, os.ErrInvalid)
@@ -150,12 +151,13 @@ func OpenManifestWriter(path string) (*ManifestWriter, error) {
 				Mode: info.Mode(),
 			}
 		}
+		preInfo = info
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("manifest: failed to inspect path %s: %w", cleanPath, err)
 	}
 
 	flags := os.O_WRONLY | os.O_CREATE | os.O_APPEND
-	f, err := os.OpenFile(cleanPath, flags, ManifestFileMode)
+	f, err := openFileNoFollow(cleanPath, flags, ManifestFileMode)
 	if err != nil {
 		return nil, fmt.Errorf("manifest: failed to open file %s: %w", cleanPath, err)
 	}
@@ -171,13 +173,21 @@ func OpenManifestWriter(path string) (*ManifestWriter, error) {
 		return nil, fmt.Errorf("manifest: path %s is not a regular file (mode: %s): %w", cleanPath, finfo.Mode(), os.ErrInvalid)
 	}
 
-	// Post-open verification: prove the open file descriptor matches the inode on disk
+	// Post-open verification: double SameFile pinning.
 	postInfo, lstatErr := os.Lstat(cleanPath)
 	if lstatErr != nil {
 		_ = f.Close()
 		return nil, fmt.Errorf("manifest: failed to lstat file %s: %w", cleanPath, lstatErr)
 	}
+	if postInfo.Mode()&os.ModeSymlink != 0 {
+		_ = f.Close()
+		return nil, fmt.Errorf("manifest: file %s was replaced with symlink during open: %w", cleanPath, os.ErrInvalid)
+	}
 	if !os.SameFile(finfo, postInfo) {
+		_ = f.Close()
+		return nil, fmt.Errorf("manifest: file %s was replaced during open: %w", cleanPath, os.ErrInvalid)
+	}
+	if preInfo != nil && !os.SameFile(finfo, preInfo) {
 		_ = f.Close()
 		return nil, fmt.Errorf("manifest: file %s was replaced during open: %w", cleanPath, os.ErrInvalid)
 	}
@@ -227,7 +237,7 @@ func CreateManifestWriter(path string) (*ManifestWriter, error) {
 
 	// Atomic exclusive creation: kernel guarantees fail-fast if file exists concurrently
 	flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL | os.O_APPEND
-	f, err := os.OpenFile(cleanPath, flags, ManifestFileMode)
+	f, err := openFileNoFollow(cleanPath, flags, ManifestFileMode)
 	if err != nil {
 		if os.IsExist(err) {
 			return nil, fmt.Errorf("%w: %w: failed to create manifest file %s", errors.ErrManifestExists, err, cleanPath)
@@ -251,6 +261,10 @@ func CreateManifestWriter(path string) (*ManifestWriter, error) {
 	if lstatErr != nil {
 		_ = f.Close()
 		return nil, fmt.Errorf("manifest: failed to lstat created file %s: %w", cleanPath, lstatErr)
+	}
+	if postInfo.Mode()&os.ModeSymlink != 0 {
+		_ = f.Close()
+		return nil, fmt.Errorf("manifest: file %s was replaced with symlink during create: %w", cleanPath, os.ErrInvalid)
 	}
 	if !os.SameFile(finfo, postInfo) {
 		_ = f.Close()

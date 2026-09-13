@@ -445,7 +445,7 @@ func searchDataBlock(blockBuf []byte, targetUserKey []byte, blockOffset uint64) 
 		off := int(restartOffsets[restartIdx])
 		entrySlice := blockBuf[off:entryDataEnd]
 
-		shared, n1, err := binary.GetVarint64(entrySlice)
+		shared, n1, err := binary.GetVarint64Canonical(entrySlice)
 		if err != nil {
 			return nil, &errors.DataBlockCorruptedError{
 				Offset: blockOffset + uint64(off),
@@ -459,7 +459,7 @@ func searchDataBlock(blockBuf []byte, targetUserKey []byte, blockOffset uint64) 
 			}
 		}
 
-		unshared, n2, err := binary.GetVarint64(entrySlice[n1:])
+		unshared, n2, err := binary.GetVarint64Canonical(entrySlice[n1:])
 		if err != nil {
 			return nil, &errors.DataBlockCorruptedError{
 				Offset: blockOffset + uint64(off) + uint64(n1),
@@ -467,7 +467,7 @@ func searchDataBlock(blockBuf []byte, targetUserKey []byte, blockOffset uint64) 
 			}
 		}
 
-		valueLen, n3, err := binary.GetVarint64(entrySlice[n1+n2:])
+		valueLen, n3, err := binary.GetVarint64Canonical(entrySlice[n1+n2:])
 		if err != nil {
 			return nil, &errors.DataBlockCorruptedError{
 				Offset: blockOffset + uint64(off) + uint64(n1+n2),
@@ -534,7 +534,7 @@ func searchDataBlock(blockBuf []byte, targetUserKey []byte, blockOffset uint64) 
 	for currOffset < entryDataEnd {
 		entrySlice := blockBuf[currOffset:entryDataEnd]
 
-		shared, n1, err := binary.GetVarint64(entrySlice)
+		shared, n1, err := binary.GetVarint64Canonical(entrySlice)
 		if err != nil {
 			return nil, &errors.DataBlockCorruptedError{
 				Offset: blockOffset + uint64(currOffset),
@@ -542,7 +542,7 @@ func searchDataBlock(blockBuf []byte, targetUserKey []byte, blockOffset uint64) 
 			}
 		}
 
-		unshared, n2, err := binary.GetVarint64(entrySlice[n1:])
+		unshared, n2, err := binary.GetVarint64Canonical(entrySlice[n1:])
 		if err != nil {
 			return nil, &errors.DataBlockCorruptedError{
 				Offset: blockOffset + uint64(currOffset) + uint64(n1),
@@ -550,7 +550,7 @@ func searchDataBlock(blockBuf []byte, targetUserKey []byte, blockOffset uint64) 
 			}
 		}
 
-		valueLen, n3, err := binary.GetVarint64(entrySlice[n1+n2:])
+		valueLen, n3, err := binary.GetVarint64Canonical(entrySlice[n1+n2:])
 		if err != nil {
 			return nil, &errors.DataBlockCorruptedError{
 				Offset: blockOffset + uint64(currOffset) + uint64(n1+n2),
@@ -730,11 +730,18 @@ func (r *TableReader) ReadFilterBlock() (*filter.BloomFilter, error) {
 			Reason: "filter block handle exceeds architecture integer bounds",
 		}
 	}
-	if filterHandle.Offset+filterHandle.Size > r.footer.MetaIndexHandle.Offset {
+	if filterHandle.Offset > math.MaxUint64-filterHandle.Size || filterHandle.Offset+filterHandle.Size > r.footer.MetaIndexHandle.Offset {
 		return nil, &errors.InvalidBlockHandleError{
 			Offset: filterHandle.Offset,
 			Size:   filterHandle.Size,
 			Reason: "filter block handle overlaps or exceeds metaindex boundary",
+		}
+	}
+	if filterHandle.Offset+filterHandle.Size > uint64(r.fileSize)-FooterSize {
+		return nil, &errors.InvalidBlockHandleError{
+			Offset: filterHandle.Offset,
+			Size:   filterHandle.Size,
+			Reason: "filter block handle exceeds physical file boundary",
 		}
 	}
 

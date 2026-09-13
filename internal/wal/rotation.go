@@ -470,8 +470,12 @@ func (rw *RotatingWriter) rotateLocked() error {
 	nextID := oldID + 1
 
 	// Step 1: Seal, flush, and close current active segment
+	// FIND-NEW-02: on Close failure the old descriptor is unusable; nil the
+	// active handle so subsequent Append fails closed instead of writing to
+	// a closed file.
 	if oldWriter != nil {
 		if err := oldWriter.Close(); err != nil {
+			rw.active = nil
 			return fmt.Errorf("wal: failed to close segment %d during rotation: %w", oldID, err)
 		}
 	}

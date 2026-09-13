@@ -75,12 +75,12 @@ func OpenReader(path string) (*WALReader, error) {
 		return nil, fmt.Errorf("wal: path %s is not a regular file (mode: %s): %w", cleanPath, info.Mode(), os.ErrInvalid)
 	}
 
-	f, err := os.OpenFile(cleanPath, os.O_RDONLY, 0)
+	f, err := openFileNoFollow(cleanPath, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, fmt.Errorf("wal: failed to open reader file %s: %w", cleanPath, err)
 	}
 
-	// Post-open verification: prove the open descriptor matches the inode on disk
+	// Post-open verification: double SameFile pinning (finfo vs pre + finfo vs post).
 	finfo, statErr := f.Stat()
 	if statErr != nil {
 		_ = f.Close()
@@ -96,7 +96,11 @@ func OpenReader(path string) (*WALReader, error) {
 		_ = f.Close()
 		return nil, fmt.Errorf("wal: failed to lstat reader file %s: %w", cleanPath, lstatErr)
 	}
-	if !os.SameFile(finfo, postInfo) {
+	if postInfo.Mode()&os.ModeSymlink != 0 {
+		_ = f.Close()
+		return nil, fmt.Errorf("wal: reader file %s was replaced with symlink: %w", cleanPath, os.ErrInvalid)
+	}
+	if !os.SameFile(finfo, postInfo) || !os.SameFile(finfo, info) {
 		_ = f.Close()
 		return nil, fmt.Errorf("wal: reader file %s was replaced during open: %w", cleanPath, os.ErrInvalid)
 	}

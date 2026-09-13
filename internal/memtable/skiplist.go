@@ -178,6 +178,10 @@ func (s *SkipList) IsFrozen() bool {
 // Memory Ownership:
 //   - Defensive copies of UserKey and Value are created during node allocation.
 //   - Callers mutating external slices after Insert will not corrupt internal state.
+//
+// Memory Ceiling (SEC-003):
+//   - Returns ErrMemTableFull without allocating when ByteSize()+entry > MaxMemTableSize (64 MiB).
+//   - Caller should Freeze and flush to disk on ErrMemTableFull.
 func (s *SkipList) Insert(key binary.InternalKey, value []byte) error {
 	if s == nil {
 		return errors.ErrNilReceiver
@@ -241,6 +245,13 @@ func (s *SkipList) insertInternal(key binary.InternalKey, value []byte, forcedHe
 		}
 		newValBytes := valueMemoryBytes(len(value))
 
+		// SEC-003: enforce memory ceiling before allocating.
+		if newValBytes > oldValBytes {
+			if cur := s.byteSize.Load(); cur >= MaxMemTableSize || newValBytes-oldValBytes > MaxMemTableSize-cur {
+				return &errors.MemTableFullError{Current: cur, Needed: newValBytes - oldValBytes, Max: MaxMemTableSize}
+			}
+		}
+
 		var newVal *nodeValue
 		if len(value) > 0 {
 			valCopy := make([]byte, len(value))
@@ -271,12 +282,17 @@ func (s *SkipList) insertInternal(key binary.InternalKey, value []byte, forcedHe
 		}
 	}
 
-	// 6. Allocate and fully initialize the new node in writer memory
+	// 6. SEC-003: enforce memory ceiling before allocating.
+	entryBytes := nodeMemoryBytes(len(key.UserKey), len(value), nodeHeight)
+	if cur := s.byteSize.Load(); cur >= MaxMemTableSize || entryBytes > MaxMemTableSize-cur {
+		return &errors.MemTableFullError{Current: cur, Needed: entryBytes, Max: MaxMemTableSize}
+	}
+
+	// Allocate and fully initialize the new node in writer memory
 	newNode, err := newSkipListNode(key, value, nodeHeight)
 	if err != nil {
 		return err
 	}
-	entryBytes := nodeMemoryBytes(len(key.UserKey), len(value), nodeHeight)
 
 	// 7. If new node's height exceeds current list height, initialize update pointers for new levels
 	if nodeHeight > currentHeight {
@@ -331,6 +347,12 @@ func (s *SkipList) Search(userKey []byte) ([]byte, error) {
 //   - Traverses forward pointer express lanes using atomic pointer loads (atomic.Pointer.Load).
 //   - Guaranteed to never block or be blocked by serialized writers.
 //   - Thread-safe for arbitrary numbers of simultaneous readers running concurrently with a writer.
+//
+// SEC-MEM-01 (ABA analysis): ABA requires free/reuse of a node address between a
+// reader's Load and use. Lattice never deletes or recycles nodes; inserts only,
+// nodes immutable once published, predecessors spliced bottom-up under s.mu, and
+// Go GC keeps any Load()ed node alive for the reader's duration. No hazard
+// pointers/epoch reclamation needed unless a delete/free-list path is added.
 //
 // Return Semantics:
 //   - If userKey is invalid: returns (nil, error).

@@ -165,7 +165,7 @@ func DecodeMetaIndexBlock(data []byte) (map[string]BlockHandle, error) {
 		entrySlice := data[start:end]
 
 		// Decode varint KeyLen
-		keyLen, varintLen, err := binary.GetVarint64(entrySlice)
+		keyLen, varintLen, err := binary.GetVarint64Canonical(entrySlice)
 		if err != nil {
 			return nil, &errors.IndexBlockCorruptedError{Reason: "corrupted metaindex key length varint"}
 		}

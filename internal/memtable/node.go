@@ -24,6 +24,12 @@ const (
 	// - Search path crosses on average 1/p = 4 nodes per level.
 	// - MaxHeight = 16 accommodates ~4^15 ≈ 1 billion keys with O(log N) search complexity.
 	DefaultPromotionProbability = 0.25
+
+	// MaxMemTableSize caps user-record bytes tracked by ByteSize (64 MiB).
+	// Insert returns ErrMemTableFull before allocating when the new entry
+	// would exceed this ceiling; caller should Freeze and flush to disk.
+	// Matches memtable_size_bytes in docs/architecture-spec.md.
+	MaxMemTableSize = uint64(64 << 20)
 )
 
 // nodeValue wraps a byte slice in an immutable container to enable lock-free atomic value

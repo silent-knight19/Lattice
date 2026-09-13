@@ -20,6 +20,7 @@ linters:
     - unused       # Flags unused constants, variables, functions, and types
     - errorlint    # Enforces Go 1.13+ error wrapping semantics (errors.Is/As instead of ==)
     - nolintlint   # Prevents blanket suppression; requires specific linter name + explanation
+    - gosec        # Flags crypto, file-perm, and unbounded-alloc risks (FIND-NEW-03 defense in depth)
 
   settings:
     errcheck:

@@ -8,6 +8,12 @@ import (
 	"github.com/silent-knight19/lattice/internal/security/model"
 )
 
+// WARNING: Heuristic only. Does not verify control-flow order.
+// This rule looks for the words "max"/"limit"/"bound" anywhere in the function
+// and for make([]byte, nonConst); it does NOT prove the length is validated
+// before allocation. Require manual code review for all new binary parsers
+// regardless of scanner output.
+//
 // Sec012Alloc checks for unbounded slice allocations based on external integer lengths.
 type Sec012Alloc struct{}
 

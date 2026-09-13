@@ -1169,7 +1169,7 @@ All fixed-width binary fields (CRC32, lengths, sequence numbers) are encoded in 
 Lattice is engineered as an internal infrastructure data tier:
 1. **Frame Bomb Protection**: Max payload length is strictly capped at $5\text{MB}$. Inbound frames exceeding this limit trigger immediate socket termination, protecting against allocation exploits.
 2. **Buffer Sanitization**: Internal byte buffers drawn from `sync.Pool` are scrubbed before reuse to prevent cross-request memory bleeding.
-3. **TLS Termination Hooks**: The network listener interface wraps Go's standard `crypto/tls` package, allowing TLS 1.3 encryption over public or untrusted network interfaces.
+3. **Mandatory Raft mTLS**: All Raft cluster traffic (`:9098`) uses mutual TLS 1.3 in every environment (dev, staging, prod). Plaintext connections are rejected by default; peers must present allowlisted node IDs (see `cluster_peers`) with client-certificate verification. Rogue nodes without an allowlisted cert cannot join or disrupt elections.
 
 ---
 

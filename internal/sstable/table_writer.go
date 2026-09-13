@@ -335,9 +335,20 @@ func NewTableWriter(dstPath string, opts TableWriterOptions) (*TableWriter, erro
 
 // NewTableWriterWithFile initializes a TableWriter writing directly to an open *os.File without staging rename.
 // Useful for direct file testing and custom file descriptors.
+//
+// FIND-NEW-01: caller-provided descriptors bypass staging symlink checks, so
+// validate the descriptor here: must stat to a regular file (rejects dirs,
+// pipes, sockets, devices opened by mistake).
 func NewTableWriterWithFile(file *os.File, opts TableWriterOptions) (*TableWriter, error) {
 	if file == nil {
 		return nil, errors.ErrNilReceiver
+	}
+	if fi, err := file.Stat(); err != nil {
+		return nil, err
+	} else if fi.IsDir() {
+		return nil, &errors.NotADirectoryError{Path: file.Name(), Mode: fi.Mode()}
+	} else if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("sstable: %q is not a regular file (mode: %s): %w", file.Name(), fi.Mode(), os.ErrInvalid)
 	}
 
 	if opts.TargetBlockSize <= 0 {

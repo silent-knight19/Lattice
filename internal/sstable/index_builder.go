@@ -449,7 +449,7 @@ func DecodeBlockIndex(data []byte) (*BlockIndex, error) {
 		}
 
 		entrySlice := data[start:end]
-		keyLen, n, err := binary.GetVarint64(entrySlice)
+		keyLen, n, err := binary.GetVarint64Canonical(entrySlice)
 		if err != nil {
 			return nil, &errors.IndexBlockCorruptedError{Reason: "varint key length truncated or invalid"}
 		}

@@ -137,6 +137,10 @@ var (
 	// because the MemTable/SkipList is permanently frozen (read-only).
 	ErrMemTableFrozen = stdErrors.New("memtable is frozen")
 
+	// ErrMemTableFull indicates that an insert was rejected because the MemTable
+	// would exceed MaxMemTableSize. Caller should freeze/flush to disk.
+	ErrMemTableFull = stdErrors.New("memtable is full")
+
 	// ErrIteratorClosed indicates that an operation was attempted on a closed iterator.
 	ErrIteratorClosed = stdErrors.New("iterator is closed")
 
@@ -992,4 +996,24 @@ func (e *ManifestCorruptedError) Error() string {
 // Is reports whether this error matches target sentinel ErrManifestCorrupted.
 func (e *ManifestCorruptedError) Is(target error) bool {
 	return target == ErrManifestCorrupted
+}
+
+// MemTableFullError provides structured context when an insert exceeds MaxMemTableSize.
+// It matches ErrMemTableFull when interrogated with errors.Is().
+type MemTableFullError struct {
+	Current uint64
+	Needed  uint64
+	Max     uint64
+}
+
+func (e *MemTableFullError) Error() string {
+	if e == nil {
+		return ErrMemTableFull.Error()
+	}
+	return fmt.Sprintf("memtable full: current %d + needed %d exceeds max %d", e.Current, e.Needed, e.Max)
+}
+
+// Is reports whether this error matches target sentinel ErrMemTableFull.
+func (e *MemTableFullError) Is(target error) bool {
+	return target == ErrMemTableFull
 }

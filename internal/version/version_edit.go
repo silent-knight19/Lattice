@@ -3,6 +3,7 @@ package version
 import (
 	"bytes"
 	"cmp"
+	stdErrors "errors"
 	"fmt"
 	"slices"
 
@@ -609,9 +610,15 @@ func DecodeVersionEdit(data []byte) (*VersionEdit, error) {
 	for offset < len(data) {
 		fieldStart := offset
 
-		// 1. Decode Tag
-		tag, nTag, err := binary.GetVarint64(data[offset:])
+		// 1. Decode Tag (SEC-BIN-01: strict canonical — reject overlong encodings).
+		tag, nTag, err := binary.GetVarint64Canonical(data[offset:])
 		if err != nil {
+			if stdErrors.Is(err, errors.ErrVarintNonCanonical) || stdErrors.Is(err, errors.ErrVarintOverflow) {
+				return nil, &errors.CorruptedVersionEditError{
+					Offset: int64(fieldStart),
+					Reason: "non-canonical or overflowing TLV tag varint",
+				}
+			}
 			return nil, &errors.TruncatedVersionEditError{
 				Expected: offset + 1,
 				Actual:   len(data),
@@ -619,15 +626,21 @@ func DecodeVersionEdit(data []byte) (*VersionEdit, error) {
 		}
 		offset += nTag
 
-		// 2. Decode Length
+		// 2. Decode Length (SEC-BIN-01: strict canonical).
 		if offset >= len(data) {
 			return nil, &errors.TruncatedVersionEditError{
 				Expected: offset + 1,
 				Actual:   len(data),
 			}
 		}
-		length, nLen, err := binary.GetVarint64(data[offset:])
+		length, nLen, err := binary.GetVarint64Canonical(data[offset:])
 		if err != nil {
+			if stdErrors.Is(err, errors.ErrVarintNonCanonical) || stdErrors.Is(err, errors.ErrVarintOverflow) {
+				return nil, &errors.CorruptedVersionEditError{
+					Offset: int64(fieldStart),
+					Reason: "non-canonical or overflowing TLV length varint",
+				}
+			}
 			return nil, &errors.TruncatedVersionEditError{
 				Expected: offset + 1,
 				Actual:   len(data),
@@ -664,7 +677,7 @@ func DecodeVersionEdit(data []byte) (*VersionEdit, error) {
 					Reason: "empty NextFileNum payload",
 				}
 			}
-			val, n, err := binary.GetVarint64(payload)
+			val, n, err := binary.GetVarint64Canonical(payload)
 			if err != nil || n != len(payload) {
 				return nil, &errors.CorruptedVersionEditError{
 					Offset: int64(fieldStart),
@@ -685,7 +698,7 @@ func DecodeVersionEdit(data []byte) (*VersionEdit, error) {
 					Reason: "empty LastSeqNum payload",
 				}
 			}
-			val, n, err := binary.GetVarint64(payload)
+			val, n, err := binary.GetVarint64Canonical(payload)
 			if err != nil || n != len(payload) {
 				return nil, &errors.CorruptedVersionEditError{
 					Offset: int64(fieldStart),
@@ -704,7 +717,7 @@ func DecodeVersionEdit(data []byte) (*VersionEdit, error) {
 				}
 			}
 			pOff := 0
-			lvl, n1, err := binary.GetVarint64(payload[pOff:])
+			lvl, n1, err := binary.GetVarint64Canonical(payload[pOff:])
 			if err != nil {
 				return nil, &errors.CorruptedVersionEditError{
 					Offset: int64(fieldStart),
@@ -722,7 +735,7 @@ func DecodeVersionEdit(data []byte) (*VersionEdit, error) {
 					Reason: "truncated DeleteFile fileNum",
 				}
 			}
-			fNum, n2, err := binary.GetVarint64(payload[pOff:])
+			fNum, n2, err := binary.GetVarint64Canonical(payload[pOff:])
 			if err != nil {
 				return nil, &errors.CorruptedVersionEditError{
 					Offset: int64(fieldStart),
@@ -752,7 +765,7 @@ func DecodeVersionEdit(data []byte) (*VersionEdit, error) {
 				}
 			}
 			pOff := 0
-			lvl, n, err := binary.GetVarint64(payload[pOff:])
+			lvl, n, err := binary.GetVarint64Canonical(payload[pOff:])
 			if err != nil {
 				return nil, &errors.CorruptedVersionEditError{Offset: int64(fieldStart), Reason: "malformed AddFile level"}
 			}
@@ -764,7 +777,7 @@ func DecodeVersionEdit(data []byte) (*VersionEdit, error) {
 			if pOff >= len(payload) {
 				return nil, &errors.CorruptedVersionEditError{Offset: int64(fieldStart), Reason: "truncated AddFile fileNum"}
 			}
-			fNum, n, err := binary.GetVarint64(payload[pOff:])
+			fNum, n, err := binary.GetVarint64Canonical(payload[pOff:])
 			if err != nil {
 				return nil, &errors.CorruptedVersionEditError{Offset: int64(fieldStart), Reason: "malformed AddFile fileNum"}
 			}
@@ -773,7 +786,7 @@ func DecodeVersionEdit(data []byte) (*VersionEdit, error) {
 			if pOff >= len(payload) {
 				return nil, &errors.CorruptedVersionEditError{Offset: int64(fieldStart), Reason: "truncated AddFile fileSize"}
 			}
-			fSize, n, err := binary.GetVarint64(payload[pOff:])
+			fSize, n, err := binary.GetVarint64Canonical(payload[pOff:])
 			if err != nil {
 				return nil, &errors.CorruptedVersionEditError{Offset: int64(fieldStart), Reason: "malformed AddFile fileSize"}
 			}
@@ -782,7 +795,7 @@ func DecodeVersionEdit(data []byte) (*VersionEdit, error) {
 			if pOff >= len(payload) {
 				return nil, &errors.CorruptedVersionEditError{Offset: int64(fieldStart), Reason: "truncated AddFile smallestSeqNum"}
 			}
-			sSeq, n, err := binary.GetVarint64(payload[pOff:])
+			sSeq, n, err := binary.GetVarint64Canonical(payload[pOff:])
 			if err != nil {
 				return nil, &errors.CorruptedVersionEditError{Offset: int64(fieldStart), Reason: "malformed AddFile smallestSeqNum"}
 			}
@@ -791,7 +804,7 @@ func DecodeVersionEdit(data []byte) (*VersionEdit, error) {
 			if pOff >= len(payload) {
 				return nil, &errors.CorruptedVersionEditError{Offset: int64(fieldStart), Reason: "truncated AddFile largestSeqNum"}
 			}
-			lSeq, n, err := binary.GetVarint64(payload[pOff:])
+			lSeq, n, err := binary.GetVarint64Canonical(payload[pOff:])
 			if err != nil {
 				return nil, &errors.CorruptedVersionEditError{Offset: int64(fieldStart), Reason: "malformed AddFile largestSeqNum"}
 			}
@@ -800,7 +813,7 @@ func DecodeVersionEdit(data []byte) (*VersionEdit, error) {
 			if pOff >= len(payload) {
 				return nil, &errors.CorruptedVersionEditError{Offset: int64(fieldStart), Reason: "truncated AddFile smallestKeyLen"}
 			}
-			skLen, n, err := binary.GetVarint64(payload[pOff:])
+			skLen, n, err := binary.GetVarint64Canonical(payload[pOff:])
 			if err != nil {
 				return nil, &errors.CorruptedVersionEditError{Offset: int64(fieldStart), Reason: "malformed AddFile smallestKeyLen"}
 			}
@@ -817,7 +830,7 @@ func DecodeVersionEdit(data []byte) (*VersionEdit, error) {
 			if pOff >= len(payload) {
 				return nil, &errors.CorruptedVersionEditError{Offset: int64(fieldStart), Reason: "truncated AddFile largestKeyLen"}
 			}
-			lkLen, n, err := binary.GetVarint64(payload[pOff:])
+			lkLen, n, err := binary.GetVarint64Canonical(payload[pOff:])
 			if err != nil {
 				return nil, &errors.CorruptedVersionEditError{Offset: int64(fieldStart), Reason: "malformed AddFile largestKeyLen"}
 			}

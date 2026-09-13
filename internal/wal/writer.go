@@ -84,7 +84,8 @@ func OpenWriter(path string) (*WALWriter, error) {
 
 	cleanPath := filepath.Clean(path)
 
-	// Pre-open inspection: reject symlinks and directories
+	// Pre-open inspection: reject symlinks and directories (SEC-WAL-01: pin inode for double SameFile).
+	var preInfo os.FileInfo
 	if info, err := os.Lstat(cleanPath); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
 			return nil, fmt.Errorf("wal: cannot open symlink %s: %w", cleanPath, os.ErrInvalid)
@@ -95,12 +96,13 @@ func OpenWriter(path string) (*WALWriter, error) {
 				Mode: info.Mode(),
 			}
 		}
+		preInfo = info
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("wal: failed to inspect path %s: %w", cleanPath, err)
 	}
 
 	flags := os.O_WRONLY | os.O_CREATE | os.O_APPEND
-	f, err := os.OpenFile(cleanPath, flags, FileMode)
+	f, err := openFileNoFollow(cleanPath, flags, FileMode)
 	if err != nil {
 		return nil, fmt.Errorf("wal: failed to open file %s: %w", cleanPath, err)
 	}
@@ -116,13 +118,22 @@ func OpenWriter(path string) (*WALWriter, error) {
 		return nil, fmt.Errorf("wal: path %s is not a regular file (mode: %s): %w", cleanPath, finfo.Mode(), os.ErrInvalid)
 	}
 
-	// Post-open verification: prove the open file descriptor matches the inode on disk
+	// Post-open verification: double SameFile pinning (finfo vs pre + finfo vs post)
+	// closes A->B regular-swap window between pre-Lstat and open.
 	postInfo, lstatErr := os.Lstat(cleanPath)
 	if lstatErr != nil {
 		_ = f.Close()
 		return nil, fmt.Errorf("wal: failed to lstat file %s: %w", cleanPath, lstatErr)
 	}
+	if postInfo.Mode()&os.ModeSymlink != 0 {
+		_ = f.Close()
+		return nil, fmt.Errorf("wal: file %s was replaced with symlink during open: %w", cleanPath, os.ErrInvalid)
+	}
 	if !os.SameFile(finfo, postInfo) {
+		_ = f.Close()
+		return nil, fmt.Errorf("wal: file %s was replaced during open: %w", cleanPath, os.ErrInvalid)
+	}
+	if preInfo != nil && !os.SameFile(finfo, preInfo) {
 		_ = f.Close()
 		return nil, fmt.Errorf("wal: file %s was replaced during open: %w", cleanPath, os.ErrInvalid)
 	}
@@ -177,7 +188,7 @@ func CreateWriter(path string) (*WALWriter, error) {
 
 	// Atomic exclusive creation: kernel guarantees fail-fast if file exists concurrently
 	flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL | os.O_APPEND
-	f, err := os.OpenFile(cleanPath, flags, FileMode)
+	f, err := openFileNoFollow(cleanPath, flags, FileMode)
 	if err != nil {
 		return nil, fmt.Errorf("wal: failed to create segment file %s: %w", cleanPath, err)
 	}
@@ -198,6 +209,10 @@ func CreateWriter(path string) (*WALWriter, error) {
 	if lstatErr != nil {
 		_ = f.Close()
 		return nil, fmt.Errorf("wal: failed to lstat created file %s: %w", cleanPath, lstatErr)
+	}
+	if postInfo.Mode()&os.ModeSymlink != 0 {
+		_ = f.Close()
+		return nil, fmt.Errorf("wal: file %s was replaced with symlink during create: %w", cleanPath, os.ErrInvalid)
 	}
 	if !os.SameFile(finfo, postInfo) {
 		_ = f.Close()
