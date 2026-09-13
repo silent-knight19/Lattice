@@ -271,6 +271,15 @@ var (
 
 	// ErrCurrentCorrupted indicates that the CURRENT pointer file content is malformed, truncated, oversized, or non-canonical.
 	ErrCurrentCorrupted = stdErrors.New("CURRENT file corrupted")
+
+	// ErrNilVersion indicates that a nil Version pointer was passed to VersionSet.
+	ErrNilVersion = stdErrors.New("version cannot be nil")
+
+	// ErrDeadVersion indicates that an operation was attempted on a Version whose reference count has reached zero.
+	ErrDeadVersion = stdErrors.New("cannot operate on dead version: reference count is zero")
+
+	// ErrVersionAlreadyAppended indicates that a Version was attempted to be appended to a VersionSet when it already belongs to one.
+	ErrVersionAlreadyAppended = stdErrors.New("version already belongs to a VersionSet")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing

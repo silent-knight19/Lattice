@@ -1742,11 +1742,30 @@ TOTAL: 184 Discrete, Testable Micro-Phases
     - `BenchmarkReadCurrentManifest`: 12.23 µs/op, 1,224 B/op, 12 allocs/op (~81.7k ops/sec full OS pipeline).
   * *Completion*: Complete and verified under `-race`, `go vet`, `golangci-lint`. P06-S02-M02 complete; P06-S02-M03 remains next micro-phase.
 * **P06-S02-M03: `VersionSet` & Version-Pinned Reference Counting**
-  * *Objective*: Maintain linked list of active `Version` structs with atomic `Ref()` and `Unref()`.
-  * *Changes*: `VersionSet.AppendVersion(v *Version)`, `Version.Ref()`, `Version.Unref()`.
-  * *Invariants*: SSTable physical file descriptors are never closed while `v.refCount > 0`.
-  * *Tests*: Multi-threaded test pinning versions while compactor simulates file deletions.
-  * *Completion*: Reference counting verified race-clean.
+  * *Objective*: Implement the in-memory `Version` and `VersionSet` metadata ownership layer. Maintain an active circular doubly-linked version chain with atomic reference counting (`Ref()`, `Unref()`, `TryRef()`) and atomic publication (`AppendVersion(v)`, `Current()`).
+  * *Invariants*:
+    - Non-resurrection: Calling `Ref()` on a Version whose `refCount <= 0` panics. Dead versions cannot be resurrected.
+    - Underflow defense: Calling `Unref()` on a Version whose `refCount <= 0` panics. Negative reference counts are impossible.
+    - Exactly-once cleanup: The final transition from 1 to 0 triggers `finalize()` (unlinks Version from active chain under `vs.mu` and invokes `cleanup()`) exactly once.
+    - Immutability: `NewVersion` defensively clones all level slices and internal byte keys (`SmallestKey`, `LargestKey`). Published versions cannot be mutated by caller slice aliasing.
+    - Pinned version survival: Reader holding a pinned snapshot via `Current()` remains valid after newer versions are installed; obsolete resources are not reclaimed until the last reader calls `Unref()`.
+    - Lock-order safety: `AppendVersion` releases `oldCurrent.Unref()` outside `vs.mu` to prevent deadlock with `finalize()`.
+  * *Tests & Verification*:
+    - Initial state: verifies `refCount = 1`, `ID = 0`, valid empty levels.
+    - Reference lifecycle: single and multiple `Ref()` and `Unref()` sequences.
+    - Invariant violations: verifies panic on `Ref()` resurrection and `Unref()` underflow.
+    - Immutability defense: verifies caller mutations to input slices and key buffers do not leak into `Version`.
+    - Active chain management: sequential installation of V1, V2, V3 with sequential ID assignment and unpinned version unlinking.
+    - Input validation: rejects `nil` (`ErrNilVersion`), dead versions (`ErrDeadVersion`), and already-appended versions (`ErrVersionAlreadyAppended`).
+    - Pinning survival: reader holds V1 while V2 installs; verifies V1 is retained in active chain and reclaimed only after reader unpins.
+    - Compactor simulation: verifies obsolete SSTable file retention while an older Version is pinned, and reclamation upon final unpin.
+    - Concurrent stress: 8 readers and 4 installers executing hundreds of concurrent pins and updates verified race-free under `go test -race`.
+    - Deterministic random lifecycle: randomized sequence of `Ref()` and `Unref()` calls confirming exact modeled lifecycle.
+  * *Measured Results* (Apple M4, Darwin arm64):
+    - `BenchmarkVersion_RefUnref`: 7.81 ns/op, 0 B/op, 0 allocs/op (~128M ops/sec).
+    - `BenchmarkVersionSet_Current`: 7.79 ns/op, 0 B/op, 0 allocs/op (~128M ops/sec).
+    - `BenchmarkVersionSet_AppendVersion`: 40.88 ns/op, 224 B/op, 1 alloc/op (~24.4M ops/sec).
+  * *Completion*: Complete and verified under `-race`, `go vet`, `golangci-lint`. Phase 06 Section 02 complete; Phase 07 (Recovery & Replay) remains next phase.
 
 ---
 

@@ -86,6 +86,9 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrCurrentDirectorySync", errors.ErrCurrentDirectorySync, "failed to synchronize parent directory for CURRENT"},
 		{"ErrCurrentNotFound", errors.ErrCurrentNotFound, "CURRENT file not found"},
 		{"ErrCurrentCorrupted", errors.ErrCurrentCorrupted, "CURRENT file corrupted"},
+		{"ErrNilVersion", errors.ErrNilVersion, "version cannot be nil"},
+		{"ErrDeadVersion", errors.ErrDeadVersion, "cannot operate on dead version: reference count is zero"},
+		{"ErrVersionAlreadyAppended", errors.ErrVersionAlreadyAppended, "version already belongs to a VersionSet"},
 	}
 
 	for _, tc := range sentinels {

@@ -78,3 +78,8 @@ func SetCurrentLstatFnForTesting(fn func(name string) (os.FileInfo, error)) func
 	currentLstatFn = fn
 	return func() { currentLstatFn = orig }
 }
+
+// SetCleanupFnForTesting attaches an arbitrary callback invoked on the final 1->0 Unref transition.
+func (v *Version) SetCleanupFnForTesting(fn func()) {
+	v.cleanupFn = fn
+}
