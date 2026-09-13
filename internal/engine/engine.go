@@ -350,7 +350,16 @@ func (e *Engine) RecoverWAL() error {
 	}
 
 	// Step 2: Recover uncommitted WAL records newer than checkpoint
-	return e.recoverWALInternal(dbPath, checkpoint, replayRes)
+	if err := e.recoverWALInternal(dbPath, checkpoint, replayRes); err != nil {
+		return err
+	}
+
+	// Step 3: Purge unreferenced crash-window temporary files left by interrupted writes/flushes
+	if err := e.CleanOrphanedFiles(); err != nil {
+		return fmt.Errorf("engine: failed to clean orphaned temporary files: %w", err)
+	}
+
+	return nil
 }
 
 // RecoverWALFromCheckpoint executes WAL recovery with an explicitly supplied sequence watermark.
@@ -368,7 +377,10 @@ func (e *Engine) RecoverWALFromCheckpoint(checkpoint binary.SeqNum) error {
 		return fmt.Errorf("%w: engine dbPath cannot be empty", os.ErrInvalid)
 	}
 
-	return e.recoverWALInternal(dbPath, checkpoint, nil)
+	if err := e.recoverWALInternal(dbPath, checkpoint, nil); err != nil {
+		return err
+	}
+	return e.CleanOrphanedFiles()
 }
 
 // RecoverWALWithManifestResult executes WAL recovery composing directly with a pre-computed
@@ -389,7 +401,10 @@ func (e *Engine) RecoverWALWithManifestResult(res *version.ReplayResult) error {
 		return fmt.Errorf("%w: engine dbPath cannot be empty", os.ErrInvalid)
 	}
 
-	return e.recoverWALInternal(dbPath, res.LastSeqNum, res)
+	if err := e.recoverWALInternal(dbPath, res.LastSeqNum, res); err != nil {
+		return err
+	}
+	return e.CleanOrphanedFiles()
 }
 
 func (e *Engine) recoverWALInternal(dbPath string, checkpoint binary.SeqNum, replayRes *version.ReplayResult) error {

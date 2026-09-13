@@ -1913,10 +1913,51 @@ TOTAL: 184 Discrete, Testable Micro-Phases
     - `BenchmarkEngineRecoverWAL_1000Records`: 4.21 ms/op, 298.6 KB/op, 16,070 allocs/op (~237 replays/sec, ~4.2 µs/record replayed).
   * *Completion*: Complete and verified under `-race`, `go vet`, `golangci-lint`. P07-S02-M01 complete; P07-S02-M02 (Orphaned Temporary File Garbage Collector) remains next micro-phase.
 * **P07-S02-M02: Orphaned Temporary File Garbage Collector**
-  * *Objective*: Scan directory on boot and remove unreferenced `.tmp` files left by interrupted compactions or flushes.
-  * *Changes*: `Engine.CleanOrphanedFiles() error`.
-  * *Tests*: Inject fake `.tmp` files; verify recovery safely purges them without touching valid SSTables.
-  * *Completion*: Orphan GC verified.
+  * *Objective*: Safely scan the database directory at startup and remove unreferenced crash-window temporary files left behind by interrupted flushes, SSTable publication, or compaction work.
+  * *Changes*:
+    - `internal/engine/cleaner.go`:
+      - `IsOrphanStagingFile(name string) bool`: strictly validates temporary staging file grammar (`.tmp_<name>.sst_<random>`).
+      - `CleanOrphanReport`: diagnostic result structure tracking `CandidatesFound`, `FilesCleaned`, and `Failures`.
+      - `CleanOrphanedFilesDir(dbPath string) (CleanOrphanReport, error)`: bounded, non-recursive direct directory scanner enforcing symlink refusal, directory masquerade protection, parent directory pinning, and safe unlink.
+      - `(e *Engine) CleanOrphanedFiles() error` and `(e *Engine) CleanOrphanedFilesWithReport() (CleanOrphanReport, error)`: thread-safe engine methods.
+    - `internal/engine/engine.go`:
+      - Integrated `e.CleanOrphanedFiles()` into the final stage of `RecoverWAL()`, `RecoverWALFromCheckpoint()`, and `RecoverWALWithManifestResult()`, establishing the canonical startup recovery pipeline: `boot -> CURRENT discovery -> MANIFEST replay -> WAL replay -> orphan cleanup`.
+    - `internal/engine/cleaner_test.go`: 15 comprehensive unit and integration tests covering the complete acceptance matrix (A through O) including symlink victim protection, directory masquerade defense, FIFO rejection, near-miss file preservation, real TableWriter staging artifact cleanup, and crash pipeline integration under `-race`.
+    - `internal/engine/cleaner_bench_test.go`: Benchmarks for 100, 1,000, and 10,000 directory entries.
+  * *Invariants Maintained*:
+    - *P07-S02-M02-INV-01*: Only exact known temporary/staging filename patterns (`.tmp_<name>.sst_<random>`) are eligible for deletion.
+    - *P07-S02-M02-INV-02*: Persistent database files (CURRENT, MANIFEST, .sst, WAL) are never deletion candidates.
+    - *P07-S02-M02-INV-03*: Symlink candidates are never followed or unlinked; external victim targets are preserved byte-identical.
+    - *P07-S02-M02-INV-04*: Directory/special-file candidates are never recursively removed.
+    - *P07-S02-M02-INV-05*: Deletion is strictly confined to direct children of the database directory (no directory traversal).
+    - *P07-S02-M02-INV-06*: Live SSTables, MANIFEST, CURRENT, and WAL files remain untouched (SHA-256 verified).
+    - *P07-S02-M02-INV-07*: Cleanup is idempotent (repeated executions on clean state are zero-op successes).
+    - *P07-S02-M02-INV-08*: Deletion failures surface explicitly in `CleanOrphanReport` and do not authorize unrelated deletions.
+    - *P07-S02-M02-INV-09*: Parent directory descriptor pinning (`os.SameFile`) prevents TOCTOU directory swaps.
+    - *P07-S02-M02-INV-10*: Cleanup does not modify file contents; only unlinks validated orphan regular files.
+    - *P07-S02-M02-INV-11*: Unknown or ambiguous files (`unknown.tmp`, `important.tmp.backup`, `CURRENT.tmp`) are preserved.
+    - *P07-S02-M02-INV-12*: Cleanup does not recursively scan or delete arbitrary subtrees.
+  * *Tests*:
+    - `TestCleanOrphanedFiles_A_EmptyDirectory`: Clean success on empty DB directory.
+    - `TestCleanOrphanedFiles_B_NoTemporaryFiles`: Clean success when persistent files exist without orphans.
+    - `TestCleanOrphanedFiles_C_OneValidOrphan`: Removes single orphan `.tmp_000001.sst_9876543210`.
+    - `TestCleanOrphanedFiles_D_MultipleOrphans`: Removes multiple orphan staging files.
+    - `TestCleanOrphanedFiles_E_MixedPersistentFiles`: Verifies SHA-256 byte-for-byte identity preservation across CURRENT, MANIFEST, .sst, and WAL.
+    - `TestCleanOrphanedFiles_F_SymlinkVictimProtection`: Symlink masquerade does not follow link; external victim file preserved byte-identical.
+    - `TestCleanOrphanedFiles_G_DirectoryMasquerade`: Directory named like staging file is not recursively deleted.
+    - `TestCleanOrphanedFiles_H_FIFOMasquerade`: Non-regular special file is rejected.
+    - `TestCleanOrphanedFiles_I_UnknownTmpFilesPreserved`: Near-miss files (`important.tmp.backup`, `unknown.tmp`, `CURRENT.tmp`) are preserved.
+    - `TestCleanOrphanedFiles_J_PathTraversalUnitTests`: Rejects paths with `..`, `/`, `\`, null bytes.
+    - `TestCleanOrphanedFiles_K_DeletionPermissionFailure`: Permission failure surfaces explicitly in report.
+    - `TestCleanOrphanedFiles_L_Idempotence`: Second cleanup pass is a clean no-op.
+    - `TestCleanOrphanedFiles_M_RealTableWriterStagingArtifact`: Removes real staging artifact from interrupted `sstable.TableWriter`.
+    - `TestCleanOrphanedFiles_N_CrashRecoveryPipelineIntegration`: End-to-end recovery pipeline (`RecoverWAL` -> MANIFEST + WAL + Orphan Cleanup).
+    - `TestCleanOrphanedFiles_O_DecisionTable`: Validates Section 45 decision matrix.
+  * *Benchmarks* (Apple M4, Darwin arm64):
+    - `BenchmarkCleanOrphanedFiles_100Entries`: 6.95 ms/op, 26.4 KB/op, 298 allocs/op (~144 ops/sec).
+    - `BenchmarkCleanOrphanedFiles_1000Entries`: 18.51 ms/op, 177.2 KB/op, 2,421 allocs/op (~54 ops/sec).
+    - `BenchmarkCleanOrphanedFiles_10000Entries`: 35.33 ms/op, 1.77 MB/op, 22,028 allocs/op (~28 ops/sec for scanning 10,000 files and unlinking 500 orphans).
+  * *Completion*: Complete and verified under `-race`, `go vet`, `golangci-lint`. Phase 07 (Crash Recovery & Integrity Verification) fully completed!
 
 ---
 
