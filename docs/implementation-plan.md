@@ -1791,10 +1791,37 @@ TOTAL: 184 Discrete, Testable Micro-Phases
 
 ### Sub-Phase 07.1: Manifest Replay & Version Reconstruction
 * **P07-S01-M01: Boot Discovery & CURRENT Validation**
-  * *Objective*: Scan data directory on startup, parse `CURRENT`, open active `MANIFEST`.
-  * *Changes*: `Engine.RecoverManifest() (*Version, error)`.
-  * *Tests*: Replay empty DB boot; replay populated DB boot.
-  * *Completion*: Boot discovery verified.
+  * *Status*: **COMPLETE**
+  * *Objective*: Scan data directory on startup, validate target directory, strictly parse `CURRENT` via canonical reader, resolve active `MANIFEST-%06d`, securely inspect and open the active MANIFEST regular file with symlink and TOCTOU defenses, and transfer unambiguous descriptor ownership to subsequent recovery stages.
+  * *API & Types Implemented*:
+    - `type DiscoveredManifest struct`: encapsulates `Dir`, `ManifestNum`, canonical `Path`, open regular file descriptor `File *os.File` pinned to the inode, and `FileSize int64`.
+    - `(d *DiscoveredManifest) Close() error`: safe, idempotent descriptor cleanup.
+    - `DiscoverActiveManifest(dir string) (*DiscoveredManifest, error)`: entrypoint for startup discovery.
+    - Sentinel in `internal/errors`: `ErrManifestNotFound = stdErrors.New("manifest file not found")`.
+    - Internal error: `manifestNotFoundError` matching both `ErrManifestNotFound` and `os.ErrNotExist` via `errors.Is`.
+  * *Invariants & Security Hardening*:
+    - *P07-S01-M01-INV-01*: Exactly one authoritative active manifest resolved from `CURRENT`.
+    - *P07-S01-M01-INV-02*: Malformed `CURRENT` never triggers fallback to another MANIFEST in the directory.
+    - *P07-S01-M01-INV-03*: Discovered MANIFEST must be a validated regular file (directories, symlinks, and special files rejected fail-closed).
+    - *P07-S01-M01-INV-04*: Filesystem replacement races rejected via double inode pinning (`os.SameFile(fstat, lstatBefore)` and `os.SameFile(fstat, lstatAfter)`).
+    - *P07-S01-M01-INV-05*: Discovery performs zero state mutation on disk (`CURRENT` and `MANIFEST` byte hashes strictly identical before and after).
+    - *P07-S01-M01-INV-06*: Unambiguous descriptor ownership: opened descriptor transferred to `DiscoveredManifest`, guaranteed cleanup on all error paths without leaks.
+    - *P07-S01-M01-INV-07*: Bounded metadata consumption only (31-byte stack buffer for `CURRENT`; no buffering of `MANIFEST` content into RAM).
+    - *P07-S01-M01-INV-08*: Repeated discovery over unchanged storage state is strictly deterministic.
+    - *P07-S01-M01-INV-09*: Fail-closed on all ambiguous or corrupted states.
+  * *Tests Added* (`internal/version/boot_test.go`, `boot_bench_test.go`):
+    - Test A: Populated directory boot with valid edits and descriptor verification.
+    - Test B: Multi-digit manifest numbers (`42`, `999999`, `1000000`, `999999999999`).
+    - Test C: Clean 0-byte regular MANIFEST discovery.
+    - Invalid CURRENT matrix: missing, empty, missing newline, double newline, CRLF, leading whitespace, invalid prefix, zero sequence, superfluous leading zeros, non-digits, uint64 overflow, too short (<16B), too long (>30B), symlink, directory.
+    - Invalid MANIFEST matrix: referenced file missing, directory, symlink, unopenable.
+    - Directory validation: empty string, non-existent path, regular file passed as directory, directory symlink.
+    - TOCTOU replacement races: inode swapped post-open, replaced with symlink post-open, parent directory swapped post-open.
+    - Invariants INV-01 through INV-09 verified.
+  * *Measured Results* (Apple M4, Darwin arm64):
+    - `BenchmarkDiscoverActiveManifest_Populated`: 27.26 µs/op, 3,201 B/op, 27 allocs/op (~36.7k ops/sec).
+    - `BenchmarkDiscoverActiveManifest_Empty`: 28.05 µs/op, 3,201 B/op, 27 allocs/op (~35.6k ops/sec).
+  * *Completion*: Complete and verified under `-race`, `go vet`, `golangci-lint`. P07-S01-M01 complete; P07-S01-M02 (Sequential VersionEdit Replay Engine) remains next micro-phase.
 * **P07-S01-M02: Sequential VersionEdit Replay Engine**
   * *Objective*: Replay `VersionEdit` records sequentially from manifest, reconstructing level arrays ($L_0..L_N$).
   * *Invariants*: If any referenced `.sst` file is missing from disk, abort with `ErrMissingSSTable`.

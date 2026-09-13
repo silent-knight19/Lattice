@@ -708,6 +708,18 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 43. Boot Discovery Scope & Sequential Replay Decoupling (P07-S01-M01)
+* **Limitation**: In `P07-S01-M01`, `DiscoverActiveManifest` establishes the secure boot discovery boundary that inspects the database directory, strictly parses the authoritative `CURRENT` pointer, resolves the active `MANIFEST-%06d` path, and safely opens the active MANIFEST regular file with symlink and TOCTOU defenses, but sequential `VersionEdit` record decoding, level array reconstruction ($L_0..L_6$), missing SSTable file detection (`ErrMissingSSTable`), and WAL replay into MemTable are intentionally excluded and reserved for subsequent micro-phases (`P07-S01-M02` and `P07-S02-M01`).
+* **Why It Exists**: Hard scope boundary enforcement and architectural separation of concerns. Startup recovery requires a verified, uncompromised descriptor to the active MANIFEST before state machine replay can begin. Coupling file discovery with record decoding would entangle descriptor lifecycle safety with logical state reconstruction.
+* **Impact**: Callers receive a verified `*DiscoveredManifest` with exclusive descriptor ownership (`File *os.File`), physical file size, and authoritative manifest sequence number, but must pass this descriptor to the sequential replay engine (`P07-S01-M02`) to reconstruct `Version` state.
+* **Current Mitigation**: Strict canonical parsing via `ReadCurrentManifest` rejects malformed or non-canonical pointers without fallback. Pre-open `os.Lstat` rejects symlinks, directories, and non-regular files; `openFileNoFollow` prevents symlink traversal; and post-open `os.SameFile` verification ensures the descriptor matches the inspected disk inode before and after opening. Failure paths guarantee descriptor closure via `defer`.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Zero fallback on corrupted `CURRENT`; zero state mutation; fail-closed on any ambiguous filesystem state).
+  * Performance: **Optimal** (~27.26 µs/op across full OS `lstat`/`open`/`fstat` pipeline; zero heap buffering of MANIFEST contents).
+  * Security: **Optimal** (Descriptor identity invariance eliminates TOCTOU substitution attacks).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*
 
 

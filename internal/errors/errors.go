@@ -287,6 +287,9 @@ var (
 	// ErrManifestExists indicates that a MANIFEST file already exists at the target path and cannot be overwritten.
 	ErrManifestExists = stdErrors.New("manifest file already exists")
 
+	// ErrManifestNotFound indicates that the referenced active MANIFEST file does not exist on disk.
+	ErrManifestNotFound = stdErrors.New("manifest file not found")
+
 	// ErrManifestHeaderTruncated indicates that a MANIFEST record header buffer is shorter than 8 bytes.
 	ErrManifestHeaderTruncated = stdErrors.New("manifest header truncated: buffer smaller than 8 bytes")
 

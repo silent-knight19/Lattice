@@ -101,3 +101,30 @@ func (v *Version) SetRefCountForTesting(count int64) {
 func ActiveCurrentLockCount() int {
 	return currentDirLocks.activeLockCount()
 }
+
+// SetBootLstatFnForTesting temporarily replaces bootLstatFn and returns a restore closure.
+func SetBootLstatFnForTesting(fn func(name string) (os.FileInfo, error)) func() {
+	orig := bootLstatFn
+	bootLstatFn = fn
+	return func() { bootLstatFn = orig }
+}
+
+// SetBootOpenFnForTesting temporarily replaces bootOpenFn and returns a restore closure.
+func SetBootOpenFnForTesting(fn func(path string, flag int, perm os.FileMode) (*os.File, error)) func() {
+	orig := bootOpenFn
+	bootOpenFn = fn
+	return func() { bootOpenFn = orig }
+}
+
+// SetBootPostOpenHookForTesting temporarily attaches a post-open hook and returns a restore closure.
+func SetBootPostOpenHookForTesting(fn func(path string, f *os.File) error) func() {
+	bootHookMu.Lock()
+	orig := bootPostOpenHook
+	bootPostOpenHook = fn
+	bootHookMu.Unlock()
+	return func() {
+		bootHookMu.Lock()
+		bootPostOpenHook = orig
+		bootHookMu.Unlock()
+	}
+}
