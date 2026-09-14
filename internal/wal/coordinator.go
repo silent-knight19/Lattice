@@ -257,8 +257,18 @@ func RecoverWAL(dbPath string, sink ReplaySink) (RecoveryReport, error) {
 	return report, nil
 }
 
-// ValidateSegmentContinuity validates that a sorted slice of segment IDs has no duplicates and no gaps.
+// ValidateSegmentContinuity validates that a sorted slice of segment IDs has no duplicates and no gaps,
+// and enforces that a non-empty segment chain begins at initial segment ID 1 (P07-SEC-013).
 func ValidateSegmentContinuity(ids []uint64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if ids[0] != 1 {
+		return &errors.SegmentGapError{
+			Expected: 1,
+			Actual:   ids[0],
+		}
+	}
 	for i := 1; i < len(ids); i++ {
 		if ids[i] == ids[i-1] {
 			return &errors.DuplicateSegmentError{SegmentID: ids[i]}

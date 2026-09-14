@@ -2004,6 +2004,43 @@ TOTAL: 184 Discrete, Testable Micro-Phases
     - *SEC-P07-06*: Cleaner directory-sync failures explicitly visible without corrupting deletion counts.
   * *Completion*: 100% tests green, race detector clean, 0 data races, cross-platform verified (Darwin arm64/amd64, Linux arm64/amd64, Windows fallback). Phase 08 remains NOT started.
 
+* **P07-SEC-REMED-2: Phase 07 Audit 2 Security Remediation — Metadata, WAL Bounds & SSTable Lifecycle**
+  * *Status*: **COMPLETE**
+  * *Objective*: Remediate 10 confirmed Phase 07 security/correctness findings identified by Audit 2 (`P07-SEC-001` through `P07-SEC-014`).
+  * *Changes*:
+    - `internal/errors/errors.go`:
+      - Sentinels: `ErrSSTableSizeMismatch`, `ErrRecoveryBatchLimitExceeded`.
+      - Structured errors: `SSTableSizeMismatchError`, `RecoveryBatchLimitError`.
+    - `internal/wal/coordinator.go`:
+      - Validated initial WAL segment ID `ids[0] == 1` in `ValidateSegmentContinuity()`.
+    - `internal/version/replay.go`:
+      - Added `ParseTableFilename(name string) (uint64, bool)`.
+      - Added `fileProvenance` to `versionBuilder` tracking `RecordIndex` and `Offset` for each `AddFile`.
+      - Monotonicity checks in `applyEdit`: regressing `NextFileNum` or `LastSeqNum` fails closed with `ErrCorruptedVersionEdit`.
+      - Physical SSTable file size verification against `FileMetadata.FileSize` in `validatePhysicalSSTables()`, propagating provenance in `ReplayError`.
+    - `internal/engine/engine.go`:
+      - Engine-level allocator state `nextFileNum atomic.Uint64` with `NextFileNum()` and `AllocateFileNum()`.
+      - Authoritative watermark initialization and advancement beyond physical `.sst` files on disk (`maxPhysicalSSTNum + 1`).
+      - Cleaner resilience: safe refusals (symlink, directory, permissions) preserved as diagnostics in `lastCleanerReport` without blocking engine startup.
+      - Bounded WAL `batchBuffer`: `MaxRecoveryBatchRecords = 10000`, `MaxRecoveryBatchBytes = 64 * 1024 * 1024`, checked before allocation with zero partial publication.
+    - `docs/interview-knowledge.md`:
+      - Resolved sequence watermark vs runtime allocation documentation discrepancy (`P07-SEC-014`).
+    - Tests Added:
+      - `internal/wal/sec_p07_audit2_wal_test.go`: Segment continuity matrix, end-to-end recovery, empty WAL.
+      - `internal/version/sec_p07_audit2_version_test.go`: SSTable size validation matrix, scalar regressions, diagnostic provenance, filename parsing.
+      - `internal/engine/sec_p07_audit2_test.go`: Missing MANIFEST matrix, crash-window and file-number collision prevention, cleaner refusal resilience, WAL batch bounds, cross-finding interactions.
+  * *Invariants & Security Guarantees*:
+    - *P07-SEC-001*: Missing referenced MANIFEST fails closed (`ErrManifestNotFound`); fresh database requires absence of CURRENT.
+    - *P07-SEC-004 & P07-SEC-006*: Allocator advances past physically existing files; uncommitted staging files cannot collide with future allocations.
+    - *P07-SEC-005*: Cleaner refusal of unsafe entries records diagnostics without causing startup denial of service.
+    - *P07-SEC-007*: WAL batchBuffer bounded before allocation; oversized batches fail closed without publishing partial state.
+    - *P07-SEC-008*: Physical SSTable sizes must match manifest metadata; mismatches fail closed.
+    - *P07-SEC-011*: VersionEdit scalar regressions fail closed.
+    - *P07-SEC-012*: ReplayError post-scan validation diagnostics accurately report the originating edit's record index and offset.
+    - *P07-SEC-013*: Non-empty WAL segment chains must start with segment 1.
+    - *P07-SEC-014*: Documentation accurately reflects sequence watermark and atomic increment semantics.
+  * *Completion*: 100% tests green, race detector clean, 0 data races. Phase 08 remains NOT started.
+
 ---
 
 # Phase 08: Leveled Compaction Subsystem

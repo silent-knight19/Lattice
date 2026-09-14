@@ -47,11 +47,22 @@ func setupTestManifest(t *testing.T, dir string, manifestNum uint64, edits []*Ve
 }
 
 // createDummySSTable creates a valid regular file for the given file number.
-func createDummySSTable(t *testing.T, dir string, fileNum uint64) string {
+func createDummySSTable(t *testing.T, dir string, fileNum uint64, size ...uint64) string {
 	t.Helper()
 	p := TablePath(dir, fileNum)
-	if err := os.WriteFile(p, []byte("valid-sstable-regular-file-content"), 0600); err != nil {
-		t.Fatalf("createDummySSTable: failed to write %s: %v", p, err)
+	fileSize := uint64(1024)
+	if len(size) > 0 {
+		fileSize = size[0]
+	}
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatalf("createDummySSTable: failed to open %s: %v", p, err)
+	}
+	defer f.Close()
+	if fileSize > 0 {
+		if err := f.Truncate(int64(fileSize)); err != nil {
+			t.Fatalf("createDummySSTable: failed to truncate %s to %d: %v", p, fileSize, err)
+		}
 	}
 	return p
 }
@@ -201,7 +212,7 @@ func TestReplayManifest_HistoricallyDeletedSSTable(t *testing.T) {
 	})
 
 	// Crucial: File 1 does NOT exist on disk! Only File 2 exists.
-	createDummySSTable(t, dir, 2)
+	createDummySSTable(t, dir, 2, 800)
 
 	disc := setupTestManifest(t, dir, 1, []*VersionEdit{e1, e2})
 	defer func() { _ = disc.Close() }()
@@ -270,11 +281,11 @@ func TestReplayManifest_MultipleLevelsAndOrdering(t *testing.T) {
 	})
 
 	// Create physical SSTables
-	createDummySSTable(t, dir, 5)
-	createDummySSTable(t, dir, 2)
-	createDummySSTable(t, dir, 20)
-	createDummySSTable(t, dir, 10)
-	createDummySSTable(t, dir, 30)
+	createDummySSTable(t, dir, 5, 100)
+	createDummySSTable(t, dir, 2, 100)
+	createDummySSTable(t, dir, 20, 200)
+	createDummySSTable(t, dir, 10, 200)
+	createDummySSTable(t, dir, 30, 200)
 
 	disc := setupTestManifest(t, dir, 1, []*VersionEdit{e})
 	defer func() { _ = disc.Close() }()
@@ -759,8 +770,8 @@ func TestReplayManifest_100HistoricalEdits_Differential(t *testing.T) {
 
 	// Create dummy SSTable regular files ONLY for surviving active files in the oracle
 	for lvl := 0; lvl < NumLevels; lvl++ {
-		for fileNum := range oracle.levels[lvl] {
-			createDummySSTable(t, dir, fileNum)
+		for fileNum, meta := range oracle.levels[lvl] {
+			createDummySSTable(t, dir, fileNum, meta.FileSize)
 		}
 	}
 
@@ -949,8 +960,8 @@ func TestReplayManifest_Determinism(t *testing.T) {
 		SmallestSeqNum: 3, LargestSeqNum: 4,
 	})
 
-	createDummySSTable(t, dir, 1)
-	createDummySSTable(t, dir, 2)
+	createDummySSTable(t, dir, 1, 100)
+	createDummySSTable(t, dir, 2, 200)
 
 	disc := setupTestManifest(t, dir, 1, []*VersionEdit{e})
 	defer func() { _ = disc.Close() }()
@@ -1011,7 +1022,7 @@ func TestReplayManifest_UnreferencedExtraSSTable(t *testing.T) {
 		SmallestSeqNum: 1, LargestSeqNum: 2,
 	})
 
-	createDummySSTable(t, dir, 1)
+	createDummySSTable(t, dir, 1, 100)
 
 	// Extra SSTables on disk not referenced in the manifest (e.g. obsolete or staged)
 	createDummySSTable(t, dir, 999)

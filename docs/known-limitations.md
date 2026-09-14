@@ -771,6 +771,25 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 48. Phase 07 Audit 2 Security Hardening: Metadata, WAL Bounds & SSTable Lifecycle (P07-SEC-REMED-2)
+* **Remediation & Architectural Boundaries**:
+  Following the second independent security audit of Phase 07, ten confirmed security and correctness findings (`P07-SEC-001` through `P07-SEC-014`) were remediated:
+  1. **Missing MANIFEST Fail-Closed (`P07-SEC-001`)**: `Engine.RecoverWAL()` strictly differentiates `ErrCurrentNotFound` (an uninitialized, fresh database directory) from `ErrManifestNotFound` (an existing `CURRENT` pointing to a missing `MANIFEST` file). If `CURRENT` references a missing `MANIFEST`, recovery fails closed with `ErrManifestNotFound` rather than treating the directory as uninitialized or resetting checkpoints to 0.
+  2. **Orphan Finalized SSTable Crash-Window & File-Number Safety (`P07-SEC-004`, `P07-SEC-006`)**: During recovery, `Engine` initializes its `nextFileNum` allocator to the maximum of: the authoritative MANIFEST watermark, the highest numbered physical `.sst` file on disk + 1, and 1. This guarantees that uncommitted SSTables written and linked prior to a crash can never collide with subsequent TableWriter allocations.
+  3. **Cleaner Startup Denial of Service Prevention (`P07-SEC-005`)**: The orphan file cleaner strictly refuses unsafe entries (symlinks, directories, permission-denied files) without deleting them, but records refusal diagnostics in `lastCleanerReport` instead of converting individual safe refusals into fatal boot errors. Startup fails only on critical filesystem-level failures (e.g. inability to open the DB directory).
+  4. **WAL Recovery Bounded Batch Buffering (`P07-SEC-007`)**: Uncommitted batch records between `BATCH_START` and `BATCH_COMMIT` are buffered with strict pre-allocation limits: `MaxRecoveryBatchRecords = 10,000` records and `MaxRecoveryBatchBytes = 64 MiB`. Memory accounting includes key, value, and overhead bytes before append, failing closed with `ErrRecoveryBatchLimitExceeded` without publishing partial batches.
+  5. **SSTable Physical File Size Validation (`P07-SEC-008`)**: During MANIFEST replay, all referenced `.sst` files are verified via `os.Lstat` to ensure their physical disk size exactly equals `FileMetadata.FileSize`. Mismatches fail closed with `ErrSSTableSizeMismatch`.
+  6. **MANIFEST Scalar Regression Detection (`P07-SEC-011`)**: `versionBuilder.applyEdit()` strictly enforces monotonicity on `NextFileNum` and `LastSeqNum`. Decreasing scalar values in subsequent `VersionEdit` records are rejected as corruption with `ErrCorruptedVersionEdit`.
+  7. **ReplayError Diagnostic Provenance (`P07-SEC-012`)**: Post-replay validation errors (such as missing SSTables, file size mismatches, or level range overlaps) accurately report the originating `RecordIndex` and stream `Offset` of the `AddFile` edit that introduced the file.
+  8. **Initial WAL Segment ID Validation (`P07-SEC-013`)**: `ValidateSegmentContinuity()` requires that non-empty WAL segment chains begin with segment ID 1 (`ids[0] == 1`). Chains with missing initial segments fail closed with `SegmentGapError`.
+  9. **Sequence Number Contract Alignment (`P07-SEC-014`)**: Documentation has been aligned with runtime semantics: `nextSeqNum` represents the sequence watermark, and runtime write mutations allocate sequence numbers via `nextSeqNum.Add(1)`.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Missing authoritative metadata fails closed; file allocations are collision-free; WAL batches are strictly bounded).
+  * Performance: **Optimal** (Pre-allocation bounds prevent heap exhaustion; O(1) atomic file-number allocation).
+  * Security: **Optimal** (Adversarial symlink or permission squats cannot cause denial of service; corrupted metadata is immediately rejected).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*
 
 

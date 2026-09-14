@@ -4,6 +4,7 @@ import (
 	"context"
 	stdErrors "errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -25,6 +26,36 @@ const (
 	engineStateClosed
 )
 
+const (
+	// MaxRecoveryBatchRecords defines the maximum count of records permitted within a single WAL batch during recovery (10,000 records).
+	MaxRecoveryBatchRecords = 10000
+
+	// MaxRecoveryBatchBytes defines the maximum cumulative memory budget permitted for a single WAL batch during recovery (64 MiB).
+	MaxRecoveryBatchBytes uint64 = 64 * 1024 * 1024
+)
+
+var (
+	recoveryBatchMaxRecords = MaxRecoveryBatchRecords
+	recoveryBatchMaxBytes   = MaxRecoveryBatchBytes
+	recoveryBatchLimitsMu   sync.Mutex
+)
+
+// SetRecoveryBatchLimitsForTesting configures custom recovery batch limits for testing and returns a restore function.
+func SetRecoveryBatchLimitsForTesting(maxRecords int, maxBytes uint64) func() {
+	recoveryBatchLimitsMu.Lock()
+	prevRecords := recoveryBatchMaxRecords
+	prevBytes := recoveryBatchMaxBytes
+	recoveryBatchMaxRecords = maxRecords
+	recoveryBatchMaxBytes = maxBytes
+	recoveryBatchLimitsMu.Unlock()
+	return func() {
+		recoveryBatchLimitsMu.Lock()
+		recoveryBatchMaxRecords = prevRecords
+		recoveryBatchMaxBytes = prevBytes
+		recoveryBatchLimitsMu.Unlock()
+	}
+}
+
 var (
 	recoveryPrePublishHookMu sync.Mutex
 	recoveryPrePublishHook   func(*Engine)
@@ -45,15 +76,17 @@ func SetRecoveryPrePublishHookForTesting(hook func(*Engine)) func() {
 // Engine coordinates the active MemTable, immutable flush candidates,
 // VersionSet snapshot management, and backpressure gating (SEC-003).
 type Engine struct {
-	mu           sync.RWMutex
-	dbPath       string
-	activeMem    *memtable.SkipList
-	immMems      []*memtable.SkipList
-	backpressure *BackpressureController
-	nextSeqNum   atomic.Uint64
-	closed       atomic.Bool
-	state        engineState
-	vset         *version.VersionSet
+	mu                sync.RWMutex
+	dbPath            string
+	activeMem         *memtable.SkipList
+	immMems           []*memtable.SkipList
+	backpressure      *BackpressureController
+	nextSeqNum        atomic.Uint64
+	nextFileNum       atomic.Uint64
+	closed            atomic.Bool
+	state             engineState
+	vset              *version.VersionSet
+	lastCleanerReport CleanOrphanReport
 }
 
 // EngineOptions specifies configuration parameters for initializing an Engine instance.
@@ -134,6 +167,24 @@ func (e *Engine) VersionSet() *version.VersionSet {
 // NextSeqNum returns the current sequence number watermark.
 func (e *Engine) NextSeqNum() uint64 {
 	return e.nextSeqNum.Load()
+}
+
+// NextFileNum returns the current next file number watermark (P07-SEC-006).
+func (e *Engine) NextFileNum() uint64 {
+	return e.nextFileNum.Load()
+}
+
+// AllocateFileNum atomically allocates and returns a new unique file number (P07-SEC-006).
+// Allocations start from the recovered nextFileNum watermark and advance monotonically.
+func (e *Engine) AllocateFileNum() uint64 {
+	return e.nextFileNum.Add(1) - 1
+}
+
+// LastCleanerReport returns the diagnostic report from the most recent orphan cleanup pass (P07-SEC-005).
+func (e *Engine) LastCleanerReport() CleanOrphanReport {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.lastCleanerReport
 }
 
 // Backpressure returns the engine's BackpressureController.
@@ -343,7 +394,7 @@ func (e *Engine) beginRecovery() error {
 		return errors.ErrRecoveryAlreadyComplete
 	}
 	// SEC-P07-01: Prohibit recovery if engine contains live mutations or uncommitted state
-	if e.activeMem.Len() > 0 || len(e.immMems) > 0 || e.nextSeqNum.Load() > 0 {
+	if e.activeMem.Len() > 0 || len(e.immMems) > 0 || e.nextSeqNum.Load() > 0 || e.nextFileNum.Load() > 0 {
 		return errors.ErrRecoveryInvalidState
 	}
 	if e.vset != nil && e.vset.HasCurrent() {
@@ -432,8 +483,16 @@ func (e *Engine) RecoverWAL() error {
 	}
 
 	// Step 3: Purge unreferenced crash-window temporary files left by interrupted writes/flushes
-	if err := e.CleanOrphanedFiles(); err != nil {
-		return fmt.Errorf("engine: failed to clean orphaned temporary files: %w", err)
+	// Individual orphan cleanup failures (e.g. symlinks, permission errors) do not invalidate
+	// successfully recovered durable state and must not cause startup denial of service (P07-SEC-005).
+	cleanReport, cleanErr := e.CleanOrphanedFilesWithReport()
+	e.mu.Lock()
+	e.lastCleanerReport = cleanReport
+	e.mu.Unlock()
+	if cleanErr != nil {
+		if isCriticalCleanerError(cleanErr, cleanReport) {
+			return fmt.Errorf("engine: failed to clean orphaned temporary files: %w", cleanErr)
+		}
 	}
 
 	return nil
@@ -458,7 +517,16 @@ func (e *Engine) RecoverWALFromCheckpoint(checkpoint binary.SeqNum) error {
 	if err := e.recoverWALInternal(dbPath, checkpoint, nil); err != nil {
 		return err
 	}
-	return e.CleanOrphanedFiles()
+	cleanReport, cleanErr := e.CleanOrphanedFilesWithReport()
+	e.mu.Lock()
+	e.lastCleanerReport = cleanReport
+	e.mu.Unlock()
+	if cleanErr != nil {
+		if isCriticalCleanerError(cleanErr, cleanReport) {
+			return fmt.Errorf("engine: failed to clean orphaned temporary files: %w", cleanErr)
+		}
+	}
+	return nil
 }
 
 // RecoverWALWithManifestResult executes WAL recovery composing directly with a pre-computed
@@ -489,7 +557,16 @@ func (e *Engine) RecoverWALWithManifestResult(res *version.ReplayResult) error {
 	if err := e.recoverWALInternal(dbPath, res.LastSeqNum, res); err != nil {
 		return err
 	}
-	return e.CleanOrphanedFiles()
+	cleanReport, cleanErr := e.CleanOrphanedFilesWithReport()
+	e.mu.Lock()
+	e.lastCleanerReport = cleanReport
+	e.mu.Unlock()
+	if cleanErr != nil {
+		if isCriticalCleanerError(cleanErr, cleanReport) {
+			return fmt.Errorf("engine: failed to clean orphaned temporary files: %w", cleanErr)
+		}
+	}
+	return nil
 }
 
 func (e *Engine) recoverWALInternal(dbPath string, checkpoint binary.SeqNum, replayRes *version.ReplayResult) error {
@@ -497,8 +574,10 @@ func (e *Engine) recoverWALInternal(dbPath string, checkpoint binary.SeqNum, rep
 	var recoveryImm []*memtable.SkipList
 
 	var (
-		inBatch     bool
-		batchBuffer []wal.Record
+		inBatch          bool
+		batchBuffer      []wal.Record
+		batchRecordCount int
+		batchByteSize    uint64
 	)
 
 	// Set up the ReplaySink adapter
@@ -507,6 +586,8 @@ func (e *Engine) recoverWALInternal(dbPath string, checkpoint binary.SeqNum, rep
 		case wal.RecordTypeBatchStart:
 			inBatch = true
 			batchBuffer = nil
+			batchRecordCount = 0
+			batchByteSize = 0
 			return nil
 
 		case wal.RecordTypeBatchCommit:
@@ -522,11 +603,36 @@ func (e *Engine) recoverWALInternal(dbPath string, checkpoint binary.SeqNum, rep
 				}
 			}
 			batchBuffer = nil
+			batchRecordCount = 0
+			batchByteSize = 0
 			return nil
 
 		case wal.RecordTypePut, wal.RecordTypeDelete:
 			if inBatch {
+				recoveryBatchLimitsMu.Lock()
+				maxRecs := recoveryBatchMaxRecords
+				maxBytes := recoveryBatchMaxBytes
+				recoveryBatchLimitsMu.Unlock()
+
+				// Pre-allocation checks (P07-SEC-007)
+				if batchRecordCount+1 > maxRecs {
+					return &errors.RecoveryBatchLimitError{
+						LimitType: "records",
+						Limit:     uint64(maxRecs),
+						Actual:    uint64(batchRecordCount + 1),
+					}
+				}
+				recBytes := uint64(len(rec.Key)) + uint64(len(rec.Value))
+				if math.MaxUint64-batchByteSize < recBytes || batchByteSize+recBytes > maxBytes {
+					return &errors.RecoveryBatchLimitError{
+						LimitType: "bytes",
+						Limit:     maxBytes,
+						Actual:    batchByteSize + recBytes,
+					}
+				}
 				batchBuffer = append(batchBuffer, rec)
+				batchRecordCount++
+				batchByteSize += recBytes
 				return nil
 			}
 			// Standalone PUT or DELETE
@@ -603,7 +709,38 @@ func (e *Engine) recoverWALInternal(dbPath string, checkpoint binary.SeqNum, rep
 		}
 	}
 
-	// 4. Synchronize backpressure accounting with recovered memory
+	// 4. File number watermark initialization and advancement (P07-SEC-004, P07-SEC-006)
+	// Scan dbPath for existing canonical SSTables to detect any uncommitted crash-window files
+	var maxPhysicalFileNum uint64
+	if entries, readErr := os.ReadDir(dbPath); readErr == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				if num, ok := version.ParseTableFilename(entry.Name()); ok {
+					if num > maxPhysicalFileNum {
+						maxPhysicalFileNum = num
+					}
+				}
+			}
+		}
+	}
+
+	var replayedNextFile uint64
+	if replayRes != nil {
+		replayedNextFile = replayRes.NextFileNum
+	}
+	targetFileNum := replayedNextFile
+	if maxPhysicalFileNum >= targetFileNum {
+		targetFileNum = maxPhysicalFileNum + 1
+	}
+	if targetFileNum < 1 {
+		targetFileNum = 1
+	}
+	curFileNum := e.nextFileNum.Load()
+	if targetFileNum > curFileNum {
+		e.nextFileNum.Store(targetFileNum)
+	}
+
+	// 5. Synchronize backpressure accounting with recovered memory
 	if e.backpressure != nil {
 		totalBytes := e.activeMem.ByteSize()
 		for _, imm := range e.immMems {
@@ -612,10 +749,22 @@ func (e *Engine) recoverWALInternal(dbPath string, checkpoint binary.SeqNum, rep
 		e.backpressure.RecordUsage(totalBytes)
 	}
 
-	// 5. State transition to recovered
+	// 6. State transition to recovered
 	e.state = engineStateRecovered
 
 	return nil
+}
+
+func isCriticalCleanerError(err error, report CleanOrphanReport) bool {
+	if err == nil {
+		return false
+	}
+	// If the error originated solely from individual candidate refusal/removal failures,
+	// it is a best-effort cleanup failure and not critical to engine recovery (P07-SEC-005).
+	if len(report.Failures) > 0 && !report.DirectorySyncFailed {
+		return false
+	}
+	return true
 }
 
 func insertRecordToMemTable(activeMem **memtable.SkipList, immMems *[]*memtable.SkipList, rec wal.Record) error {

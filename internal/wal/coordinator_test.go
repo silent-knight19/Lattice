@@ -214,19 +214,13 @@ func TestCoordinator_ThreeCleanSegments(t *testing.T) {
 	}
 }
 
-// 4. Numeric ordering with IDs such as: 1, 2, 9, 10
+// 4. Numeric ordering with IDs such as: 1, 2, ..., 9, 10 (ensuring segment 10 is ordered after 9, not after 1)
 func TestCoordinator_NumericOrdering(t *testing.T) {
 	dbPath := t.TempDir()
-	r7 := testRecord(7, "k7", "v7")
-	r8 := testRecord(8, "k8", "v8")
-	r9 := testRecord(9, "k9", "v9")
-	r10 := testRecord(10, "k10", "v10")
-
-	// Create segments 7, 8, 9, 10
-	writeSegmentRecords(t, dbPath, 7, r7)
-	writeSegmentRecords(t, dbPath, 8, r8)
-	writeSegmentRecords(t, dbPath, 9, r9)
-	writeSegmentRecords(t, dbPath, 10, r10)
+	for i := uint64(1); i <= 10; i++ {
+		rec := testRecord(i, fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i))
+		writeSegmentRecords(t, dbPath, i, rec)
+	}
 
 	sink := &recordingSink{}
 	report, err := wal.RecoverWAL(dbPath, sink)
@@ -234,14 +228,16 @@ func TestCoordinator_NumericOrdering(t *testing.T) {
 		t.Fatalf("expected success, got: %v", err)
 	}
 
-	if report.SegmentCount != 4 || report.HighestSegmentID != 10 {
+	if report.SegmentCount != 10 || report.HighestSegmentID != 10 {
 		t.Errorf("unexpected segments: count=%d, highest=%d", report.SegmentCount, report.HighestSegmentID)
 	}
-	if len(sink.records) != 4 {
-		t.Fatalf("expected 4 records, got %d", len(sink.records))
+	if len(sink.records) != 10 {
+		t.Fatalf("expected 10 records, got %d", len(sink.records))
 	}
-	if sink.records[0].SeqNum != 7 || sink.records[1].SeqNum != 8 || sink.records[2].SeqNum != 9 || sink.records[3].SeqNum != 10 {
-		t.Errorf("records were not replayed in numeric segment order: %v", sink.records)
+	for i := uint64(1); i <= 10; i++ {
+		if sink.records[i-1].SeqNum != binary.SeqNum(i) {
+			t.Errorf("record %d: expected seq %d, got %v", i, i, sink.records[i-1].SeqNum)
+		}
 	}
 }
 

@@ -45,9 +45,9 @@ func setupTestManifestWithCheckpoint(t *testing.T, dir string, lastSeq uint64) *
 		LargestSeqNum:  lastSeq,
 	})
 
-	// Create dummy physical SSTable file
+	// Create dummy physical SSTable file matching FileSize: 1024
 	sstPath := version.TablePath(dir, 1)
-	if err := os.WriteFile(sstPath, []byte("sstable-dummy-content"), 0600); err != nil {
+	if err := os.WriteFile(sstPath, make([]byte, 1024), 0600); err != nil {
 		t.Fatalf("failed to write dummy sstable: %v", err)
 	}
 

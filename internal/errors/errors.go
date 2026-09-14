@@ -339,6 +339,14 @@ var (
 	// ErrManifestReplayLimit indicates that MANIFEST replay exceeded global resource bounds
 	// (replayed bytes, record count, or live file count).
 	ErrManifestReplayLimit = stdErrors.New("manifest replay resource limit exceeded")
+
+	// ErrSSTableSizeMismatch indicates that the physical size of an SSTable on disk does not match
+	// the authoritative FileSize recorded in the MANIFEST metadata.
+	ErrSSTableSizeMismatch = stdErrors.New("sstable physical size does not match manifest metadata")
+
+	// ErrRecoveryBatchLimitExceeded indicates that a single WAL batch during recovery exceeded
+	// the maximum allowed record count or memory byte budget.
+	ErrRecoveryBatchLimitExceeded = stdErrors.New("recovery batch limit exceeded")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing
@@ -1069,4 +1077,49 @@ func (e *ManifestReplayLimitError) Error() string {
 // Is reports whether this error matches target sentinel ErrManifestReplayLimit.
 func (e *ManifestReplayLimitError) Is(target error) bool {
 	return target == ErrManifestReplayLimit
+}
+
+// SSTableSizeMismatchError provides structured context when an SSTable's physical size on disk
+// differs from the authoritative FileSize stored in manifest metadata.
+// It matches ErrSSTableSizeMismatch when interrogated with errors.Is().
+type SSTableSizeMismatchError struct {
+	Path     string
+	FileNum  uint64
+	Expected uint64
+	Actual   int64
+}
+
+func (e *SSTableSizeMismatchError) Error() string {
+	if e == nil {
+		return ErrSSTableSizeMismatch.Error()
+	}
+	return fmt.Sprintf("sstable physical size mismatch for %s (file %d): expected %d bytes, got %d bytes on disk",
+		e.Path, e.FileNum, e.Expected, e.Actual)
+}
+
+// Is reports whether this error matches target sentinel ErrSSTableSizeMismatch.
+func (e *SSTableSizeMismatchError) Is(target error) bool {
+	return target == ErrSSTableSizeMismatch
+}
+
+// RecoveryBatchLimitError provides structured context when a WAL batch during recovery exceeds
+// resource bounds (record count or cumulative byte size).
+// It matches ErrRecoveryBatchLimitExceeded when interrogated with errors.Is().
+type RecoveryBatchLimitError struct {
+	LimitType string // "records" or "bytes"
+	Limit     uint64
+	Actual    uint64
+}
+
+func (e *RecoveryBatchLimitError) Error() string {
+	if e == nil {
+		return ErrRecoveryBatchLimitExceeded.Error()
+	}
+	return fmt.Sprintf("recovery batch limit exceeded for %s: actual %d exceeds limit %d",
+		e.LimitType, e.Actual, e.Limit)
+}
+
+// Is reports whether this error matches target sentinel ErrRecoveryBatchLimitExceeded.
+func (e *RecoveryBatchLimitError) Is(target error) bool {
+	return target == ErrRecoveryBatchLimitExceeded
 }

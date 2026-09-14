@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
+	"strings"
 
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
@@ -68,6 +70,31 @@ func TablePath(dbPath string, fileNum uint64) string {
 	return filepath.Join(filepath.Clean(dbPath), TableFilename(fileNum))
 }
 
+// ParseTableFilename parses a canonical SSTable filename (e.g. "000001.sst") and returns
+// the 64-bit file number. Returns (0, false) if name does not match the canonical format.
+func ParseTableFilename(name string) (uint64, bool) {
+	if !strings.HasSuffix(name, ".sst") {
+		return 0, false
+	}
+	base := strings.TrimSuffix(name, ".sst")
+	if len(base) < 6 {
+		return 0, false
+	}
+	for i := 0; i < len(base); i++ {
+		if base[i] < '0' || base[i] > '9' {
+			return 0, false
+		}
+	}
+	num, err := strconv.ParseUint(base, 10, 64)
+	if err != nil || num == 0 {
+		return 0, false
+	}
+	if name != TableFilename(num) {
+		return 0, false
+	}
+	return num, true
+}
+
 // ReplayError provides structured diagnostic context for MANIFEST replay failures.
 // It tracks the manifest number, 0-based record index, byte offset within the MANIFEST file,
 // and the underlying cause of failure.
@@ -123,10 +150,18 @@ type ReplayResult struct {
 	FinalOffset int64
 }
 
+// fileProvenance preserves the origin VersionEdit metadata, record index, and byte stream offset
+// for an added SSTable to enable precise post-scan diagnostic reporting (P07-SEC-012).
+type fileProvenance struct {
+	Meta        FileMetadata
+	RecordIndex int
+	Offset      int64
+}
+
 // versionBuilder provides an isolated in-memory reconstruction workspace for accumulating
 // VersionEdit state deltas before constructing an immutable Version snapshot.
 type versionBuilder struct {
-	levels      [NumLevels]map[uint64]FileMetadata
+	levels      [NumLevels]map[uint64]fileProvenance
 	nextFileNum uint64
 	lastSeqNum  binary.SeqNum
 }
@@ -134,7 +169,7 @@ type versionBuilder struct {
 func newVersionBuilder() *versionBuilder {
 	b := &versionBuilder{}
 	for i := 0; i < NumLevels; i++ {
-		b.levels[i] = make(map[uint64]FileMetadata)
+		b.levels[i] = make(map[uint64]fileProvenance)
 	}
 	return b
 }
@@ -148,7 +183,7 @@ func (b *versionBuilder) liveFileCount() int {
 }
 
 // applyEdit applies a validated VersionEdit delta to the in-memory reconstruction state.
-func (b *versionBuilder) applyEdit(edit *VersionEdit) error {
+func (b *versionBuilder) applyEdit(edit *VersionEdit, recordIndex int, offset int64) error {
 	if edit == nil {
 		return nil
 	}
@@ -204,20 +239,28 @@ func (b *versionBuilder) applyEdit(edit *VersionEdit) error {
 			}
 		}
 
-		// Store defensive copy of metadata
-		b.levels[a.Level][a.Meta.FileNum] = a.Meta.Clone()
+		// Store defensive copy of metadata with origin provenance (P07-SEC-012)
+		b.levels[a.Level][a.Meta.FileNum] = fileProvenance{
+			Meta:        a.Meta.Clone(),
+			RecordIndex: recordIndex,
+			Offset:      offset,
+		}
 	}
 
-	// 4. Monotonic scalar progression
+	// 4. Monotonic scalar progression (P07-SEC-011)
 	if nextNum, ok := edit.NextFileNum(); ok {
-		if nextNum > b.nextFileNum {
-			b.nextFileNum = nextNum
+		if nextNum < b.nextFileNum {
+			return fmt.Errorf("%w: next file num regressed from %d to %d",
+				errors.ErrCorruptedVersionEdit, b.nextFileNum, nextNum)
 		}
+		b.nextFileNum = nextNum
 	}
 	if lastSeq, ok := edit.LastSeqNum(); ok {
-		if lastSeq > b.lastSeqNum {
-			b.lastSeqNum = lastSeq
+		if lastSeq < b.lastSeqNum {
+			return fmt.Errorf("%w: last seq num regressed from %d to %d",
+				errors.ErrCorruptedVersionEdit, b.lastSeqNum, lastSeq)
 		}
+		b.lastSeqNum = lastSeq
 	}
 
 	return nil
@@ -350,8 +393,8 @@ func ReplayManifest(discovered *DiscoveredManifest) (*ReplayResult, error) {
 			}
 		}
 
-		// Apply edit to reconstruction state
-		if applyErr := builder.applyEdit(edit); applyErr != nil {
+		// Apply edit to reconstruction state with record index and offset provenance
+		if applyErr := builder.applyEdit(edit, recordIndex, offset); applyErr != nil {
 			return nil, &ReplayError{
 				ManifestNum: discovered.ManifestNum,
 				RecordIndex: recordIndex,
@@ -366,66 +409,82 @@ func ReplayManifest(discovered *DiscoveredManifest) (*ReplayResult, error) {
 
 	// Reconstruct and validate level slices
 	var finalLevels [NumLevels][]FileMetadata
+	var finalProvs [NumLevels][]fileProvenance
 
 	// Level 0: Sort deterministically by FileNum ASC
-	l0Files := make([]FileMetadata, 0, len(builder.levels[0]))
-	for _, meta := range builder.levels[0] {
-		l0Files = append(l0Files, meta)
+	l0Provs := make([]fileProvenance, 0, len(builder.levels[0]))
+	for _, prov := range builder.levels[0] {
+		l0Provs = append(l0Provs, prov)
 	}
-	slices.SortFunc(l0Files, func(a, b FileMetadata) int {
-		return cmp.Compare(a.FileNum, b.FileNum)
+	slices.SortFunc(l0Provs, func(a, b fileProvenance) int {
+		return cmp.Compare(a.Meta.FileNum, b.Meta.FileNum)
 	})
+	l0Files := make([]FileMetadata, len(l0Provs))
+	for i, p := range l0Provs {
+		l0Files[i] = p.Meta
+	}
 	finalLevels[0] = l0Files
+	finalProvs[0] = l0Provs
 
 	// Levels 1..6: Sort canonically by SmallestKey and assert non-overlapping key ranges
 	for lvl := 1; lvl < NumLevels; lvl++ {
-		files := make([]FileMetadata, 0, len(builder.levels[lvl]))
-		for _, meta := range builder.levels[lvl] {
-			files = append(files, meta)
+		provs := make([]fileProvenance, 0, len(builder.levels[lvl]))
+		for _, p := range builder.levels[lvl] {
+			provs = append(provs, p)
 		}
 
-		slices.SortFunc(files, func(a, b FileMetadata) int {
-			ikA := decodeInternalKeyNoAlloc(a.SmallestKey)
-			ikB := decodeInternalKeyNoAlloc(b.SmallestKey)
+		slices.SortFunc(provs, func(a, b fileProvenance) int {
+			ikA := decodeInternalKeyNoAlloc(a.Meta.SmallestKey)
+			ikB := decodeInternalKeyNoAlloc(b.Meta.SmallestKey)
 			return binary.CompareInternalKey(ikA, ikB)
 		})
 
-		for i := 0; i < len(files)-1; i++ {
-			prevLargest := decodeInternalKeyNoAlloc(files[i].LargestKey)
-			currSmallest := decodeInternalKeyNoAlloc(files[i+1].SmallestKey)
+		for i := 0; i < len(provs)-1; i++ {
+			prevLargest := decodeInternalKeyNoAlloc(provs[i].Meta.LargestKey)
+			currSmallest := decodeInternalKeyNoAlloc(provs[i+1].Meta.SmallestKey)
 			if bytes.Compare(prevLargest.UserKey, currSmallest.UserKey) >= 0 || binary.CompareInternalKey(prevLargest, currSmallest) >= 0 {
+				offending := provs[i+1]
+				if provs[i].RecordIndex > provs[i+1].RecordIndex {
+					offending = provs[i]
+				}
 				return nil, &ReplayError{
 					ManifestNum: discovered.ManifestNum,
-					RecordIndex: recordIndex,
-					Offset:      offset,
+					RecordIndex: offending.RecordIndex,
+					Offset:      offending.Offset,
 					Err: fmt.Errorf("%w: overlapping key ranges at level %d between file %d and file %d",
-						errors.ErrInvalidKeyRange, lvl, files[i].FileNum, files[i+1].FileNum),
+						errors.ErrInvalidKeyRange, lvl, provs[i].Meta.FileNum, provs[i+1].Meta.FileNum),
 				}
 			}
 		}
 
+		files := make([]FileMetadata, len(provs))
+		for i, p := range provs {
+			files[i] = p.Meta
+		}
 		finalLevels[lvl] = files
+		finalProvs[lvl] = provs
 	}
 
-	// Physical SSTable existence and file-type validation on disk
+	// Physical SSTable existence, file-type, and size validation on disk (P07-SEC-008, P07-SEC-012)
 	cleanDir := filepath.Clean(discovered.Dir)
 	for lvl := 0; lvl < NumLevels; lvl++ {
-		for _, meta := range finalLevels[lvl] {
+		for _, prov := range finalProvs[lvl] {
+			meta := prov.Meta
 			sstPath := TablePath(cleanDir, meta.FileNum)
 			info, err := replayLstatFn(sstPath)
 			if err != nil {
 				if os.IsNotExist(err) {
 					return nil, &ReplayError{
 						ManifestNum: discovered.ManifestNum,
-						RecordIndex: recordIndex,
-						Offset:      offset,
+						RecordIndex: prov.RecordIndex,
+						Offset:      prov.Offset,
 						Err:         fmt.Errorf("%w: %s", errors.ErrMissingSSTable, sstPath),
 					}
 				}
 				return nil, &ReplayError{
 					ManifestNum: discovered.ManifestNum,
-					RecordIndex: recordIndex,
-					Offset:      offset,
+					RecordIndex: prov.RecordIndex,
+					Offset:      prov.Offset,
 					Err:         fmt.Errorf("replay: failed to inspect sstable %s: %w", sstPath, err),
 				}
 			}
@@ -433,8 +492,8 @@ func ReplayManifest(discovered *DiscoveredManifest) (*ReplayResult, error) {
 			if info.Mode()&os.ModeSymlink != 0 {
 				return nil, &ReplayError{
 					ManifestNum: discovered.ManifestNum,
-					RecordIndex: recordIndex,
-					Offset:      offset,
+					RecordIndex: prov.RecordIndex,
+					Offset:      prov.Offset,
 					Err:         fmt.Errorf("%w: sstable %s is a symlink", errors.ErrSSTableSymlink, sstPath),
 				}
 			}
@@ -442,8 +501,8 @@ func ReplayManifest(discovered *DiscoveredManifest) (*ReplayResult, error) {
 			if info.IsDir() {
 				return nil, &ReplayError{
 					ManifestNum: discovered.ManifestNum,
-					RecordIndex: recordIndex,
-					Offset:      offset,
+					RecordIndex: prov.RecordIndex,
+					Offset:      prov.Offset,
 					Err:         &errors.NotADirectoryError{Path: sstPath, Mode: info.Mode()},
 				}
 			}
@@ -451,9 +510,24 @@ func ReplayManifest(discovered *DiscoveredManifest) (*ReplayResult, error) {
 			if !info.Mode().IsRegular() {
 				return nil, &ReplayError{
 					ManifestNum: discovered.ManifestNum,
-					RecordIndex: recordIndex,
-					Offset:      offset,
+					RecordIndex: prov.RecordIndex,
+					Offset:      prov.Offset,
 					Err:         fmt.Errorf("%w: sstable %s is not a regular file (mode: %s)", os.ErrInvalid, sstPath, info.Mode()),
+				}
+			}
+
+			// SSTable physical size validation against authoritative manifest metadata (P07-SEC-008)
+			if uint64(info.Size()) != meta.FileSize {
+				return nil, &ReplayError{
+					ManifestNum: discovered.ManifestNum,
+					RecordIndex: prov.RecordIndex,
+					Offset:      prov.Offset,
+					Err: &errors.SSTableSizeMismatchError{
+						Path:     sstPath,
+						FileNum:  meta.FileNum,
+						Expected: meta.FileSize,
+						Actual:   info.Size(),
+					},
 				}
 			}
 		}
