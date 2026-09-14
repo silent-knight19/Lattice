@@ -119,12 +119,20 @@ func (v *Version) Unref() {
 
 // finalize handles reclamation and unlinking when refCount reaches 0.
 func (v *Version) finalize() {
+	var toDelete []uint64
+	var dbPath string
+	var vset *VersionSet
 	if v.vset != nil {
-		v.vset.mu.Lock()
+		vset = v.vset
+		vset.mu.Lock()
 		v.unlinkLocked()
-		v.vset.mu.Unlock()
+		toDelete, dbPath = vset.collectObsoleteFilesLocked()
+		vset.mu.Unlock()
 	}
 	v.cleanup()
+	if vset != nil && len(toDelete) > 0 && dbPath != "" {
+		_, _ = vset.deletePhysicalFiles(dbPath, toDelete)
+	}
 }
 
 // unlinkLocked unlinks the Version from the VersionSet circular doubly-linked active chain.

@@ -326,6 +326,9 @@ var (
 	// ErrNilVersion indicates that a nil Version pointer was passed to VersionSet.
 	ErrNilVersion = stdErrors.New("version cannot be nil")
 
+	// ErrNilVersionEdit indicates that a nil VersionEdit pointer was passed to VersionSet.
+	ErrNilVersionEdit = stdErrors.New("version edit cannot be nil")
+
 	// ErrDeadVersion indicates that an operation was attempted on a Version whose reference count has reached zero.
 	ErrDeadVersion = stdErrors.New("cannot operate on dead version: reference count is zero")
 

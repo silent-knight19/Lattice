@@ -93,6 +93,7 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrCurrentNotFound", errors.ErrCurrentNotFound, "CURRENT file not found"},
 		{"ErrCurrentCorrupted", errors.ErrCurrentCorrupted, "CURRENT file corrupted"},
 		{"ErrNilVersion", errors.ErrNilVersion, "version cannot be nil"},
+		{"ErrNilVersionEdit", errors.ErrNilVersionEdit, "version edit cannot be nil"},
 		{"ErrDeadVersion", errors.ErrDeadVersion, "cannot operate on dead version: reference count is zero"},
 		{"ErrVersionAlreadyAppended", errors.ErrVersionAlreadyAppended, "version already belongs to a VersionSet"},
 		{"ErrParentDirectorySymlink", errors.ErrParentDirectorySymlink, "parent directory is a symlink"},

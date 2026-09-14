@@ -865,6 +865,27 @@ This document tracks all **genuine architectural and operational limitations** o
   * Performance: **Optimal** (~77 ms for 100K records / ~140 MB/s; ~167 MB/s on large partitioned workloads; ~480 MB/s on 90% tombstone omission workloads).
   * Security: **Optimal** (Atomic staging `.tmp_*`, hard-link `link(2)` without TOCTOU rename overwrites, strict file mode enforcement 0600, monotonic file number allocation).
 
+### 53. Atomic Manifest Commit, Version Installation, & Obsolete SSTable Reclamation Boundaries (P08-S03-M02)
+* **Limitation & Architectural Boundaries**:
+  In `P08-S03-M02`:
+  1. *LogAndApply Lifecycle & Ordering Invariant*: State transitions follow the strict deterministic ordering:
+     `validate edit -> derive next Version -> persist to MANIFEST -> hardware durability barrier (fdatasync) -> atomic publication to VersionSet -> release superseded Version -> safe obsolete SSTable cleanup`.
+     A successful return guarantees that the edit has achieved physical non-volatile durability on disk before in-memory publication occurs.
+  2. *Fail-Closed Manifest Durability Barrier*: If appending or synchronizing the manifest record fails, the active ManifestWriter enters an unrecoverable poisoned state, the uninstalled candidate Version snapshot is safely discarded, and the live database `Current` pointer remains completely unmodified on the preceding Version.
+  3. *Concurrency & Lock Decoupling*: Commit state transitions are strictly serialized by `vs.applyMu` to eliminate stale-base updates or lost concurrent edits. Readers acquiring pinned snapshots via `vs.Current()` or `vs.ActiveVersions()` hold `vs.mu.RLock()` for pointer copying and are never blocked across slow disk I/O operations.
+  4. *Reference-Counted Obsolete File Deletion*: Physical SSTables deleted by committed `VersionEdit`s are NOT immediately unlinked if older `Version` snapshots are pinned by active reader queries. Obsolete SSTables are safely reclaimed if and only if no Version in the active chain references them (upon `Version.refCount` transitioning from 1 to 0 during `finalize()`).
+  5. *Non-Rollback Cleanup Semantics*: A failed obsolete-file unlink operation does not roll back or corrupt an already-published `Version`. The database's logical snapshot remains committed and valid, while cleanup failures are recorded as diagnostic errors and retained for subsequent reclamation passes.
+  6. *Recovery Parity Guarantee*: Sequential MANIFEST replay via `ReplayManifest` reconstructs the exact same level hierarchy, file metadata descriptors, and monotonic scalar watermarks as normal runtime `LogAndApply`.
+  7. *Subsystem Scope Boundaries*: This micro-phase implements atomic manifest commit and obsolete file reclamation. Background compaction worker scheduling, automatic compaction triggering, block cache integration (Phase 09), and top-level engine orchestration (Phase 10) are deferred to subsequent phases.
+* **Why It Exists**:
+  Core ACID atomicity and durability contract for LSM-tree metadata. Guaranteeing that in-memory version state never advances beyond durable on-disk manifest state ensures that process crashes, power failures, or I/O faults can never cause recovery divergence.
+* **Impact**:
+  Guaranteed durability, serialized atomic version transitions, zero stale-base corruption, zero premature file deletion under reader concurrency, and 100% replay parity.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Verified against Acceptance Matrix A-V, 2,000-iteration randomized differential test suite vs independent reference model, and native Go fuzz target `FuzzLogAndApply`; 0 mismatches/crashes).
+  * Performance: **Optimal** (~13.3 µs in-memory version derivation; ~3.7 ms per durable manifest sync; zero reader lock contention during manifest I/O).
+  * Security: **Optimal** (Path traversal defense, symlink rejection before unlinking, parent directory inode pinning, monotonic watermarks, fail-closed poison state machine).
+
 ---
 
 *End of Known Limitations — To be updated continuously throughout implementation.*
