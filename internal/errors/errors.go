@@ -34,6 +34,14 @@ var (
 	// proceed because another compaction worker is actively processing the targeted levels.
 	ErrCompactionRunning = stdErrors.New("compaction already in progress")
 
+	// ErrInvalidCompactionPlan indicates that a generated or requested compaction plan
+	// violates structural, level, key-range, or file-uniqueness invariants.
+	ErrInvalidCompactionPlan = stdErrors.New("invalid compaction plan")
+
+	// ErrByteCountOverflow indicates that accumulating file sizes or resource bounds
+	// exceeded 64-bit unsigned integer capacity (math.MaxUint64).
+	ErrByteCountOverflow = stdErrors.New("byte count overflow")
+
 	// ErrVarintOverflow indicates that a varint byte sequence exceeds the maximum
 	// 64-bit unsigned integer representation (exceeds 10 bytes, or the 10th byte
 	// contains invalid payload bits).

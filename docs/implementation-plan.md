@@ -2050,12 +2050,12 @@ TOTAL: 184 Discrete, Testable Micro-Phases
 * **Risks**: Write stalls, ghost key resurrects caused by premature tombstone purging, disk full during merge.
 
 ### Sub-Phase 08.1: Compaction Scoring & Input Selection
-* **P08-S01-M01: Level Compaction Score Heuristics**
-  * *Objective*: Calculate score for $L0$ ($\text{FileCount} / 4$) and $L_1..L_N$ ($\text{TotalBytes} / \text{MaxBytes}$).
-  * *Changes*: `Compactor.PickCompactionLevel() (int, float64)`.
-  * *Invariants*: Level with score $\ge 1.0$ prioritized; $L0$ prioritized over deeper levels.
-  * *Tests*: Unit test scoring formula across simulated level metadata.
-  * *Completion*: Compaction scoring verified.
+* **P08-S01-M01: Compaction Plan Model & Deterministic Input Selection**
+  * *Objective*: Establish pure compaction planning layer: calculate score for $L0$ ($\text{FileCount} / 4$) and $L_1..L_N$ ($\text{TotalBytes} / \text{MaxBytes}$), select triggering level, compute L0 transitive overlap closure, identify overlapping target files, and construct immutable, validated `CompactionPlan` snapshots.
+  * *Changes*: `internal/compaction/policy.go`, `internal/compaction/overlap.go`, `internal/compaction/plan.go`, `internal/compaction/planner.go`, and domain sentinels in `internal/errors/errors.go`.
+  * *Invariants*: Pure planning (zero I/O, zero file mutations, zero Version mutations); $L0$ score $\ge 1.0$ prioritized over deeper levels; deterministic level tie-breaking; L0 transitive overlap closure; boundary-touching ranges ($[a, b]$ and $[b, c]$) overlap; accumulator overflow protection (`ErrByteCountOverflow`); defensive snapshot cloning.
+  * *Tests*: 14 unit tests across matrix A-M, 2,000 differential testing iterations against reference pairwise scanner, property-based fuzz campaign (1.8M+ execs), and Small/Medium/Large benchmarks.
+  * *Completion*: 100% tests pass, race detector clean, zero data races. Sub-Phase 08.1 M01 verified.
 * **P08-S01-M02: Overlapping Key Range File Selector**
   * *Objective*: Pick file from $L_i$, calculate key range $[Key_{min}, Key_{max}]$, find all overlapping files in $L_{i+1}$.
   * *Changes*: `Compactor.GetOverlappingInputs(level int, f *SSTableMetadata) []*SSTableMetadata`.
