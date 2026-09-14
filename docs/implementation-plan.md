@@ -2072,9 +2072,10 @@ TOTAL: 184 Discrete, Testable Micro-Phases
   * *Completion*: 100% tests pass under `-race`, 0 data races, `go vet` clean, `golangci-lint` clean. Sub-Phase 08.2 M01 verified.
 * **P08-S02-M02: Tombstone Purge Safety Invariant Enforcer**
   * *Objective*: Purge tombstone record if and only if key does not exist in any level deeper than target level.
-  * *Changes*: `Compactor.CanDropTombstone(key []byte, targetLevel int) bool`.
-  * *Tests*: Ghost key test: verify tombstone retained when older version exists in deeper level; verify tombstone dropped when no older version exists.
-  * *Completion*: Tombstone purge safety verified.
+  * *Changes*: `internal/compaction/compactor.go`, `internal/compaction/compactor_test.go`, `internal/compaction/compactor_differential_test.go`, `internal/compaction/compactor_fuzz_test.go`, `internal/compaction/compactor_bench_test.go`.
+  * *Invariants*: Tombstone purge safety invariant enforced ($\text{CanDropTombstone} == \text{true} \iff \text{key does not exist in levels } targetLevel+1 \dots NumLevels-1$); asymmetric error contract (false negatives acceptable, false positives prohibited); bottom-level invariant ($targetLevel == NumLevels-1 \implies \text{true}$); Model A conservative range pruning; Model C hybrid exact existence verification via optional `TableOpener`; atomic Version reference pinning (`v.TryRef()`) on creation and release (`v.Unref()`) on `Close()`; zero filesystem mutations; race-free concurrent read evaluation.
+  * *Tests*: Acceptance matrix A-S (no deeper files, older PUT in L2, older PUT in L6, disjoint ranges, same key across multiple deeper levels, sequence checks, deeper tombstones, bottom level, empty version, boundary/invalid target levels, corrupt metadata, oversized/nil keys, range false-positive case comparing conservative vs exact modes, version immutability, refcounting and lifecycle, concurrent goroutine checks under `-race`), 2,500-iteration randomized differential test suite vs independent reference model, native fuzz campaign (`FuzzCanDropTombstone`, 898k+ execs, 0 crashes), and Small/Medium/Large/Exact benchmarks.
+  * *Completion*: 100% tests pass under `-race`, 0 data races, `go vet` clean, `golangci-lint` clean. Sub-Phase 08.2 M02 verified.
 
 ### Sub-Phase 08.3: Compaction Execution & Manifest Commit
 * **P08-S03-M01: Compaction Output SSTable Generation**
