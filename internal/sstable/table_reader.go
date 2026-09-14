@@ -301,6 +301,59 @@ func (r *TableReader) Close() error {
 	return nil
 }
 
+// NewIterator creates an unpositioned sequential streaming TableIterator over this SSTable.
+// The caller retains ownership of the TableReader; calling Close on the returned TableIterator
+// does not close the underlying TableReader.
+func (r *TableReader) NewIterator() (*TableIterator, error) {
+	return NewTableIterator(r)
+}
+
+// ReadDataBlock reads and returns the raw uncompressed bytes of a data block referenced by handle.
+// Validates handle bounds against MaxDataBlockSize, 64-bit address bounds, physical file boundaries,
+// and architecture integer limits.
+func (r *TableReader) ReadDataBlock(handle BlockHandle) ([]byte, error) {
+	if r == nil {
+		return nil, errors.ErrNilReceiver
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if r.closed {
+		return nil, errors.ErrTableReaderClosed
+	}
+	return r.readDataBlockLocked(handle)
+}
+
+func (r *TableReader) readDataBlockLocked(handle BlockHandle) ([]byte, error) {
+	if handle.Size == 0 || handle.Size > MaxDataBlockSize {
+		return nil, &errors.InvalidBlockHandleError{
+			Offset: handle.Offset,
+			Size:   handle.Size,
+			Reason: "data block size exceeds MaxDataBlockSize or is zero",
+		}
+	}
+	if handle.Offset > math.MaxUint64-handle.Size || handle.Offset+handle.Size > uint64(r.fileSize)-FooterSize {
+		return nil, &errors.InvalidBlockHandleError{
+			Offset: handle.Offset,
+			Size:   handle.Size,
+			Reason: "candidate data block extends into footer, exceeds physical file boundary, or overflows address space",
+		}
+	}
+	if handle.Size > math.MaxInt || handle.Offset > math.MaxInt64 {
+		return nil, &errors.InvalidBlockHandleError{
+			Offset: handle.Offset,
+			Size:   handle.Size,
+			Reason: "candidate data block offset or size exceeds architecture integer bounds",
+		}
+	}
+
+	blockBuf := make([]byte, int(handle.Size))
+	if err := readExactAt(r.readAtFn, blockBuf, int64(handle.Offset)); err != nil {
+		return nil, fmt.Errorf("failed to read data block at offset %d: %w", handle.Offset, err)
+	}
+	return blockBuf, nil
+}
+
 // Seek performs a point lookup for the given user key in the SSTable.
 //
 // Lookup Flow:
@@ -338,36 +391,13 @@ func (r *TableReader) Seek(userKey []byte) ([]byte, error) {
 		return nil, errors.ErrKeyNotFound
 	}
 
-	// 2. Validate data block handle bounds
-	if handle.Size == 0 || handle.Size > MaxDataBlockSize {
-		return nil, &errors.InvalidBlockHandleError{
-			Offset: handle.Offset,
-			Size:   handle.Size,
-			Reason: "data block size exceeds MaxDataBlockSize or is zero",
-		}
-	}
-	if handle.Offset > math.MaxUint64-handle.Size || handle.Offset+handle.Size > uint64(r.fileSize)-FooterSize {
-		return nil, &errors.InvalidBlockHandleError{
-			Offset: handle.Offset,
-			Size:   handle.Size,
-			Reason: "candidate data block extends into footer, exceeds physical file boundary, or overflows address space",
-		}
-	}
-	if handle.Size > math.MaxInt || handle.Offset > math.MaxInt64 {
-		return nil, &errors.InvalidBlockHandleError{
-			Offset: handle.Offset,
-			Size:   handle.Size,
-			Reason: "candidate data block offset or size exceeds architecture integer bounds",
-		}
+	// 2. Validate bounds and read candidate data block from disk via ReadAt
+	blockBuf, err := r.readDataBlockLocked(handle)
+	if err != nil {
+		return nil, err
 	}
 
-	// 3. Read candidate data block from disk via ReadAt
-	blockBuf := make([]byte, int(handle.Size))
-	if err := readExactAt(r.readAtFn, blockBuf, int64(handle.Offset)); err != nil {
-		return nil, fmt.Errorf("failed to read data block at offset %d: %w", handle.Offset, err)
-	}
-
-	// 4. Decode and search prefix-compressed data block
+	// 3. Decode and search prefix-compressed data block
 	return searchDataBlock(blockBuf, userKey, handle.Offset)
 }
 

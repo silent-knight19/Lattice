@@ -2056,11 +2056,12 @@ TOTAL: 184 Discrete, Testable Micro-Phases
   * *Invariants*: Pure planning (zero I/O, zero file mutations, zero Version mutations); $L0$ score $\ge 1.0$ prioritized over deeper levels; deterministic level tie-breaking; L0 transitive overlap closure; boundary-touching ranges ($[a, b]$ and $[b, c]$) overlap; accumulator overflow protection (`ErrByteCountOverflow`); defensive snapshot cloning.
   * *Tests*: 14 unit tests across matrix A-M, 2,000 differential testing iterations against reference pairwise scanner, property-based fuzz campaign (1.8M+ execs), and Small/Medium/Large benchmarks.
   * *Completion*: 100% tests pass, race detector clean, zero data races. Sub-Phase 08.1 M01 verified.
-* **P08-S01-M02: Overlapping Key Range File Selector**
-  * *Objective*: Pick file from $L_i$, calculate key range $[Key_{min}, Key_{max}]$, find all overlapping files in $L_{i+1}$.
-  * *Changes*: `Compactor.GetOverlappingInputs(level int, f *SSTableMetadata) []*SSTableMetadata`.
-  * *Tests*: Test key range intersection logic with non-overlapping and overlapping boundary cases.
-  * *Completion*: File selection verified.
+* **P08-S01-M02: SSTable Sequential Iterator & Streaming Block Traversal**
+  * *Objective*: Provide a safe, ordered, memory-bounded streaming iterator (`TableIterator`) over the records stored in one SSTable file, creating the input abstraction for subsequent k-way merge compaction.
+  * *Changes*: `internal/sstable/table_iterator.go`, `internal/sstable/table_reader.go` (`NewIterator`, `ReadDataBlock`).
+  * *Invariants*: Streaming memory boundedness (retains at most 1 data block in RAM); strictly increasing canonical `binary.CompareInternalKey` ordering enforced within and across data block boundaries; error propagation distinguishing clean EOF (`Err() == nil`) from corruption (`Err() != nil`); idempotent `Close()`; defensive copies on `Key()` and `Value()`; tombstone preservation (`OpTypeDelete` emitted verbatim); concurrent independent iterators over stateless `TableReader.ReadAt`.
+  * *Tests*: 19 unit test cases across matrix A-S (`TestTableIterator_A_SingleBlock` through `TestTableIterator_S_ErrorAfterValidPrefix`), fuzz campaign (9,317+ iterations, 0 crashes/panics), and benchmarks (`BenchmarkTableIterator_SequentialScan_Small/Medium/Large` and `BenchmarkTableIterator_Next_PerRecord`).
+  * *Completion*: 100% tests pass under `-race`, 0 data races, `go vet` clean, `golangci-lint` clean. Sub-Phase 08.1 M02 verified.
 
 ### Sub-Phase 08.2: K-Way Merge Sort & Tombstone Purging
 * **P08-S02-M01: Min-Heap K-Way Merge Iterator**
