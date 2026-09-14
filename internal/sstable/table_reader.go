@@ -431,6 +431,12 @@ func searchDataBlock(blockBuf []byte, targetUserKey []byte, blockOffset uint64) 
 			Reason: "data block restart count is zero",
 		}
 	}
+	if restartCount > MaxRestartCount {
+		return nil, &errors.DataBlockCorruptedError{
+			Offset: blockOffset,
+			Reason: fmt.Sprintf("data block restart count %d exceeds MaxRestartCount %d", restartCount, MaxRestartCount),
+		}
+	}
 
 	// 3. Verify restart array bounds
 	restartBytes := uint64(restartCount) * 4

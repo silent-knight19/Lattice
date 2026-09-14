@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 
 	"github.com/silent-knight19/lattice/internal/binary"
@@ -33,10 +35,10 @@ type VersionSet struct {
 	mu            sync.RWMutex
 	applyMu       sync.Mutex
 	current       *Version
-	dummy         Version // sentinel node for circular doubly-linked active version chain
+	dummy         Version // circular active version chain sentinel
 	nextID        uint64
-	manifest      *ManifestWriter
 	dbPath        string
+	manifest      *ManifestWriter
 	nextFileNum   uint64
 	lastSeqNum    binary.SeqNum
 	obsoleteFiles map[uint64]struct{}
@@ -44,9 +46,10 @@ type VersionSet struct {
 	cleanupErrors []error
 
 	// Pluggable filesystem hooks for deterministic fault injection and testing
-	lstatFn   func(name string) (os.FileInfo, error)
-	unlinkFn  func(name string) error
-	syncDirFn func(f *os.File) error
+	lstatFn    func(name string) (os.FileInfo, error)
+	unlinkFn   func(name string) error
+	removeAtFn func(dirFile *os.File, name string) error
+	syncDirFn  func(f *os.File) error
 }
 
 // VersionSetOptions configures optional initialization properties of a VersionSet.
@@ -63,7 +66,8 @@ func NewVersionSet() *VersionSet {
 		obsoleteFiles: make(map[uint64]struct{}),
 		cleaningFiles: make(map[uint64]struct{}),
 		lstatFn:       os.Lstat,
-		unlinkFn:      os.Remove,
+		unlinkFn:      nil,
+		removeAtFn:    removeAt,
 		syncDirFn:     func(f *os.File) error { return f.Sync() },
 	}
 	vs.dummy.next = &vs.dummy
@@ -181,6 +185,15 @@ func (vs *VersionSet) SetTestHooks(lstat func(string) (os.FileInfo, error), unli
 	}
 }
 
+// SetRemoveAtHook configures a custom directory-anchored unlink hook for deterministic testing.
+func (vs *VersionSet) SetRemoveAtHook(removeAt func(*os.File, string) error) {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+	if removeAt != nil {
+		vs.removeAtFn = removeAt
+	}
+}
+
 // AppendVersion installs an immutable Version into the VersionSet and publishes it as Current.
 //
 // Lifecycle & Reference Transition:
@@ -273,45 +286,56 @@ func (vs *VersionSet) HasCurrent() bool {
 	return vs.current != nil
 }
 
-// ActiveVersions returns a slice of all live Version snapshots currently retained in the active chain.
-//
-// Ownership & Concurrency Contract:
-// Every returned *Version is pinned with an incremented reference count owned by the caller.
-// The caller owns one reference to each returned *Version and MUST call Unref() exactly once
-// on every element in the returned slice when finished.
-//
-// Thread-Safety & Non-Resurrection:
-// While holding vs.mu.RLock(), ActiveVersions walks the active chain and attempts atomic pinning
-// via TryRef(). Only versions that are live (refCount > 0) are pinned and appended. Any node in
-// the active chain whose reference count has already transitioned to zero (awaiting unlinking by
-// finalize()) is safely omitted to prevent resurrection of dead versions.
-// If the VersionSet is empty or contains no live versions, ActiveVersions returns nil.
-func (vs *VersionSet) ActiveVersions() []*Version {
-	vs.mu.RLock()
-	defer vs.mu.RUnlock()
-
-	var result []*Version
-	for cur := vs.dummy.next; cur != &vs.dummy; cur = cur.next {
-		if cur.TryRef() {
-			result = append(result, cur)
-		}
-	}
-	return result
-}
-
-// ActiveCount returns the count of live Version snapshots currently retained in the active chain.
-// Nodes whose reference count has transitioned to zero (awaiting unlinking) are not counted.
+// ActiveCount returns the number of active Version snapshots currently alive in the chain.
 func (vs *VersionSet) ActiveCount() int {
 	vs.mu.RLock()
 	defer vs.mu.RUnlock()
 
-	var count int
-	for cur := vs.dummy.next; cur != &vs.dummy; cur = cur.next {
-		if cur.refCount.Load() > 0 {
-			count++
-		}
+	count := 0
+	for curr := vs.dummy.next; curr != &vs.dummy; curr = curr.next {
+		count++
 	}
 	return count
+}
+
+// ActiveVersions returns defensive, retained pointers to all Versions in the active chain.
+// The caller assumes ownership of one reference per returned Version and MUST call Unref()
+// on each element when finished.
+//
+// Concurrency & Lifetime Guarantee:
+// Versions whose refCount has already transitioned to zero are skipped.
+func (vs *VersionSet) ActiveVersions() []*Version {
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
+
+	var active []*Version
+	for curr := vs.dummy.next; curr != &vs.dummy; curr = curr.next {
+		if curr.TryRef() {
+			active = append(active, curr)
+		}
+	}
+	return active
+}
+
+// ObsoleteFiles returns a snapshot of all uncleaned obsolete SSTable file numbers.
+func (vs *VersionSet) ObsoleteFiles() []uint64 {
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
+
+	res := make([]uint64, 0, len(vs.obsoleteFiles))
+	for f := range vs.obsoleteFiles {
+		res = append(res, f)
+	}
+	slices.Sort(res)
+	return res
+}
+
+// IsFileObsolete reports whether fileNum is marked as obsolete and pending deletion.
+func (vs *VersionSet) IsFileObsolete(fileNum uint64) bool {
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
+	_, exists := vs.obsoleteFiles[fileNum]
+	return exists
 }
 
 // validatePhysicalAddedFiles validates that all added SSTables exist on disk as regular files
@@ -351,33 +375,32 @@ func (vs *VersionSet) validatePhysicalAddedFiles(adds []AddFileEntry) error {
 	return nil
 }
 
-// collectObsoleteFilesLocked collects candidate obsolete files that are no longer referenced
-// by any active version in the circular doubly-linked active version chain.
-// Must be called with vs.mu held.
+// collectObsoleteFilesLocked computes the set of candidate obsolete SSTable files that are
+// not referenced by any active Version in the chain, moves them to cleaningFiles, and returns them.
+// Must be called while holding vs.mu.Lock().
 func (vs *VersionSet) collectObsoleteFilesLocked() ([]uint64, string) {
 	if len(vs.obsoleteFiles) == 0 {
 		return nil, vs.dbPath
 	}
 
-	// Identify all FileNums present across all active versions (where refCount > 0)
-	activeFileNums := make(map[uint64]struct{})
-	for cur := vs.dummy.next; cur != &vs.dummy; cur = cur.next {
-		if cur.refCount.Load() > 0 {
-			for lvl := 0; lvl < NumLevels; lvl++ {
-				for _, f := range cur.levels[lvl] {
-					activeFileNums[f.FileNum] = struct{}{}
-				}
+	// 1. Build set of all files currently referenced by any active Version in the chain
+	referenced := make(map[uint64]struct{})
+	for curr := vs.dummy.next; curr != &vs.dummy; curr = curr.next {
+		for lvl := 0; lvl < NumLevels; lvl++ {
+			for _, f := range curr.levels[lvl] {
+				referenced[f.FileNum] = struct{}{}
 			}
 		}
 	}
 
+	// 2. Filter obsolete files not referenced by any active Version and not already being cleaned
 	var toDelete []uint64
-	for fileNum := range vs.obsoleteFiles {
-		if _, active := activeFileNums[fileNum]; !active {
-			if _, cleaning := vs.cleaningFiles[fileNum]; !cleaning {
-				toDelete = append(toDelete, fileNum)
-				vs.cleaningFiles[fileNum] = struct{}{}
-				delete(vs.obsoleteFiles, fileNum)
+	for f := range vs.obsoleteFiles {
+		if _, isRef := referenced[f]; !isRef {
+			if _, isCleaning := vs.cleaningFiles[f]; !isCleaning {
+				toDelete = append(toDelete, f)
+				vs.cleaningFiles[f] = struct{}{}
+				delete(vs.obsoleteFiles, f)
 			}
 		}
 	}
@@ -393,11 +416,68 @@ func (vs *VersionSet) deletePhysicalFiles(dbPath string, fileNums []uint64) ([]u
 	}
 
 	cleanDBPath := filepath.Clean(dbPath)
+
+	// Step 1: Secure parent directory descriptor pinning (P08-SEC-001)
+	dirFile, openErr := os.Open(cleanDBPath)
+	if openErr != nil {
+		vs.mu.Lock()
+		vs.cleanupErrors = append(vs.cleanupErrors, openErr)
+		vs.mu.Unlock()
+		return nil, fmt.Errorf("failed to open database directory for cleanup: %w", openErr)
+	}
+	defer func() { _ = dirFile.Close() }()
+
+	dirStat, statErr := dirFile.Stat()
+	if statErr != nil {
+		vs.mu.Lock()
+		vs.cleanupErrors = append(vs.cleanupErrors, statErr)
+		vs.mu.Unlock()
+		return nil, fmt.Errorf("failed to stat database directory: %w", statErr)
+	}
+	if !dirStat.IsDir() {
+		err := fmt.Errorf("security violation: database path is not a directory: %s", cleanDBPath)
+		vs.mu.Lock()
+		vs.cleanupErrors = append(vs.cleanupErrors, err)
+		vs.mu.Unlock()
+		return nil, err
+	}
+
+	pStat, lstatErr := vs.lstatFn(cleanDBPath)
+	if lstatErr != nil {
+		vs.mu.Lock()
+		vs.cleanupErrors = append(vs.cleanupErrors, lstatErr)
+		vs.mu.Unlock()
+		return nil, fmt.Errorf("failed to lstat database directory: %w", lstatErr)
+	}
+	if pStat.Mode()&os.ModeSymlink != 0 {
+		err := fmt.Errorf("security violation: database directory is a symlink: %s", cleanDBPath)
+		vs.mu.Lock()
+		vs.cleanupErrors = append(vs.cleanupErrors, err)
+		vs.mu.Unlock()
+		return nil, err
+	}
+	if !os.SameFile(dirStat, pStat) {
+		err := fmt.Errorf("security violation: database directory was substituted: %s", cleanDBPath)
+		vs.mu.Lock()
+		vs.cleanupErrors = append(vs.cleanupErrors, err)
+		vs.mu.Unlock()
+		return nil, err
+	}
+
 	var cleaned []uint64
 	var errorsList []error
 
 	for _, fileNum := range fileNums {
 		name := TableFilename(fileNum)
+		// Strict canonical filename format validation (P08-SEC-008)
+		parsedNum, ok := ParseTableFilename(name)
+		if !ok || parsedNum != fileNum || filepath.Base(name) != name || strings.Contains(name, "/") || strings.Contains(name, "\\") {
+			err := fmt.Errorf("security violation: invalid or path-escaping SSTable filename: %q", name)
+			errorsList = append(errorsList, err)
+			vs.recordCleanupResult(fileNum, false, err)
+			continue
+		}
+
 		sstPath := filepath.Clean(filepath.Join(cleanDBPath, name))
 
 		// Security: directory confinement check
@@ -441,8 +521,17 @@ func (vs *VersionSet) deletePhysicalFiles(dbPath string, fileNums []uint64) ([]u
 			continue
 		}
 
-		// Safely unlink regular file
-		if removeErr := vs.unlinkFn(sstPath); removeErr != nil {
+		// Safely unlink regular file anchored to pinned directory descriptor (P08-SEC-001)
+		var removeErr error
+		if vs.unlinkFn != nil {
+			removeErr = vs.unlinkFn(sstPath)
+		} else if vs.removeAtFn != nil {
+			removeErr = vs.removeAtFn(dirFile, name)
+		} else {
+			removeErr = removeAt(dirFile, name)
+		}
+
+		if removeErr != nil {
 			if os.IsNotExist(removeErr) {
 				cleaned = append(cleaned, fileNum)
 				vs.recordCleanupResult(fileNum, true, nil)
@@ -456,13 +545,10 @@ func (vs *VersionSet) deletePhysicalFiles(dbPath string, fileNums []uint64) ([]u
 		}
 	}
 
-	// Synchronize parent directory if files were removed
+	// Synchronize pinned parent directory if files were removed
 	if len(cleaned) > 0 {
-		if dirFile, openErr := os.Open(cleanDBPath); openErr == nil {
-			if syncErr := vs.syncDirFn(dirFile); syncErr != nil {
-				errorsList = append(errorsList, fmt.Errorf("directory sync failed after unlinking: %w", syncErr))
-			}
-			_ = dirFile.Close()
+		if syncErr := vs.syncDirFn(dirFile); syncErr != nil {
+			errorsList = append(errorsList, fmt.Errorf("directory sync failed after unlinking: %w", syncErr))
 		}
 	}
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"container/heap"
 	stdErrors "errors"
+	"fmt"
 	"io"
 	"sync"
 
@@ -13,6 +14,10 @@ import (
 )
 
 var _ sstable.Iterator = (*MergingIterator)(nil)
+
+// MaxMergingIterators defines the maximum allowable number of child iterators
+// in a single MergingIterator (10,000) to prevent min-heap resource exhaustion (P08-SEC-018).
+const MaxMergingIterators = 10000
 
 // Iterator represents the sequential record traversal interface consumed by MergingIterator.
 // It is directly satisfied by sstable.Iterator, memtable.Iterator, and nested merge iterators.
@@ -117,6 +122,10 @@ type MergingIterator struct {
 	hasEmitted         bool
 	lastEmittedUserKey []byte
 
+	// Child iterator tracking and monotonic progression invariants (P08-SEC-019)
+	childPrevKeys    []binary.InternalKey
+	childRepeatCount []int
+
 	// Child iterator whose record is currently being emitted and must be advanced on next Next()
 	lastEmittedIter  Iterator
 	lastEmittedIndex int
@@ -141,10 +150,20 @@ func NewRawMergingIterator(iters []Iterator) *MergingIterator {
 }
 
 func newMergingIteratorInternal(iters []Iterator, raw bool) *MergingIterator {
+	if len(iters) > MaxMergingIterators {
+		return &MergingIterator{
+			raw:   raw,
+			state: mergeStateFailed,
+			err:   fmt.Errorf("compaction: iterator count %d exceeds maximum limit of %d", len(iters), MaxMergingIterators),
+		}
+	}
+
 	it := &MergingIterator{
 		raw:                raw,
 		state:              mergeStateUninitialized,
 		children:           make([]Iterator, 0, len(iters)),
+		childPrevKeys:      make([]binary.InternalKey, len(iters)),
+		childRepeatCount:   make([]int, len(iters)),
 		lastEmittedUserKey: make([]byte, 0, 64),
 	}
 
@@ -170,9 +189,12 @@ func newMergingIteratorInternal(iters []Iterator, raw bool) *MergingIterator {
 			continue
 		}
 
+		k := child.Key()
+		it.childPrevKeys[i] = k.Clone()
+
 		item := &heapItem{
 			iter:  child,
-			key:   child.Key(),
+			key:   k,
 			value: child.Value(),
 			index: i,
 		}
@@ -194,9 +216,13 @@ func (it *MergingIterator) Valid() bool {
 	return it.state == mergeStateValid
 }
 
-// Next advances the iterator to the next logical record in the merged stream.
-// Returns true if positioned at a valid record, or false if iteration has ended cleanly (EOF)
-// or failed due to child corruption.
+// Next advances the merge iterator to the next winning record.
+//
+// Semantics:
+//  1. If raw == false: suppresses duplicate older revisions of already-emitted UserKeys.
+//  2. If raw == true: yields all records in strictly sorted canonical InternalKey order.
+//  3. If a child encounters an error, transitions to mergeStateFailed and returns false.
+//  4. Upon clean exhaustion of all children, transitions to mergeStateExhausted and returns false.
 func (it *MergingIterator) Next() bool {
 	if it == nil {
 		return false
@@ -222,6 +248,7 @@ func (it *MergingIterator) Next() bool {
 		}
 	}
 
+	dedupLoops := 0
 	// Step 2: Pop candidates from the min-heap until finding a record to emit or exhausting the heap.
 	for len(it.h) > 0 {
 		popped := heap.Pop(&it.h)
@@ -232,6 +259,15 @@ func (it *MergingIterator) Next() bool {
 
 		// Check for older revision deduplication
 		if !it.raw && it.hasEmitted && bytes.Equal(item.key.UserKey, it.lastEmittedUserKey) {
+			// Loop defense (P08-SEC-019): Bounded suppression count per Next() invocation.
+			dedupLoops++
+			if dedupLoops > 1000000 {
+				it.state = mergeStateFailed
+				it.err = fmt.Errorf("compaction: excessive deduplication iterations (%d) for user key %q (loop detected)", dedupLoops, it.lastEmittedUserKey)
+				it.clearEmittedRecord()
+				return false
+			}
+
 			// This record has the same UserKey as an already emitted record.
 			// Because of canonical ordering (SeqNum descending), this item is strictly an older
 			// revision and must be suppressed. Advance this child and push back to heap if valid.
@@ -273,9 +309,38 @@ func (it *MergingIterator) Next() bool {
 // If child cleanly exhausts, returns true without pushing to the heap.
 func (it *MergingIterator) advanceAndPush(child Iterator, index int) bool {
 	if child.Next() {
+		currKey := child.Key()
+
+		// Monotonic progression invariant (P08-SEC-019):
+		// Each child iterator must yield records in canonical InternalKey order.
+		// If a child iterator yields a key strictly smaller than its previous key (going backwards),
+		// or repeats the exact same internal key excessively, it is corrupted or hostile;
+		// fail closed to prevent infinite loops in deduplication.
+		if index >= 0 && index < len(it.childPrevKeys) && it.childPrevKeys[index].UserKey != nil {
+			cmp := binary.CompareInternalKey(it.childPrevKeys[index], currKey)
+			if cmp > 0 {
+				it.state = mergeStateFailed
+				it.err = fmt.Errorf("compaction: child iterator %d yielded keys out of canonical order: prev > curr", index)
+				return false
+			}
+			if cmp == 0 {
+				it.childRepeatCount[index]++
+				if it.childRepeatCount[index] > 8 {
+					it.state = mergeStateFailed
+					it.err = fmt.Errorf("compaction: child iterator %d repeated identical key %d times (loop detected)", index, it.childRepeatCount[index])
+					return false
+				}
+			} else {
+				it.childRepeatCount[index] = 0
+			}
+		}
+		if index >= 0 && index < len(it.childPrevKeys) {
+			it.childPrevKeys[index] = currKey.Clone()
+		}
+
 		item := &heapItem{
 			iter:  child,
-			key:   child.Key(),
+			key:   currKey,
 			value: child.Value(),
 			index: index,
 		}
@@ -377,6 +442,7 @@ func (it *MergingIterator) Close() error {
 	it.h = nil
 	it.clearEmittedRecord()
 	it.lastEmittedUserKey = nil
+	it.childPrevKeys = nil
 
 	var closeErrs []error
 	for _, child := range it.children {

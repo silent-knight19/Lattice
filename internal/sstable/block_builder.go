@@ -39,6 +39,11 @@ const (
 	// Any block header, decompression size, or handle advertising a Size exceeding this ceiling is
 	// rejected immediately prior to buffer allocation to prevent memory exhaustion DoS (VULN-001).
 	MaxBlockSize = 64 * 1024 * 1024
+
+	// MaxRestartCount is the maximum allowable count of restart points in an SSTable data block (65,536).
+	// Blocks advertising restart counts beyond this threshold are rejected during parsing
+	// to prevent unbounded array allocations and resource exhaustion DoS (P08-SEC-017).
+	MaxRestartCount = 65536
 )
 
 // BlockBuilder constructs prefix-compressed SSTable data blocks from consecutive sorted records.

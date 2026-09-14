@@ -626,6 +626,12 @@ func (it *TableIterator) loadBlock(idx int) error {
 			Reason: "data block restart count is zero",
 		}
 	}
+	if restartCount > MaxRestartCount {
+		return &errors.DataBlockCorruptedError{
+			Offset: entry.Handle.Offset,
+			Reason: fmt.Sprintf("data block restart count %d exceeds MaxRestartCount %d", restartCount, MaxRestartCount),
+		}
+	}
 
 	// 3. Verify restart array boundaries
 	restartBytes := uint64(restartCount) * 4
