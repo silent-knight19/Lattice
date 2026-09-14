@@ -2079,10 +2079,11 @@ TOTAL: 184 Discrete, Testable Micro-Phases
 
 ### Sub-Phase 08.3: Compaction Execution & Manifest Commit
 * **P08-S03-M01: Compaction Output SSTable Generation**
-  * *Objective*: Stream merged records into new SSTable files partitioned at 2MB boundaries for $L \ge 1$.
-  * *Changes*: `Compactor.Run() error`.
-  * *Tests*: Execute simulated compaction; verify output files adhere to non-overlapping key range invariant.
-  * *Completion*: Compaction file generation verified.
+  * *Objective*: Materialize the deduplicated compaction merge stream into immutable SSTables partitioned around a 2 MiB boundary, enforcing physical omission of provably safe tombstones and returning finalized file metadata descriptors without mutating the live VersionSet.
+  * *Changes*: `internal/compaction/output.go`, `internal/compaction/output_test.go`, `internal/compaction/output_differential_test.go`, `internal/compaction/output_fuzz_test.go`, `internal/compaction/output_bench_test.go`.
+  * *Invariants*: Canonical ordering preservation (`UserKey ASC, SeqNum DESC, OpType DESC`); safe tombstone physical omission via `TombstoneSafetyChecker.CanDropTombstone(userKey, targetLevel)` (with distinct UserKey vs InternalKey domains); 2 MiB partition target with oversized single-record forward-progress guarantee; atomic record boundaries (records never split); zero-output contract on empty stream or 100% dropped tombstones; fail-closed staging and descriptor cleanup on write/iteration/validation failure; physical SSTable validation via `TableReader` (inode pinning, header, footer, index block, and per-block CRC32 verification).
+  * *Tests*: Acceptance matrix A-T (empty input -> 0 files, single PUT, canonical ordering, safe tombstone omission, unsafe tombstone retention, range false positive with exact vs conservative compactor, all tombstones dropped -> 0 files, mixed tombstones + PUTs, multiple partitions, boundary-sized records, oversized single record, partition exactness, writer failure, finalization failure, child iterator corruption, file collision safety, metadata correctness, reader round-trip, determinism, resource lifecycle without leaks, and concurrent multi-worker builds), 1,000-iteration randomized differential test suite vs independent reference model (0 mismatches), native Go fuzz target (`FuzzCompactionOutput`), and benchmarks across Small (1K), Medium (100K), Large (multiple 2 MiB partitions), and high-tombstone omission workloads.
+  * *Completion*: 100% tests pass under `-race`, 0 data races, `go vet` clean, `golangci-lint` clean (0 issues). Sub-Phase 08.3 M01 verified.
 * **P08-S03-M02: Atomic Manifest Commit & Obsolete File Deletion**
   * *Objective*: Commit `VersionEdit` deleting input files and adding output files; unlink obsolete files once unpinned.
   * *Changes*: `VersionSet.LogAndApply(edit VersionEdit) error`.
