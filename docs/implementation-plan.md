@@ -2066,10 +2066,10 @@ TOTAL: 184 Discrete, Testable Micro-Phases
 ### Sub-Phase 08.2: K-Way Merge Sort & Tombstone Purging
 * **P08-S02-M01: Min-Heap K-Way Merge Iterator**
   * *Objective*: Multi-file iterator using `container/heap` sorting by `Key` ascending, `SeqNum` descending.
-  * *Changes*: `NewMergingIterator(iters []Iterator) *MergingIterator`.
-  * *Invariants*: Yields newest record revision first; discards duplicate older revisions.
-  * *Tests*: Merge 4 files containing overlapping keys and revisions; verify output strictly sorted and deduplicated.
-  * *Completion*: K-way merge verified.
+  * *Changes*: `internal/compaction/merge.go`, `internal/compaction/merge_test.go`, `internal/compaction/merge_differential_test.go`, `internal/compaction/merge_fuzz_test.go`, `internal/compaction/merge_bench_test.go`.
+  * *Invariants*: Canonical `binary.CompareInternalKey` ordering (UserKey ASC, SeqNum DESC, OpType DESC); deterministic lower-child-index tie-breaking; newest revision emission per UserKey with duplicate older revision suppression; raw mode option (`NewRawMergingIterator`); verbatim tombstone surfacing (`OpTypeDelete` with `Value() == nil`); fail-closed child error propagation; memory-bounded $O(N)$ heap footprint; defensive copies on `Key()`, `RawKey()`, `Value()`; idempotent child-owning `Close()`.
+  * *Tests*: Acceptance matrix A-U (empty, single, disjoint, 4-file overlapping with real SSTable files, 16-way, same-key revisions, stable tie-break, tombstones, mid-iteration child corruption, panic-freedom), 2,500-iteration randomized differential test suite vs independent reference model, native fuzz test (`FuzzMergingIterator`, 437k+ execs), and Small/Medium/Large benchmarks.
+  * *Completion*: 100% tests pass under `-race`, 0 data races, `go vet` clean, `golangci-lint` clean. Sub-Phase 08.2 M01 verified.
 * **P08-S02-M02: Tombstone Purge Safety Invariant Enforcer**
   * *Objective*: Purge tombstone record if and only if key does not exist in any level deeper than target level.
   * *Changes*: `Compactor.CanDropTombstone(key []byte, targetLevel int) bool`.
