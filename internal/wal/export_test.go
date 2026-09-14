@@ -27,3 +27,19 @@ func (rw *RotatingWriter) SetCreateWriterFnForTesting(fn func(path string) (*WAL
 	defer rw.mu.Unlock()
 	rw.createWriterFn = fn
 }
+
+// SetSyncDirFnForTesting exports syncDirFn seam injection on RotatingWriter.
+func (rw *RotatingWriter) SetSyncDirFnForTesting(fn func(dirPath string) error) {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	rw.syncDirFn = fn
+}
+
+// SetOpenSyncDirFnForTesting overrides openSyncDirFn for testing directory sync during OpenRotatingWriter.
+func SetOpenSyncDirFnForTesting(fn func(dirPath string) error) func() {
+	prev := openSyncDirFn
+	openSyncDirFn = fn
+	return func() {
+		openSyncDirFn = prev
+	}
+}

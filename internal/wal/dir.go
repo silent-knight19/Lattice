@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/silent-knight19/lattice/internal/errors"
 )
@@ -156,4 +157,25 @@ func InitDir(dbPath string) (string, error) {
 	}
 
 	return walPath, nil
+}
+
+// SyncDir synchronizes directory metadata (dentries) to non-volatile storage.
+// On POSIX platforms, it opens the directory handle and executes fsync() to ensure
+// that newly created segment files and unlinks are committed to durable media.
+// On Windows platforms, directory handle synchronization is not supported by Win32/NTFS
+// and returns nil safely.
+func SyncDir(dirPath string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	df, err := os.Open(dirPath)
+	if err != nil {
+		return fmt.Errorf("wal: failed to open directory for sync %s: %w", dirPath, err)
+	}
+	defer func() { _ = df.Close() }()
+
+	if err := df.Sync(); err != nil {
+		return fmt.Errorf("wal: failed to sync directory %s: %w", dirPath, err)
+	}
+	return nil
 }

@@ -195,7 +195,13 @@ type RotatingWriter struct {
 
 	// createWriterFn is an internal test seam for injecting creation failures.
 	createWriterFn func(path string) (*WALWriter, error)
+
+	// syncDirFn is the parent directory durability barrier called after creating a new segment.
+	syncDirFn func(dirPath string) error
 }
+
+// openSyncDirFn is a package-level seam for injecting directory sync failures during OpenRotatingWriter.
+var openSyncDirFn = SyncDir
 
 // WAL is an alias for RotatingWriter, matching standard database engine terminology.
 type WAL = RotatingWriter
@@ -243,6 +249,10 @@ func OpenRotatingWriter(dbPath string, opts Options) (*RotatingWriter, error) {
 		if err != nil {
 			return nil, fmt.Errorf("wal: failed to create initial segment %d: %w", activeID, err)
 		}
+		if err := openSyncDirFn(Dir(cleanDBPath)); err != nil {
+			_ = w.Close()
+			return nil, fmt.Errorf("wal: failed to sync directory for initial segment %d: %w", activeID, err)
+		}
 		activeWriter = w
 		activeLen = 0
 	} else {
@@ -269,6 +279,7 @@ func OpenRotatingWriter(dbPath string, opts Options) (*RotatingWriter, error) {
 		activeLen:      activeLen,
 		closed:         false,
 		createWriterFn: CreateWriter,
+		syncDirFn:      SyncDir,
 	}
 
 	return rw, nil
@@ -492,6 +503,15 @@ func (rw *RotatingWriter) rotateLocked() error {
 		// Mark active as nil so subsequent appends cannot corrupt or write to closed segments.
 		rw.active = nil
 		return fmt.Errorf("wal: failed to create next segment %d at %s: %w", nextID, nextPath, err)
+	}
+
+	// Step 2.5: Parent directory durability barrier to ensure segment creation is committed
+	if rw.syncDirFn != nil {
+		if err := rw.syncDirFn(Dir(rw.dbPath)); err != nil {
+			_ = newWriter.Close()
+			rw.active = nil
+			return fmt.Errorf("wal: failed to sync directory during rotation: %w", err)
+		}
 	}
 
 	// Step 3: Transition active state to new segment

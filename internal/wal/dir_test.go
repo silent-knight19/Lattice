@@ -638,3 +638,26 @@ func TestInitDir_ExistingDirectoryInodePreservation(t *testing.T) {
 		t.Fatalf("directory inode changed during idempotent call! Directory was recreated.")
 	}
 }
+
+// TestDir_SyncDir verifies that wal.SyncDir safely synchronizes directory metadata
+// on POSIX platforms and handles error conditions correctly.
+func TestDir_SyncDir(t *testing.T) {
+	tempDir := t.TempDir()
+	walDir := filepath.Join(tempDir, "wal")
+	if err := os.Mkdir(walDir, 0700); err != nil {
+		t.Fatalf("failed to create test dir: %v", err)
+	}
+
+	// 1. Sync valid directory
+	if err := wal.SyncDir(walDir); err != nil {
+		t.Errorf("SyncDir failed on valid dir: %v", err)
+	}
+
+	// 2. Non-existent directory returns error on POSIX systems
+	if runtime.GOOS != "windows" {
+		nonExistent := filepath.Join(tempDir, "non_existent_dir")
+		if err := wal.SyncDir(nonExistent); err == nil {
+			t.Errorf("expected error syncing non-existent directory, got nil")
+		}
+	}
+}

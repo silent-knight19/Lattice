@@ -594,6 +594,186 @@ func FuzzRoundTripVarint64(f *testing.F) {
 	})
 }
 
+func FuzzGetVarint64Canonical(f *testing.F) {
+	seeds := [][]byte{
+		{},
+		{0x00},
+		{0x01},
+		{0x7F},
+		{0x80, 0x01},
+		{0xFF, 0x01},
+		{0x80, 0x80, 0x01},
+		{0xFF, 0xFF, 0x7F},
+		{0x80, 0x80, 0x80, 0x80, 0x08},
+		bytes.Repeat([]byte{0xFF}, 9),
+		append(bytes.Repeat([]byte{0xFF}, 9), 0x01),
+		append(bytes.Repeat([]byte{0xFF}, 9), 0x02),
+		{0x80, 0x00}, // overlong 0
+		{0x81, 0x00}, // overlong 1
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		val, n, err := binary.GetVarint64Canonical(data)
+		if err != nil {
+			if n != 0 || val != 0 {
+				t.Fatalf("expected (0, 0) on error, got val=%d, n=%d", val, n)
+			}
+			if !stdErrors.Is(err, errors.ErrVarintTruncated) &&
+				!stdErrors.Is(err, errors.ErrVarintOverflow) &&
+				!stdErrors.Is(err, errors.ErrVarintNonCanonical) {
+				t.Fatalf("unexpected error type returned: %v", err)
+			}
+			return
+		}
+
+		// On canonical success, n must exactly match VarintLen(val)
+		if expectedLen := binary.VarintLen(val); expectedLen != n {
+			t.Fatalf("canonical byte count mismatch: VarintLen=%d, GetVarint64Canonical consumed=%d", expectedLen, n)
+		}
+		if n < 1 || n > 10 || n > len(data) {
+			t.Fatalf("invalid bytesConsumed reported: n=%d for len(data)=%d", n, len(data))
+		}
+
+		// Re-encoding must match the first n bytes exactly
+		reencoded := make([]byte, binary.MaxVarintLen64)
+		reN := binary.PutVarint64(reencoded, val)
+		if reN != n || !bytes.Equal(reencoded[:reN], data[:n]) {
+			t.Fatalf("re-encoded canonical bytes mismatch: got %x, want %x", reencoded[:reN], data[:n])
+		}
+	})
+}
+
+func FuzzGetVarint32(f *testing.F) {
+	seeds := [][]byte{
+		{},
+		{0x00},
+		{0x01},
+		{0x7F},
+		{0x80, 0x01},
+		{0xFF, 0x01},
+		{0x80, 0x80, 0x01},
+		{0xFF, 0xFF, 0x7F},
+		{0x80, 0x80, 0x80, 0x80, 0x08},
+		{0x80, 0x80, 0x80, 0x80, 0x10}, // overflow bit
+		bytes.Repeat([]byte{0xFF}, 5),
+		bytes.Repeat([]byte{0x80}, 5),
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		val, n, err := binary.GetVarint32(data)
+		if err != nil {
+			if n != 0 || val != 0 {
+				t.Fatalf("expected (0, 0) on error, got val=%d, n=%d", val, n)
+			}
+			if !stdErrors.Is(err, errors.ErrVarintTruncated) && !stdErrors.Is(err, errors.ErrVarintOverflow) {
+				t.Fatalf("unexpected error type returned: %v", err)
+			}
+			return
+		}
+
+		if n < 1 || n > binary.MaxVarintLen32 || n > len(data) {
+			t.Fatalf("invalid bytesConsumed reported: n=%d for len(data)=%d", n, len(data))
+		}
+
+		reencoded := make([]byte, binary.MaxVarintLen32)
+		reN := binary.PutVarint32(reencoded, val)
+		if reN > n {
+			t.Fatalf("canonical encoding length (%d) exceeds decoded length (%d)", reN, n)
+		}
+	})
+}
+
+func FuzzGetVarint32Canonical(f *testing.F) {
+	seeds := [][]byte{
+		{},
+		{0x00},
+		{0x01},
+		{0x7F},
+		{0x80, 0x01},
+		{0xFF, 0x01},
+		{0x80, 0x80, 0x01},
+		{0xFF, 0xFF, 0x7F},
+		{0x80, 0x80, 0x80, 0x80, 0x08},
+		{0x80, 0x00}, // overlong 0
+		{0x81, 0x00}, // overlong 1
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		val, n, err := binary.GetVarint32Canonical(data)
+		if err != nil {
+			if n != 0 || val != 0 {
+				t.Fatalf("expected (0, 0) on error, got val=%d, n=%d", val, n)
+			}
+			if !stdErrors.Is(err, errors.ErrVarintTruncated) &&
+				!stdErrors.Is(err, errors.ErrVarintOverflow) &&
+				!stdErrors.Is(err, errors.ErrVarintNonCanonical) {
+				t.Fatalf("unexpected error type returned: %v", err)
+			}
+			return
+		}
+
+		if expectedLen := binary.VarintLen32(val); expectedLen != n {
+			t.Fatalf("canonical byte count mismatch: VarintLen32=%d, GetVarint32Canonical consumed=%d", expectedLen, n)
+		}
+		if n < 1 || n > binary.MaxVarintLen32 || n > len(data) {
+			t.Fatalf("invalid bytesConsumed reported: n=%d for len(data)=%d", n, len(data))
+		}
+
+		reencoded := make([]byte, binary.MaxVarintLen32)
+		reN := binary.PutVarint32(reencoded, val)
+		if reN != n || !bytes.Equal(reencoded[:reN], data[:n]) {
+			t.Fatalf("re-encoded canonical bytes mismatch: got %x, want %x", reencoded[:reN], data[:n])
+		}
+	})
+}
+
+func FuzzRoundTripVarint32(f *testing.F) {
+	seeds := []uint32{
+		0, 1, 127, 128, 129, 255, 256, 16383, 16384,
+		math.MaxInt32 - 1, math.MaxInt32, uint32(math.MaxInt32) + 1, math.MaxUint32 - 1, math.MaxUint32,
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+
+	f.Fuzz(func(t *testing.T, v uint32) {
+		buf := make([]byte, binary.MaxVarintLen32)
+		n := binary.PutVarint32(buf, v)
+
+		if n < 1 || n > binary.MaxVarintLen32 {
+			t.Fatalf("PutVarint32 returned invalid byte count: %d", n)
+		}
+
+		decoded, readN, err := binary.GetVarint32(buf[:n])
+		if err != nil {
+			t.Fatalf("GetVarint32 failed on validly encoded uint32 (%d): %v", v, err)
+		}
+		if readN != n {
+			t.Fatalf("byte count mismatch: Put=%d, Get=%d", n, readN)
+		}
+		if decoded != v {
+			t.Fatalf("value mismatch: Put=%d, Get=%d", v, decoded)
+		}
+
+		canonicalDecoded, canonN, err := binary.GetVarint32Canonical(buf[:n])
+		if err != nil {
+			t.Fatalf("GetVarint32Canonical failed on canonical uint32 (%d): %v", v, err)
+		}
+		if canonN != n || canonicalDecoded != v {
+			t.Fatalf("GetVarint32Canonical mismatch: got (%d, %d), want (%d, %d)", canonicalDecoded, canonN, v, n)
+		}
+	})
+}
+
 // ============================================================================
 // 10. Zero-Allocation Benchmarks
 // ============================================================================

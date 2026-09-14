@@ -37,10 +37,10 @@ import (
 //     3. OpType DESC (DELETE/Tombstone sorts before PUT for identical seqNum)
 //   - Traversal along forward pointers terminates at nil without cycles.
 type SkipList struct {
-	mu       sync.RWMutex
-	head     *skipListNode
-	height   atomic.Int32
-	rnd      *HeightGenerator
+	mu              sync.RWMutex
+	head            *skipListNode
+	height          atomic.Int32
+	rnd             *HeightGenerator
 	count           atomic.Int64
 	byteSize        atomic.Uint64
 	frozen          atomic.Bool

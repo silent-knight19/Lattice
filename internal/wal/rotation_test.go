@@ -1554,3 +1554,101 @@ func TestRotation_MaxUint64_BoundaryAndNamingConsistency(t *testing.T) {
 		t.Errorf("expected ID math.MaxUint64, got %d", id)
 	}
 }
+
+// 39. SyncDir durability barrier is invoked on rotation with the correct WAL directory path.
+func TestRotation_SyncDirInvokedOnRotation(t *testing.T) {
+	dir := t.TempDir()
+	rw, err := wal.OpenRotatingWriter(dir, wal.Options{SegmentSize: 1024})
+	if err != nil {
+		t.Fatalf("OpenRotatingWriter failed: %v", err)
+	}
+	defer func() { _ = rw.Close() }()
+
+	var (
+		syncDirCalls int
+		syncedPath   string
+		mu           sync.Mutex
+	)
+	rw.SetSyncDirFnForTesting(func(dirPath string) error {
+		mu.Lock()
+		syncDirCalls++
+		syncedPath = dirPath
+		mu.Unlock()
+		return nil
+	})
+
+	if err := rw.Rotate(); err != nil {
+		t.Fatalf("Rotate failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if syncDirCalls != 1 {
+		t.Errorf("expected 1 syncDir call, got %d", syncDirCalls)
+	}
+	expectedDir := wal.Dir(dir)
+	if syncedPath != expectedDir {
+		t.Errorf("expected synced directory %q, got %q", expectedDir, syncedPath)
+	}
+}
+
+// 40. SyncDir failure during rotation fails closed and invalidates active writer.
+func TestRotation_SyncDirFailureDuringRotation_FailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	rw, err := wal.OpenRotatingWriter(dir, wal.Options{SegmentSize: 1024})
+	if err != nil {
+		t.Fatalf("OpenRotatingWriter failed: %v", err)
+	}
+	defer func() { _ = rw.Close() }()
+
+	injectedErr := stdErrors.New("injected fsync directory failure")
+	rw.SetSyncDirFnForTesting(func(dirPath string) error {
+		return injectedErr
+	})
+
+	err = rw.Rotate()
+	if err == nil {
+		t.Fatal("expected Rotate to fail when syncDir fails, got nil")
+	}
+	if !stdErrors.Is(err, injectedErr) {
+		t.Errorf("expected error wrapping injectedErr, got: %v", err)
+	}
+
+	// Active segment must be cleared to fail-closed
+	if rw.ActiveSegmentID() != 0 {
+		t.Errorf("expected active segment ID 0 after failed rotation, got %d", rw.ActiveSegmentID())
+	}
+	if rw.ActiveWriter() != nil {
+		t.Error("expected active writer to be nil after failed rotation")
+	}
+
+	// Subsequent append operations must fail closed
+	rec := makeRotRecord(1, "key", "val")
+	if appendErr := rw.Append(rec); appendErr == nil {
+		t.Error("expected Append to fail after rotation failure, got nil")
+	}
+	if syncErr := rw.AppendSync(rec); syncErr == nil {
+		t.Error("expected AppendSync to fail after rotation failure, got nil")
+	}
+}
+
+// 41. SyncDir failure during initial segment creation fails OpenRotatingWriter cleanly.
+func TestRotation_SyncDirFailureDuringInit(t *testing.T) {
+	dir := t.TempDir()
+	injectedErr := stdErrors.New("injected initial dir sync failure")
+	restore := wal.SetOpenSyncDirFnForTesting(func(dirPath string) error {
+		return injectedErr
+	})
+	defer restore()
+
+	rw, err := wal.OpenRotatingWriter(dir, wal.Options{SegmentSize: 1024})
+	if err == nil {
+		if rw != nil {
+			_ = rw.Close()
+		}
+		t.Fatal("expected OpenRotatingWriter to fail when initial directory sync fails, got nil")
+	}
+	if !stdErrors.Is(err, injectedErr) {
+		t.Errorf("expected error wrapping injectedErr, got: %v", err)
+	}
+}

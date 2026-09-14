@@ -33,6 +33,9 @@ trace.out
 *.sst.tmp
 *.log.tmp
 *.tmp
+node-state.json
+*.state.json
+
 
 # Crash Dumps & Debugging Symbols
 core
