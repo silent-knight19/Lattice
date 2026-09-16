@@ -35,6 +35,10 @@ const (
 	engineStateNotRecovering engineState = iota
 	engineStateRecovering
 	engineStateRecovered
+	// engineStateClosing is the M04 shutdown drain phase: new mutations are
+	// rejected, stalled writers are woken, queued immutable generations are
+	// flushed synchronously, and only then are resources closed.
+	engineStateClosing
 	engineStateClosed
 )
 
@@ -137,6 +141,13 @@ type Engine struct {
 	// source for deterministic tests; -1 (default) reads the authoritative
 	// VersionSet L0 file count. No duplicate L0 counter is maintained.
 	l0Override atomic.Int64
+
+	// P10-S01-M04 shutdown state. closeDone is closed exactly once by the
+	// first Close when terminal cleanup completes; concurrent closers wait on
+	// it and receive the same remembered result. closeErr is the terminal
+	// shutdown error (nil on success), guarded by mu.
+	closeDone chan struct{}
+	closeErr  error
 }
 
 // EngineOptions specifies configuration parameters for initializing an Engine instance.
@@ -176,6 +187,7 @@ func NewEngineWithOptions(opts EngineOptions) *Engine {
 		vset:         vset,
 		wal:          opts.WAL,
 		blockCache:   opts.BlockCache,
+		closeDone:    make(chan struct{}),
 	}
 	eng.l0Override.Store(-1)
 	return eng
@@ -260,7 +272,7 @@ func (e *Engine) Open() error {
 	hasWAL := e.wal != nil
 	hasCache := e.blockCache != nil
 	e.mu.RUnlock()
-	if st == engineStateClosed || e.closed.Load() {
+	if st == engineStateClosing || st == engineStateClosed || e.closed.Load() {
 		return errors.ErrWriterClosed
 	}
 	if st == engineStateRecovering {
@@ -822,41 +834,84 @@ func lookupSSTableFile(dbPath string, meta version.FileMetadata, key []byte, bc 
 	return true, false, it.Value(), nil
 }
 
-// Close freezes active tables, stops the background flusher (waiting for any
-// in-flight flush to finish without starting new work), and closes WAL,
-// manifest, and backpressure resources. Close is idempotent. It does not
-// implement M04 flush-on-close drain, compaction coordination, or manifest
-// sync beyond releasing M01/M02 resources; remaining immutable generations
-// stay readable in memory and WAL-durable for future recovery.
+// Close performs clean Engine shutdown and resource reclamation.
+//
+// Ordering (derived from worker dependencies; no Engine mutex is held across
+// disk I/O, manifest work, or worker waits):
+//  1. Single-winner transition RUNNING → CLOSING. New Put/Delete are rejected
+//     from this point (closed flag); concurrent closers wait for completion.
+//  2. Wake stalled/paced writers by closing stopCh; they return ErrWriterClosed.
+//  3. Wait for the background flusher's in-flight flushOne to finish, then the
+//     worker exits (it takes no new work once stopCh is closed).
+//  4. Final rotation of a non-empty active MemTable into the immutable queue,
+//     then synchronous oldest-first drain of every queued generation through
+//     the existing flushOne/TableWriter/VersionSet pipeline (skipped entirely
+//     for engines whose worker never started, preserving memory-only behavior).
+//  5. Freeze memory, close WAL, close manifest, close backpressure (all
+//     attempted even after a drain failure; first error wins, raw for
+//     errors.Is/As), mark CLOSED, retain the terminal error for repeated Close.
+//
+// Successful Close guarantees: every accepted mutation is WAL-durable, every
+// queued and active MemTable generation is published as an L0 SSTable with a
+// synced manifest record, no Engine-owned goroutine remains, and owned WAL /
+// manifest descriptors are closed. Get keeps serving throughout (established
+// contract) from whatever layers remain authoritative.
 func (e *Engine) Close() error {
 	if e == nil {
 		return nil
 	}
+	// Phase 1: single-winner transition to CLOSING.
 	e.mu.Lock()
 	if e.state == engineStateClosed {
+		err := e.closeErr
 		e.mu.Unlock()
-		return nil
+		return err
 	}
+	if e.state == engineStateClosing {
+		done := e.closeDone
+		e.mu.Unlock()
+		<-done
+		e.mu.Lock()
+		err := e.closeErr
+		e.mu.Unlock()
+		return err
+	}
+	// Note: Close during engineStateRecovering intentionally proceeds. The
+	// P07 recovery contract requires the paused publication to observe the
+	// closed state and abort with ErrWriterClosed without installing state.
 	e.closed.Store(true)
-	e.state = engineStateClosed
+	e.state = engineStateClosing
 	stopCh := e.stopCh
+	started := e.flushStarted
 	e.mu.Unlock()
 
-	// Minimal M02 interaction: signal the worker and wait for any in-flight
-	// flushOne to finish so it never touches resources we are about to close.
-	// The worker exits promptly without draining the whole queue (no M04 drain).
+	// Phase 2: wake M03 gates (ErrWriterClosed) and stop the worker from
+	// taking new work.
 	if stopCh != nil {
 		close(stopCh)
 	}
+	// Phase 3: wait for any in-flight flushOne so the worker never touches
+	// resources we are about to close. The worker exits without draining;
+	// the synchronous drain below owns all remaining generations.
 	e.flushWG.Wait()
 
+	// Phase 4: final rotation + synchronous drain (no Engine mutex held
+	// across I/O inside flushOne).
+	var firstErr error
+	if started {
+		if err := e.drainForShutdown(); err != nil {
+			firstErr = err
+		}
+	}
+
+	// Phase 5: release resources. Every close is attempted even after a drain
+	// failure so descriptors never leak; the first (durability) error wins.
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	e.activeMem.Freeze()
-	var firstErr error
 	if e.wal != nil {
-		if err := e.wal.Close(); err != nil {
+		if err := e.wal.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -866,6 +921,9 @@ func (e *Engine) Close() error {
 		}
 	}
 	e.backpressure.Close()
+	e.state = engineStateClosed
+	e.closeErr = firstErr
+	close(e.closeDone)
 	return firstErr
 }
 

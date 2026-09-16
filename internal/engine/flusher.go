@@ -285,10 +285,12 @@ func (e *Engine) flushOne(imm *memtable.SkipList) error {
 	e.mu.RLock()
 	dbPath := e.dbPath
 	vset := e.vset
-	closed := e.closed.Load()
 	st := e.state
 	e.mu.RUnlock()
-	if closed || st == engineStateClosed {
+	// During CLOSING the synchronous shutdown drain owns this flush; only a
+	// fully CLOSED engine refuses work (no worker or drain can be running
+	// then, so this is purely defensive).
+	if st == engineStateClosed {
 		return fmt.Errorf("%w: engine closed during flush", os.ErrClosed)
 	}
 	if dbPath == "" {
@@ -424,6 +426,46 @@ func (e *Engine) ensureManifestWriter(dbPath string) error {
 	e.manifest = mw
 	e.mu.Unlock()
 	return nil
+}
+
+// drainForShutdown performs the M04 final persistence pass: rotate a
+// non-empty active MemTable into the immutable queue, then flush every queued
+// generation oldest-first through flushOne. It runs synchronously in the Close
+// goroutine after the background worker has exited, so no generation is
+// flushed twice. The first flush error stops the drain (remaining generations
+// stay queued and WAL-durable for future recovery); the caller aggregates it.
+func (e *Engine) drainForShutdown() error {
+	if e == nil {
+		return nil
+	}
+	// Final rotation under the mutex, no I/O: reuse the M02 mechanism.
+	e.mu.Lock()
+	if e.activeMem != nil && e.activeMem.Len() > 0 {
+		e.activeMem.Freeze()
+		e.immMems = append(e.immMems, e.activeMem)
+		e.activeMem = memtable.NewSkipList()
+	}
+	e.mu.Unlock()
+
+	var firstErr error
+	for {
+		imm := e.takeOldestImm()
+		if imm == nil {
+			break
+		}
+		if imm.Len() == 0 {
+			e.removeFlushedImm(imm)
+			continue
+		}
+		if err := e.flushOne(imm); err != nil {
+			e.recordFlushError(err)
+			firstErr = err
+			break
+		}
+		e.removeFlushedImm(imm)
+		e.flushCount.Add(1)
+	}
+	return firstErr
 }
 
 // WaitForFlushQueueEmptyForTesting polls until the immutable queue drains or

@@ -999,6 +999,26 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 60. Shutdown Drain Scope, Single-Winner Close, and External-Compaction Contract (P10-S01-M04)
+* **Limitation & Architectural Boundaries**:
+  In `P10-S01-M04`:
+  1. *Single-Winner Close*: First `Close()` drives RUNNING→CLOSING→CLOSED; concurrent closers wait on `closeDone` and receive the identical remembered error (nil on success). No double channel close, no double final flush, no duplicate publication.
+  2. *Drain, Not Background*: After joining the exited worker, `Close` rotates a non-empty active table and flushes every queued generation oldest-first synchronously through `flushOne` (original seqs, same allocator, `LogAndApply`). No Engine mutex is held across this I/O. Engines whose worker never started (memory-only / never Opened) skip the drain, preserving prior behavior.
+  3. *Failure Retention*: A failed generation stops the drain with the error recorded (`FlushError`) and state retained; resources are still all closed (best-effort) and the terminal error is remembered. WAL is never truncated by shutdown, so a fresh Engine recovers every accepted mutation past a failed Close.
+  4. *External Compaction*: No Engine-owned compactor exists. In-flight external `LogAndApply` racing `Close` is serialized by existing `applyMu`/manifest locks (fails closed either way; never panics or corrupts). Callers must quiesce external publishers before `Close` for guaranteed inclusion; concurrent Engine-owned publishing is impossible by construction (worker joined before drain).
+  5. *Reads Stay Open*: `Get` is never gated by lifecycle (established M01 contract); after a successful drain it serves from published SSTables.
+  6. *Cache*: The shared block cache is left untouched (memory-only; may be shared outside Engine).
+* **Why It Exists**:
+  Deterministic end-of-life: every accepted write ends WAL-durable plus SSTable-published with a synced manifest, with no leaked goroutines, descriptors, or retained MemTables, and a database reopenable by a fresh Engine.
+* **Impact**:
+  Successful Close leaves queue empty, one terminal error slot, zero Engine goroutines; Open/Close ×10 stress shows no goroutine growth and exact cumulative state.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Drain ordering, tombstone/update preservation across reopen, failure-state recovery verified under `-race` + lifecycle fuzz).
+  * Performance: **Adequate** (Empty Open+Close ≈12ms dominated by creation fsyncs; 100-key drain adds ≈0.1ms).
+  * Security: **Optimal** (No close-under-worker, no send-on-closed channel, no lost durability on failed Close, no immortal stalled writers).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*
 
 

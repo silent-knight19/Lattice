@@ -2187,9 +2187,23 @@ TOTAL: 184 Discrete, Testable Micro-Phases
   * *Completion*: Write pacing verified (P10-S01-M03).
 * **P10-S01-M04: Clean Engine Shutdown & Resource Reclamation**
   * *Objective*: Flush active MemTable, wait for in-flight compactions to pause, sync manifest, close file descriptors.
-  * *Changes*: `Engine.Close() error`.
-  * *Tests*: Verify clean shutdown leaves zero uncommitted logs or open file leaks.
-  * *Completion*: Clean shutdown verified.
+  * *Changes*: `Engine.Close()` five-phase shutdown (RUNNING→CLOSING single-winner transition
+    rejecting new writes; close stopCh waking M03 gates; join background flusher after its
+    in-flight flush; final active rotation + synchronous oldest-first drain of every immutable
+    generation through the existing flushOne/TableWriter/LogAndApply pipeline; freeze + WAL +
+    manifest + backpressure close with first-error-wins; CLOSED with remembered terminal error
+    for idempotent repeated Close). `Get` keeps serving throughout (established contract).
+    No Engine-owned compactor exists, so compaction coordination is structural safety
+    (manifest/VersionSet locks serialize external publishers; no new wait).
+  * *Tests*: Idempotent/concurrent Close, mutation rejection, Get availability, empty/memory-only
+    Close, active/imm drain with reopen verification, Close during active/blocked flush
+    (waits, never closes under the worker), Close during M03 stall (writer gets ErrWriterClosed),
+    combined flush+stall, flush/manifest/WAL-close failure injection (error preserved, state
+    retained, WAL recovery restores), real L0→L1 compaction before shutdown and racing shutdown
+    (no panic/race, recoverable), 10× Open/Close stress with goroutine bound and full-state check,
+    full lifecycle acceptance (rotations, flushes, compaction relief, drain, reopen compare),
+    lifecycle fuzz with Close/reopen cycles, Close benchmarks (empty Open+Close ≈12ms).
+  * *Completion*: Clean shutdown verified (P10-S01-M04). Phase 10 complete.
 
 ---
 
