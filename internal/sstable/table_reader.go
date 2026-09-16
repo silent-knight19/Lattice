@@ -8,9 +8,12 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/silent-knight19/lattice/internal/binary"
+	"github.com/silent-knight19/lattice/internal/cache"
 	"github.com/silent-knight19/lattice/internal/errors"
 	"github.com/silent-knight19/lattice/internal/filter"
 )
@@ -20,6 +23,25 @@ var (
 	postOpenHookFn func() error
 	postOpenHookMu sync.Mutex
 )
+
+// BlockCache defines the minimal block cache interface required by TableReader for SSTable data block caching.
+// It is satisfied directly by *cache.ShardedCache and *cache.LRUShard.
+type BlockCache interface {
+	Get(key cache.BlockKey) ([]byte, bool)
+	Put(key cache.BlockKey, val []byte)
+}
+
+// TableReaderOptions configures optional settings for TableReader, including
+// block caching and explicit physical SSTable file identification.
+type TableReaderOptions struct {
+	// FileNum is the physical SSTable sequential file number (e.g. 1 for "000001.sst").
+	// If FileNum is 0, NewTableReaderWithOptions attempts to parse FileNum from the filename.
+	FileNum uint64
+
+	// BlockCache is the optional BlockCache (e.g. *cache.ShardedCache) to use for data blocks.
+	// If nil, caching is disabled and all reads go directly to disk.
+	BlockCache BlockCache
+}
 
 // TableReader provides point-lookup access to an immutable, finalized SSTable file.
 // Upon opening, the reader reads the fixed 48-byte footer, validates its format
@@ -31,20 +53,55 @@ var (
 //     restart points, and prefix-compressed forward decoding to find the target user key.
 //
 // Concurrency:
-// TableReader is safe for concurrent Seek operations across multiple goroutines.
+// TableReader is safe for concurrent Seek and ReadBlock operations across multiple goroutines.
 // Disk reads use positional ReadAt, ensuring no mutable file offset state is shared.
+// BlockCache accesses delegate to concurrent sharded caches without holding a global reader lock.
 // Close acquires an exclusive write lock to safely release file resources.
 type TableReader struct {
-	mu       sync.RWMutex
-	file     *os.File
-	fileSize int64
-	footer   Footer
-	index    *BlockIndex
-	readAtFn func(p []byte, off int64) (int, error)
-	closed   bool
+	mu         sync.RWMutex
+	file       *os.File
+	fileSize   int64
+	footer     Footer
+	index      *BlockIndex
+	readAtFn   func(p []byte, off int64) (int, error)
+	closed     bool
+	fileNum    uint64
+	blockCache BlockCache
 }
 
-// NewTableReader opens an SSTable file at path and initializes a TableReader.
+// parseTableFilename attempts to extract the 6-digit numeric file number from an SSTable filename (e.g. "000042.sst").
+// Returns (0, false) if the filename does not strictly conform to the "%06d.sst" pattern.
+func parseTableFilename(name string) (uint64, bool) {
+	if len(name) != 10 || !strings.HasSuffix(name, ".sst") {
+		return 0, false
+	}
+	base := name[:6]
+	for i := 0; i < 6; i++ {
+		if base[i] < '0' || base[i] > '9' {
+			return 0, false
+		}
+	}
+	num, err := strconv.ParseUint(base, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	if fmt.Sprintf("%06d.sst", num) != name {
+		return 0, false
+	}
+	return num, true
+}
+
+// NewTableReader opens an SSTable file at path and initializes a TableReader with default options.
+func NewTableReader(path string) (*TableReader, error) {
+	return NewTableReaderWithOptions(path, TableReaderOptions{})
+}
+
+// OpenTableReader is an alias for NewTableReader following idiomatic Go naming conventions.
+func OpenTableReader(path string) (*TableReader, error) {
+	return NewTableReader(path)
+}
+
+// NewTableReaderWithOptions opens an SSTable file at path with the provided options.
 //
 // Security & TOCTOU Hardening (SEC-007 / F-007):
 //  1. Pre-open inspection: Inspects path with os.Lstat (without following symlinks),
@@ -63,12 +120,16 @@ type TableReader struct {
 //     and after opening.
 //  7. Re-validation of intermediate components: Re-verifies ancestor components post-open.
 //  8. Descriptor-centric lifecycle: Once validated, the opened *os.File descriptor is passed to
-//     NewTableReaderWithFile. All subsequent point lookups, filter reads, and index reads execute
-//     exclusively via positional reads on the opened descriptor (file.ReadAt). The pathname is never
-//     re-opened or re-consulted.
-func NewTableReader(path string) (*TableReader, error) {
+//     NewTableReaderWithFileAndOptions.
+func NewTableReaderWithOptions(path string, opts TableReaderOptions) (*TableReader, error) {
 	if path == "" {
 		return nil, os.ErrInvalid
+	}
+
+	if opts.FileNum == 0 {
+		if num, ok := parseTableFilename(filepath.Base(path)); ok {
+			opts.FileNum = num
+		}
 	}
 
 	// 1. Pre-open inspection of destination path without following symlinks
@@ -147,17 +208,17 @@ func NewTableReader(path string) (*TableReader, error) {
 		return nil, err
 	}
 
-	// Hand over ownership of open file descriptor to NewTableReaderWithFile
+	// Hand over ownership of open file descriptor to NewTableReaderWithFileAndOptions
 	success = true
-	return NewTableReaderWithFile(file)
+	return NewTableReaderWithFileAndOptions(file, opts)
 }
 
-// OpenTableReader is an alias for NewTableReader following idiomatic Go naming conventions.
-func OpenTableReader(path string) (*TableReader, error) {
-	return NewTableReader(path)
+// NewTableReaderWithFile initializes a TableReader wrapping an existing open *os.File with default options.
+func NewTableReaderWithFile(file *os.File) (*TableReader, error) {
+	return NewTableReaderWithFileAndOptions(file, TableReaderOptions{})
 }
 
-// NewTableReaderWithFile initializes a TableReader wrapping an existing open *os.File.
+// NewTableReaderWithFileAndOptions initializes a TableReader wrapping an existing open *os.File with provided options.
 // The reader assumes ownership of the file descriptor; calling Close on the reader
 // will close the provided file.
 //
@@ -165,9 +226,15 @@ func OpenTableReader(path string) (*TableReader, error) {
 // If initialization fails on any early return path (stat failure, truncated file, corrupt footer,
 // oversized index handle, corrupted index), the provided file descriptor is guaranteed to be closed,
 // preventing descriptor leaks.
-func NewTableReaderWithFile(file *os.File) (*TableReader, error) {
+func NewTableReaderWithFileAndOptions(file *os.File, opts TableReaderOptions) (*TableReader, error) {
 	if file == nil {
 		return nil, errors.ErrNilReceiver
+	}
+
+	if opts.FileNum == 0 {
+		if num, ok := parseTableFilename(filepath.Base(file.Name())); ok {
+			opts.FileNum = num
+		}
 	}
 
 	var success bool
@@ -250,13 +317,42 @@ func NewTableReaderWithFile(file *os.File) (*TableReader, error) {
 
 	success = true
 	return &TableReader{
-		file:     file,
-		fileSize: fileSize,
-		footer:   footer,
-		index:    blockIndex,
-		readAtFn: file.ReadAt,
+		file:       file,
+		fileSize:   fileSize,
+		footer:     footer,
+		index:      blockIndex,
+		readAtFn:   file.ReadAt,
+		fileNum:    opts.FileNum,
+		blockCache: opts.BlockCache,
 	}, nil
+}
 
+// FileNum returns the physical SSTable file number associated with this reader.
+func (r *TableReader) FileNum() uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.fileNum
+}
+
+// SetFileNum updates the physical SSTable file number associated with this reader.
+func (r *TableReader) SetFileNum(fileNum uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.fileNum = fileNum
+}
+
+// BlockCache returns the configured BlockCache, or nil if block caching is disabled.
+func (r *TableReader) BlockCache() BlockCache {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.blockCache
+}
+
+// SetBlockCache updates the BlockCache for this reader. If nil, block caching is disabled.
+func (r *TableReader) SetBlockCache(c BlockCache) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.blockCache = c
 }
 
 // FileSize returns the total physical byte size of the underlying SSTable file.
@@ -308,10 +404,49 @@ func (r *TableReader) NewIterator() (*TableIterator, error) {
 	return NewTableIterator(r)
 }
 
-// ReadDataBlock reads and returns the raw uncompressed bytes of a data block referenced by handle.
-// Validates handle bounds against MaxDataBlockSize, 64-bit address bounds, physical file boundaries,
-// and architecture integer limits.
-func (r *TableReader) ReadDataBlock(handle BlockHandle) ([]byte, error) {
+// validateBlockHandle verifies that candidate data block handle parameters conform to
+// MaxDataBlockSize, 64-bit integer address limits, and physical file boundaries.
+func (r *TableReader) validateBlockHandle(handle BlockHandle) error {
+	if handle.Size == 0 || handle.Size > MaxDataBlockSize {
+		return &errors.InvalidBlockHandleError{
+			Offset: handle.Offset,
+			Size:   handle.Size,
+			Reason: "data block size exceeds MaxDataBlockSize or is zero",
+		}
+	}
+	if handle.Offset > math.MaxUint64-handle.Size || handle.Offset+handle.Size > uint64(r.fileSize)-FooterSize {
+		return &errors.InvalidBlockHandleError{
+			Offset: handle.Offset,
+			Size:   handle.Size,
+			Reason: "candidate data block extends into footer, exceeds physical file boundary, or overflows address space",
+		}
+	}
+	if handle.Size > math.MaxInt || handle.Offset > math.MaxInt64 {
+		return &errors.InvalidBlockHandleError{
+			Offset: handle.Offset,
+			Size:   handle.Size,
+			Reason: "candidate data block offset or size exceeds architecture integer bounds",
+		}
+	}
+	return nil
+}
+
+// ReadBlock reads and returns the validated bytes of a data block referenced by handle.
+//
+// Read Flow:
+//  1. Validates handle bounds against MaxDataBlockSize, 64-bit integer limits, and physical file boundaries.
+//     Malformed handles are rejected immediately before any cache lookup or disk I/O.
+//  2. If a BlockCache is configured, checks the cache for (fileNum, handle.Offset).
+//     On a cache hit, returns a defensive copy from cache immediately, bypassing disk I/O and checksum calculation.
+//  3. On a cache miss (or if cache is disabled):
+//     - Reads handle.Size bytes from disk via positional ReadAt.
+//     - Validates minimum block trailer length (>= 8 bytes).
+//     - Validates CRC32-IEEE checksum over [entry data || restart offsets || restart count].
+//     - Validates restart count and restart array boundaries.
+//     - If corrupted, returns an explicit error and NEVER inserts corrupted bytes into the cache.
+//     - If valid and BlockCache is configured, inserts the validated block into the cache.
+//  4. Returns the validated block buffer.
+func (r *TableReader) ReadBlock(handle BlockHandle) ([]byte, error) {
 	if r == nil {
 		return nil, errors.ErrNilReceiver
 	}
@@ -321,37 +456,93 @@ func (r *TableReader) ReadDataBlock(handle BlockHandle) ([]byte, error) {
 	if r.closed {
 		return nil, errors.ErrTableReaderClosed
 	}
-	return r.readDataBlockLocked(handle)
+	return r.readBlockLocked(handle)
 }
 
-func (r *TableReader) readDataBlockLocked(handle BlockHandle) ([]byte, error) {
-	if handle.Size == 0 || handle.Size > MaxDataBlockSize {
-		return nil, &errors.InvalidBlockHandleError{
-			Offset: handle.Offset,
-			Size:   handle.Size,
-			Reason: "data block size exceeds MaxDataBlockSize or is zero",
-		}
+// readBlockLocked performs the handle validation, cache lookup, disk read, integrity validation,
+// and cache insertion under shared read lock.
+func (r *TableReader) readBlockLocked(handle BlockHandle) ([]byte, error) {
+	// 1. Validate block handle bounds strictly BEFORE consulting cache
+	if err := r.validateBlockHandle(handle); err != nil {
+		return nil, err
 	}
-	if handle.Offset > math.MaxUint64-handle.Size || handle.Offset+handle.Size > uint64(r.fileSize)-FooterSize {
-		return nil, &errors.InvalidBlockHandleError{
-			Offset: handle.Offset,
-			Size:   handle.Size,
-			Reason: "candidate data block extends into footer, exceeds physical file boundary, or overflows address space",
-		}
-	}
-	if handle.Size > math.MaxInt || handle.Offset > math.MaxInt64 {
-		return nil, &errors.InvalidBlockHandleError{
-			Offset: handle.Offset,
-			Size:   handle.Size,
-			Reason: "candidate data block offset or size exceeds architecture integer bounds",
+
+	// 2. Check BlockCache if configured
+	key := cache.NewBlockKey(r.fileNum, handle.Offset)
+	if r.blockCache != nil {
+		if val, ok := r.blockCache.Get(key); ok {
+			// Ensure cached entry matches expected handle size
+			if uint64(len(val)) == handle.Size {
+				return val, nil
+			}
 		}
 	}
 
+	// 3. Read raw block bytes from disk via positional readAt
 	blockBuf := make([]byte, int(handle.Size))
 	if err := readExactAt(r.readAtFn, blockBuf, int64(handle.Offset)); err != nil {
 		return nil, fmt.Errorf("failed to read data block at offset %d: %w", handle.Offset, err)
 	}
+
+	// 4. Verify block integrity before trusting or caching
+	if len(blockBuf) < 8 {
+		return nil, &errors.DataBlockCorruptedError{
+			Offset: handle.Offset,
+			Reason: "data block buffer smaller than minimum trailer length",
+		}
+	}
+
+	// 4a. Verify CRC32-IEEE checksum
+	expectedCRC := binary.GetUint32(blockBuf[len(blockBuf)-4:])
+	actualCRC := binary.Checksum(blockBuf[:len(blockBuf)-4])
+	if expectedCRC != actualCRC {
+		var offInt64 int64
+		if handle.Offset <= math.MaxInt64 {
+			offInt64 = int64(handle.Offset) // #nosec G115
+		}
+		return nil, &errors.ChecksumMismatchError{
+			Offset:   offInt64,
+			Expected: expectedCRC,
+			Actual:   actualCRC,
+		}
+	}
+
+	// 4b. Verify restart count and restart array bounds
+	restartCount := binary.GetUint32(blockBuf[len(blockBuf)-8 : len(blockBuf)-4])
+	if restartCount == 0 {
+		return nil, &errors.DataBlockCorruptedError{
+			Offset: handle.Offset,
+			Reason: "data block restart count is zero",
+		}
+	}
+	if restartCount > MaxRestartCount {
+		return nil, &errors.DataBlockCorruptedError{
+			Offset: handle.Offset,
+			Reason: fmt.Sprintf("data block restart count %d exceeds MaxRestartCount %d", restartCount, MaxRestartCount),
+		}
+	}
+	restartBytes := uint64(restartCount) * 4
+	if restartBytes+8 > uint64(len(blockBuf)) {
+		return nil, &errors.DataBlockCorruptedError{
+			Offset: handle.Offset,
+			Reason: "data block restart array exceeds block size",
+		}
+	}
+
+	// 5. Insert valid, verified block into cache
+	if r.blockCache != nil {
+		r.blockCache.Put(key, blockBuf)
+	}
+
 	return blockBuf, nil
+}
+
+// ReadDataBlock reads and returns the raw uncompressed bytes of a data block referenced by handle.
+// Validates handle bounds against MaxDataBlockSize, 64-bit address bounds, physical file boundaries,
+// and architecture integer limits.
+// Delegates to ReadBlock to utilize the BlockCache when configured.
+func (r *TableReader) ReadDataBlock(handle BlockHandle) ([]byte, error) {
+	return r.ReadBlock(handle)
 }
 
 // Seek performs a point lookup for the given user key in the SSTable.
@@ -362,14 +553,13 @@ func (r *TableReader) readDataBlockLocked(handle BlockHandle) ([]byte, error) {
 //  3. Uses the in-memory sparse index binary search to locate the candidate data block.
 //     If targetKey > all largest keys in the index, returns errors.ErrKeyNotFound with zero disk I/O.
 //  4. Validates the data block handle against physical file bounds.
-//  5. Reads exactly handle.Size bytes starting at handle.Offset via positional ReadAt.
-//  6. Validates the data block CRC32-IEEE checksum and restart metadata.
-//  7. Binary-searches restart points to locate the nearest restart interval.
-//  8. Scans prefix-compressed entries forward, reconstructing full InternalKeys.
-//  9. If a match is found:
+//  5. Reads candidate block from BlockCache or disk via readBlockLocked.
+//  6. Binary-searches restart points to locate the nearest restart interval.
+//  7. Scans prefix-compressed entries forward, reconstructing full InternalKeys.
+//  8. If a match is found:
 //     - If OpType == OpTypePut: returns an owned defensive copy of the value bytes and nil.
 //     - If OpType == OpTypeDelete: returns nil and errors.ErrKeyNotFound (tombstone).
-//  10. If the key does not exist or scanning passes the key, returns nil and errors.ErrKeyNotFound.
+//  9. If the key does not exist or scanning passes the key, returns nil and errors.ErrKeyNotFound.
 func (r *TableReader) Seek(userKey []byte) ([]byte, error) {
 	if r == nil {
 		return nil, errors.ErrNilReceiver
@@ -391,14 +581,14 @@ func (r *TableReader) Seek(userKey []byte) ([]byte, error) {
 		return nil, errors.ErrKeyNotFound
 	}
 
-	// 2. Validate bounds and read candidate data block from disk via ReadAt
-	blockBuf, err := r.readDataBlockLocked(handle)
+	// 2. Validate bounds and read candidate data block from cache or disk
+	blockBuf, err := r.readBlockLocked(handle)
 	if err != nil {
 		return nil, err
 	}
 
-	// 3. Decode and search prefix-compressed data block
-	return searchDataBlock(blockBuf, userKey, handle.Offset)
+	// 3. Decode and search prefix-compressed data block (already validated)
+	return searchDataBlockVerified(blockBuf, userKey, handle.Offset)
 }
 
 // searchDataBlock validates block integrity, binary-searches restart points, decodes
@@ -416,12 +606,22 @@ func searchDataBlock(blockBuf []byte, targetUserKey []byte, blockOffset uint64) 
 	expectedCRC := binary.GetUint32(blockBuf[len(blockBuf)-4:])
 	actualCRC := binary.Checksum(blockBuf[:len(blockBuf)-4])
 	if expectedCRC != actualCRC {
+		var offInt64 int64
+		if blockOffset <= math.MaxInt64 {
+			offInt64 = int64(blockOffset) // #nosec G115
+		}
 		return nil, &errors.ChecksumMismatchError{
-			Offset:   int64(blockOffset),
+			Offset:   offInt64,
 			Expected: expectedCRC,
 			Actual:   actualCRC,
 		}
 	}
+
+	return searchDataBlockVerified(blockBuf, targetUserKey, blockOffset)
+}
+
+// searchDataBlockVerified searches an already CRC-verified data block.
+func searchDataBlockVerified(blockBuf []byte, targetUserKey []byte, blockOffset uint64) ([]byte, error) {
 
 	// 2. Parse and validate restart count
 	restartCount := binary.GetUint32(blockBuf[len(blockBuf)-8 : len(blockBuf)-4])

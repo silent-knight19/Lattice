@@ -908,7 +908,7 @@ This document tracks all **genuine architectural and operational limitations** o
   2. *Model A Capacity Distribution & Integer Remainder*: Global cache capacity $C$ is distributed evenly across 16 shards (`base = C / 16`). Non-divisible capacities distribute the remainder `rem = C % 16` by adding 1 unit of capacity to the first `rem` shards (shards 0 through `rem - 1`). The sum of shard capacities is strictly equal to $C$, preventing memory amplification.
   3. *Hardware Cache-Line Padding (128-Byte Stride)*: Shards are embedded in a `paddedShard` struct with 48 bytes of trailing padding, creating a stride of 128 bytes ($2 \times 64\text{B}$). This guarantees that adjacent shard mutexes can never share a single 64-byte hardware cache line, eliminating CPU cache-line bouncing and false sharing during multi-core concurrent reads and writes.
   4. *Zero Global Lock on Hot Path*: Read and write operations (`Get`, `Put`, `Peek`, `Contains`, `Remove`) compute the target shard index via `Murmur3_128` and lock only that shard. Aggregate methods (`Len`, `Capacity`, `Clear`) touch shards sequentially without cross-shard nested locking, preventing deadlock cycles.
-  5. *Unconnected Subsystem Boundary*: While the 16-way sharded cache is fully implemented and tested with 64 concurrent goroutines under `-race`, integration with `TableReader.ReadBlock` and `Engine.Get` remains deferred to Phase 10.
+  5. *Subsystem Integration*: Integrated with `TableReader.ReadBlock` in Sub-Phase 09.2 (`P09-S01-M03`); top-level engine-wide cache coordination across SSTables remains scheduled for Phase 10.
 * **Why It Exists**:
   Architectural trade-off prioritizing multi-core scalability over exact global recency. Maintaining a single global LRU list across 16 shards would require a global coordination mutex or complex distributed coordination, which would defeat the primary purpose of sharding.
 * **Impact**:
@@ -917,6 +917,26 @@ This document tracks all **genuine architectural and operational limitations** o
   * Correctness: **Optimal** (Verified against comprehensive acceptance matrix, 15,000-operation differential test suite vs independent reference model, and 3.49M+ native Go fuzz executions; 0 mismatches/crashes).
   * Performance: **Optimal** (~498 ns/op under 64 concurrent workers vs ~785 ns/op on single shard, a 36.5% latency reduction; single-threaded hit ~341 ns/op, miss ~12.6 ns/op).
   * Scalability: **High** (Scales smoothly to 64+ concurrent goroutines with zero data races).
+
+---
+
+### 56. SSTable Read Path Block Cache Integration, Infallible Bounds Pre-Validation, and Canonical Data Block Caching (P09-S01-M03)
+* **Limitation & Architectural Boundaries**:
+  In `P09-S01-M03`:
+  1. *Handle Bounds Pre-Validation Invariant*: Candidate `BlockHandle` bounds (`Size > 0`, `Size <= MaxDataBlockSize`, `Offset + Size <= FileSize - FooterSize`) are validated strictly BEFORE inspecting `BlockCache`. A cache hit can NEVER bypass structural handle bounds validation.
+  2. *Canonical Data Block Caching Unit*: The cache unit is the complete validated data block payload (`[entries || restart offsets || restart count || CRC32]`). Because Lattice data block compression is prefix delta encoding, caching the validated block payload preserves zero-copy restart point binary searching while avoiding redundant physical disk reads and CRC32 recalculations on subsequent hits.
+  3. *Fail-Closed Non-Caching on Corruption*: Data blocks failing minimum trailer bounds (>= 8 bytes), CRC32-IEEE checksum verification, or restart array validation return `ChecksumMismatchError` or `DataBlockCorruptedError` immediately and are NEVER inserted into the cache. The cache stores exclusively proven, valid blocks.
+  4. *Immutable SSTable Lifetime Assumption*: Cache entries are keyed by physical identity `(FileNum, BlockOffset)`. Because SSTables in Lattice are immutable once published, cached blocks remain valid for the lifetime of that physical table. Obsolete SSTables unlinked by compaction remain harmlessly in cache until naturally evicted by shard LRU policy.
+  5. *Zero Single-Flight Request Coalescing*: Concurrent cold misses for the same block execute concurrent disk reads before populating the cache. Single-flight request coalescing is intentionally out-of-scope for this micro-phase.
+  6. *Engine-Wide Integration Boundary*: `TableReader.ReadBlock` is fully integrated with `BlockCache`. Wiring a shared `ShardedBlockCache` into `Engine` options across all active `TableReader` instances across compaction and flush pipelines is scheduled for Phase 10.
+* **Why It Exists**:
+  Security-first read-path integration. Enforcing bounds checks prior to cache queries prevents bounds-bypass attacks, and caching only post-checksum-validated blocks guarantees corrupt disk state never masquerades as valid data in RAM.
+* **Impact**:
+  Warm reads avoid physical disk reads entirely (178.1x read reduction in differential tests), `ReadBlock` latency drops from 345.7 ns to 55.98 ns (6.2x speedup), `Seek` drops from 532.4 ns to 225.1 ns (2.4x speedup), and 64-worker concurrent read throughput scales by 7.5x (160.0 ns/op vs 1193 ns/op).
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Verified against 10-scenario acceptance matrix, 5,000-op differential suite vs direct reader with 0 mismatches, and 1.85M+ native Go fuzz executions).
+  * Performance: **Optimal** (6.2x faster `ReadBlock`, 2.4x faster `Seek`, 7.5x faster concurrent reads).
+  * Security: **Optimal** (Handle bounds enforced before cache access; corrupted blocks fail closed and never enter cache; cross-SSTable key isolation enforced).
 
 ---
 

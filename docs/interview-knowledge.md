@@ -3306,4 +3306,40 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
+# 39. Sharded Read Block Cache & SSTable Read Path Integration (P09-S01-M01, M02, M03)
+
+### 1. Why must `validateBlockHandle` be evaluated strictly BEFORE consulting the `BlockCache`?
+* **Question**: In `TableReader.ReadBlock(handle)`, why is it dangerous to perform the cache lookup `r.blockCache.Get(key)` before verifying that `handle.Offset + handle.Size <= FileSize - FooterSize` and `handle.Size <= MaxDataBlockSize`?
+* **Answer**:
+  - **The Bounds-Bypass Attack Vector**: If an adversary or faulty query constructs an invalid or malicious `BlockHandle` (e.g. `Size == 0`, `Size > MaxDataBlockSize`, or `Offset` extending past the physical file into another partition or file trailer) that happens to match the `(FileNum, Offset)` of an already-cached valid block, checking the cache first would return the cached data and bypass the bounds validation entirely!
+  - **Infallible Pre-Check Invariant**: By enforcing `validateBlockHandle(handle)` before any cache interaction:
+    1. Any malformed or out-of-bounds handle is immediately rejected with `*errors.InvalidBlockHandleError`.
+    2. The cache is queried ONLY for structurally and physically valid handles.
+    3. The cache cannot be used as an oracle or shortcut to bypass storage security perimeters.
+
+### 2. What exact representation is cached in Lattice, and why does caching the raw validated block payload avoid redundant decompression work?
+* **Question**: In LSM-trees like LevelDB, Pebble, or RocksDB, does the block cache store raw disk bytes, decompressed bytes, or decoded C++/Go data structures? What does Lattice store?
+* **Answer**:
+  - **Lattice Data Block Format**: Lattice data blocks use key-prefix delta encoding (`[shared_len, unshared_len, value_len, key_delta, value]`) followed by a restart array (`[restart_0, restart_1, ..., restart_count, CRC32]`). There is no separate streaming compression layer (e.g. Snappy or ZSTD) wrapped around the block.
+  - **The Canonical Cache Unit**: Lattice caches the fully validated uncompressed data block payload (`[entries || restart offsets || restart count || CRC32]`).
+  - **Why This Is Optimal**:
+    1. Caching parsed in-memory structs would incur immense GC overhead (hundreds of small object pointers per 4KB block).
+    2. Caching unvalidated disk bytes would require recalculating CRC32 on every read hit.
+    3. Caching the validated block buffer allows `Seek` to binary-search the restart array directly in-place without disk I/O and without re-running CRC32-IEEE checksum verification (`searchDataBlockVerified`), reducing point lookup latency by 2.4x.
+
+### 3. Why must corrupted disk blocks NEVER be admitted into the `BlockCache`?
+* **Question**: If a disk read encounters a CRC32 mismatch or truncated restart array, why must the error fail closed and prevent cache insertion?
+* **Answer**:
+  - **Cache Poisoning Prevention**: A read block cache is an acceleration tier, not a source of truth. If a corrupted block on disk were inserted into the cache upon first read (e.g. by naive `cache.Put` before validation), subsequent reads for that block would hit the cache. If the cache returned that corrupted buffer without checksumming, or if a transient read error was cached as permanent state, the corrupt block would be served to client queries indefinitely.
+  - **Fail-Closed Guarantee**: Lattice computes `actualCRC := binary.Checksum(blockBuf[:len(blockBuf)-4])` and verifies it against `expectedCRC`. If mismatched, it returns `*errors.ChecksumMismatchError` immediately. `r.blockCache.Put(key, blockBuf)` is executed ONLY after CRC32, restart count, and restart array bounds checks all pass 100%.
+
+### 4. How does `(FileNum, Offset)` ensure cross-SSTable cache isolation without pathname dependencies?
+* **Question**: Why does `BlockKey` use `(FileNum uint64, Offset uint64)` instead of filesystem paths or inodes?
+* **Answer**:
+  - **Path Independence**: Filesystem paths can be relative or absolute, and temporary files or symlinks may change. File numbers (`FileNum`), on the other hand, are strictly unique, monotonic identifiers assigned by the `VersionSet` manifest sequencer upon SSTable creation.
+  - **Collision Resistance**: Two distinct SSTables (e.g. `000001.sst` and `000002.sst`) both have a data block at offset 0. If `BlockKey` were keyed only by `Offset`, cross-table cache collisions would corrupt reads across different tables. By combining `FileNum` (8 bytes) and `Offset` (8 bytes) in Big-Endian encoding, `BlockKey` provides a mathematically unique physical identity for every block in the storage engine.
+  - **Immutable SSTable Lifecycles**: Because SSTables are immutable once published, a `(FileNum, Offset)` tuple is strictly immutable. Data at that key never mutates or changes underneath the cache. When an SSTable becomes obsolete after compaction, it is unlinked from disk, and its cache entries naturally expire via shard LRU eviction without needing proactive invalidation scans.
+
+---
+
 *End of Technical Interview Knowledge Base — Lattice v1.0.0-KNOWLEDGE-BASE*

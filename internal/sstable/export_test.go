@@ -72,6 +72,13 @@ func (r *TableReader) SetReadAtFnForTesting(fn func(p []byte, off int64) (int, e
 	r.readAtFn = fn
 }
 
+// ReadAtFnForTesting returns the current low-level positional read function for TableReader.
+func (r *TableReader) ReadAtFnForTesting() func(p []byte, off int64) (int, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.readAtFn
+}
+
 // SearchDataBlockForTesting exports searchDataBlock for isolated unit testing and fuzzing.
 func SearchDataBlockForTesting(blockBuf []byte, targetUserKey []byte, blockOffset uint64) ([]byte, error) {
 	return searchDataBlock(blockBuf, targetUserKey, blockOffset)
