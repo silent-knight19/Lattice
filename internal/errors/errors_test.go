@@ -41,6 +41,7 @@ func TestSentinelIdentity(t *testing.T) {
 		{"ErrTaskAlreadyEnqueued", errors.ErrTaskAlreadyEnqueued, "wal write task already enqueued"},
 		{"ErrNilTask", errors.ErrNilTask, "wal write task cannot be nil"},
 		{"ErrInvalidQueueCapacity", errors.ErrInvalidQueueCapacity, "wal write queue capacity must be greater than zero"},
+		{"ErrInvalidCacheCapacity", errors.ErrInvalidCacheCapacity, "cache capacity cannot be negative"},
 		{"ErrRunnerRunning", errors.ErrRunnerRunning, "group commit runner is already running"},
 		{"ErrRunnerClosed", errors.ErrRunnerClosed, "group commit runner is closed"},
 		{"ErrInvalidSkipListHeight", errors.ErrInvalidSkipListHeight, "invalid skiplist node height"},
@@ -148,6 +149,7 @@ func TestSentinelWrappingWithErrorsIs(t *testing.T) {
 		{"ErrTaskAlreadyEnqueued", errors.ErrTaskAlreadyEnqueued},
 		{"ErrNilTask", errors.ErrNilTask},
 		{"ErrInvalidQueueCapacity", errors.ErrInvalidQueueCapacity},
+		{"ErrInvalidCacheCapacity", errors.ErrInvalidCacheCapacity},
 		{"ErrRunnerRunning", errors.ErrRunnerRunning},
 		{"ErrRunnerClosed", errors.ErrRunnerClosed},
 		{"ErrInvalidSkipListHeight", errors.ErrInvalidSkipListHeight},
@@ -207,6 +209,7 @@ func TestSentinelNegativeComparisons(t *testing.T) {
 		errors.ErrTaskAlreadyEnqueued,
 		errors.ErrNilTask,
 		errors.ErrInvalidQueueCapacity,
+		errors.ErrInvalidCacheCapacity,
 		errors.ErrRunnerRunning,
 		errors.ErrRunnerClosed,
 		errors.ErrInvalidSkipListHeight,
@@ -1106,6 +1109,48 @@ func TestInvalidQueueCapacityError(t *testing.T) {
 	var nilErr *errors.InvalidQueueCapacityError
 	if nilErr.Error() != errors.ErrInvalidQueueCapacity.Error() {
 		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrInvalidQueueCapacity.Error())
+	}
+}
+
+func TestInvalidCacheCapacityError(t *testing.T) {
+	err := &errors.InvalidCacheCapacityError{
+		Capacity: -1,
+	}
+
+	// errors.Is check
+	if !stdErrors.Is(err, errors.ErrInvalidCacheCapacity) {
+		t.Errorf("InvalidCacheCapacityError must match ErrInvalidCacheCapacity via errors.Is")
+	}
+
+	// Negative match
+	if stdErrors.Is(err, errors.ErrKeyNotFound) {
+		t.Errorf("InvalidCacheCapacityError must not match ErrKeyNotFound")
+	}
+
+	// Wrapping check
+	wrapped := fmt.Errorf("cache init: %w", err)
+	if !stdErrors.Is(wrapped, errors.ErrInvalidCacheCapacity) {
+		t.Errorf("wrapped InvalidCacheCapacityError must match ErrInvalidCacheCapacity via errors.Is")
+	}
+
+	var extracted *errors.InvalidCacheCapacityError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("failed to extract *InvalidCacheCapacityError from wrapped chain")
+	}
+	if extracted.Capacity != -1 {
+		t.Errorf("extracted mismatch: got Capacity=%d; want Capacity=-1", extracted.Capacity)
+	}
+
+	// String check
+	msg := err.Error()
+	if !strings.Contains(msg, "invalid cache capacity -1: cannot be negative") {
+		t.Errorf("unexpected error message: %q", msg)
+	}
+
+	// Typed nil safety
+	var nilErr *errors.InvalidCacheCapacityError
+	if nilErr.Error() != errors.ErrInvalidCacheCapacity.Error() {
+		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrInvalidCacheCapacity.Error())
 	}
 }
 

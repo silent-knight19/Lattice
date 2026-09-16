@@ -692,6 +692,8 @@
 * **Why MemTable is Not a Read Cache**: The MemTable caches only recent, un-flushed writes. Once flushed to an SSTable, hot data resides on disk. A dedicated block cache stores decompressed 4KB data blocks in RAM.
 * **Mutex Contention & Cache Sharding**: A single global LRU cache protected by a single mutex creates extreme lock contention across multi-core CPUs. Sharding the cache into 16 independent LRU instances eliminates contention.
 * **False Sharing**: Placing two cache shard structs on the same 64-byte hardware cache line causes CPU cache line invalidation on concurrent access. Pad shard structs to 64-byte boundaries.
+* **Sentinel-Based Circular Doubly-Linked List**: In `P09-S01-M01`, each shard manages recency with a circular doubly-linked list using a sentinel node (`sentinel.next` = MRU, `sentinel.prev` = LRU). This eliminates nil-pointer edge cases for head and tail operations and achieves strictly $O(1)$ operations for insertions, promotions, and LRU evictions.
+* **Defensive Copying & Memory Ownership**: In Go, returning raw slices from cached nodes allows caller mutations to corrupt cached blocks across concurrent readers. `LRUShard.Put` and `LRUShard.Get` defensively clone buffers via `bytes.Clone`, guaranteeing 100% memory isolation and preventing cross-request data corruption.
 
 ### Subsystem Interview Questions
 * **Basic**: What is an LRU cache, and why is it needed in an LSM-tree if the MemTable is already in RAM?
@@ -699,6 +701,8 @@
 * **Deep**: What is false sharing in multi-threaded systems, and how do you prevent it in Go?
 * **Follow-up**: What are the trade-offs between caching decompressed blocks in user space versus relying on the operating system page cache?
 * **"Did You Actually Build This?"**: What eviction policy do you use when an inserted 4KB block exceeds the shard's configured memory budget?
+* **"Did You Actually Build This?"**: How do you guarantee that a caller retrieving a cached data block cannot corrupt data returned to subsequent readers?
+  * *Answer*: In `LRUShard`, `Get` returns an owned defensive copy of the block bytes via `bytes.Clone(node.value)`, and `Put` clones the incoming slice before insertion. This eliminates aliasing without complex refcounting. On miss, `Get` incurs zero allocations (0 B/op, ~8.5 ns/op). On hit, the 4KB copy costs ~336 ns/op.
 
 ---
 

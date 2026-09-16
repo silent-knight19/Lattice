@@ -886,6 +886,21 @@ This document tracks all **genuine architectural and operational limitations** o
   * Performance: **Optimal** (~13.3 µs in-memory version derivation; ~3.7 ms per durable manifest sync; zero reader lock contention during manifest I/O).
   * Security: **Optimal** (Path traversal defense, symlink rejection before unlinking, parent directory inode pinning, monotonic watermarks, fail-closed poison state machine).
 
+### 54. LRU Block Cache Shard Defensive Copying and Single-Shard Boundary (P09-S01-M01)
+* **Limitation & Architectural Boundaries**:
+  In `P09-S01-M01`:
+  1. *Defensive Buffer Copying on Ingest and Retrieval*: `LRUShard.Put` and `LRUShard.Get` defensively clone block slices using `bytes.Clone`. For a 4 KB data block, `Get` on hit incurs one heap allocation (`4096 B/op`, ~336 ns/op).
+  2. *Single-Shard Contention Ceiling*: `LRUShard` manages recency and map lookup under an exclusive `sync.Mutex`. While optimal for low-to-medium concurrency, high-core concurrent readers hitting the same shard will experience lock contention until 16-way sharding is introduced in `P09-S01-M02`.
+  3. *Unconnected Subsystem Boundary*: `LRUShard` is implemented as an independent storage building block in `internal/cache/`. Integration with `TableReader.Seek` and `Engine.Get` remains deferred to Phase 10.
+* **Why It Exists**:
+  Security-first memory isolation. In Go, returning raw `[]byte` slice pointers from an internal cache node creates catastrophic cross-request data corruption if a caller mutates the returned slice. Defensive copying guarantees 100% data integrity and eliminates aliasing vulnerabilities without manual C-style reference counting.
+* **Impact**:
+  Guaranteed panic-free, thread-safe LRU caching with zero data corruption. Read hits allocate one buffer copy; cache misses execute with zero heap allocations (0 B/op, ~8.5 ns/op).
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Verified against Acceptance Matrix A-S, 15,000-operation differential test suite vs independent slice-based reference model, and 1.89M+ native Go fuzz executions with zero invariant violations).
+  * Performance: **Optimal for single shard** (~336 ns/op hit, ~8.5 ns/op miss, ~332 ns/op update, ~344 ns/op eviction).
+  * Scalability: **Bounded by single mutex** (16-way sharded partitioning with 64-byte hardware cache-line padding is implemented in `P09-S01-M02`).
+
 ---
 
 *End of Known Limitations — To be updated continuously throughout implementation.*

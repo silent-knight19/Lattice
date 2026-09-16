@@ -127,6 +127,9 @@ var (
 	// ErrInvalidQueueCapacity indicates that a WAL write queue capacity was non-positive.
 	ErrInvalidQueueCapacity = stdErrors.New("wal write queue capacity must be greater than zero")
 
+	// ErrInvalidCacheCapacity indicates that a block cache capacity was negative.
+	ErrInvalidCacheCapacity = stdErrors.New("cache capacity cannot be negative")
+
 	// ErrRunnerRunning indicates that Start was called on an already-running group commit runner.
 	ErrRunnerRunning = stdErrors.New("group commit runner is already running")
 
@@ -654,6 +657,24 @@ func (e *InvalidQueueCapacityError) Error() string {
 // Is reports whether this error matches target sentinel ErrInvalidQueueCapacity.
 func (e *InvalidQueueCapacityError) Is(target error) bool {
 	return target == ErrInvalidQueueCapacity
+}
+
+// InvalidCacheCapacityError provides structured context when a block cache is initialized with a negative capacity.
+// It matches ErrInvalidCacheCapacity when interrogated with errors.Is().
+type InvalidCacheCapacityError struct {
+	Capacity int
+}
+
+func (e *InvalidCacheCapacityError) Error() string {
+	if e == nil {
+		return ErrInvalidCacheCapacity.Error()
+	}
+	return fmt.Sprintf("invalid cache capacity %d: cannot be negative", e.Capacity)
+}
+
+// Is reports whether this error matches target sentinel ErrInvalidCacheCapacity.
+func (e *InvalidCacheCapacityError) Is(target error) bool {
+	return target == ErrInvalidCacheCapacity
 }
 
 // InvalidSkipListHeightError provides structured context when a SkipList node height violates bounds.

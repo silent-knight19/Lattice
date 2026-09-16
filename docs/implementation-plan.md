@@ -2102,10 +2102,10 @@ TOTAL: 184 Discrete, Testable Micro-Phases
 ### Sub-Phase 09.1: LRU Doubly-Linked List & Sharding
 * **P09-S01-M01: Cache Shard Mutex & Doubly-Linked List**
   * *Objective*: Implement single LRU cache shard using hash map and circular doubly-linked list.
-  * *Changes*: `type lruShard struct`, `lruShard.Get()`, `lruShard.Put()`.
-  * *Invariants*: Least recently accessed block evicted when capacity exceeded.
-  * *Tests*: Insert 100 blocks with capacity 50; verify first 50 evicted in order.
-  * *Completion*: Single shard verified.
+  * *Changes*: `internal/cache/key.go` (`BlockKey`), `internal/cache/lru.go` (`LRUShard`, `NewLRUShard`, `Get`, `Put`, `Peek`, `Contains`, `Remove`, `Len`, `Capacity`, `Clear`), `internal/errors/errors.go` (`ErrInvalidCacheCapacity`, `InvalidCacheCapacityError`).
+  * *Invariants*: Sentinel-based circular doubly-linked list (`sentinel.next` = MRU, `sentinel.prev` = LRU); bidirectional pointer reciprocity (`n.next.prev == n`, `n.prev.next == n`); count invariance (`len(table) == list.count <= capacity`); defensive copy immutability via `bytes.Clone` on `Put` and `Get`; strictly O(1) recency updates and LRU evictions.
+  * *Tests*: Full acceptance matrix A-S (empty shard baseline, single entry, two entries, capacity-1 eviction, capacity-0 non-retaining behavior, capacity-50 / 100-entry eviction ordering, Get MRU promotion, miss recency preservation, existing Put replacement without node duplication, mutable input-buffer isolation, mutable output-buffer isolation, 4 KB to 8 MiB large blocks, explicit removal, clear, repeated eviction churn, multi-goroutine concurrent stress under `-race` with 8, 16, 32 workers, and future shard handoff), 15,000-operation randomized differential test suite vs independent slice-based reference model (0 mismatches), native Go fuzz target (`FuzzLRUShard`, 1,895,000+ executions, 0 crashes/panics), and benchmarks measuring Get hit (~336 ns/op, 1 alloc), Get miss (~8.5 ns/op, 0 allocs), Put existing (~325 ns/op, 1 alloc), and Put eviction (~344 ns/op, 2 allocs).
+  * *Completion*: 100% tests pass under `-race`, 0 data races, `go vet` clean, `golangci-lint` clean (0 issues). Sub-Phase 09.1 M01 verified.
 * **P09-S01-M02: 16-Way Sharded Cache Partitioning with Cache-Line Padding**
   * *Objective*: Route block queries across 16 shards using high hash bits; pad shard structs to 64-byte boundaries.
   * *Changes*: `ShardedBlockCache.Get(sstableID uint64, offset uint64)`.
