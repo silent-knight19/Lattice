@@ -47,17 +47,28 @@ type LRUShard struct {
 //   - If capacity < 0, returns *errors.InvalidCacheCapacityError.
 //   - If capacity == 0, returns a valid zero-capacity shard where Put immediately discards and Get always misses.
 //   - If capacity > 0, returns a shard configured to hold at most capacity block entries.
+//
+// initLRUShard initializes the internal map and sentinel list for an LRUShard.
+func initLRUShard(shard *LRUShard, capacity int) {
+	shard.capacity = capacity
+	shard.table = make(map[BlockKey]*lruNode, capacity)
+	shard.sentinel.next = &shard.sentinel
+	shard.sentinel.prev = &shard.sentinel
+}
+
+// NewLRUShard initializes a new LRUShard with the given block capacity.
+//
+// Capacity Contract:
+//   - If capacity < 0, returns *errors.InvalidCacheCapacityError.
+//   - If capacity == 0, returns a valid zero-capacity shard where Put immediately discards and Get always misses.
+//   - If capacity > 0, returns a shard configured to hold at most capacity block entries.
 func NewLRUShard(capacity int) (*LRUShard, error) {
 	if capacity < 0 {
 		return nil, &errors.InvalidCacheCapacityError{Capacity: capacity}
 	}
 
-	shard := &LRUShard{
-		capacity: capacity,
-		table:    make(map[BlockKey]*lruNode, capacity),
-	}
-	shard.sentinel.next = &shard.sentinel
-	shard.sentinel.prev = &shard.sentinel
+	shard := &LRUShard{}
+	initLRUShard(shard, capacity)
 	return shard, nil
 }
 
