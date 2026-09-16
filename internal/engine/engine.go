@@ -132,6 +132,11 @@ type Engine struct {
 	flushErrMu sync.Mutex
 	flushErr   error
 	flushCount atomic.Uint64
+
+	// P10-S01-M03 L0 write-pacing state. l0Override forces the pressure
+	// source for deterministic tests; -1 (default) reads the authoritative
+	// VersionSet L0 file count. No duplicate L0 counter is maintained.
+	l0Override atomic.Int64
 }
 
 // EngineOptions specifies configuration parameters for initializing an Engine instance.
@@ -164,7 +169,7 @@ func NewEngineWithOptions(opts EngineOptions) *Engine {
 	if opts.DBPath != "" {
 		cleanDBPath = filepath.Clean(opts.DBPath)
 	}
-	return &Engine{
+	eng := &Engine{
 		dbPath:       cleanDBPath,
 		activeMem:    memtable.NewSkipList(),
 		backpressure: bc,
@@ -172,6 +177,8 @@ func NewEngineWithOptions(opts EngineOptions) *Engine {
 		wal:          opts.WAL,
 		blockCache:   opts.BlockCache,
 	}
+	eng.l0Override.Store(-1)
+	return eng
 }
 
 // WAL returns the Engine's configured WAL writer, or nil if operating in
@@ -414,6 +421,12 @@ func (e *Engine) Put(ctx context.Context, key, val []byte) error {
 		return err
 	}
 
+	// P10-S01-M03: L0 pacing/stall before any sequence allocation or
+	// durability work. Holds no storage locks while waiting; reads stay free.
+	if err := e.gateL0Write(ctx); err != nil {
+		return err
+	}
+
 	// Approximate wire allocation: node structure + key + pointers + value
 	estBytes := memtable.NodeStructSize + uint64(len(key)) + 8*8 + uint64(len(val))
 
@@ -511,6 +524,11 @@ func (e *Engine) Delete(ctx context.Context, key []byte) error {
 	}
 
 	if err := binary.ValidateKey(key); err != nil {
+		return err
+	}
+
+	// P10-S01-M03: deletes are mutations and gate identically to puts.
+	if err := e.gateL0Write(ctx); err != nil {
 		return err
 	}
 

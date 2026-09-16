@@ -979,6 +979,26 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 59. L0 Write Pacing and Stall Scope, Polling Relief, and Deferred Shutdown (P10-S01-M03)
+* **Limitation & Architectural Boundaries**:
+  In `P10-S01-M03`:
+  1. *Authoritative Pressure*: Pacing reads `VersionSet.Current().NumFiles(0)` per gate (pinned only for the read, never across sleeps); no duplicate L0 counter exists. `SetL0CountOverrideForTesting` is test-only.
+  2. *Exact Thresholds*: L0 ≤ 8 normal (no timer); 9→1ms, 10→5ms, 11→15ms, 12→30ms single pacing sleep; L0 > 12 stalls in bounded 20ms polls until L0 ≤ 12 (release hysteresis = roadmap boundary; no extra bands). Constants only: no overflow, no unbounded sleep.
+  3. *Placement*: Gate runs after key/value validation, before memory backpressure/`Acquire`, sequence allocation, WAL, and MemTable work — stalled writers reserve no seqs and create no internal copies (caller goroutine waits; no pending-write queue, no per-writer goroutine). `Get` is never gated.
+  4. *Relief*: The controller never deletes files; compaction (or VersionSet publication as compaction would publish) reduces L0 and writers observe it on the next poll. No compaction kick, no forced compaction, no second compaction system.
+  5. *Lifecycle*: Stall/pacing selects honor ctx cancellation, `stopCh`, and `closed`; `Close()` terminates waiters with `ErrWriterClosed` (no M04 drain). Stall itself returns no new error type.
+  6. *Explicitly Deferred*: Full graceful shutdown sequencing with compaction coordination (M04). Flush-failure state (`FlushError`) is orthogonal: pacing neither masks nor clears it.
+* **Why It Exists**:
+  Self-protection under L0 pressure with deterministic, reviewable policy: progressive latency instead of disk-exhaustion crash, without lock-held sleeps or waiter amplification.
+* **Impact**:
+  No-pressure Put ≈ 616ns/op; L0=12 paced ≈ 31ms/op; stall holds caller goroutines in 20ms slices (no spin, no retained internal buffers beyond call args).
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Boundaries 8/12/13, monotonic pacing, atomic same-key/delete application after relief, real-L0 + relief acceptance verified under `-race` + 26.7k fuzz execs).
+  * Performance: **Adequate** (Zero timer at ≤8; one timer per paced write; stall polls bounded).
+  * Security: **Optimal** (No lock retention while waiting, no unbounded queue/goroutines, no delay amplification, reads unaffected, close/cancel terminate waits).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*
 
 

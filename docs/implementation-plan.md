@@ -2172,9 +2172,19 @@ TOTAL: 184 Discrete, Testable Micro-Phases
 ### Sub-Phase 10.2: Write Backpressure & Graceful Shutdown
 * **P10-S01-M03: Progressive Write Pacing & Stall Controller**
   * *Objective*: Throttle incoming writes when $L0$ file count exceeds 8; stall when $>12$.
-  * *Changes*: `Engine.maybeDelayWrite()`.
-  * *Tests*: Saturate engine with writes; verify write latency smoothly increases rather than crashing with disk exhaustion.
-  * *Completion*: Write pacing verified.
+  * *Changes*: `Engine.gateL0Write(ctx)` after validation, before sequence allocation.
+    Pure policy `l0PacingDelay` (8→0, 9→1ms, 10→5ms, 11→15ms, 12→30ms, >12→stall path),
+    authoritative `VersionSet.Current().NumFiles(0)` pressure source (no duplicate counter,
+    version pinned only for the read), bounded 20ms stall polls honoring ctx/stopCh/close,
+    release at L0 ≤ 12. `Put`/`Delete` gate; `Get` never gated.
+  * *Tests*: Policy boundaries (8 normal, 12 paced-not-stalled, 13 stalls), monotonic pacing
+    bands (8≈9µs, 9≈1.2ms, 12≈31ms), stall-block-resume via override flip, Delete parity,
+    reads-during-stall, validation-before-pacing, Close/ctx termination, 32 concurrent stalled
+    writers, real 9/13-file L0 pressure with compaction-planner observation and VersionSet relief,
+    same-key atomicity across pressure, end-to-end acceptance (13 real L0 → blocked Put+Delete →
+    relief to 7 → resume correct), fuzz (`FuzzEngineM03_Pacing`, 26.7k execs), benchmarks
+    (no-pressure ~616ns/op vs paced ~31ms/op).
+  * *Completion*: Write pacing verified (P10-S01-M03).
 * **P10-S01-M04: Clean Engine Shutdown & Resource Reclamation**
   * *Objective*: Flush active MemTable, wait for in-flight compactions to pause, sync manifest, close file descriptors.
   * *Changes*: `Engine.Close() error`.
