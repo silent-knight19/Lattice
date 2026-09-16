@@ -302,6 +302,7 @@ func (e *Engine) Open() error {
 		}
 		e.mu.Unlock()
 	}
+	var installedWAL bool
 	if !hasWAL {
 		rw, err := wal.OpenRotatingWriter(dbPath, wal.Options{})
 		if err != nil {
@@ -310,6 +311,7 @@ func (e *Engine) Open() error {
 		e.mu.Lock()
 		if e.wal == nil {
 			e.wal = rw
+			installedWAL = true
 		} else {
 			_ = rw.Close()
 		}
@@ -318,6 +320,19 @@ func (e *Engine) Open() error {
 	// P10-S01-M02: durable VersionSet publication requires an active MANIFEST
 	// writer. Set it up after recovery so flushes can LogAndApply.
 	if err := e.ensureManifestWriter(dbPath); err != nil {
+		// Avoid leaking the WAL descriptor we just opened when manifest setup
+		// fails; the caller still owns Close for previously existing state.
+		// installedWAL avoids interface comparison (panics on non-comparable
+		// dynamic types) by tracking ownership with a bool under the mutex.
+		if installedWAL {
+			e.mu.Lock()
+			w := e.wal
+			e.wal = nil
+			e.mu.Unlock()
+			if w != nil {
+				_ = w.Close()
+			}
+		}
 		return err
 	}
 	// Start the single background flusher and drain any immutable generations
@@ -392,6 +407,19 @@ func (e *Engine) AllocateFileNum() uint64 {
 	return e.nextFileNum.Add(1) - 1
 }
 
+// allocSeqNumLocked allocates the next sequence number for a mutation.
+// Caller must hold e.mu (Put/Delete serialize allocation under the write mutex,
+// so the check-then-add is linearizable and cannot wrap to a duplicate).
+// Returns ErrSeqNumOverflow without consuming a number when the watermark is
+// already at MaxSeqNum.
+func (e *Engine) allocSeqNumLocked() (binary.SeqNum, error) {
+	cur := e.nextSeqNum.Load()
+	if cur == uint64(binary.MaxSeqNum) {
+		return binary.MaxSeqNum, &errors.SeqNumOverflowError{Current: cur}
+	}
+	return binary.SeqNum(e.nextSeqNum.Add(1)), nil
+}
+
 // LastCleanerReport returns the diagnostic report from the most recent orphan cleanup pass (P07-SEC-005).
 func (e *Engine) LastCleanerReport() CleanOrphanReport {
 	e.mu.RLock()
@@ -464,7 +492,16 @@ func (e *Engine) Put(ctx context.Context, key, val []byte) error {
 		return errors.ErrRecoveryInProgress
 	}
 
-	seq := binary.SeqNum(e.nextSeqNum.Add(1))
+	// Intentionally serialized under e.mu: sequence allocation, WAL append,
+	// and MemTable insertion must stay atomically ordered so WAL physical
+	// order always matches sequence order for recovery. Do not move the WAL
+	// barrier outside this mutex to reduce Get latency; out-of-order WAL
+	// records would break monotonic replay. Pacing/stall sleeps stay outside.
+	seq, err := e.allocSeqNumLocked()
+	if err != nil {
+		e.backpressure.Release(estBytes)
+		return err
+	}
 	if e.wal != nil {
 		rec := wal.Record{
 			Type:      wal.RecordTypePut,
@@ -567,7 +604,11 @@ func (e *Engine) Delete(ctx context.Context, key []byte) error {
 		return errors.ErrRecoveryInProgress
 	}
 
-	seq := binary.SeqNum(e.nextSeqNum.Add(1))
+	seq, err := e.allocSeqNumLocked()
+	if err != nil {
+		e.backpressure.Release(estBytes)
+		return err
+	}
 	if e.wal != nil {
 		rec := wal.Record{
 			Type:      wal.RecordTypeDelete,
@@ -1165,8 +1206,8 @@ func (e *Engine) recoverWALInternal(dbPath string, checkpoint binary.SeqNum, rep
 				if batchRecordCount+1 > maxRecs {
 					return &errors.RecoveryBatchLimitError{
 						LimitType: "records",
-						Limit:     uint64(maxRecs),
-						Actual:    uint64(batchRecordCount + 1),
+						Limit:     safeUint64FromInt(maxRecs),
+						Actual:    safeUint64FromInt(batchRecordCount + 1),
 					}
 				}
 				recBytes := uint64(len(rec.Key)) + uint64(len(rec.Value))
@@ -1300,6 +1341,16 @@ func (e *Engine) recoverWALInternal(dbPath string, checkpoint binary.SeqNum, rep
 	e.state = engineStateRecovered
 
 	return nil
+}
+
+// safeUint64FromInt converts a non-negative int count to uint64 without
+// gosec G115 wrap risk; negative inputs (possible via test-injected limits)
+// saturate to 0 instead of wrapping to a huge value.
+func safeUint64FromInt(n int) uint64 {
+	if n < 0 {
+		return 0
+	}
+	return uint64(n)
 }
 
 func isCriticalCleanerError(err error, report CleanOrphanReport) bool {

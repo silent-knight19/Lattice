@@ -141,6 +141,15 @@ func (e *Engine) recordFlushError(err error) {
 	e.flushErrMu.Unlock()
 }
 
+// clearFlushError resets the retained flush error after a generation retires
+// successfully, so FlushError always reports the latest terminal state instead
+// of a stale transient failure.
+func (e *Engine) clearFlushError() {
+	e.flushErrMu.Lock()
+	e.flushErr = nil
+	e.flushErrMu.Unlock()
+}
+
 func (e *Engine) signalFlush() {
 	if e == nil {
 		return
@@ -253,6 +262,11 @@ func (e *Engine) flushLoop() {
 			if imm == nil {
 				break
 			}
+			if imm.Len() == 0 {
+				// Empty generation: bookkeeping only, not a published flush.
+				e.removeFlushedImm(imm)
+				continue
+			}
 			if err := e.flushOne(imm); err != nil {
 				e.recordFlushError(err)
 				// Retain imm for reads and future retry; break to avoid a
@@ -261,6 +275,7 @@ func (e *Engine) flushLoop() {
 			}
 			e.removeFlushedImm(imm)
 			e.flushCount.Add(1)
+			e.clearFlushError()
 		}
 	}
 }
@@ -309,6 +324,12 @@ func (e *Engine) flushOne(imm *memtable.SkipList) error {
 		}
 	}
 
+	// Fail closed before consuming a number or touching disk when the
+	// allocator is exhausted. The late check after Finish in older code could
+	// leave an orphan SSTable behind; checking up front avoids that.
+	if e.NextFileNum() == ^uint64(0) {
+		return fmt.Errorf("%w: file number overflow", os.ErrInvalid)
+	}
 	fileNum := e.AllocateFileNum()
 	if fileNum == 0 {
 		// First allocation on a non-recovered engine yields the 0 sentinel;
@@ -317,6 +338,9 @@ func (e *Engine) flushOne(imm *memtable.SkipList) error {
 		if fileNum == 0 {
 			return fmt.Errorf("%w: file number allocation returned sentinel 0", os.ErrInvalid)
 		}
+	}
+	if fileNum == ^uint64(0) {
+		return fmt.Errorf("%w: file number overflow", os.ErrInvalid)
 	}
 	path := version.TablePath(dbPath, fileNum)
 	w, err := writerFactory(path, sstable.DefaultTableWriterOptions())
@@ -365,9 +389,6 @@ func (e *Engine) flushOne(imm *memtable.SkipList) error {
 	edit := version.NewVersionEdit()
 	if err := edit.AddFile(0, fm); err != nil {
 		return err
-	}
-	if fileNum == ^uint64(0) {
-		return fmt.Errorf("%w: file number overflow", os.ErrInvalid)
 	}
 	edit.SetNextFileNum(fileNum + 1)
 	edit.SetLastSeqNum(maxSeq)
@@ -464,6 +485,7 @@ func (e *Engine) drainForShutdown() error {
 		}
 		e.removeFlushedImm(imm)
 		e.flushCount.Add(1)
+		e.clearFlushError()
 	}
 	return firstErr
 }
