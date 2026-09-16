@@ -2147,8 +2147,20 @@ TOTAL: 184 Discrete, Testable Micro-Phases
 * **P10-S01-M01: Unified `PUT`, `GET`, `DELETE` Engine API**
   * *Objective*: Expose top-level `Engine` struct implementing single-node operations.
   * *Changes*: `Engine.Put(k, v []byte)`, `Engine.Get(k []byte)`, `Engine.Delete(k []byte)`.
+    P10-S01-M01 implements thin orchestration over existing subsystems: single sequence
+    allocation per mutation (`Engine.nextSeqNum`), WAL `AppendSync` before MemTable mutation
+    (success only after both barriers), tombstone-aware reads via `Iterator.Seek` OpType
+    (newest revision decides; tombstone stops search without consulting older layers),
+    persistent reads via pinned `VersionSet.Current()` + transient `TableReader`s sharing one
+    `ShardedCache`, `Open()` (mkdir + `RecoverWAL` + default cache + `RotatingWriter`), and
+    `Close()` WAL release. No flush loop, L0 pacing/stall, or shutdown drain (M02–M04).
   * *Tests*: End-to-end CRUD test executing 50,000 operations across memory and disk.
-  * *Completion*: Basic engine integration complete.
+    M01 verifies with deterministic 50k mixed workload (20,000 PUT / 20,000 GET / 10,000 DELETE
+    over 3000 keys + 500 cold disk-only keys, 0 mismatches vs independent map), real SSTable +
+    VersionSet + TableReader + BlockCache disk coverage, WAL durability + reopen/update/delete
+    across restart, corruption-not-NotFound, buffer-ownership, concurrency matrix under `-race`,
+    and native fuzz (`FuzzEngineM01_CRUD`, 4.2M+ execs, 0 failures).
+  * *Completion*: Basic engine integration complete (P10-S01-M01 verified).
 * **P10-S01-M02: Asynchronous Background Flusher Pipeline**
   * *Objective*: Monitor active MemTable size; when $>64\text{MB}$, atomically swap to `imm` and trigger background flush to $L0$.
   * *Changes*: `Engine.flushLoop()`.

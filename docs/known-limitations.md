@@ -940,6 +940,25 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 57. Unified Engine CRUD Scope, Transient Reader Model, and Deferred Flush/Backpressure/Shutdown (P10-S01-M01)
+* **Limitation & Architectural Boundaries**:
+  In `P10-S01-M01`:
+  1. *Thin Orchestration Only*: `Engine` owns `activeMem`/`immMems` bookkeeping, `nextSeqNum`/`nextFileNum` watermarks, lifecycle state, and backpressure accounting. It coordinates WAL, `VersionSet`, transient `TableReader`s, and one shared `ShardedCache`; it maintains no `[]SSTable`, `map[key]value`, second WAL/cache/`VersionSet`, and performs no raw file I/O, manifest writes, or compaction output construction.
+  2. *WAL-Optional Durability*: `Put`/`Delete` allocate one sequence, `AppendSync` when a WAL is configured (success only after WAL barrier + MemTable insert), else memory-only for unit tests. `Open()` recovers via existing `RecoverWAL` before opening `RotatingWriter` to preserve quiescence.
+  3. *Tombstone-Aware Lookup*: `Get` uses `Iterator.Seek` OpType (not `SearchConcurrent`/`Seek` alone) so a tombstone at any layer stops the search; L0 is searched newest `FileNum` first, L1.. via decoded key-range prune. Storage errors never map to `NotFound`.
+  4. *Transient Readers*: Persistent reads open a short-lived `TableReader` per candidate file with the shared cache and close it before returning. No persistent reader pool/registry is introduced; concurrent `Get`s never share a reader lifetime.
+  5. *Explicitly Deferred*: Background flush loop + `imm` drain (M02), L0-count pacing/stall (M03), and flush-on-close/compaction-drain/manifest-sync shutdown (M04) are not implemented. `Close()` only freezes, closes WAL, and closes backpressure. Dual `Engine`/`VersionSet` watermarks and WAL-less bulk-test mode (50k acceptance uses SSTables without per-op fsync; durability proven by small WAL tests) remain until M02 reconciles flush allocation.
+* **Why It Exists**:
+  Single-micro-phase discipline: prove durable CRUD + versioned reads + cache integration without building background pipelines, stall controllers, or shutdown coordinators.
+* **Impact**:
+  50k mixed CRUD verified (20k PUT / 20k GET / 10k DELETE, 0 mismatches); WAL durability + reopen/update/delete-across-restart verified separately; transient opens cost one footer+index read per candidate file per miss (acceptable for M01 correctness-first scope).
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Tombstone shadowing, L0 newest-wins, corruption-not-NotFound, defensive copies, Version pin/unpin verified under `-race` + 4.2M fuzz execs).
+  * Performance: **Adequate** (Bulk 50k in ~1.6s WAL-less; WAL-backed writes bounded by fsync; no global Engine lock across persistent I/O on reads).
+  * Security: **Optimal** (No WAL-success-before-sync, no tombstone bypass, no released-Version use, no shared-reader close race, no cache-bounds bypass, no buffer aliasing, no corruption masking).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*
 
 

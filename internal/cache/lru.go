@@ -26,6 +26,13 @@ type lruNode struct {
 //     cached data or introduce aliasing bugs.
 //  3. No disk I/O, network calls, or logging callbacks are executed while holding the shard lock.
 //
+// Must not be copied after initialization: LRUShard contains a sync.Mutex and
+// internal map/list state. Always use *LRUShard. Copying a live shard
+// duplicates the mutex and breaks synchronization and list/map consistency.
+//
+// Zero value: the zero value is valid for reads (miss) but Clear initializes
+// it to empty. Prefer NewLRUShard for explicit capacity contracts.
+//
 // Invariants (Enforced at all times under mu):
 //  1. sentinel.next points to the Most Recently Used (MRU) node, or &sentinel if empty.
 //  2. sentinel.prev points to the Least Recently Used (LRU) node, or &sentinel if empty.
@@ -39,6 +46,18 @@ type LRUShard struct {
 	capacity int
 	table    map[BlockKey]*lruNode
 	sentinel lruNode
+}
+
+// ensureInitializedLocked repairs zero-value or partially-initialized shard
+// state under lock. It is idempotent and preserves the configured capacity.
+func (s *LRUShard) ensureInitializedLocked() {
+	if s.table == nil || s.sentinel.next == nil || s.sentinel.prev == nil {
+		cap := s.capacity
+		if cap < 0 {
+			cap = 0
+		}
+		initLRUShard(s, cap)
+	}
 }
 
 // NewLRUShard initializes a new LRUShard with the given block capacity.
@@ -77,7 +96,11 @@ func NewLRUShard(capacity int) (*LRUShard, error) {
 // Returns (value, true) if found, moving the accessed entry to the MRU position.
 // Returns (nil, false) if absent, leaving the list order and map unchanged.
 // The returned byte slice is an owned defensive copy.
+// A nil receiver reports a miss.
 func (s *LRUShard) Get(key BlockKey) ([]byte, bool) {
+	if s == nil {
+		return nil, false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -98,9 +121,16 @@ func (s *LRUShard) Get(key BlockKey) ([]byte, bool) {
 //     The entry count does not increase and no duplicate list node is created.
 //   - If key does not exist, inserts a new MRU entry with an owned defensive copy.
 //     If the shard is at capacity, the LRU entry (sentinel.prev) is evicted before insertion.
+//
+// A nil receiver is a no-op.
 func (s *LRUShard) Put(key BlockKey, val []byte) {
+	if s == nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.ensureInitializedLocked()
 
 	if s.capacity == 0 {
 		return
@@ -128,7 +158,11 @@ func (s *LRUShard) Put(key BlockKey, val []byte) {
 
 // Peek retrieves the cached value for key without modifying its recency.
 // Returns (defensiveCopy, true) if found, or (nil, false) if absent.
+// A nil receiver reports a miss.
 func (s *LRUShard) Peek(key BlockKey) ([]byte, bool) {
+	if s == nil {
+		return nil, false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -140,7 +174,11 @@ func (s *LRUShard) Peek(key BlockKey) ([]byte, bool) {
 }
 
 // Contains reports whether key exists in the cache without modifying recency.
+// A nil receiver reports false.
 func (s *LRUShard) Contains(key BlockKey) bool {
+	if s == nil {
+		return false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -150,7 +188,11 @@ func (s *LRUShard) Contains(key BlockKey) bool {
 
 // Remove deletes key and its corresponding node from the cache if present.
 // Returns true if an entry was removed, or false if it did not exist.
+// A nil receiver reports false.
 func (s *LRUShard) Remove(key BlockKey) bool {
+	if s == nil {
+		return false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -165,21 +207,37 @@ func (s *LRUShard) Remove(key BlockKey) bool {
 }
 
 // Len returns the current number of cached entries in the shard.
+// A nil receiver reports 0.
 func (s *LRUShard) Len() int {
+	if s == nil {
+		return 0
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.table)
 }
 
 // Capacity returns the maximum block capacity configured for this shard.
+// A nil receiver reports 0. Capacity is immutable after construction, so no
+// lock is required; all writers are established before publication.
 func (s *LRUShard) Capacity() int {
+	if s == nil {
+		return 0
+	}
 	return s.capacity
 }
 
 // Clear purges all entries from the shard, resetting map and linked-list state to empty.
+// A nil receiver is a no-op. Zero-value shards are initialized to empty rather
+// than panicking.
 func (s *LRUShard) Clear() {
+	if s == nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.ensureInitializedLocked()
 
 	curr := s.sentinel.next
 	for curr != &s.sentinel {

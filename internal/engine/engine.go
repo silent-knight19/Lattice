@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	stdErrors "errors"
 	"fmt"
@@ -9,13 +10,24 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/silent-knight19/lattice/internal/binary"
+	"github.com/silent-knight19/lattice/internal/cache"
 	"github.com/silent-knight19/lattice/internal/errors"
 	"github.com/silent-knight19/lattice/internal/memtable"
+	"github.com/silent-knight19/lattice/internal/sstable"
 	"github.com/silent-knight19/lattice/internal/version"
 	"github.com/silent-knight19/lattice/internal/wal"
 )
+
+// walWriter is the minimal WAL durability interface required by Engine for
+// P10-S01-M01. It is satisfied by *wal.RotatingWriter and *wal.WALWriter.
+// Tests may inject failing implementations to verify failure propagation.
+type walWriter interface {
+	AppendSync(rec wal.Record) error
+	Close() error
+}
 
 type engineState uint32
 
@@ -75,6 +87,15 @@ func SetRecoveryPrePublishHookForTesting(hook func(*Engine)) func() {
 
 // Engine coordinates the active MemTable, immutable flush candidates,
 // VersionSet snapshot management, and backpressure gating (SEC-003).
+//
+// P10-S01-M01 ownership:
+//   - Owns directly: dbPath, activeMem, immMems slice management, nextSeqNum /
+//     nextFileNum watermarks, lifecycle state, backpressure accounting.
+//   - Coordinates (does not duplicate): WAL durability, VersionSet current
+//     Version, transient TableReaders, and the single shared ShardedCache.
+//   - Engine never maintains []SSTable, map[key]value, a second WAL/cache/
+//     VersionSet, nor does it perform raw file I/O, manifest writes, or
+//     compaction output construction.
 type Engine struct {
 	mu                sync.RWMutex
 	dbPath            string
@@ -87,6 +108,8 @@ type Engine struct {
 	state             engineState
 	vset              *version.VersionSet
 	lastCleanerReport CleanOrphanReport
+	wal               walWriter
+	blockCache        *cache.ShardedCache
 }
 
 // EngineOptions specifies configuration parameters for initializing an Engine instance.
@@ -94,6 +117,13 @@ type EngineOptions struct {
 	DBPath       string
 	Backpressure BackpressureConfig
 	VersionSet   *version.VersionSet
+	// WAL is the optional durability writer. When nil, Put/Delete operate on
+	// memory only (preserving pre-M01 in-memory behavior for unit tests).
+	// Open() initializes a RotatingWriter when WAL is nil and DBPath is set.
+	WAL walWriter
+	// BlockCache is the single shared Phase 09 ShardedCache passed to transient
+	// TableReaders. When nil, persistent reads go directly to disk.
+	BlockCache *cache.ShardedCache
 }
 
 // NewEngine constructs an Engine instance backed by the given backpressure configuration.
@@ -117,7 +147,134 @@ func NewEngineWithOptions(opts EngineOptions) *Engine {
 		activeMem:    memtable.NewSkipList(),
 		backpressure: bc,
 		vset:         vset,
+		wal:          opts.WAL,
+		blockCache:   opts.BlockCache,
 	}
+}
+
+// WAL returns the Engine's configured WAL writer, or nil if operating in
+// memory-only mode (no durability).
+func (e *Engine) WAL() walWriter {
+	if e == nil {
+		return nil
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.wal
+}
+
+// SetWALForTesting installs a WAL writer for testing and returns a restore
+// function. It is used to inject failing writers for failure-propagation tests.
+func (e *Engine) SetWALForTesting(w walWriter) {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.wal = w
+}
+
+// BlockCache returns the Engine's shared block cache, or nil if caching is disabled.
+func (e *Engine) BlockCache() *cache.ShardedCache {
+	if e == nil {
+		return nil
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.blockCache
+}
+
+// SetBlockCache installs the shared block cache passed to transient TableReaders.
+func (e *Engine) SetBlockCache(c *cache.ShardedCache) {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.blockCache = c
+}
+
+// Open initializes database directories, recovers durable state using existing
+// recovery machinery, and opens the WAL for subsequent mutations.
+//
+// Steps (in order to preserve quiescence):
+//  1. Validate DBPath and create the database directory (0700).
+//  2. Point the VersionSet at DBPath for physical SSTable validation.
+//  3. If not yet recovered, run RecoverWAL() (manifest replay + WAL replay).
+//  4. Create a default shared block cache if none is configured.
+//  5. Open a RotatingWriter if none is configured.
+//
+// Open is idempotent: repeated calls on a recovered Engine with an open WAL
+// return nil. Initialization failures leave already-created resources owned by
+// the Engine for Close() to release; no partially usable state is presented
+// beyond the returned error.
+func (e *Engine) Open() error {
+	if e == nil {
+		return errors.ErrNilReceiver
+	}
+	if e.closed.Load() {
+		return errors.ErrWriterClosed
+	}
+	dbPath := e.DBPath()
+	if dbPath == "" {
+		return fmt.Errorf("%w: engine dbPath cannot be empty", os.ErrInvalid)
+	}
+	if err := os.MkdirAll(dbPath, 0700); err != nil {
+		return fmt.Errorf("engine: failed to create database directory: %w", err)
+	}
+	if vs := e.VersionSet(); vs != nil {
+		vs.SetDBPath(dbPath)
+	}
+
+	e.mu.RLock()
+	st := e.state
+	hasWAL := e.wal != nil
+	hasCache := e.blockCache != nil
+	e.mu.RUnlock()
+	if st == engineStateClosed || e.closed.Load() {
+		return errors.ErrWriterClosed
+	}
+	if st == engineStateRecovering {
+		return errors.ErrRecoveryInProgress
+	}
+	if st != engineStateRecovered {
+		if err := e.RecoverWAL(); err != nil {
+			// RecoverWAL on a clean empty directory succeeds; any other error
+			// (including AlreadyComplete from a concurrent Open) is propagated
+			// unless the Engine is now recovered.
+			e.mu.RLock()
+			cur := e.state
+			e.mu.RUnlock()
+			if cur != engineStateRecovered {
+				return err
+			}
+		}
+	}
+	if !hasCache {
+		c, err := cache.NewShardedCache(1024)
+		if err != nil {
+			return err
+		}
+		e.mu.Lock()
+		if e.blockCache == nil {
+			e.blockCache = c
+		}
+		e.mu.Unlock()
+	}
+	if !hasWAL {
+		rw, err := wal.OpenRotatingWriter(dbPath, wal.Options{})
+		if err != nil {
+			return fmt.Errorf("engine: failed to open WAL: %w", err)
+		}
+		e.mu.Lock()
+		if e.wal == nil {
+			e.wal = rw
+		} else {
+			_ = rw.Close()
+		}
+		e.mu.Unlock()
+	}
+	return nil
 }
 
 // SetDBPath sets the root database directory path for the Engine.
@@ -198,6 +355,14 @@ func (e *Engine) Backpressure() *BackpressureController {
 // Put writes a key-value pair under backpressure control (SEC-003).
 // If total engine memory approaches or exceeds configured thresholds,
 // Put throttles or rejects the write fail-closed.
+//
+// Durability (P10-S01-M01): when a WAL is configured, Put allocates exactly
+// one sequence number, appends one WAL PUT record and synchronizes it
+// (AppendSync) before mutating the MemTable. Success is reported only after
+// both the WAL barrier and the MemTable insertion succeed. WAL append/sync
+// failures return the underlying error without mutating memory; MemTable
+// failures after a durable WAL append return the insert error (the record
+// remains recoverable via WAL replay).
 func (e *Engine) Put(ctx context.Context, key, val []byte) error {
 	if e == nil {
 		return errors.ErrNilReceiver
@@ -233,6 +398,19 @@ func (e *Engine) Put(ctx context.Context, key, val []byte) error {
 	}
 
 	seq := binary.SeqNum(e.nextSeqNum.Add(1))
+	if e.wal != nil {
+		rec := wal.Record{
+			Type:      wal.RecordTypePut,
+			SeqNum:    seq,
+			Timestamp: uint64(time.Now().UnixNano()),
+			Key:       key,
+			Value:     val,
+		}
+		if err := e.wal.AppendSync(rec); err != nil {
+			e.backpressure.Release(estBytes)
+			return err
+		}
+	}
 	ik, err := binary.NewInternalKey(key, seq, binary.OpTypePut)
 	if err != nil {
 		e.backpressure.Release(estBytes)
@@ -268,6 +446,12 @@ func (e *Engine) Put(ctx context.Context, key, val []byte) error {
 }
 
 // Delete appends a tombstone deletion marker under backpressure control.
+//
+// Tombstone semantics (P10-S01-M01): Delete always creates a tombstone with a
+// fresh sequence number, even for nonexistent keys, because an older SSTable
+// value may exist beneath memory. The tombstone shadows older revisions until
+// compaction provably drops it. Durability mirrors Put: WAL AppendSync first,
+// then MemTable tombstone; failures propagate without reporting success.
 func (e *Engine) Delete(ctx context.Context, key []byte) error {
 	if e == nil {
 		return errors.ErrNilReceiver
@@ -298,6 +482,18 @@ func (e *Engine) Delete(ctx context.Context, key []byte) error {
 	}
 
 	seq := binary.SeqNum(e.nextSeqNum.Add(1))
+	if e.wal != nil {
+		rec := wal.Record{
+			Type:      wal.RecordTypeDelete,
+			SeqNum:    seq,
+			Timestamp: uint64(time.Now().UnixNano()),
+			Key:       key,
+		}
+		if err := e.wal.AppendSync(rec); err != nil {
+			e.backpressure.Release(estBytes)
+			return err
+		}
+	}
 	ik, err := binary.NewInternalKey(key, seq, binary.OpTypeDelete)
 	if err != nil {
 		e.backpressure.Release(estBytes)
@@ -328,7 +524,18 @@ func (e *Engine) Delete(ctx context.Context, key []byte) error {
 	return nil
 }
 
-// Get retrieves the newest value associated with key across active and immutable MemTables.
+// Get retrieves the newest value associated with key across memory and disk.
+//
+// Precedence (newest wins, tombstone shadows):
+//  1. Active MemTable (newest layer).
+//  2. Immutable MemTables, newest frozen first.
+//  3. Persistent Version: L0 newest FileNum first (overlapping), then L1..L6
+//     in order (each non-overlapping, at most one file per level via key-range).
+//
+// A tombstone at any layer stops the search and returns ErrKeyNotFound without
+// consulting older layers. Storage failures (missing file, checksum, I/O,
+// corruption, closed reader) are returned as errors and never mapped to
+// not-found. Returned values are defensive copies.
 func (e *Engine) Get(key []byte) ([]byte, error) {
 	if e == nil {
 		return nil, errors.ErrNilReceiver
@@ -338,30 +545,207 @@ func (e *Engine) Get(key []byte) ([]byte, error) {
 	}
 
 	e.mu.RLock()
-	defer e.mu.RUnlock()
-
 	if e.state == engineStateRecovering {
+		e.mu.RUnlock()
 		return nil, errors.ErrRecoveryInProgress
 	}
+	active := e.activeMem
+	imm := make([]*memtable.SkipList, len(e.immMems))
+	copy(imm, e.immMems)
+	vset := e.vset
+	dbPath := e.dbPath
+	bc := e.blockCache
+	e.mu.RUnlock()
 
-	// 1. Search active MemTable
-	val, err := e.activeMem.SearchConcurrent(key)
-	if err == nil {
-		return val, nil
-	}
-
-	// 2. Search immutable MemTables in reverse chronological order
-	for i := len(e.immMems) - 1; i >= 0; i-- {
-		val, err := e.immMems[i].SearchConcurrent(key)
-		if err == nil {
+	// 1. Active MemTable (tombstone-aware).
+	if active != nil {
+		val, put, tomb := lookupMemLayer(active, key)
+		if put {
 			return val, nil
+		}
+		if tomb {
+			return nil, errors.ErrKeyNotFound
+		}
+	}
+	// 2. Immutable MemTables, newest first.
+	for i := len(imm) - 1; i >= 0; i-- {
+		if imm[i] == nil {
+			continue
+		}
+		val, put, tomb := lookupMemLayer(imm[i], key)
+		if put {
+			return val, nil
+		}
+		if tomb {
+			return nil, errors.ErrKeyNotFound
 		}
 	}
 
+	// 3. Persistent Version via transient TableReaders + shared block cache.
+	if vset == nil || dbPath == "" || !vset.HasCurrent() {
+		return nil, errors.ErrKeyNotFound
+	}
+	ver := vset.Current()
+	if ver == nil {
+		return nil, errors.ErrKeyNotFound
+	}
+	defer ver.Unref()
+	return e.getFromVersion(key, ver, dbPath, bc)
+}
+
+// lookupMemLayer inspects a single SkipList for key, distinguishing PUT,
+// tombstone, and absence. It uses Iterator.Seek so the newest revision's
+// OpType decides: PUT returns (value, true, false), DELETE returns
+// (nil, false, true), absence returns (nil, false, false).
+func lookupMemLayer(sl *memtable.SkipList, key []byte) (val []byte, put bool, tomb bool) {
+	if sl == nil {
+		return nil, false, false
+	}
+	it := sl.NewIterator()
+	if it == nil {
+		return nil, false, false
+	}
+	defer it.Close()
+	if err := it.Seek(key); err != nil {
+		return nil, false, false
+	}
+	if !it.Valid() {
+		return nil, false, false
+	}
+	ik := it.Key()
+	if !bytes.Equal(ik.UserKey, key) {
+		return nil, false, false
+	}
+	if ik.OpType == binary.OpTypeDelete {
+		return nil, false, true
+	}
+	return it.Value(), true, false
+}
+
+// getFromVersion searches a pinned Version newest-to-oldest. L0 files overlap
+// and are searched newest FileNum first; L1.. files are non-overlapping and
+// pruned by decoded user-key range. The first containing file decides: PUT
+// returns its value, tombstone returns ErrKeyNotFound without consulting
+// older files/levels. Range misses continue. Open/read/decode failures are
+// returned as errors, never as not-found.
+func (e *Engine) getFromVersion(key []byte, ver *version.Version, dbPath string, bc *cache.ShardedCache) ([]byte, error) {
+	// L0: overlapping, newest first.
+	l0 := ver.Files(0)
+	if len(l0) > 1 {
+		cp := make([]version.FileMetadata, len(l0))
+		copy(cp, l0)
+		// Sort FileNum descending (newest flush first; FileNums are monotonic).
+		for i := 1; i < len(cp); i++ {
+			for j := i; j > 0 && cp[j].FileNum > cp[j-1].FileNum; j-- {
+				cp[j], cp[j-1] = cp[j-1], cp[j]
+			}
+		}
+		l0 = cp
+	}
+	for _, meta := range l0 {
+		found, tomb, val, err := lookupSSTableFile(dbPath, meta, key, bc)
+		if err != nil {
+			return nil, err
+		}
+		if tomb {
+			return nil, errors.ErrKeyNotFound
+		}
+		if found {
+			return val, nil
+		}
+	}
+	// L1..L6: at most one file per level can contain the key.
+	for lvl := 1; lvl < version.NumLevels; lvl++ {
+		for _, meta := range ver.Files(lvl) {
+			ok, err := fileRangeContains(meta, key)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				continue
+			}
+			found, tomb, val, err := lookupSSTableFile(dbPath, meta, key, bc)
+			if err != nil {
+				return nil, err
+			}
+			if tomb {
+				return nil, errors.ErrKeyNotFound
+			}
+			if found {
+				return val, nil
+			}
+			// Range matched but key absent: non-overlapping level, no other
+			// file in this level can contain it.
+			break
+		}
+	}
 	return nil, errors.ErrKeyNotFound
 }
 
-// Close gracefully flushes state, freezes active tables, and closes the backpressure controller.
+// fileRangeContains reports whether key falls within the SSTable's decoded
+// [SmallestUserKey, LargestUserKey] range. Decode failures are storage errors.
+func fileRangeContains(meta version.FileMetadata, key []byte) (bool, error) {
+	smallIK, err := binary.DecodeInternalKey(meta.SmallestKey)
+	if err != nil {
+		return false, err
+	}
+	largeIK, err := binary.DecodeInternalKey(meta.LargestKey)
+	if err != nil {
+		return false, err
+	}
+	if bytes.Compare(key, smallIK.UserKey) < 0 {
+		return false, nil
+	}
+	if bytes.Compare(key, largeIK.UserKey) > 0 {
+		return false, nil
+	}
+	return true, nil
+}
+
+// lookupSSTableFile opens a transient TableReader for meta, seeks key via a
+// TableIterator (to observe OpType), and closes the reader before returning.
+// It uses the Engine's shared block cache without exposing shard internals.
+func lookupSSTableFile(dbPath string, meta version.FileMetadata, key []byte, bc *cache.ShardedCache) (found bool, tomb bool, val []byte, err error) {
+	var cacheIf sstable.BlockCache
+	if bc != nil {
+		cacheIf = bc
+	}
+	path := version.TablePath(dbPath, meta.FileNum)
+	reader, err := sstable.NewTableReaderWithOptions(path, sstable.TableReaderOptions{
+		FileNum:    meta.FileNum,
+		BlockCache: cacheIf,
+	})
+	if err != nil {
+		return false, false, nil, err
+	}
+	defer func() { _ = reader.Close() }()
+	it, err := reader.NewIterator()
+	if err != nil {
+		return false, false, nil, err
+	}
+	defer func() { _ = it.Close() }()
+	if err := it.Seek(key); err != nil {
+		return false, false, nil, err
+	}
+	if err := it.Err(); err != nil {
+		return false, false, nil, err
+	}
+	if !it.Valid() {
+		return false, false, nil, nil
+	}
+	ik := it.Key()
+	if !bytes.Equal(ik.UserKey, key) {
+		return false, false, nil, nil
+	}
+	if ik.OpType == binary.OpTypeDelete {
+		return false, true, nil, nil
+	}
+	return true, false, it.Value(), nil
+}
+
+// Close freezes active tables, closes the WAL if owned, and closes the backpressure controller.
+// Close is idempotent. It does not implement M04 flush-on-close, compaction
+// drain, or manifest sync; it only releases resources opened for M01.
 func (e *Engine) Close() error {
 	if e == nil {
 		return nil
@@ -376,8 +760,12 @@ func (e *Engine) Close() error {
 	e.state = engineStateClosed
 
 	e.activeMem.Freeze()
+	var walErr error
+	if e.wal != nil {
+		walErr = e.wal.Close()
+	}
 	e.backpressure.Close()
-	return nil
+	return walErr
 }
 
 func (e *Engine) beginRecovery() error {

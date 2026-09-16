@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,11 +37,34 @@ type BlockCache interface {
 type TableReaderOptions struct {
 	// FileNum is the physical SSTable sequential file number (e.g. 1 for "000001.sst").
 	// If FileNum is 0, NewTableReaderWithOptions attempts to parse FileNum from the filename.
+	//
+	// Cache identity: cached blocks are keyed by (FileNum, Offset). FileNum 0
+	// disables block caching for that reader (reads go directly to disk) because
+	// 0 is the unassigned sentinel and cannot distinguish distinct files.
+	// When sharing one BlockCache across readers, every reader MUST use a
+	// distinct non-zero FileNum; two different files using the same FileNum
+	// would return each other's cached blocks.
 	FileNum uint64
 
 	// BlockCache is the optional BlockCache (e.g. *cache.ShardedCache) to use for data blocks.
-	// If nil, caching is disabled and all reads go directly to disk.
+	// If nil (or a typed-nil *cache.ShardedCache/*cache.LRUShard), caching is
+	// disabled and all reads go directly to disk.
 	BlockCache BlockCache
+}
+
+// isNilBlockCache reports whether a BlockCache interface holds no usable cache,
+// covering both untyped nil and typed-nil pointers (e.g. (*cache.ShardedCache)(nil)).
+func isNilBlockCache(c BlockCache) bool {
+	if c == nil {
+		return true
+	}
+	v := reflect.ValueOf(c)
+	switch v.Kind() {
+	case reflect.Ptr, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func, reflect.Interface:
+		return v.IsNil()
+	default:
+		return false
+	}
 }
 
 // TableReader provides point-lookup access to an immutable, finalized SSTable file.
@@ -55,7 +79,11 @@ type TableReaderOptions struct {
 // Concurrency:
 // TableReader is safe for concurrent Seek and ReadBlock operations across multiple goroutines.
 // Disk reads use positional ReadAt, ensuring no mutable file offset state is shared.
-// BlockCache accesses delegate to concurrent sharded caches without holding a global reader lock.
+// ReadBlock and Seek hold the reader's shared read lock for the duration of the
+// operation (including cache access and, on miss, disk I/O and validation), so a
+// concurrent Close or SetFileNum/SetBlockCache waits for in-flight reads.
+// BlockCache accesses then take only the targeted shard mutex; there is no global
+// cache lock on the hot path and no lock-order inversion (reader -> shard only).
 // Close acquires an exclusive write lock to safely release file resources.
 type TableReader struct {
 	mu         sync.RWMutex
@@ -335,6 +363,12 @@ func (r *TableReader) FileNum() uint64 {
 }
 
 // SetFileNum updates the physical SSTable file number associated with this reader.
+//
+// Changing the identity of a live reader orphans entries cached under the old
+// (FileNum, Offset) keys (they remain until evicted but are unreachable via the
+// new identity) and requires the new FileNum to be unique among all readers
+// sharing the cache. Setting FileNum to 0 disables block caching for
+// subsequent reads. Prefer immutable identity set at construction.
 func (r *TableReader) SetFileNum(fileNum uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -342,10 +376,22 @@ func (r *TableReader) SetFileNum(fileNum uint64) {
 }
 
 // BlockCache returns the configured BlockCache, or nil if block caching is disabled.
+// A typed-nil cache (e.g. (*cache.ShardedCache)(nil)) is reported as nil.
 func (r *TableReader) BlockCache() BlockCache {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	if isNilBlockCache(r.blockCache) {
+		return nil
+	}
 	return r.blockCache
+}
+
+// cacheEnabledLocked reports whether block caching is usable for the current
+// reader state. Caching requires a non-nil cache AND a non-zero FileNum, so
+// ambiguous identity (FileNum 0) never reads or populates shared cache entries.
+// Caller must hold at least the read lock.
+func (r *TableReader) cacheEnabledLocked() bool {
+	return r.fileNum != 0 && !isNilBlockCache(r.blockCache)
 }
 
 // SetBlockCache updates the BlockCache for this reader. If nil, block caching is disabled.
@@ -436,15 +482,18 @@ func (r *TableReader) validateBlockHandle(handle BlockHandle) error {
 // Read Flow:
 //  1. Validates handle bounds against MaxDataBlockSize, 64-bit integer limits, and physical file boundaries.
 //     Malformed handles are rejected immediately before any cache lookup or disk I/O.
-//  2. If a BlockCache is configured, checks the cache for (fileNum, handle.Offset).
-//     On a cache hit, returns a defensive copy from cache immediately, bypassing disk I/O and checksum calculation.
+//  2. If block caching is enabled (non-nil cache AND non-zero FileNum), checks the
+//     cache for (fileNum, handle.Offset).
+//     On a cache hit with matching size, returns a defensive copy from cache
+//     immediately, bypassing disk I/O and checksum calculation.
 //  3. On a cache miss (or if cache is disabled):
 //     - Reads handle.Size bytes from disk via positional ReadAt.
 //     - Validates minimum block trailer length (>= 8 bytes).
 //     - Validates CRC32-IEEE checksum over [entry data || restart offsets || restart count].
-//     - Validates restart count and restart array boundaries.
+//     - Validates restart count, restart array boundaries, and full restart offset
+//     - structure (first offset zero, strictly increasing, within entry bounds).
 //     - If corrupted, returns an explicit error and NEVER inserts corrupted bytes into the cache.
-//     - If valid and BlockCache is configured, inserts the validated block into the cache.
+//     - If valid and caching is enabled, inserts the validated block into the cache.
 //  4. Returns the validated block buffer.
 func (r *TableReader) ReadBlock(handle BlockHandle) ([]byte, error) {
 	if r == nil {
@@ -459,6 +508,49 @@ func (r *TableReader) ReadBlock(handle BlockHandle) ([]byte, error) {
 	return r.readBlockLocked(handle)
 }
 
+// validateBlockRestartOffsets verifies full restart-offset structure: first
+// offset zero, strictly increasing, and strictly within the entry-data region.
+// blockBuf must already have passed trailer length, CRC, count, and array
+// bounds checks.
+func validateBlockRestartOffsets(blockBuf []byte, blockOffset uint64) error {
+	restartCount := binary.GetUint32(blockBuf[len(blockBuf)-8 : len(blockBuf)-4])
+	restartBytes := uint64(restartCount) * 4
+	// Caller guarantees restartBytes+8 <= len(blockBuf); re-check defensively.
+	if restartBytes+8 > uint64(len(blockBuf)) {
+		return &errors.DataBlockCorruptedError{
+			Offset: blockOffset,
+			Reason: "data block restart array exceeds block size",
+		}
+	}
+	entryDataEnd := len(blockBuf) - 8 - int(restartBytes)
+	restartOffsetsStart := entryDataEnd
+	var prev uint32
+	for i := 0; i < int(restartCount); i++ {
+		offPos := restartOffsetsStart + i*4
+		off := binary.GetUint32(blockBuf[offPos : offPos+4])
+		if i == 0 && off != 0 {
+			return &errors.DataBlockCorruptedError{
+				Offset: blockOffset,
+				Reason: "first restart offset must be zero",
+			}
+		}
+		if i > 0 && off <= prev {
+			return &errors.DataBlockCorruptedError{
+				Offset: blockOffset,
+				Reason: "restart offsets are not strictly increasing",
+			}
+		}
+		if uint64(off) >= uint64(entryDataEnd) {
+			return &errors.DataBlockCorruptedError{
+				Offset: blockOffset,
+				Reason: "restart offset exceeds entry data boundary",
+			}
+		}
+		prev = off
+	}
+	return nil
+}
+
 // readBlockLocked performs the handle validation, cache lookup, disk read, integrity validation,
 // and cache insertion under shared read lock.
 func (r *TableReader) readBlockLocked(handle BlockHandle) ([]byte, error) {
@@ -467,9 +559,11 @@ func (r *TableReader) readBlockLocked(handle BlockHandle) ([]byte, error) {
 		return nil, err
 	}
 
-	// 2. Check BlockCache if configured
-	key := cache.NewBlockKey(r.fileNum, handle.Offset)
-	if r.blockCache != nil {
+	cacheEnabled := r.cacheEnabledLocked()
+	var key cache.BlockKey
+	if cacheEnabled {
+		// 2. Check BlockCache if enabled (non-zero FileNum, usable cache).
+		key = cache.NewBlockKey(r.fileNum, handle.Offset)
 		if val, ok := r.blockCache.Get(key); ok {
 			// Ensure cached entry matches expected handle size
 			if uint64(len(val)) == handle.Size {
@@ -529,8 +623,14 @@ func (r *TableReader) readBlockLocked(handle BlockHandle) ([]byte, error) {
 		}
 	}
 
+	// 4c. Verify full restart offset structure before trusting or caching, so
+	// ReadBlock never caches a block that Seek would reject.
+	if err := validateBlockRestartOffsets(blockBuf, handle.Offset); err != nil {
+		return nil, err
+	}
+
 	// 5. Insert valid, verified block into cache
-	if r.blockCache != nil {
+	if cacheEnabled {
 		r.blockCache.Put(key, blockBuf)
 	}
 
