@@ -959,6 +959,26 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 58. Asynchronous Flusher Scope, Single-Worker Model, and Deferred Pacing/Shutdown (P10-S01-M02)
+* **Limitation & Architectural Boundaries**:
+  In `P10-S01-M02`:
+  1. *Single Worker, FIFO Queue*: One `flushLoop` goroutine drains `immMems` oldest-first with a coalesced `flushCh` (cap 1, no per-trigger goroutine, no busy poll). Multiple rotations append (no overwrite); the worker never holds `Engine.mu` during `TableWriter`/`Finish`/`LogAndApply` I/O.
+  2. *Threshold*: Single authoritative `memtable.MaxMemTableSize` (64 MiB) via `ByteSize()`; rotation when `>=` threshold after success plus existing `ErrMemTableFull` rotate-and-retry. `SetFlushThresholdForTesting` exists only for fast tests; the 200MB acceptance uses the real 64MB threshold.
+  3. *Manifest Durability*: `ensureManifestWriter` creates/opens the active MANIFEST and points `VersionSet` at it; each flush publishes `AddFile(L0)` + `NextFileNum(fileNum+1)` + `LastSeqNum(maxFlushedSeq)` via `LogAndApply` (manifest sync barrier). WAL segments are intentionally retained (no truncation/GC); recovery skips `Seq <= checkpoint` and serves flushed keys from L0.
+  4. *Failure Retention*: Writer/`Finish`/`Add`/`LogAndApply` failures retain the imm, record `FlushError`, publish nothing, and break to avoid tight retry (next rotation signal retries oldest-first). Post-`Finish` publish failures may leave an orphan SSTable on disk (ignored by replay, FileNum bumped past it).
+  5. *Minimal Close*: `Close()` signals `stopCh`, waits for in-flight `flushOne` (no full drain/flush-on-close), then freezes and closes WAL/manifest/backpressure. Remaining imm stays memory-readable and WAL-durable.
+  6. *Explicitly Deferred*: L0-count pacing/stall (M03) and full shutdown sequencing with compaction coordination (M04) are not implemented; unbounded imm growth under sustained flush failure is bounded only by future backpressure.
+* **Why It Exists**:
+  Correctness-first background persistence: prove async rotation/flush/publication/retirement without building stall controllers or shutdown coordinators.
+* **Impact**:
+  200MB ingest yields 3 L0 files with full 50k-key validation; blocked-flush test proves fresh writes complete while I/O is stalled; empty imm flushes publish nothing.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (No visibility gap, seq/tombstone preservation, unique FileNums, orphan-safe failures verified under `-race` + fuzz).
+  * Performance: **Adequate** (200MB in ~54s with real SSTable+manifest I/O; hot-path threshold check O(1); dormant worker when idle).
+  * Security: **Optimal** (No lock-held I/O, no imm overwrite, no double publish, no FileNum reuse, no silent background errors, no WAL premature disposal).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*
 
 

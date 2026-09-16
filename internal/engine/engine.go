@@ -110,6 +110,28 @@ type Engine struct {
 	lastCleanerReport CleanOrphanReport
 	wal               walWriter
 	blockCache        *cache.ShardedCache
+	manifest          *version.ManifestWriter
+
+	// P10-S01-M02 background flusher state. The worker is started by Open
+	// for DB-backed engines; memory-only engines have nil channels and no
+	// goroutine. flushCh is a coalescing signal (cap 1); stopCh is closed
+	// once by Close.
+	flushCh      chan struct{}
+	stopCh       chan struct{}
+	flushWG      sync.WaitGroup
+	flushStarted bool
+
+	// flushCfgMu guards test-injectable flusher configuration. It is a leaf
+	// lock never held across e.mu or any disk I/O.
+	flushCfgMu             sync.Mutex
+	flushThresholdOverride uint64
+	tableWriterFactory     func(path string, opts sstable.TableWriterOptions) (*sstable.TableWriter, error)
+	versionApply           func(edit *version.VersionEdit) error
+	flushPauseHook         func(imm *memtable.SkipList)
+
+	flushErrMu sync.Mutex
+	flushErr   error
+	flushCount atomic.Uint64
 }
 
 // EngineOptions specifies configuration parameters for initializing an Engine instance.
@@ -274,6 +296,20 @@ func (e *Engine) Open() error {
 		}
 		e.mu.Unlock()
 	}
+	// P10-S01-M02: durable VersionSet publication requires an active MANIFEST
+	// writer. Set it up after recovery so flushes can LogAndApply.
+	if err := e.ensureManifestWriter(dbPath); err != nil {
+		return err
+	}
+	// Start the single background flusher and drain any immutable generations
+	// left by recovery.
+	e.mu.Lock()
+	e.startFlushWorkerLocked()
+	needSignal := len(e.immMems) > 0
+	e.mu.Unlock()
+	if needSignal {
+		e.signalFlush()
+	}
 	return nil
 }
 
@@ -386,7 +422,13 @@ func (e *Engine) Put(ctx context.Context, key, val []byte) error {
 	}
 
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	rotated := false
+	defer func() {
+		e.mu.Unlock()
+		if rotated {
+			e.signalFlush()
+		}
+	}()
 
 	if e.closed.Load() || e.state == engineStateClosed {
 		e.backpressure.Release(estBytes)
@@ -424,6 +466,7 @@ func (e *Engine) Put(ctx context.Context, key, val []byte) error {
 			e.activeMem.Freeze()
 			e.immMems = append(e.immMems, e.activeMem)
 			e.activeMem = memtable.NewSkipList()
+			rotated = true
 
 			// Retry insert in fresh active MemTable
 			insertErr = e.activeMem.Insert(ik, val)
@@ -433,6 +476,13 @@ func (e *Engine) Put(ctx context.Context, key, val []byte) error {
 	if insertErr != nil {
 		e.backpressure.Release(estBytes)
 		return insertErr
+	}
+
+	// P10-S01-M02: proactive rotation when the successful insert filled the
+	// active table to the threshold. No I/O under the mutex; the background
+	// worker flushes asynchronously.
+	if e.maybeRotateLocked() {
+		rotated = true
 	}
 
 	// Synchronize backpressure controller with exact active heap usage
@@ -470,7 +520,13 @@ func (e *Engine) Delete(ctx context.Context, key []byte) error {
 	}
 
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	rotated := false
+	defer func() {
+		e.mu.Unlock()
+		if rotated {
+			e.signalFlush()
+		}
+	}()
 
 	if e.closed.Load() || e.state == engineStateClosed {
 		e.backpressure.Release(estBytes)
@@ -506,6 +562,7 @@ func (e *Engine) Delete(ctx context.Context, key []byte) error {
 			e.activeMem.Freeze()
 			e.immMems = append(e.immMems, e.activeMem)
 			e.activeMem = memtable.NewSkipList()
+			rotated = true
 			insertErr = e.activeMem.Insert(ik, nil)
 		}
 	}
@@ -513,6 +570,10 @@ func (e *Engine) Delete(ctx context.Context, key []byte) error {
 	if insertErr != nil {
 		e.backpressure.Release(estBytes)
 		return insertErr
+	}
+
+	if e.maybeRotateLocked() {
+		rotated = true
 	}
 
 	totalBytes := e.activeMem.ByteSize()
@@ -743,29 +804,51 @@ func lookupSSTableFile(dbPath string, meta version.FileMetadata, key []byte, bc 
 	return true, false, it.Value(), nil
 }
 
-// Close freezes active tables, closes the WAL if owned, and closes the backpressure controller.
-// Close is idempotent. It does not implement M04 flush-on-close, compaction
-// drain, or manifest sync; it only releases resources opened for M01.
+// Close freezes active tables, stops the background flusher (waiting for any
+// in-flight flush to finish without starting new work), and closes WAL,
+// manifest, and backpressure resources. Close is idempotent. It does not
+// implement M04 flush-on-close drain, compaction coordination, or manifest
+// sync beyond releasing M01/M02 resources; remaining immutable generations
+// stay readable in memory and WAL-durable for future recovery.
 func (e *Engine) Close() error {
 	if e == nil {
 		return nil
 	}
 	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	e.closed.Store(true)
 	if e.state == engineStateClosed {
+		e.mu.Unlock()
 		return nil
 	}
+	e.closed.Store(true)
 	e.state = engineStateClosed
+	stopCh := e.stopCh
+	e.mu.Unlock()
+
+	// Minimal M02 interaction: signal the worker and wait for any in-flight
+	// flushOne to finish so it never touches resources we are about to close.
+	// The worker exits promptly without draining the whole queue (no M04 drain).
+	if stopCh != nil {
+		close(stopCh)
+	}
+	e.flushWG.Wait()
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
 	e.activeMem.Freeze()
-	var walErr error
+	var firstErr error
 	if e.wal != nil {
-		walErr = e.wal.Close()
+		if err := e.wal.Close(); err != nil {
+			firstErr = err
+		}
+	}
+	if e.manifest != nil {
+		if err := e.manifest.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
 	e.backpressure.Close()
-	return walErr
+	return firstErr
 }
 
 func (e *Engine) beginRecovery() error {

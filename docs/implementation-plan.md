@@ -2163,10 +2163,11 @@ TOTAL: 184 Discrete, Testable Micro-Phases
   * *Completion*: Basic engine integration complete (P10-S01-M01 verified).
 * **P10-S01-M02: Asynchronous Background Flusher Pipeline**
   * *Objective*: Monitor active MemTable size; when $>64\text{MB}$, atomically swap to `imm` and trigger background flush to $L0$.
-  * *Changes*: `Engine.flushLoop()`.
-  * *Invariants*: Writes continue to fresh active MemTable without blocking during flush I/O.
+  * *Changes*: `Engine.flushLoop()` single worker with coalesced `flushCh` (cap 1) + `stopCh` + `flushWG`; `maybeRotateLocked()` under `Engine.mu` (Freeze active, append to `immMems` FIFO, fresh active, no I/O); `flushOne()` without Engine lock (capture imm pointer, `TableWriter` stream in canonical order preserving seq/tombstones, `Finish`, `VersionEdit.AddFile(L0)` + `SetNextFileNum/SetLastSeqNum`, `LogAndApply`); `ensureManifestWriter()` (fresh MANIFEST-000001+CURRENT or open active); `Open()` starts worker + drains recovery imm; `Close()` signals stop, waits in-flight, then closes WAL/manifest/backpressure (no M04 drain).
+  * *Invariants*: Writes continue to fresh active MemTable without blocking during flush I/O; imm retires only after VersionSet publication (no visibility gap); failures retain imm + record `FlushError` (no silent loss, no partial SSTable visible); FileNums from `AllocateFileNum` (>=1, monotonic); seqs preserved (no new allocation on flush).
   * *Tests*: Ingest 200MB data; verify multiple $L0$ files generated on disk.
-  * *Completion*: Flush pipeline verified.
+    M02 verifies with 50k x 4KB ~= 200MB ingest (3 L0 files, 3 flushes, full 50k Get validation), deterministic blocked-flush write-progress test (pause hook, 20 fresh writes complete while flush stalled), rotation/threshold/no-over-rotate, tombstone/update/multi-write across flushes, L0 integrity via TableReader reopen, failure injection (writer + apply) retaining imm with observable error, concurrent rotation (8x200, 0 mismatches, unique FileNums), readers-during-flush, cache-after-flush, recovery-after-flush via manifest replay, and `FuzzEngineM02_Flush`.
+  * *Completion*: Flush pipeline verified (P10-S01-M02).
 
 ### Sub-Phase 10.2: Write Backpressure & Graceful Shutdown
 * **P10-S01-M03: Progressive Write Pacing & Stall Controller**
