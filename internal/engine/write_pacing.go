@@ -118,6 +118,13 @@ func (e *Engine) gateL0Write(ctx context.Context) error {
 	}
 	// Stall phase: wait until L0 <= 12. Bounded polls; each slice honors
 	// cancellation and lifecycle without holding any lock.
+	var stallTimer *time.Timer
+	defer func() {
+		if stallTimer != nil {
+			stallTimer.Stop()
+		}
+	}()
+
 	for {
 		if e.closed.Load() {
 			return errors.ErrWriterClosed
@@ -137,19 +144,32 @@ func (e *Engine) gateL0Write(ctx context.Context) error {
 		if !l0NeedsStall(e.l0FileCount()) {
 			break
 		}
+
+		if stallTimer == nil {
+			stallTimer = time.NewTimer(l0StallPollInterval)
+		} else {
+			if !stallTimer.Stop() {
+				select {
+				case <-stallTimer.C:
+				default:
+				}
+			}
+			stallTimer.Reset(l0StallPollInterval)
+		}
+
 		if ctx != nil {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-e.stopChan():
 				return errors.ErrWriterClosed
-			case <-time.After(l0StallPollInterval):
+			case <-stallTimer.C:
 			}
 		} else {
 			select {
 			case <-e.stopChan():
 				return errors.ErrWriterClosed
-			case <-time.After(l0StallPollInterval):
+			case <-stallTimer.C:
 			}
 		}
 		if e.closed.Load() {
@@ -162,19 +182,23 @@ func (e *Engine) gateL0Write(ctx context.Context) error {
 	if delay <= 0 {
 		return nil
 	}
+
+	pacingTimer := time.NewTimer(delay)
+	defer pacingTimer.Stop()
+
 	if ctx != nil {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-e.stopChan():
 			return errors.ErrWriterClosed
-		case <-time.After(delay):
+		case <-pacingTimer.C:
 		}
 	} else {
 		select {
 		case <-e.stopChan():
 			return errors.ErrWriterClosed
-		case <-time.After(delay):
+		case <-pacingTimer.C:
 		}
 	}
 	if e.closed.Load() {
