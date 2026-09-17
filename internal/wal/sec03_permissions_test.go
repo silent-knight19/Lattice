@@ -136,6 +136,9 @@ func TestSEC03_Perms_04_InaccessibleDirectoryFailsClosed(t *testing.T) {
 	if h.IsWindows() {
 		t.Skip("POSIX 0000 / 0500 directory permissions not applicable on Windows")
 	}
+	if os.Geteuid() == 0 {
+		t.Skip("skipping permission-dependent test when running as root (UID 0)")
+	}
 
 	restrictedDB := filepath.Join(h.RootDir(), "restricted_db")
 	if err := os.MkdirAll(restrictedDB, 0700); err != nil {
@@ -164,6 +167,9 @@ func TestSEC03_Perms_05_ReadOnlySegmentRecovery(t *testing.T) {
 	segPath := h.CreateSegmentWithRecords(1, 1, 3)
 
 	if !h.IsWindows() {
+		if os.Geteuid() == 0 {
+			t.Skip("skipping permission-dependent test when running as root (UID 0)")
+		}
 		// Make segment 0400 (read-only)
 		if err := os.Chmod(segPath, 0400); err != nil {
 			t.Fatalf("chmod 0400 failed: %v", err)

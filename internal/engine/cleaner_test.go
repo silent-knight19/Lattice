@@ -471,6 +471,9 @@ func TestCleanOrphanedFiles_K_DeletionPermissionFailure(t *testing.T) {
 	}
 
 	// Make directory read-only so unlink fails with EACCES / EPERM
+	if os.Geteuid() == 0 {
+		t.Skip("skipping permission-dependent test when running as root (UID 0)")
+	}
 	if err := os.Chmod(dir, 0500); err != nil { // #nosec G302 - test-only permission restriction
 		t.Fatalf("chmod dir failed: %v", err)
 	}

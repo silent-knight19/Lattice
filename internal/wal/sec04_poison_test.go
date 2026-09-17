@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 
@@ -336,8 +337,11 @@ func TestSecurity_Issue7_WAL_FilesystemErrorHandling(t *testing.T) {
 	})
 
 	t.Run("OpenWriter and CreateWriter handle permission error without confusing ErrNotExist", func(t *testing.T) {
-		if os.Getenv("GOOS") == "windows" {
+		if runtime.GOOS == "windows" {
 			t.Skip("skipping POSIX permission test on Windows")
+		}
+		if os.Geteuid() == 0 {
+			t.Skip("skipping permission-dependent test when running as root (UID 0)")
 		}
 		restrictedDir := filepath.Join(dir, "restricted")
 		if err := os.Mkdir(restrictedDir, 0700); err != nil {

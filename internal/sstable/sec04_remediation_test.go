@@ -1569,6 +1569,9 @@ func TestSecurity_Issue7_FilesystemErrorHandling_AndPublicationSemantics(t *test
 		if runtime.GOOS == "windows" {
 			t.Skip("skipping POSIX permission test on Windows")
 		}
+		if os.Geteuid() == 0 {
+			t.Skip("skipping permission-dependent test when running as root (UID 0)")
+		}
 		restrictedDir := filepath.Join(dir, "no_access_dir")
 		if err := os.Mkdir(restrictedDir, 0700); err != nil {
 			t.Fatal(err)

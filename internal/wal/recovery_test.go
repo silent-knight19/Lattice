@@ -764,6 +764,9 @@ func TestRecovery_PermissionFailure(t *testing.T) {
 	appendBytesToFile(t, path, []byte{0x01})
 
 	// Make file read-only
+	if os.Geteuid() == 0 {
+		t.Skip("skipping permission-dependent test when running as root (UID 0)")
+	}
 	if err := os.Chmod(path, 0400); err != nil {
 		t.Fatalf("Chmod failed: %v", err)
 	}

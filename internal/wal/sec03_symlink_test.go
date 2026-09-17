@@ -365,6 +365,9 @@ func TestSEC03_Symlink_11_PermissionChangesDuringOpen(t *testing.T) {
 	_ = w.Close()
 
 	if !h.IsWindows() {
+		if os.Geteuid() == 0 {
+			t.Skip("skipping permission-dependent test when running as root (UID 0)")
+		}
 		// Make segment read-only (0400)
 		if err := os.Chmod(segPath, 0400); err != nil {
 			t.Fatalf("chmod 0400: %v", err)
