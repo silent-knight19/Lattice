@@ -2241,9 +2241,12 @@ TOTAL: 176 Discrete, Testable Micro-Phases
   * *Changes*: `cmd/lattice/main.go`, `cmd/lattice/config.go`, `cmd/lattice/daemon.go`, `cmd/lattice/daemon_test.go`.
   * *Security*: Enforces loopback security constraint fail-closed (`errors.ErrInsecureTransport`) unless `--insecure-transport` is explicitly provided; bounds config files to 1 MiB to prevent memory exhaustion DoS; sanitizes and normalizes paths via `filepath.Clean`; safe absorption of repeated signals.
   * *Tests*: Flag parsing and defaults, boundary port validation (`-1`, `0`, `65535`, `65536`), config precedence (defaults $\to$ config file $\to$ CLI flags), key-value & JSON config parsing, loopback security enforcement, port collision handling, full lifecycle real TCP PUT/GET/DELETE integration, durability restart verification, and real subprocess signal shutdown.
-  * *Completion*: Server daemon entrypoint and lifecycle orchestration verified.
 * **P12-S01-M02: Interactive REPL Client (`cmd/lattice-cli`)**
-  * *Objective*: Interactive prompt supporting `PUT`, `GET`, `DELETE`, `EXISTS`, `STATS` commands with colored output.
+  * *Objective*: Interactive terminal prompt supporting `PUT`, `GET`, `DELETE`, `EXISTS`, `STATS` commands with optional colored output.
+  * *Changes*: `cmd/lattice-cli/main.go`, `cmd/lattice-cli/config.go`, `cmd/lattice-cli/parser.go`, `cmd/lattice-cli/client.go`, `cmd/lattice-cli/repl.go`, `cmd/lattice-cli/repl_test.go`.
+  * *Security*: Input bounded to 5 MiB to prevent memory exhaustion DoS; zero shell or command execution; binary-safe parsing with hex escape sequences (`\xHH`) and quote handling (`'...'`, `"..."`); Sequence ID verification to prevent frame interleaving attacks; no local database file access (TCP client only).
+  * *Tests*: Flag parsing and overrides, single and double quote tokenization, escape sequences (`\n`, `\t`, `\r`, `\xHH`), empty value vs missing arg preservation, command validation, mock client execution, scripted REPL loop, EOF handling, sequence ID and opcode mismatch detection, live storage engine TCP integration, binary subprocess tests (server unavailable, help/version, scripted stdin pipeline).
+  * *Completion*: Interactive REPL client implemented and verified.
 * **P12-S01-M03: SSTable Forensic Inspection Tool (`lattice inspect-sstable`)**
   * *Objective*: Read raw SSTable file, print block counts, key ranges, Bloom filter stats, and restart points.
 * **P12-S01-M04: WAL Forensic Dump Tool (`lattice dump-wal`)**

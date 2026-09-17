@@ -1085,6 +1085,24 @@ This document tracks all **genuine architectural and operational limitations** o
   * Performance: **Optimal** (Negligible CLI initialization overhead, zero runtime CPU cost on hot paths).
   * Security: **Optimal** (Early loopback security enforcement, bounded configuration file reads, directory path sanitization, safe absorption of repeated shutdown signals).
 
+### 64. Interactive REPL Client Boundaries & Protocol Transparency (P12-S01-M02)
+* **Limitation & Architectural Boundaries**:
+  In `P12-S01-M02`:
+  1. *Client-Side Network Boundary Only*: `cmd/lattice-cli` is strictly a network client interacting with the running Lattice server over TCP using the Phase 11 binary wire protocol. It does NOT open database files, access WALs, inspect SSTables, or alter Manifest state directly.
+  2. *Strict Protocol Fidelity (No Client-Side Operation Fabrication)*: Commands `PUT`, `GET`, and `DELETE` execute against active storage engine operations. For `EXISTS` and `STATS`, the client transmits the real wire opcodes (`OpExists`, `OpStats`) to the server and transparently renders the server's authoritative response (`StatusInvalidRequest: unsupported operation...`). The client does NOT fabricate boolean values via client-side `GET` emulation or synthesize fake statistics.
+  3. *Zero Unbounded Buffer Allocation*: Command input is bounded to 5 MiB (`MaxInputLineSize`) using bounded line readers to prevent memory exhaustion DoS.
+  4. *Binary Escaping & Distinguishable Empty Values*: Unprintable binary bytes in GET responses are safely escaped as `\xHH` inside quotes to protect terminal emulators from control sequence corruption. Zero-length values (`""`) are distinctly rendered from non-existent keys (`NOT FOUND`).
+  5. *No Automatic Mutation Retries*: In the event of a connection failure or timeout during `PUT` or `DELETE`, the client does NOT automatically reconnect and retry the operation, preventing duplicate mutation hazards and adhering to the server's authoritative storage semantics.
+  6. *Excluded Diagnostic Forensics*: Raw SSTable forensic inspection (`inspect-sstable`) and WAL record dumping (`dump-wal`) remain excluded and deferred to `P12-S01-M03` and `P12-S01-M04`.
+* **Why It Exists**:
+  Preserves clear separation between client presentation and storage engine invariants; enforces defensive programming at user terminal boundaries; maintains protocol transparency.
+* **Impact**:
+  Provides a secure, binary-safe, interactive and scriptable terminal interface (`lattice-cli`) with deterministic exit codes, clean EOF/quit handling, and zero memory leaks.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Transparent response rendering, sequence ID correlation, distinction between empty values and not-found keys).
+  * Performance: **Optimal** (Streaming bounded tokenization, zero unnecessary buffer allocations).
+  * Security: **Optimal** (5 MiB input bounds, no command injection/shell invocation, non-TTY color suppression, no credential leakage via shell history).
+
 ---
 
 *End of Known Limitations — To be updated continuously throughout implementation.*
