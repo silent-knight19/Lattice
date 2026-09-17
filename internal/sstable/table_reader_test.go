@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/silent-knight19/lattice/internal/binary"
+	"github.com/silent-knight19/lattice/internal/cache"
 	"github.com/silent-knight19/lattice/internal/errors"
 	"github.com/silent-knight19/lattice/internal/sstable"
 )
@@ -801,5 +802,75 @@ func TestTableReader_100000Keys_Verification(t *testing.T) {
 		if !stdErrors.Is(err, errors.ErrKeyNotFound) {
 			t.Errorf("expected ErrKeyNotFound for absent probe %q, got val=%v, err=%v", probe, val, err)
 		}
+	}
+}
+
+// TestTableReader_BlockCacheDefensiveCopyIsolation verifies that mutating a byte slice
+// returned by ReadBlock does not poison or corrupt the cached block entry (SEC-EXT-001).
+func TestTableReader_BlockCacheDefensiveCopyIsolation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "000100.sst")
+
+	opts := sstable.DefaultTableWriterOptions()
+	opts.TargetBlockSize = 256
+	w, err := sstable.NewTableWriter(path, opts)
+	if err != nil {
+		t.Fatalf("NewTableWriter: %v", err)
+	}
+
+	for i := 0; i < 50; i++ {
+		ik := binary.InternalKey{
+			UserKey: []byte(fmt.Sprintf("key_%04d", i)),
+			SeqNum:  binary.SeqNum(i + 1),
+			OpType:  binary.OpTypePut,
+		}
+		if err := w.Add(ik, []byte("value_payload_data")); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+	}
+
+	if _, err := w.Finish(); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+
+	shardedCache, err := cache.NewShardedCache(32)
+	if err != nil {
+		t.Fatalf("NewShardedCache: %v", err)
+	}
+
+	reader, err := sstable.NewTableReaderWithOptions(path, sstable.TableReaderOptions{
+		FileNum:    100,
+		BlockCache: shardedCache,
+	})
+	if err != nil {
+		t.Fatalf("NewTableReaderWithOptions: %v", err)
+	}
+	defer reader.Close()
+
+	indexEntries := reader.Index().Entries()
+	if len(indexEntries) == 0 {
+		t.Fatal("expected at least 1 data block entry")
+	}
+
+	handle := indexEntries[0].Handle
+
+	// 1. First read populates cache
+	read1, err := reader.ReadBlock(handle)
+	if err != nil {
+		t.Fatalf("ReadBlock 1: %v", err)
+	}
+	origFirstByte := read1[0]
+
+	// 2. Intentionally mutate the caller's slice
+	read1[0] = ^origFirstByte
+
+	// 3. Second read should hit the cache and return unmodified data
+	read2, err := reader.ReadBlock(handle)
+	if err != nil {
+		t.Fatalf("ReadBlock 2: %v", err)
+	}
+
+	if read2[0] != origFirstByte {
+		t.Fatalf("SEC-EXT-001 cache poisoning detected! Cached block was mutated: expected byte 0x%02x, got 0x%02x", origFirstByte, read2[0])
 	}
 }

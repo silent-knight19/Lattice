@@ -506,12 +506,24 @@ func (s *Server) mapEngineError(err error, resp *Response) {
 		resp.Message = "request timed out under storage backpressure"
 		return
 	}
-	if stdErrors.Is(err, errors.ErrKeyTooLarge) ||
-		stdErrors.Is(err, errors.ErrValueTooLarge) ||
-		stdErrors.Is(err, errors.ErrEmptyKey) ||
-		stdErrors.Is(err, errors.ErrInvalidPayload) {
+	if stdErrors.Is(err, errors.ErrKeyTooLarge) {
 		resp.Status = StatusInvalidRequest
-		resp.Message = err.Error()
+		resp.Message = errors.ErrKeyTooLarge.Error()
+		return
+	}
+	if stdErrors.Is(err, errors.ErrValueTooLarge) {
+		resp.Status = StatusInvalidRequest
+		resp.Message = errors.ErrValueTooLarge.Error()
+		return
+	}
+	if stdErrors.Is(err, errors.ErrEmptyKey) {
+		resp.Status = StatusInvalidRequest
+		resp.Message = errors.ErrEmptyKey.Error()
+		return
+	}
+	if stdErrors.Is(err, errors.ErrInvalidPayload) {
+		resp.Status = StatusInvalidRequest
+		resp.Message = errors.ErrInvalidPayload.Error()
 		return
 	}
 	// Sanitize general storage errors to avoid disclosing filesystem paths or internal diagnostics
@@ -540,6 +552,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// Close all currently active connections
 	s.mu.Lock()
 	for conn := range s.conns {
+		_ = conn.SetDeadline(time.Now())
 		_ = conn.Close()
 	}
 	s.mu.Unlock()

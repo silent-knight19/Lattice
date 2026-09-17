@@ -576,7 +576,10 @@ func (r *TableReader) readBlockLocked(handle BlockHandle) ([]byte, error) {
 		if val, ok := r.blockCache.Get(key); ok {
 			// Ensure cached entry matches expected handle size
 			if uint64(len(val)) == handle.Size {
-				return val, nil
+				// Defensive copy: isolate cached memory from caller mutations (SEC-EXT-001)
+				res := make([]byte, len(val))
+				copy(res, val)
+				return res, nil
 			}
 		}
 	}
@@ -638,9 +641,11 @@ func (r *TableReader) readBlockLocked(handle BlockHandle) ([]byte, error) {
 		return nil, err
 	}
 
-	// 5. Insert valid, verified block into cache
+	// 5. Insert valid, verified block into cache (store isolated copy)
 	if cacheEnabled {
-		r.blockCache.Put(key, blockBuf)
+		cachedCopy := make([]byte, len(blockBuf))
+		copy(cachedCopy, blockBuf)
+		r.blockCache.Put(key, cachedCopy)
 	}
 
 	return blockBuf, nil
