@@ -388,6 +388,9 @@ var (
 
 	// ErrConnectionLimitExceeded indicates that an inbound connection was rejected because active connections reached capacity.
 	ErrConnectionLimitExceeded = stdErrors.New("connection limit exceeded")
+
+	// ErrInsecureTransport indicates that cleartext TCP is prohibited on a non-loopback address without InsecureTransport opt-in.
+	ErrInsecureTransport = stdErrors.New("plaintext TCP forbidden on non-loopback address without InsecureTransport opt-in")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing

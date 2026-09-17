@@ -1891,6 +1891,7 @@ func TestTransportFramingErrors(t *testing.T) {
 		{errors.ErrServerClosed, "server is closed"},
 		{errors.ErrServerAlreadyStarted, "server already started"},
 		{errors.ErrConnectionLimitExceeded, "connection limit exceeded"},
+		{errors.ErrInsecureTransport, "plaintext TCP forbidden on non-loopback address without InsecureTransport opt-in"},
 	}
 	for _, tc := range transportSentinels {
 		if tc.err == nil {

@@ -28,6 +28,10 @@ type ServerConfig struct {
 	// Address is the TCP address to bind and listen on (default: "127.0.0.1:9099").
 	Address string
 
+	// InsecureTransport explicitly permits unencrypted plaintext TCP on non-loopback network interfaces.
+	// When false (default), binding to any non-loopback address (e.g. 0.0.0.0, public IP) is rejected with ErrInsecureTransport.
+	InsecureTransport bool
+
 	// MaxConnections is the maximum number of concurrent client connections (default: 1024).
 	MaxConnections int
 
@@ -64,6 +68,22 @@ func DefaultServerConfig() ServerConfig {
 	}
 }
 
+// isLoopbackAddress reports whether the given TCP address specifies a loopback interface.
+func isLoopbackAddress(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
+}
+
 // Server manages the TCP listener, connection lifecycle, Slowloris defenses, and Engine request dispatching.
 type Server struct {
 	cfg      ServerConfig
@@ -71,13 +91,14 @@ type Server struct {
 	listener net.Listener
 	addr     net.Addr
 
-	mu          sync.Mutex
-	conns       map[net.Conn]struct{}
-	started     atomic.Bool
-	closed      atomic.Bool
-	shutdownCh  chan struct{}
-	wg          sync.WaitGroup
-	activeConns atomic.Int64
+	mu           sync.Mutex
+	conns        map[net.Conn]struct{}
+	started      atomic.Bool
+	closed       atomic.Bool
+	shutdownCh   chan struct{}
+	shutdownDone chan struct{}
+	wg           sync.WaitGroup
+	activeConns  atomic.Int64
 }
 
 // NewServer constructs a new transport Server. It validates the configuration and verifies that eng is non-nil.
@@ -89,6 +110,9 @@ func NewServer(cfg ServerConfig, eng Engine) (*Server, error) {
 	defaults := DefaultServerConfig()
 	if cfg.Address == "" {
 		cfg.Address = defaults.Address
+	}
+	if !cfg.InsecureTransport && !isLoopbackAddress(cfg.Address) {
+		return nil, errors.ErrInsecureTransport
 	}
 	if cfg.MaxConnections <= 0 {
 		cfg.MaxConnections = defaults.MaxConnections
@@ -113,10 +137,11 @@ func NewServer(cfg ServerConfig, eng Engine) (*Server, error) {
 	}
 
 	return &Server{
-		cfg:        cfg,
-		engine:     eng,
-		conns:      make(map[net.Conn]struct{}),
-		shutdownCh: make(chan struct{}),
+		cfg:          cfg,
+		engine:       eng,
+		conns:        make(map[net.Conn]struct{}),
+		shutdownCh:   make(chan struct{}),
+		shutdownDone: make(chan struct{}),
 	}, nil
 }
 
@@ -130,6 +155,10 @@ func (s *Server) Listen(addr string) error {
 	bindAddr := addr
 	if bindAddr == "" {
 		bindAddr = s.cfg.Address
+	}
+	if !s.cfg.InsecureTransport && !isLoopbackAddress(bindAddr) {
+		s.started.Store(false)
+		return errors.ErrInsecureTransport
 	}
 
 	l, err := net.Listen("tcp", bindAddr)
@@ -336,27 +365,45 @@ func (s *Server) readFrameWithDeadlines(conn net.Conn, isFirst bool) (*Frame, er
 	}
 
 	var payload []byte
+	var expectedCRC uint32
 	if hdr.PayloadLength > 0 {
-		payload = make([]byte, hdr.PayloadLength)
-		if _, err := io.ReadFull(conn, payload); err != nil {
+		bufPtr, is64K := getPooledBuffer(hdr.PayloadLength)
+		tempBuf := (*bufPtr)[:hdr.PayloadLength]
+
+		if _, err := io.ReadFull(conn, tempBuf); err != nil {
+			putPooledBuffer(bufPtr, is64K)
 			return nil, err
 		}
-	}
 
-	var trailerBuf [TrailerSize]byte
-	if _, err := io.ReadFull(conn, trailerBuf[:]); err != nil {
-		return nil, err
-	}
+		var trailerBuf [TrailerSize]byte
+		if _, err := io.ReadFull(conn, trailerBuf[:]); err != nil {
+			putPooledBuffer(bufPtr, is64K)
+			return nil, err
+		}
 
-	// Step 3: Incremental CRC32 verification over Header + Payload
-	computedCRC := crc32.ChecksumIEEE(headerBuf[:])
-	if len(payload) > 0 {
-		computedCRC = crc32.Update(computedCRC, crc32.IEEETable, payload)
-	}
+		computedCRC := crc32.ChecksumIEEE(headerBuf[:])
+		computedCRC = crc32.Update(computedCRC, crc32.IEEETable, tempBuf)
 
-	expectedCRC := binary.GetUint32(trailerBuf[:])
-	if computedCRC != expectedCRC {
-		return nil, &errors.ChecksumMismatchError{Expected: expectedCRC, Actual: computedCRC}
+		expectedCRC = binary.GetUint32(trailerBuf[:])
+		if computedCRC != expectedCRC {
+			putPooledBuffer(bufPtr, is64K)
+			return nil, &errors.ChecksumMismatchError{Expected: expectedCRC, Actual: computedCRC}
+		}
+
+		payload = make([]byte, hdr.PayloadLength)
+		copy(payload, tempBuf)
+		putPooledBuffer(bufPtr, is64K)
+	} else {
+		var trailerBuf [TrailerSize]byte
+		if _, err := io.ReadFull(conn, trailerBuf[:]); err != nil {
+			return nil, err
+		}
+
+		computedCRC := crc32.ChecksumIEEE(headerBuf[:])
+		expectedCRC = binary.GetUint32(trailerBuf[:])
+		if computedCRC != expectedCRC {
+			return nil, &errors.ChecksumMismatchError{Expected: expectedCRC, Actual: computedCRC}
+		}
 	}
 
 	// Reset read deadline upon successful frame completion
@@ -476,7 +523,12 @@ func (s *Server) mapEngineError(err error, resp *Response) {
 // and waits for connection goroutines to complete within ctx deadline.
 func (s *Server) Shutdown(ctx context.Context) error {
 	if !s.closed.CompareAndSwap(false, true) {
-		return nil
+		select {
+		case <-s.shutdownDone:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	close(s.shutdownCh)
 
@@ -497,6 +549,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	go func() {
 		s.wg.Wait()
 		close(done)
+		close(s.shutdownDone)
 	}()
 
 	select {

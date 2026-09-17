@@ -760,3 +760,215 @@ func TestServer_ShutdownWithActiveConnections(t *testing.T) {
 		t.Fatal("expected error reading from connection after shutdown, but succeeded")
 	}
 }
+
+func TestServer_InsecureTransportValidation(t *testing.T) {
+	eng := newMockEngine()
+
+	// 1. Non-loopback 0.0.0.0 rejected when InsecureTransport is false
+	cfg := transport.DefaultServerConfig()
+	cfg.Address = "0.0.0.0:9099"
+	cfg.InsecureTransport = false
+	_, err := transport.NewServer(cfg, eng)
+	if !stdErrors.Is(err, errors.ErrInsecureTransport) {
+		t.Fatalf("expected ErrInsecureTransport for 0.0.0.0 without opt-in, got: %v", err)
+	}
+
+	// 2. Wildcard :9099 rejected when InsecureTransport is false
+	cfg.Address = ":9099"
+	_, err = transport.NewServer(cfg, eng)
+	if !stdErrors.Is(err, errors.ErrInsecureTransport) {
+		t.Fatalf("expected ErrInsecureTransport for :9099 without opt-in, got: %v", err)
+	}
+
+	// 3. Permitted with InsecureTransport: true
+	cfg.Address = "127.0.0.1:0"
+	cfg.InsecureTransport = true
+	srv, err := transport.NewServer(cfg, eng)
+	if err != nil {
+		t.Fatalf("expected NewServer to succeed with InsecureTransport: true, got: %v", err)
+	}
+
+	// 4. Listen on non-loopback with InsecureTransport: false rejected
+	loopbackCfg := transport.DefaultServerConfig()
+	loopbackCfg.Address = "127.0.0.1:0"
+	loopbackCfg.InsecureTransport = false
+	srv2, err := transport.NewServer(loopbackCfg, eng)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	err = srv2.Listen("0.0.0.0:0")
+	if !stdErrors.Is(err, errors.ErrInsecureTransport) {
+		t.Fatalf("expected ErrInsecureTransport from Listen on 0.0.0.0, got: %v", err)
+	}
+	_ = srv.Close()
+	_ = srv2.Close()
+}
+
+func TestServer_ConcurrentShutdownWait(t *testing.T) {
+	eng := newMockEngine()
+	srv := startTestServer(t, transport.DefaultServerConfig(), eng)
+
+	// Connect 5 clients
+	conns := make([]net.Conn, 5)
+	for i := range conns {
+		c, err := net.Dial("tcp", srv.Addr().String())
+		if err != nil {
+			t.Fatalf("dial failed: %v", err)
+		}
+		conns[i] = c
+		defer c.Close()
+	}
+
+	time.Sleep(30 * time.Millisecond)
+	if srv.ActiveConnections() != 5 {
+		t.Fatalf("expected 5 active connections, got: %d", srv.ActiveConnections())
+	}
+
+	// Launch 10 concurrent Shutdown callers
+	const numClosers = 10
+	var wg sync.WaitGroup
+	wg.Add(numClosers)
+
+	for i := 0; i < numClosers; i++ {
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if err := srv.Shutdown(ctx); err != nil {
+				t.Errorf("shutdown returned error: %v", err)
+			}
+			// When any Shutdown returns, active connections must already be 0
+			if srv.ActiveConnections() != 0 {
+				t.Errorf("expected 0 active connections upon Shutdown return, got: %d", srv.ActiveConnections())
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+type temporaryError struct{}
+
+func (e temporaryError) Error() string   { return "simulated temporary network error" }
+func (e temporaryError) Timeout() bool   { return false }
+func (e temporaryError) Temporary() bool { return true }
+
+type mockFaultyListener struct {
+	mu        sync.Mutex
+	tempFails int
+	closed    bool
+	realL     net.Listener
+}
+
+func (m *mockFaultyListener) Accept() (net.Conn, error) {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil, net.ErrClosed
+	}
+	if m.tempFails > 0 {
+		m.tempFails--
+		m.mu.Unlock()
+		return nil, temporaryError{}
+	}
+	m.mu.Unlock()
+	return m.realL.Accept()
+}
+
+func (m *mockFaultyListener) Close() error {
+	m.mu.Lock()
+	m.closed = true
+	m.mu.Unlock()
+	return m.realL.Close()
+}
+
+func (m *mockFaultyListener) Addr() net.Addr {
+	return m.realL.Addr()
+}
+
+func TestServer_AcceptLoop_TemporaryErrorBackoff(t *testing.T) {
+	realL, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+
+	mockL := &mockFaultyListener{
+		tempFails: 3, // Fail 3 times with temporary error before accepting
+		realL:     realL,
+	}
+
+	eng := newMockEngine()
+	srv, err := transport.NewServer(transport.DefaultServerConfig(), eng)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- srv.Serve(mockL)
+	}()
+
+	// Connect client to real address; accept loop should back off 3 times and then accept
+	conn, err := net.Dial("tcp", mockL.Addr().String())
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Send a simple ping-pong request
+	putReq := &transport.Request{
+		OpCode: transport.OpPut,
+		SeqID:  1234,
+		Key:    []byte("temp_err_key"),
+		Value:  []byte("temp_err_val"),
+	}
+	if err := transport.WriteRequest(conn, putReq); err != nil {
+		t.Fatalf("write request failed: %v", err)
+	}
+	resp, err := transport.ReadResponse(conn)
+	if err != nil || resp.Status != transport.StatusOk {
+		t.Fatalf("request failed after backoff: err=%v, status=%v", err, resp.Status)
+	}
+
+	_ = srv.Close()
+	select {
+	case err := <-serverDone:
+		if !stdErrors.Is(err, errors.ErrServerClosed) {
+			t.Fatalf("expected ErrServerClosed, got: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for server to shut down")
+	}
+}
+
+func TestFrame_GarbagePayloadNoAllocationAmplification(t *testing.T) {
+	// Construct an 18-byte header claiming 1MB payload with an intentionally corrupt CRC
+	hdr := transport.Header{
+		Magic:         transport.Magic,
+		OpCode:        transport.OpPut,
+		SeqID:         777,
+		PayloadLength: 1024 * 1024, // 1 MB
+	}
+	var hdrBuf [transport.HeaderSize]byte
+	hdr.Encode(hdrBuf[:])
+
+	garbagePayload := make([]byte, 1024*1024)
+	corruptTrailer := []byte{0xDE, 0xAD, 0xBE, 0xEF}
+
+	var frameBytes bytes.Buffer
+	frameBytes.Write(hdrBuf[:])
+	frameBytes.Write(garbagePayload)
+	frameBytes.Write(corruptTrailer)
+
+	raw := frameBytes.Bytes()
+
+	// Decode 50 consecutive frames with bad CRC
+	for i := 0; i < 50; i++ {
+		reader := bytes.NewReader(raw)
+		_, err := transport.DecodeFrame(reader)
+		var crcErr *errors.ChecksumMismatchError
+		if !stdErrors.As(err, &crcErr) {
+			t.Fatalf("expected ChecksumMismatchError, got: %v", err)
+		}
+	}
+}

@@ -1040,30 +1040,33 @@ This document tracks all **genuine architectural and operational limitations** o
   * Performance: **Optimal** (Zero-allocation header decode and incremental CRC32 update; single contiguous write framing).
   * Security: **Optimal** (Pre-allocation $5\text{MB}$ ceiling, integer overflow checks, fail-closed unknown opcodes, defensive buffer copies).
 
-### 62. TCP Server Connection Lifecycle & Engine Request Dispatch (P11-S01-M02)
+### 62. TCP Server Connection Lifecycle & Engine Request Dispatch (P11-S01-M02) — HARDENED
 * **Limitation & Architectural Boundaries**:
-  In `P11-S01-M02`:
-  1. *Plaintext Transport Only*: The TCP server currently runs unauthenticated plaintext binary protocol traffic over loopback (`127.0.0.1:9099`). TLS 1.3 / mTLS and client authentication are deferred to later security hardening micro-phases. Remote binding (`0.0.0.0`) in production environments should not be enabled without external network-level isolation or TLS proxies.
-  2. *Supported vs Unsupported Engine Operations*:
+  In `P11-S01-M02` and Post-Audit Hardening:
+  1. *Plaintext Transport Remote Exposure Prevention (SEC-P11-001)*: The TCP server runs unauthenticated plaintext binary wire traffic. To prevent accidental exposure on untrusted networks, the server strictly restricts binding to loopback addresses (`127.0.0.1`, `localhost`, `::1`) by default. Any attempt to bind to a wildcard (`0.0.0.0`, `:port`) or public IP without explicit opt-in fails immediately with `ErrInsecureTransport`. Setting `ServerConfig.InsecureTransport = true` is required to bind non-loopback interfaces (e.g. for container networking behind TLS proxies or private networks). TLS 1.3 / mTLS is scheduled for Phase 19.
+  2. *Garbage Payload Allocation Defense via Pooled Buffers (SEC-P11-002)*: To mitigate heap allocation amplification attacks where an adversary streams valid-length headers ($\le 5\text{MB}$) followed by corrupted payload bytes or mismatched CRC32 trailers, frame reading utilizes sized `sync.Pool` buffers (64KB and 5MB). Corrupted frames, truncated streams, or CRC checksum failures return the rented buffer to the pool immediately, producing zero net heap allocations on invalid frames.
+  3. *Synchronized Multi-Caller Graceful Shutdown (SEC-P11-003)*: Concurrent invocations of `Server.Shutdown(ctx)` are coordinated via a dedicated `shutdownDone` channel. While the single-winner caller triggers listener close and waits for active connections to drain, all concurrent callers wait on `shutdownDone` (or context cancellation). No caller returns success before all connection goroutines have exited and all sockets are closed.
+  4. *Listener Backoff on Temporary Network Errors (GAP-P11-001)*: The accept loop detects transient network errors (`net.Error.Temporary()`, such as `EMFILE`/`ENFILE` file descriptor exhaustion) and applies exponential backoff (5ms to 1s) rather than tightly spinning CPU cycles.
+  5. *Supported vs Unsupported Engine Operations*:
      - `OP_PUT`, `OP_GET`, `OP_DELETE` dispatch directly to Phase 10 `Engine.Put`, `Engine.Get`, and `Engine.Delete`.
      - `OP_EXISTS`, `OP_BATCH`, `OP_STATS` are rejected deterministically with `StatusInvalidRequest` and explanatory diagnostics, adhering strictly to the principle of not fabricating unexposed storage engine functionality.
-  3. *Slowloris & Resource Defense*:
+  6. *Slowloris & Resource Defense*:
      - Reading frames enforces separate deadlines: `IdleTimeout` (default 60s) for inactivity between requests, `HeaderTimeout` (default 5s) for frame header completion, and `PayloadTimeout` (default 10s) for payload completion.
      - `WriteTimeout` (default 5s) prevents stalled clients from holding server goroutines blocked indefinitely during response transmission.
      - `MaxConnections` (default 1024) caps simultaneous accepted connections to mitigate OS file descriptor and goroutine exhaustion.
-  4. *Error Sanitization & Sequence Independence*:
+  7. *Error Sanitization & Sequence Independence*:
      - Internal storage errors returned across the wire are sanitized to `"internal storage error"`, preventing leakage of filesystem paths, SSTable filenames, or WAL structures.
      - Wire `SeqID` is preserved strictly as a transport-level request correlation identifier; it is never mapped to or confused with internal Engine MVCC sequence numbers.
-  5. *Pipelining & Advanced Concurrency*:
+  8. *Pipelining & Advanced Concurrency*:
      - Connections process requests sequentially (one request read -> dispatched -> response written -> next request read). Out-of-order request pipelining and connection multiplexing are not implemented.
 * **Why It Exists**:
   Provides a bounded, DoS-resistant TCP server boundary above the single-node storage engine without violating storage invariants or introducing speculative networking complexity.
 * **Impact**:
   Decouples transport goroutines from storage engine internals; guarantees clean graceful shutdown without goroutine or socket leaks; isolates network client timeouts from storage durability.
 * **Dimensional Impact**:
-  * Correctness: **Optimal** (Sequential request-response correlation, exact binary transparency, clean error mappings verified under `-race`).
-  * Performance: **Optimal** (Direct non-blocking dispatch, minimal leaf lock contention, zero unnecessary allocations).
-  * Security: **Optimal** (Slowloris defense, connection limits, sanitized error diagnostics, clean shutdown unblocking).
+  * Correctness: **Optimal** (Sequential request-response correlation, exact binary transparency, clean error mappings, concurrent shutdown synchronization verified under `-race`).
+  * Performance: **Optimal** (Direct non-blocking dispatch, buffer pooling on invalid/corrupt payloads, minimal leaf lock contention).
+  * Security: **Optimal** (Default loopback-only binding enforcement, garbage payload heap exhaustion protection, Slowloris defense, connection limits, sanitized error diagnostics).
 
 ---
 

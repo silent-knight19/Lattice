@@ -4,10 +4,43 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"sync"
 
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
 )
+
+const pooledBufferSize = 64 * 1024 // 64 KiB covers standard key-value operations
+
+var (
+	pool64K = sync.Pool{
+		New: func() any {
+			b := make([]byte, pooledBufferSize)
+			return &b
+		},
+	}
+	poolMax = sync.Pool{
+		New: func() any {
+			b := make([]byte, MaxPayloadLength)
+			return &b
+		},
+	}
+)
+
+func getPooledBuffer(size uint32) (*[]byte, bool) {
+	if size <= pooledBufferSize {
+		return pool64K.Get().(*[]byte), true
+	}
+	return poolMax.Get().(*[]byte), false
+}
+
+func putPooledBuffer(buf *[]byte, is64K bool) {
+	if is64K {
+		pool64K.Put(buf)
+	} else {
+		poolMax.Put(buf)
+	}
+}
 
 // DecodeHeader reads and decodes an 18-byte fixed frame header from r.
 //
@@ -107,11 +140,41 @@ func DecodeFrame(r io.Reader) (*Frame, error) {
 
 	var payload []byte
 	if hdr.PayloadLength > 0 {
-		payload = make([]byte, hdr.PayloadLength)
-		pn, pErr := io.ReadFull(r, payload)
+		bufPtr, is64K := getPooledBuffer(hdr.PayloadLength)
+		tempBuf := (*bufPtr)[:hdr.PayloadLength]
+
+		pn, pErr := io.ReadFull(r, tempBuf)
 		if pErr != nil {
+			putPooledBuffer(bufPtr, is64K)
 			return nil, fmt.Errorf("%w: read %d/%d payload bytes: %v", errors.ErrFrameTruncated, pn, hdr.PayloadLength, pErr)
 		}
+
+		var trailerBuf [TrailerSize]byte
+		tn, tErr := io.ReadFull(r, trailerBuf[:])
+		if tErr != nil {
+			putPooledBuffer(bufPtr, is64K)
+			return nil, fmt.Errorf("%w: read %d/%d crc trailer bytes: %v", errors.ErrFrameTruncated, tn, TrailerSize, tErr)
+		}
+
+		// Compute CRC32-IEEE incrementally over header and payload with zero heap allocation.
+		computedCRC := crc32.ChecksumIEEE(headerBuf[:])
+		computedCRC = crc32.Update(computedCRC, crc32.IEEETable, tempBuf)
+
+		expectedCRC := binary.GetUint32(trailerBuf[:])
+		if computedCRC != expectedCRC {
+			putPooledBuffer(bufPtr, is64K)
+			return nil, &errors.ChecksumMismatchError{Expected: expectedCRC, Actual: computedCRC}
+		}
+
+		payload = make([]byte, hdr.PayloadLength)
+		copy(payload, tempBuf)
+		putPooledBuffer(bufPtr, is64K)
+
+		return &Frame{
+			Header:  *hdr,
+			Payload: payload,
+			CRC:     expectedCRC,
+		}, nil
 	}
 
 	var trailerBuf [TrailerSize]byte
@@ -120,12 +183,7 @@ func DecodeFrame(r io.Reader) (*Frame, error) {
 		return nil, fmt.Errorf("%w: read %d/%d crc trailer bytes: %v", errors.ErrFrameTruncated, tn, TrailerSize, tErr)
 	}
 
-	// Compute CRC32-IEEE incrementally over header and payload with zero heap allocation.
 	computedCRC := crc32.ChecksumIEEE(headerBuf[:])
-	if len(payload) > 0 {
-		computedCRC = crc32.Update(computedCRC, crc32.IEEETable, payload)
-	}
-
 	expectedCRC := binary.GetUint32(trailerBuf[:])
 	if computedCRC != expectedCRC {
 		return nil, &errors.ChecksumMismatchError{Expected: expectedCRC, Actual: computedCRC}
@@ -133,7 +191,7 @@ func DecodeFrame(r io.Reader) (*Frame, error) {
 
 	return &Frame{
 		Header:  *hdr,
-		Payload: payload,
+		Payload: nil,
 		CRC:     expectedCRC,
 	}, nil
 }
