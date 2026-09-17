@@ -2255,6 +2255,10 @@ TOTAL: 176 Discrete, Testable Micro-Phases
   * *Completion*: SSTable forensic inspection tool implemented and verified.
 * **P12-S01-M04: WAL Forensic Dump Tool (`lattice dump-wal`)**
   * *Objective*: Decode and print every WAL record, sequence number, and CRC status for debugging corruptions.
+  * *Changes*: `cmd/lattice/dump_wal.go`, `cmd/lattice/daemon.go`, `cmd/lattice/config.go`, `cmd/lattice/dump_wal_test.go`, `cmd/lattice/dump_wal_fuzz_test.go`.
+  * *Security*: Strictly read-only file access (`wal.OpenReader`, `os.O_RDONLY`, `openFileNoFollow`); zero mutation, repair, replay, or truncation paths; inode pinning to prevent symlink/TOCTOU substitution; streaming $O(1)$ memory processing; safe terminal escaping of binary keys and values via `FormatBytes` (`\xHH` escaping); bounds checks against `MaxRecordLength`; zero Engine or recovery subsystem imports.
+  * *Tests*: Valid single PUT, multi-record (PUT, DELETE, BATCH_START, BATCH_COMMIT, binary keys, zero-length value, large value), empty WAL, verbose mode, byte-for-byte SHA-256 read-only immutability verification, comprehensive corruption matrix (single byte, truncated header, invalid record type, corrupt CRC, zero key length, batch marker invalid payloads, truncated payloads), torn tail matrix, CLI usage and file error tests, real binary subprocess verification, and native Go fuzzing (`FuzzDumpWAL`).
+  * *Completion*: WAL forensic dump tool implemented and verified.
 
 ---
 

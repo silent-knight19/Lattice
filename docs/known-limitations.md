@@ -1111,7 +1111,7 @@ This document tracks all **genuine architectural and operational limitations** o
   3. *Independent Diagnostic Tooling*: Does not initialize the `Engine`, `VersionSet`, `MemTable`, `WAL`, or `BlockCache`. Operates directly on the raw on-disk SSTable structures (`Footer`, `BlockIndex`, `MetaIndex`, `BloomFilter`, `DataBlocks`).
   4. *Defensive Memory Bounds & Anti-DoS*: Rejects block sizes exceeding `MaxDataBlockSize` (8 MiB) and `MaxIndexBlockSize` (8 MiB), restart counts exceeding `MaxRestartCount` (65,536), and bit counts exceeding `MaxBitsetBytes` (256 MiB) prior to memory allocation.
   5. *Binary Output Safety*: All key bytes in forensic output are escaped with `\xHH` when non-printable, preventing terminal control sequence manipulation attacks.
-  6. *Excluded Forensic Tooling*: WAL forensic dumping (`dump-wal`) remains excluded and deferred to `P12-S01-M04`.
+  6. *Completed Diagnostic Forensics*: WAL forensic dumping (`dump-wal`) is implemented in `P12-S01-M04`.
 * **Why It Exists**:
   Guarantees that diagnostic and forensic inspection can be safely performed on suspect or corrupted SSTable files without triggering unwanted mutations, engine side-effects, or terminal crashes.
 * **Impact**:
@@ -1120,6 +1120,25 @@ This document tracks all **genuine architectural and operational limitations** o
   * Correctness: **Optimal** (Exact physical format decoding; comprehensive CRC, magic, padding, and restart point validation).
   * Performance: **Optimal** (Targeted positional `ReadAt` reads; minimal memory allocation).
   * Security: **Optimal** (Read-only immutability, integer overflow protection on all block handle offsets, bounded memory allocations, terminal injection protection).
+
+### 66. WAL Forensic Dump Tool Boundaries & Read-Only Invariants (P12-S01-M04)
+* **Limitation & Architectural Boundaries**:
+  In `P12-S01-M04`:
+  1. *Strict Read-Only Guarantee*: `lattice dump-wal` opens target files strictly via `wal.OpenReader` with `O_RDONLY` and `openFileNoFollow`. It never repairs, rewrites, truncates, syncs, or modifies WAL segment files. Byte-for-byte SHA-256 immutability is verified across repeated inspections.
+  2. *Single-Segment Scope*: Operates strictly on the single WAL segment file path supplied by the user. Automatic directory scanning, segment coordination, and multi-segment log stitching are excluded.
+  3. *Independent Diagnostic Tooling*: Does not initialize the `Engine`, `VersionSet`, `MemTable`, `BlockCache`, or background coordinators. Operates directly on the raw WAL segment stream via authoritative low-level decoding routines.
+  4. *Streaming O(1) Memory Footprint*: Each record is decoded, validated, formatted to stdout, and discarded sequentially. No full-segment buffers or unbounded record slices are retained in RAM.
+  5. *Bounded Length Protections & Anti-DoS*: Enforces `MaxKeyLen` (65,535 bytes), `MaxValueLen` (4 MiB), and `MaxRecordLength` (4,259,866 bytes) prior to payload allocation, preventing integer overflow and memory exhaustion from malicious or corrupt length fields.
+  6. *Binary Output Safety*: All key bytes and preview values are escaped via `FormatBytes` (`\xHH` escaping), preventing terminal control sequence manipulation or ANSI escape attacks. Value previews in verbose mode are capped at 64 bytes.
+  7. *Excluded WAL Mutation & Replay*: WAL rewriting, log truncation, automatic corruption repair, transaction replay, and live crash recovery are strictly excluded from the forensic dumper.
+* **Why It Exists**:
+  Ensures that incident triage, corruption analysis, and forensic inspection of suspect WAL segments can be performed with zero risk of mutating the persistent log, replaying corrupt operations, or destabilizing the operating environment.
+* **Impact**:
+  Provides a secure, deterministic, offline forensic utility for dumping WAL segments, analyzing sequence numbers, validating checksums, and pinpointing torn writes.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Exact physical framing verification, distinction between clean EOF and torn tails, authoritative CRC32 checking).
+  * Performance: **Optimal** (Single-pass sequential streaming, $O(1)$ memory consumption, minimal allocations).
+  * Security: **Optimal** (Read-only immutability, TOCTOU inode pinning, bounded payload allocations, terminal injection prevention).
 
 ---
 

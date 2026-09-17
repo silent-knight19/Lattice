@@ -39,6 +39,9 @@ func runWithContext(ctx context.Context, args []string, stdout, stderr io.Writer
 	if len(args) > 0 && args[0] == "inspect-sstable" {
 		return runInspectSSTable(args[1:], stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "dump-wal" {
+		return runDumpWAL(args[1:], stdout, stderr)
+	}
 
 	cfg, isHelpOrVersion, err := ParseFlags(args, stdout, stderr)
 	if err != nil {
