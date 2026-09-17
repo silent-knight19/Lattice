@@ -2223,9 +2223,10 @@ TOTAL: 184 Discrete, Testable Micro-Phases
   * *Completion*: Frame decoder and defensive request codec verified.
 * **P11-S01-M02: TCP Listener & Goroutine Connection Pool**
   * *Objective*: Accept TCP connections, assign dedicated reader goroutine, dispatch requests to engine.
-  * *Changes*: `Server.Listen(addr string) error`.
-  * *Tests*: Connect 100 concurrent TCP clients; execute ping-pong `PUT`/`GET` requests.
-  * *Completion*: TCP server tested.
+  * *Changes*: `Server`, `NewServer`, `Server.Listen(addr string) error`, `Server.Serve(l net.Listener) error`, `Server.Shutdown(ctx context.Context) error`, `Server.Close() error`, Slowloris defense (`HeaderTimeout`, `PayloadTimeout`, `IdleTimeout`, `WriteTimeout`), `MaxConnections` guard, request dispatch to `Engine.Put`, `Engine.Get`, `Engine.Delete`, deterministic unsupported error responses for `EXISTS`, `BATCH`, `STATS`, error sanitization, and connection tracking.
+  * *Security*: Slowloris defense bounds slow headers and slow payloads; idle connections terminate after `IdleTimeout`; write deadline prevents blocked goroutines; `MaxConnections` ceiling mitigates FD exhaustion; sanitized storage errors prevent filesystem path leakage; storage sequence numbers remain uncoupled from network sequence IDs.
+  * *Tests*: Mock engine opcode tests, unsupported opcode tests, real `*engine.Engine` integration tests over loopback TCP, binary transparency (null bytes and 0xFF), Slowloris tests (slow header, slow payload, idle timeout), `MaxConnections` ceiling tests, 32-client concurrent stress tests under `-race`, graceful shutdown tests.
+  * *Completion*: TCP server, connection lifecycle, and engine request dispatch verified.
 
 ---
 

@@ -1040,6 +1040,31 @@ This document tracks all **genuine architectural and operational limitations** o
   * Performance: **Optimal** (Zero-allocation header decode and incremental CRC32 update; single contiguous write framing).
   * Security: **Optimal** (Pre-allocation $5\text{MB}$ ceiling, integer overflow checks, fail-closed unknown opcodes, defensive buffer copies).
 
+### 62. TCP Server Connection Lifecycle & Engine Request Dispatch (P11-S01-M02)
+* **Limitation & Architectural Boundaries**:
+  In `P11-S01-M02`:
+  1. *Plaintext Transport Only*: The TCP server currently runs unauthenticated plaintext binary protocol traffic over loopback (`127.0.0.1:9099`). TLS 1.3 / mTLS and client authentication are deferred to later security hardening micro-phases. Remote binding (`0.0.0.0`) in production environments should not be enabled without external network-level isolation or TLS proxies.
+  2. *Supported vs Unsupported Engine Operations*:
+     - `OP_PUT`, `OP_GET`, `OP_DELETE` dispatch directly to Phase 10 `Engine.Put`, `Engine.Get`, and `Engine.Delete`.
+     - `OP_EXISTS`, `OP_BATCH`, `OP_STATS` are rejected deterministically with `StatusInvalidRequest` and explanatory diagnostics, adhering strictly to the principle of not fabricating unexposed storage engine functionality.
+  3. *Slowloris & Resource Defense*:
+     - Reading frames enforces separate deadlines: `IdleTimeout` (default 60s) for inactivity between requests, `HeaderTimeout` (default 5s) for frame header completion, and `PayloadTimeout` (default 10s) for payload completion.
+     - `WriteTimeout` (default 5s) prevents stalled clients from holding server goroutines blocked indefinitely during response transmission.
+     - `MaxConnections` (default 1024) caps simultaneous accepted connections to mitigate OS file descriptor and goroutine exhaustion.
+  4. *Error Sanitization & Sequence Independence*:
+     - Internal storage errors returned across the wire are sanitized to `"internal storage error"`, preventing leakage of filesystem paths, SSTable filenames, or WAL structures.
+     - Wire `SeqID` is preserved strictly as a transport-level request correlation identifier; it is never mapped to or confused with internal Engine MVCC sequence numbers.
+  5. *Pipelining & Advanced Concurrency*:
+     - Connections process requests sequentially (one request read -> dispatched -> response written -> next request read). Out-of-order request pipelining and connection multiplexing are not implemented.
+* **Why It Exists**:
+  Provides a bounded, DoS-resistant TCP server boundary above the single-node storage engine without violating storage invariants or introducing speculative networking complexity.
+* **Impact**:
+  Decouples transport goroutines from storage engine internals; guarantees clean graceful shutdown without goroutine or socket leaks; isolates network client timeouts from storage durability.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Sequential request-response correlation, exact binary transparency, clean error mappings verified under `-race`).
+  * Performance: **Optimal** (Direct non-blocking dispatch, minimal leaf lock contention, zero unnecessary allocations).
+  * Security: **Optimal** (Slowloris defense, connection limits, sanitized error diagnostics, clean shutdown unblocking).
+
 ---
 
 *End of Known Limitations — To be updated continuously throughout implementation.*

@@ -1888,6 +1888,9 @@ func TestTransportFramingErrors(t *testing.T) {
 		{errors.ErrFrameTruncated, "frame truncated or incomplete"},
 		{errors.ErrInvalidPayload, "invalid frame payload"},
 		{errors.ErrInvalidStatus, "invalid response status code"},
+		{errors.ErrServerClosed, "server is closed"},
+		{errors.ErrServerAlreadyStarted, "server already started"},
+		{errors.ErrConnectionLimitExceeded, "connection limit exceeded"},
 	}
 	for _, tc := range transportSentinels {
 		if tc.err == nil {

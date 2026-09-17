@@ -379,6 +379,15 @@ var (
 
 	// ErrInvalidStatus indicates that a network response specifies an unrecognized or invalid status code.
 	ErrInvalidStatus = stdErrors.New("invalid response status code")
+
+	// ErrServerClosed indicates that the network server has been closed or is shutting down.
+	ErrServerClosed = stdErrors.New("server is closed")
+
+	// ErrServerAlreadyStarted indicates that Start or Listen was called on a server that is already active.
+	ErrServerAlreadyStarted = stdErrors.New("server already started")
+
+	// ErrConnectionLimitExceeded indicates that an inbound connection was rejected because active connections reached capacity.
+	ErrConnectionLimitExceeded = stdErrors.New("connection limit exceeded")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing

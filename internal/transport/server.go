@@ -1,0 +1,515 @@
+package transport
+
+import (
+	"context"
+	stdErrors "errors"
+	"fmt"
+	"hash/crc32"
+	"io"
+	"net"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/silent-knight19/lattice/internal/binary"
+	"github.com/silent-knight19/lattice/internal/errors"
+)
+
+// Engine defines the storage engine contract required by the transport server dispatcher.
+// It is satisfied by *engine.Engine.
+type Engine interface {
+	Put(ctx context.Context, key, val []byte) error
+	Get(key []byte) ([]byte, error)
+	Delete(ctx context.Context, key []byte) error
+}
+
+// ServerConfig configures the TCP transport server.
+type ServerConfig struct {
+	// Address is the TCP address to bind and listen on (default: "127.0.0.1:9099").
+	Address string
+
+	// MaxConnections is the maximum number of concurrent client connections (default: 1024).
+	MaxConnections int
+
+	// HeaderTimeout is the maximum duration allowed to read a frame header (default: 5s).
+	HeaderTimeout time.Duration
+
+	// PayloadTimeout is the maximum duration allowed to read a frame payload and trailer (default: 10s).
+	PayloadTimeout time.Duration
+
+	// IdleTimeout is the maximum duration an established connection may remain idle between requests (default: 60s).
+	IdleTimeout time.Duration
+
+	// WriteTimeout is the maximum duration allowed to write a response frame (default: 5s).
+	WriteTimeout time.Duration
+
+	// RequestTimeout is the timeout passed in the context to Engine operations (default: 5s).
+	RequestTimeout time.Duration
+
+	// ShutdownTimeout is the maximum duration to wait for active connections to drain during Close (default: 5s).
+	ShutdownTimeout time.Duration
+}
+
+// DefaultServerConfig returns a production-hardened ServerConfig with safe default timeouts and limits.
+func DefaultServerConfig() ServerConfig {
+	return ServerConfig{
+		Address:         "127.0.0.1:9099",
+		MaxConnections:  1024,
+		HeaderTimeout:   5 * time.Second,
+		PayloadTimeout:  10 * time.Second,
+		IdleTimeout:     60 * time.Second,
+		WriteTimeout:    5 * time.Second,
+		RequestTimeout:  5 * time.Second,
+		ShutdownTimeout: 5 * time.Second,
+	}
+}
+
+// Server manages the TCP listener, connection lifecycle, Slowloris defenses, and Engine request dispatching.
+type Server struct {
+	cfg      ServerConfig
+	engine   Engine
+	listener net.Listener
+	addr     net.Addr
+
+	mu          sync.Mutex
+	conns       map[net.Conn]struct{}
+	started     atomic.Bool
+	closed      atomic.Bool
+	shutdownCh  chan struct{}
+	wg          sync.WaitGroup
+	activeConns atomic.Int64
+}
+
+// NewServer constructs a new transport Server. It validates the configuration and verifies that eng is non-nil.
+func NewServer(cfg ServerConfig, eng Engine) (*Server, error) {
+	if eng == nil {
+		return nil, errors.ErrNilReceiver
+	}
+
+	defaults := DefaultServerConfig()
+	if cfg.Address == "" {
+		cfg.Address = defaults.Address
+	}
+	if cfg.MaxConnections <= 0 {
+		cfg.MaxConnections = defaults.MaxConnections
+	}
+	if cfg.HeaderTimeout <= 0 {
+		cfg.HeaderTimeout = defaults.HeaderTimeout
+	}
+	if cfg.PayloadTimeout <= 0 {
+		cfg.PayloadTimeout = defaults.PayloadTimeout
+	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = defaults.IdleTimeout
+	}
+	if cfg.WriteTimeout <= 0 {
+		cfg.WriteTimeout = defaults.WriteTimeout
+	}
+	if cfg.RequestTimeout <= 0 {
+		cfg.RequestTimeout = defaults.RequestTimeout
+	}
+	if cfg.ShutdownTimeout <= 0 {
+		cfg.ShutdownTimeout = defaults.ShutdownTimeout
+	}
+
+	return &Server{
+		cfg:        cfg,
+		engine:     eng,
+		conns:      make(map[net.Conn]struct{}),
+		shutdownCh: make(chan struct{}),
+	}, nil
+}
+
+// Listen binds on addr and starts the accept loop in a background goroutine.
+// If addr is empty, the configured Address is used.
+func (s *Server) Listen(addr string) error {
+	if !s.started.CompareAndSwap(false, true) {
+		return errors.ErrServerAlreadyStarted
+	}
+
+	bindAddr := addr
+	if bindAddr == "" {
+		bindAddr = s.cfg.Address
+	}
+
+	l, err := net.Listen("tcp", bindAddr)
+	if err != nil {
+		s.started.Store(false)
+		return err
+	}
+
+	s.listener = l
+	s.addr = l.Addr()
+
+	go s.acceptLoop(l)
+	return nil
+}
+
+// Serve accepts incoming connections on listener l and runs the accept loop synchronously.
+// It blocks until the server is closed or a fatal listener error occurs.
+func (s *Server) Serve(l net.Listener) error {
+	if l == nil {
+		return errors.ErrNilReceiver
+	}
+	if !s.started.CompareAndSwap(false, true) {
+		return errors.ErrServerAlreadyStarted
+	}
+
+	s.listener = l
+	s.addr = l.Addr()
+
+	s.acceptLoop(l)
+	return errors.ErrServerClosed
+}
+
+// Addr returns the network address the server is bound to, or nil if not listening.
+func (s *Server) Addr() net.Addr {
+	if s.listener != nil {
+		return s.listener.Addr()
+	}
+	return s.addr
+}
+
+// ActiveConnections returns the current count of active client connections.
+func (s *Server) ActiveConnections() int {
+	return int(s.activeConns.Load())
+}
+
+// acceptLoop runs the listener accept loop with backoff on temporary errors.
+func (s *Server) acceptLoop(l net.Listener) {
+	defer l.Close()
+
+	var tempDelay time.Duration
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			if s.closed.Load() {
+				return
+			}
+			var ne net.Error
+			if stdErrors.As(err, &ne) && ne.Temporary() {
+				if tempDelay == 0 {
+					tempDelay = 5 * time.Millisecond
+				} else {
+					tempDelay *= 2
+				}
+				if max := 1 * time.Second; tempDelay > max {
+					tempDelay = max
+				}
+				select {
+				case <-s.shutdownCh:
+					return
+				case <-time.After(tempDelay):
+				}
+				continue
+			}
+			return
+		}
+		tempDelay = 0
+
+		// Reject immediately if active connections exceed ceiling
+		if s.cfg.MaxConnections > 0 && s.activeConns.Load() >= int64(s.cfg.MaxConnections) {
+			conn.Close()
+			continue
+		}
+
+		if !s.trackConn(conn) {
+			conn.Close()
+			continue
+		}
+
+		go s.handleConn(conn)
+	}
+}
+
+// trackConn registers an accepted connection under s.mu. Returns false if server is closing.
+func (s *Server) trackConn(conn net.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed.Load() {
+		return false
+	}
+	s.conns[conn] = struct{}{}
+	s.activeConns.Add(1)
+	s.wg.Add(1)
+	return true
+}
+
+// untrackConn unregisters a closed connection under s.mu.
+func (s *Server) untrackConn(conn net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.conns[conn]; ok {
+		delete(s.conns, conn)
+		s.activeConns.Add(-1)
+		s.wg.Done()
+	}
+}
+
+// handleConn is the per-connection request-processing loop.
+func (s *Server) handleConn(conn net.Conn) {
+	defer func() {
+		conn.Close()
+		s.untrackConn(conn)
+	}()
+
+	isFirst := true
+	for {
+		if s.closed.Load() {
+			return
+		}
+
+		frame, err := s.readFrameWithDeadlines(conn, isFirst)
+		if err != nil {
+			// Normal EOF, read timeout (Slowloris/idle), or fatal framing error.
+			return
+		}
+		isFirst = false
+
+		req, err := DecodeRequest(frame)
+		if err != nil {
+			// Frame was structurally valid, but payload violated application constraints.
+			resp := &Response{
+				OpCode:  frame.Header.OpCode,
+				SeqID:   frame.Header.SeqID,
+				Status:  StatusInvalidRequest,
+				Message: err.Error(),
+			}
+			if writeErr := s.writeResponseWithDeadline(conn, resp); writeErr != nil {
+				return
+			}
+			continue
+		}
+
+		resp := s.dispatch(req)
+		if writeErr := s.writeResponseWithDeadline(conn, resp); writeErr != nil {
+			return
+		}
+	}
+}
+
+type deadlineSetter interface {
+	SetReadDeadline(time.Time) error
+	SetWriteDeadline(time.Time) error
+}
+
+// readFrameWithDeadlines reads a complete M01 frame while strictly defending against Slowloris attacks.
+func (s *Server) readFrameWithDeadlines(conn net.Conn, isFirst bool) (*Frame, error) {
+	ds, hasDeadlines := conn.(deadlineSetter)
+
+	// Step 1: Set idle or header deadline before reading first byte
+	if hasDeadlines {
+		if isFirst {
+			_ = ds.SetReadDeadline(time.Now().Add(s.cfg.HeaderTimeout))
+		} else {
+			_ = ds.SetReadDeadline(time.Now().Add(s.cfg.IdleTimeout))
+		}
+	}
+
+	var headerBuf [HeaderSize]byte
+	// Read first byte to observe activity / wait for idle timeout
+	if _, err := io.ReadFull(conn, headerBuf[:1]); err != nil {
+		return nil, err
+	}
+
+	// First byte received: enforce HeaderTimeout for remaining 17 bytes
+	if hasDeadlines {
+		_ = ds.SetReadDeadline(time.Now().Add(s.cfg.HeaderTimeout))
+	}
+	if _, err := io.ReadFull(conn, headerBuf[1:]); err != nil {
+		return nil, err
+	}
+
+	// Decode header: verifies Magic and PayloadLength <= 5 MiB before allocating payload buffer
+	hdr, err := DecodeHeaderBytes(headerBuf[:])
+	if err != nil {
+		return nil, err
+	}
+
+	// Step 2: Enforce PayloadTimeout for payload and trailer read
+	if hasDeadlines {
+		if hdr.PayloadLength > 0 {
+			_ = ds.SetReadDeadline(time.Now().Add(s.cfg.PayloadTimeout))
+		} else {
+			_ = ds.SetReadDeadline(time.Now().Add(s.cfg.HeaderTimeout))
+		}
+	}
+
+	var payload []byte
+	if hdr.PayloadLength > 0 {
+		payload = make([]byte, hdr.PayloadLength)
+		if _, err := io.ReadFull(conn, payload); err != nil {
+			return nil, err
+		}
+	}
+
+	var trailerBuf [TrailerSize]byte
+	if _, err := io.ReadFull(conn, trailerBuf[:]); err != nil {
+		return nil, err
+	}
+
+	// Step 3: Incremental CRC32 verification over Header + Payload
+	computedCRC := crc32.ChecksumIEEE(headerBuf[:])
+	if len(payload) > 0 {
+		computedCRC = crc32.Update(computedCRC, crc32.IEEETable, payload)
+	}
+
+	expectedCRC := binary.GetUint32(trailerBuf[:])
+	if computedCRC != expectedCRC {
+		return nil, &errors.ChecksumMismatchError{Expected: expectedCRC, Actual: computedCRC}
+	}
+
+	// Reset read deadline upon successful frame completion
+	if hasDeadlines {
+		_ = ds.SetReadDeadline(time.Time{})
+	}
+
+	return &Frame{
+		Header:  *hdr,
+		Payload: payload,
+		CRC:     expectedCRC,
+	}, nil
+}
+
+// writeResponseWithDeadline encodes and writes a complete Response frame within WriteTimeout.
+func (s *Server) writeResponseWithDeadline(conn net.Conn, resp *Response) error {
+	if ds, ok := conn.(deadlineSetter); ok {
+		_ = ds.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
+		defer func() { _ = ds.SetWriteDeadline(time.Time{}) }()
+	}
+	return WriteResponse(conn, resp)
+}
+
+// dispatch routes a decoded request to the appropriate Engine method and translates outcomes to a Response.
+func (s *Server) dispatch(req *Request) *Response {
+	resp := &Response{
+		OpCode: req.OpCode,
+		SeqID:  req.SeqID,
+	}
+
+	if s.closed.Load() {
+		resp.Status = StatusServerClosed
+		resp.Message = "server is closed"
+		return resp
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.RequestTimeout)
+	defer cancel()
+
+	switch req.OpCode {
+	case OpPut:
+		err := s.engine.Put(ctx, req.Key, req.Value)
+		s.mapEngineError(err, resp)
+
+	case OpGet:
+		val, err := s.engine.Get(req.Key)
+		if err == nil {
+			if uint32(len(val)) > MaxPayloadLength {
+				resp.Status = StatusError
+				resp.Message = "response value exceeds maximum protocol frame limit"
+			} else {
+				resp.Status = StatusOk
+				resp.Value = val
+			}
+		} else {
+			s.mapEngineError(err, resp)
+		}
+
+	case OpDelete:
+		err := s.engine.Delete(ctx, req.Key)
+		s.mapEngineError(err, resp)
+
+	case OpExists:
+		resp.Status = StatusInvalidRequest
+		resp.Message = "unsupported operation: EXISTS is not implemented by storage engine"
+
+	case OpBatch:
+		resp.Status = StatusInvalidRequest
+		resp.Message = "unsupported operation: BATCH is not implemented by storage engine"
+
+	case OpStats:
+		resp.Status = StatusInvalidRequest
+		resp.Message = "unsupported operation: STATS is not implemented by storage engine"
+
+	default:
+		resp.Status = StatusInvalidRequest
+		resp.Message = fmt.Sprintf("unsupported operation code: 0x%02x", byte(req.OpCode))
+	}
+
+	return resp
+}
+
+// mapEngineError maps storage engine errors to stable protocol status codes without disclosing internal paths.
+func (s *Server) mapEngineError(err error, resp *Response) {
+	if err == nil {
+		resp.Status = StatusOk
+		return
+	}
+	if stdErrors.Is(err, errors.ErrKeyNotFound) {
+		resp.Status = StatusKeyNotFound
+		return
+	}
+	if stdErrors.Is(err, errors.ErrWriterClosed) {
+		resp.Status = StatusServerClosed
+		resp.Message = "storage engine is closed"
+		return
+	}
+	if stdErrors.Is(err, context.DeadlineExceeded) || stdErrors.Is(err, context.Canceled) {
+		resp.Status = StatusThrottled
+		resp.Message = "request timed out under storage backpressure"
+		return
+	}
+	if stdErrors.Is(err, errors.ErrKeyTooLarge) ||
+		stdErrors.Is(err, errors.ErrValueTooLarge) ||
+		stdErrors.Is(err, errors.ErrEmptyKey) ||
+		stdErrors.Is(err, errors.ErrInvalidPayload) {
+		resp.Status = StatusInvalidRequest
+		resp.Message = err.Error()
+		return
+	}
+	// Sanitize general storage errors to avoid disclosing filesystem paths or internal diagnostics
+	resp.Status = StatusError
+	resp.Message = "internal storage error"
+}
+
+// Shutdown gracefully shuts down the server: halts listener, closes active connections,
+// and waits for connection goroutines to complete within ctx deadline.
+func (s *Server) Shutdown(ctx context.Context) error {
+	if !s.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	close(s.shutdownCh)
+
+	// Close listener to stop accepting new connections
+	if s.listener != nil {
+		_ = s.listener.Close()
+	}
+
+	// Close all currently active connections
+	s.mu.Lock()
+	for conn := range s.conns {
+		_ = conn.Close()
+	}
+	s.mu.Unlock()
+
+	// Await connection goroutine drain
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Close terminates the server immediately using the configured ShutdownTimeout.
+func (s *Server) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout)
+	defer cancel()
+	return s.Shutdown(ctx)
+}
