@@ -87,8 +87,6 @@ func (it *Iterator) Next() bool {
 		return false
 	}
 
-	it.sl.mu.RLock()
-	defer it.sl.mu.RUnlock()
 
 	switch it.state {
 	case stateUnpositioned:
@@ -136,10 +134,7 @@ func (it *Iterator) Key() binary.InternalKey {
 	if it.closed || it.state != statePositioned || it.curr == nil {
 		return binary.InternalKey{}
 	}
-	if it.sl != nil {
-		it.sl.mu.RLock()
-		defer it.sl.mu.RUnlock()
-	}
+
 	return it.curr.key.Clone()
 }
 
@@ -160,10 +155,7 @@ func (it *Iterator) Value() []byte {
 	if it.closed || it.state != statePositioned || it.curr == nil {
 		return nil
 	}
-	if it.sl != nil {
-		it.sl.mu.RLock()
-		defer it.sl.mu.RUnlock()
-	}
+
 	return it.curr.getValue()
 }
 
@@ -196,8 +188,6 @@ func (it *Iterator) Seek(userKey []byte) error {
 		return err
 	}
 
-	it.sl.mu.RLock()
-	defer it.sl.mu.RUnlock()
 
 	curr := it.sl.head
 	h := int(it.sl.height.Load())
@@ -241,8 +231,6 @@ func (it *Iterator) SeekToFirst() {
 		return
 	}
 
-	it.sl.mu.RLock()
-	defer it.sl.mu.RUnlock()
 
 	it.curr = it.sl.head.forward[0].Load()
 	if it.curr != nil {
@@ -278,8 +266,6 @@ func (it *Iterator) SeekInternalKey(target binary.InternalKey) error {
 		return err
 	}
 
-	it.sl.mu.RLock()
-	defer it.sl.mu.RUnlock()
 
 	curr := it.sl.head
 	h := int(it.sl.height.Load())

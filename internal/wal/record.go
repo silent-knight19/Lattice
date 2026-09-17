@@ -243,7 +243,7 @@ func (r Record) String() string {
 //   - RecordType must be one of PUT, DELETE, BATCH_START, BATCH_COMMIT.
 //   - PUT: Key length 1..65,535 bytes; Value length 0..4,194,304 bytes.
 //   - DELETE: Key length 1..65,535 bytes; Value length must be exactly 0 (tombstone).
-//   - BATCH_START / BATCH_COMMIT: Key and Value lengths must both be exactly 0.
+//   - BATCH_START / BATCH_COMMIT: Key and Value must both be empty (len == 0; nil or zero-length slice).
 func (r Record) Validate() error {
 	if err := r.Type.Validate(); err != nil {
 		return err
@@ -384,6 +384,11 @@ func EncodeRecord(record Record) ([]byte, error) {
 //     if bit-rot, corruption, or mismatch is detected.
 //   - Decoded Key and Value slices are newly allocated and strictly owned by the returned Record,
 //     guaranteeing no aliasing with reader buffers or future decode calls.
+//
+// Stream Consumption Semantics:
+//   - On error, an indeterminate number of bytes may have already been consumed from r.
+//     Callers that need to preserve stream position across decode failures must buffer the input
+//     or record file offsets before calling DecodeRecord.
 func DecodeRecord(r io.Reader) (Record, error) {
 	var headerBuf [HeaderSize]byte
 	n, err := io.ReadFull(r, headerBuf[:])

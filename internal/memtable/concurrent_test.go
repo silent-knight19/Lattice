@@ -500,3 +500,38 @@ func TestSkipList_ConcurrentStress_TombstonesAndRePut(t *testing.T) {
 		t.Errorf("expected val-put-101, got %q (err: %v)", reputVal, reputErr)
 	}
 }
+
+// TestInsertWithHeight_InvalidHeightFastFail asserts that invalid forced heights
+// fail fast at entry, even if the key is already present in the SkipList (SEC-P03-006).
+func TestInsertWithHeight_InvalidHeightFastFail(t *testing.T) {
+	sl := memtable.NewSkipList()
+	k := sampleKey(t, "dup-key", 1, binary.OpTypePut)
+	if err := sl.InsertWithHeightForTesting(k, []byte("v1"), 4); err != nil {
+		t.Fatalf("first insert failed: %v", err)
+	}
+
+	// Re-insert exact duplicate key with height 0 (random, valid)
+	err := sl.InsertWithHeightForTesting(k, []byte("v2"), 0)
+	if err != nil {
+		t.Fatalf("duplicate insert with height 0 failed: %v", err)
+	}
+
+	// Negative height -> must fail with InvalidSkipListHeightError before duplicate update
+	err = sl.InsertWithHeightForTesting(k, []byte("v3"), -1)
+	if err == nil {
+		t.Fatal("expected error with height -1 on duplicate key, got nil")
+	}
+	var heightErr *errors.InvalidSkipListHeightError
+	if !stdErrors.As(err, &heightErr) {
+		t.Errorf("expected *errors.InvalidSkipListHeightError, got: %T (%v)", err, err)
+	}
+
+	// Excess height -> must fail with InvalidSkipListHeightError
+	err = sl.InsertWithHeightForTesting(k, []byte("v4"), memtable.MaxHeight+1)
+	if err == nil {
+		t.Fatal("expected error with excess height on duplicate key, got nil")
+	}
+	if !stdErrors.As(err, &heightErr) {
+		t.Errorf("expected *errors.InvalidSkipListHeightError, got: %T (%v)", err, err)
+	}
+}

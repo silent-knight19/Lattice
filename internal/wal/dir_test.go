@@ -661,3 +661,55 @@ func TestDir_SyncDir(t *testing.T) {
 		}
 	}
 }
+
+// TestSEC_P02_003_InitDirParentSync verifies that InitDir synchronizes the parent directory
+// on fresh creation and propagates any sync errors.
+func TestSEC_P02_003_InitDirParentSync(t *testing.T) {
+	tempDir := t.TempDir()
+
+	var syncedPath string
+	var syncCount int
+	restore := wal.SetInitSyncParentDirFnForTesting(func(dirPath string) error {
+		syncedPath = dirPath
+		syncCount++
+		return nil
+	})
+	defer restore()
+
+	// 1. Fresh creation invokes parent sync
+	walPath, err := wal.InitDir(tempDir)
+	if err != nil {
+		t.Fatalf("InitDir failed: %v", err)
+	}
+	if walPath != filepath.Join(tempDir, wal.DirName) {
+		t.Fatalf("unexpected walPath: %s", walPath)
+	}
+	if syncCount != 1 || syncedPath != tempDir {
+		t.Errorf("expected parent sync on %s (count 1), got count %d on %s", tempDir, syncCount, syncedPath)
+	}
+
+	// 2. Idempotent call on existing directory does not re-sync parent
+	syncCount = 0
+	_, err = wal.InitDir(tempDir)
+	if err != nil {
+		t.Fatalf("idempotent InitDir failed: %v", err)
+	}
+	if syncCount != 0 {
+		t.Errorf("expected 0 syncs on idempotent call, got %d", syncCount)
+	}
+
+	// 3. Error propagation on parent sync failure
+	tempDir2 := t.TempDir()
+	syncErr := stdErrors.New("disk sync failed")
+	wal.SetInitSyncParentDirFnForTesting(func(dirPath string) error {
+		return syncErr
+	})
+
+	_, err = wal.InitDir(tempDir2)
+	if err == nil {
+		t.Fatal("expected InitDir to fail when parent sync fails, got nil")
+	}
+	if !stdErrors.Is(err, syncErr) {
+		t.Errorf("expected error wrapping %v, got %v", syncErr, err)
+	}
+}

@@ -1812,14 +1812,19 @@ func TestManifestWriterPoisonedError(t *testing.T) {
 		t.Errorf("extracted error must unwrap to root cause")
 	}
 
-	expectedMsg := `manifest writer at "/var/data/MANIFEST-000001" is poisoned: disk I/O failure`
+	expectedMsg := `manifest writer for "MANIFEST-000001" is poisoned: disk I/O failure`
 	if err.Error() != expectedMsg {
 		t.Errorf("unexpected error message: got %q, want %q", err.Error(), expectedMsg)
 	}
 
 	errNoReason := &errors.ManifestWriterPoisonedError{Path: "/var/data/MANIFEST-000001"}
-	if errNoReason.Error() != `manifest writer at "/var/data/MANIFEST-000001" is poisoned` {
+	if errNoReason.Error() != `manifest writer for "MANIFEST-000001" is poisoned` {
 		t.Errorf("unexpected error message without reason: %q", errNoReason.Error())
+	}
+
+	// Verify host directory sanitization
+	if strings.Contains(err.Error(), "/var/data") {
+		t.Errorf("error message must sanitize full host path: %s", err.Error())
 	}
 
 	var nilErr *errors.ManifestWriterPoisonedError
@@ -1831,6 +1836,37 @@ func TestManifestWriterPoisonedError(t *testing.T) {
 	}
 	if nilErr.Unwrap() != nil {
 		t.Errorf("nil *ManifestWriterPoisonedError Unwrap must return nil")
+	}
+}
+
+func TestSSTableSizeMismatchError(t *testing.T) {
+	err := &errors.SSTableSizeMismatchError{
+		Path:     "/var/data/000001.sst",
+		FileNum:  1,
+		Expected: 1024,
+		Actual:   512,
+	}
+
+	if !stdErrors.Is(err, errors.ErrSSTableSizeMismatch) {
+		t.Errorf("SSTableSizeMismatchError must match ErrSSTableSizeMismatch via errors.Is")
+	}
+
+	expectedMsg := "sstable physical size mismatch for 000001.sst (file 1): expected 1024 bytes, got 512 bytes on disk"
+	if err.Error() != expectedMsg {
+		t.Errorf("unexpected error message: got %q, want %q", err.Error(), expectedMsg)
+	}
+
+	// Verify host directory sanitization
+	if strings.Contains(err.Error(), "/var/data") {
+		t.Errorf("error message must sanitize full host path: %s", err.Error())
+	}
+
+	var nilErr *errors.SSTableSizeMismatchError
+	if nilErr.Error() != errors.ErrSSTableSizeMismatch.Error() {
+		t.Errorf("typed nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrSSTableSizeMismatch.Error())
+	}
+	if !nilErr.Is(errors.ErrSSTableSizeMismatch) {
+		t.Errorf("nil *SSTableSizeMismatchError must match ErrSSTableSizeMismatch via Is")
 	}
 }
 

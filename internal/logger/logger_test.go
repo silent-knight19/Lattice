@@ -473,6 +473,8 @@ func TestCompoundSensitiveKeyRedaction(t *testing.T) {
 		value string
 	}{
 		{"db_password", "super-secret-db-pass"},
+		{"db_pass", "super-secret-db-pass"},
+		{"user_pass", "user-secret"},
 		{"client_secret", "oauth-client-secret-999"},
 		{"auth_token", "bearer-token-val"},
 		{"session_token", "session-token-xyz"},
@@ -587,6 +589,8 @@ func TestFalsePositiveResistance(t *testing.T) {
 	}{
 		{"token_count", 42},
 		{"tokens_per_sec", 1000},
+		{"pass_count", 42},
+		{"passenger", "alice"},
 		{"author", "Shakespeare"},
 		{"authority", "root-ca"},
 		{"authenticate_user_flag", true},
@@ -1155,3 +1159,87 @@ func FuzzLoggerKeyRedaction(f *testing.F) {
 		}
 	})
 }
+
+// TestSEC_P00_001_ScrubStringUnderscoreCredentials verifies SEC-P00-001:
+// scrubString correctly redacts underscore-prefixed credential keys in free-text messages
+// without over-redacting non-credential words.
+func TestSEC_P00_001_ScrubStringUnderscoreCredentials(t *testing.T) {
+	cases := []struct {
+		input       string
+		wantContain string
+		wantAbsent  string
+	}{
+		{
+			input:       "failed: db_password=hunter2",
+			wantContain: "db_password=" + logger.RedactedPlaceholder,
+			wantAbsent:  "hunter2",
+		},
+		{
+			input:       "api_key=sk_live_abc",
+			wantContain: "api_key=" + logger.RedactedPlaceholder,
+			wantAbsent:  "sk_live_abc",
+		},
+		{
+			input:       "auth_token=tok_xyz",
+			wantContain: "auth_token=" + logger.RedactedPlaceholder,
+			wantAbsent:  "tok_xyz",
+		},
+		{
+			input:       "connection error: db_pass=secret_val",
+			wantContain: "db_pass=" + logger.RedactedPlaceholder,
+			wantAbsent:  "secret_val",
+		},
+	}
+
+	for _, tc := range cases {
+		got := logger.ScrubStringForTesting(tc.input)
+		if !strings.Contains(got, tc.wantContain) {
+			t.Errorf("input %q: got %q, want containing %q", tc.input, got, tc.wantContain)
+		}
+		if strings.Contains(got, tc.wantAbsent) {
+			t.Errorf("input %q: got %q, want absent %q", tc.input, got, tc.wantAbsent)
+		}
+	}
+
+	// Negative tests to confirm the fix does not over-redact benign keys
+	negativeCases := []string{
+		"author=alice",
+		"token_count=42",
+		"tokens_per_sec=1000",
+		"passenger=bob",
+		"pass_count=99",
+	}
+	for _, input := range negativeCases {
+		got := logger.ScrubStringForTesting(input)
+		if strings.Contains(got, logger.RedactedPlaceholder) {
+			t.Errorf("input %q was mistakenly redacted to %q", input, got)
+		}
+	}
+}
+
+// TestSEC_P00_003_ScrubValueByteSliceRedacted verifies SEC-P00-003:
+// []byte values passed to structured logging are redacted as [REDACTED].
+func TestSEC_P00_003_ScrubValueByteSliceRedacted(t *testing.T) {
+	var buf bytes.Buffer
+	log := logger.NewJSON(&buf, logger.LevelInfo)
+
+	secretBytes := []byte("password=supersecret123")
+	log.Info("byte slice test", "raw_payload", secretBytes)
+
+	var data map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &data); err != nil {
+		t.Fatalf("failed to parse JSON: %v", err)
+	}
+
+	val, exists := data["raw_payload"]
+	if !exists {
+		t.Fatalf("expected attribute raw_payload to be present")
+	}
+	if val != logger.RedactedPlaceholder {
+		t.Errorf("expected raw_payload to be redacted, got: %v", val)
+	}
+	if strings.Contains(buf.String(), "supersecret123") {
+		t.Errorf("raw byte payload leaked into log output: %s", buf.String())
+	}
+}
+

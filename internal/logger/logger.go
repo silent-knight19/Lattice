@@ -327,6 +327,8 @@ func isSensitiveKey(key string, exactMap map[string]struct{}) bool {
 		strings.Contains(stripped, "password") ||
 		strings.Contains(stripped, "passwd") ||
 		isWord(canonical, "pwd") ||
+		strings.HasSuffix(canonical, "_pass") ||
+		strings.Contains(canonical, "_pass_") ||
 		strings.Contains(canonical, "secret") ||
 		strings.Contains(canonical, "credential") ||
 		strings.Contains(canonical, "private_key") ||
@@ -368,7 +370,7 @@ func isSensitiveKey(key string, exactMap map[string]struct{}) bool {
 }
 
 var (
-	sensitiveKVRegex = regexp.MustCompile(`(?i)\b(password|passwd|pass|pwd|passphrase|secret|token|credential|credentials|api_key|apikey|private_key|privatekey|secret_key|signing_key|encryption_key|master_key|access_key|authorization|auth_token|access_token|refresh_token|cookie|set_cookie|session|session_id|sessionid|cvv|cvc|ssn|salt|nonce|mnemonic|seed)\b\s*[:=]\s*([^\s,;\"'}{]+)`)
+	sensitiveKVRegex = regexp.MustCompile(`(?i)((?:^|[^A-Za-z0-9]))(password|passwd|pass|pwd|passphrase|secret|token|credential|credentials|api_key|apikey|private_key|privatekey|secret_key|signing_key|encryption_key|master_key|access_key|authorization|auth_token|access_token|refresh_token|cookie|set_cookie|session|session_id|sessionid|cvv|cvc|ssn|salt|nonce|mnemonic|seed)\b\s*[:=]\s*([^\s,;\"'}{]+)`)
 	bearerRegex      = regexp.MustCompile(`(?i)\b(Bearer\s+)([^\s,;\"'}{]+)`)
 )
 
@@ -376,7 +378,7 @@ func scrubString(s string) string {
 	if s == "" {
 		return ""
 	}
-	s = sensitiveKVRegex.ReplaceAllString(s, "$1="+RedactedPlaceholder)
+	s = sensitiveKVRegex.ReplaceAllString(s, "${1}${2}="+RedactedPlaceholder)
 	s = bearerRegex.ReplaceAllString(s, "${1}"+RedactedPlaceholder)
 	return s
 }
@@ -463,8 +465,8 @@ func scrubValue(v any, redactedMap map[string]struct{}) any {
 		if val.Kind() == reflect.Slice && val.IsNil() {
 			return nil
 		}
-		if b, ok := v.([]byte); ok {
-			return b
+		if _, ok := v.([]byte); ok {
+			return RedactedPlaceholder
 		}
 		n := val.Len()
 		scrubbed := make([]any, n)

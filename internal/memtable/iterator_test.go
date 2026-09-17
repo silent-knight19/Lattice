@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
@@ -855,4 +856,48 @@ func TestIterator_NilReceiverSafety(t *testing.T) {
 	// SeekToFirst and Close must not panic
 	it.SeekToFirst()
 	it.Close()
+}
+
+// TestIterator_NextDoesNotBlockOnWriterLock proves that Iterator traversal
+// (Next, Key, Value, Seek) is genuinely lock-free and does not block when the writer lock is held (SEC-P03-001).
+func TestIterator_NextDoesNotBlockOnWriterLock(t *testing.T) {
+	sl := memtable.NewSkipList()
+	k := makeIK(t, "lockfree-iter-key", 10, binary.OpTypePut)
+	if err := sl.Insert(k, []byte("lockfree-iter-val")); err != nil {
+		t.Fatalf("insert failed: %v", err)
+	}
+
+	it := sl.NewIterator()
+	defer it.Close()
+
+	// Acquire writer lock exclusively
+	sl.WriterLockForTesting()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if !it.Next() {
+			t.Errorf("expected it.Next() true")
+			return
+		}
+		if string(it.Key().UserKey) != "lockfree-iter-key" {
+			t.Errorf("unexpected key: %s", it.Key().UserKey)
+		}
+		if string(it.Value()) != "lockfree-iter-val" {
+			t.Errorf("unexpected value: %s", it.Value())
+		}
+		// Test Seek as well
+		if err := it.Seek([]byte("lockfree-iter-key")); err != nil {
+			t.Errorf("Seek failed: %v", err)
+		}
+	}()
+
+	select {
+	case <-done:
+		// Succeeded without blocking on writer lock!
+	case <-time.After(1 * time.Second):
+		t.Fatalf("FAILURE: Iterator blocked on writer lock! Traversal is not lock-free.")
+	}
+
+	sl.WriterUnlockForTesting()
 }

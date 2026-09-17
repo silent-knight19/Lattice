@@ -36,6 +36,8 @@ func DirPath(dbPath string) string {
 	return Dir(dbPath)
 }
 
+var initSyncParentDirFn = SyncDir
+
 // InitDir safely and idempotently initializes the WAL directory under dbPath with 0700 permissions.
 //
 // Invariants & Operational Semantics:
@@ -80,6 +82,9 @@ func InitDir(dbPath string) (string, error) {
 	// Eliminates check-then-create TOCTOU race condition by letting the OS kernel authoritatively create the directory.
 	err := os.Mkdir(walPath, DirMode)
 	if err == nil {
+		if syncErr := initSyncParentDirFn(dbPath); syncErr != nil {
+			return "", fmt.Errorf("wal: created directory but failed to sync parent %s: %w", dbPath, syncErr)
+		}
 		return walPath, nil
 	}
 

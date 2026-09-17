@@ -232,6 +232,13 @@ func (s *SkipList) insertInternal(key binary.InternalKey, value []byte, forcedHe
 	}
 
 	// 1. Boundary validation prior to acquiring locks or mutating structure
+	if forcedHeight != 0 && (forcedHeight < MinHeight || forcedHeight > MaxHeight) {
+		return &errors.InvalidSkipListHeightError{
+			Height:    forcedHeight,
+			MinHeight: MinHeight,
+			MaxHeight: MaxHeight,
+		}
+	}
 	if err := binary.ValidateKey(key.UserKey); err != nil {
 		return err
 	}

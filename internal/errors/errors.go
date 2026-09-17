@@ -1062,10 +1062,14 @@ func (e *ManifestWriterPoisonedError) Error() string {
 	if e == nil {
 		return ErrManifestWriterPoisoned.Error()
 	}
-	if e.Reason != nil {
-		return fmt.Sprintf("manifest writer at %q is poisoned: %v", e.Path, e.Reason)
+	name := filepath.Base(e.Path)
+	if name == "" || name == "." {
+		name = "manifest"
 	}
-	return fmt.Sprintf("manifest writer at %q is poisoned", e.Path)
+	if e.Reason != nil {
+		return fmt.Sprintf("manifest writer for %q is poisoned: %v", name, e.Reason)
+	}
+	return fmt.Sprintf("manifest writer for %q is poisoned", name)
 }
 
 // Is reports whether this error matches target sentinel ErrManifestWriterPoisoned.
@@ -1160,8 +1164,12 @@ func (e *SSTableSizeMismatchError) Error() string {
 	if e == nil {
 		return ErrSSTableSizeMismatch.Error()
 	}
+	name := filepath.Base(e.Path)
+	if name == "" || name == "." {
+		name = "sstable"
+	}
 	return fmt.Sprintf("sstable physical size mismatch for %s (file %d): expected %d bytes, got %d bytes on disk",
-		e.Path, e.FileNum, e.Expected, e.Actual)
+		name, e.FileNum, e.Expected, e.Actual)
 }
 
 // Is reports whether this error matches target sentinel ErrSSTableSizeMismatch.

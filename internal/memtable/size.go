@@ -13,11 +13,25 @@ const (
 	wordSize = bits.UintSize / 8
 
 	// NodeStructSize is the heap byte size of a skipListNode struct header.
-	// On 64-bit platforms:
-	//   key binary.InternalKey (40 bytes: UserKey []byte 24B + SeqNum 8B + OpType 1B + padding 7B)
-	//   value atomic.Pointer[nodeValue] (8 bytes)
-	//   forward []atomic.Pointer[skipListNode] (24 bytes slice header)
-	// Total = 72 bytes (40 bytes on 32-bit platforms).
+	//
+	// Exact struct layout breakdown across architectures:
+	//   - 64-bit (wordSize = 8):
+	//       key binary.InternalKey: UserKey []byte (24B) + SeqNum uint64 (8B) + OpType (1B) + 7B pad = 40B
+	//       value atomic.Pointer[nodeValue]: pointer width = 8B
+	//       forward []atomic.Pointer[skipListNode]: slice header (data 8B + len 8B + cap 8B) = 24B
+	//       Total = 40 + 8 + 24 = 72 bytes.
+	//
+	//   - 32-bit (wordSize = 4):
+	//       key binary.InternalKey: UserKey []byte (12B) + SeqNum uint64 (8B) + OpType (1B) + 3B pad = 24B
+	//       value atomic.Pointer[nodeValue]: pointer width = 4B
+	//       forward []atomic.Pointer[skipListNode]: slice header (data 4B + len 4B + cap 4B) = 12B
+	//       Total = 24 + 4 + 12 = 40 bytes.
+	//
+	// Derivation formula:
+	//   The delta between 64-bit and 32-bit is: (40-24) + (8-4) + (24-12) = 16 + 4 + 12 = 32 bytes.
+	//   Expressed in terms of word width: 40 + (wordSize - 4) * 8.
+	//   For wordSize=4 (32-bit): 40 + 0 = 40 bytes.
+	//   For wordSize=8 (64-bit): 40 + 32 = 72 bytes.
 	NodeStructSize = uint64(40 + (wordSize-4)*8)
 
 	// NodeValueStructSize is the heap byte size of a nodeValue struct container.

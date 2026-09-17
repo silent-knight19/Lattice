@@ -460,6 +460,13 @@ func TestEncodeDecodeInternalKey(t *testing.T) {
 		if !stdErrors.Is(err, errors.ErrKeyTooLarge) {
 			t.Errorf("expected ErrKeyTooLarge for oversized data, got %v", err)
 		}
+		var keyTooLargeErr *errors.KeyTooLargeError
+		if !stdErrors.As(err, &keyTooLargeErr) {
+			t.Fatalf("expected *errors.KeyTooLargeError, got %T", err)
+		}
+		if keyTooLargeErr.MaxSize != binary.MaxEncodedInternalKeyLen {
+			t.Errorf("expected MaxSize %d (MaxEncodedInternalKeyLen), got %d", binary.MaxEncodedInternalKeyLen, keyTooLargeErr.MaxSize)
+		}
 
 		// 3. Invalid OpType in trailer (e.g. 0x00 or 0x03)
 		validKey := binary.InternalKey{UserKey: []byte("valid"), SeqNum: 10, OpType: binary.OpTypePut}
@@ -702,3 +709,12 @@ func TestRandomizedComparatorTriples(t *testing.T) {
 		}
 	}
 }
+
+// TestInternalKeyTrailerOffsetInvariant verifies SEC-P01-001:
+// The OpType offset within InternalKeyTrailerLen (9) must be exactly 8 (InternalKeyTrailerLen - 1).
+func TestInternalKeyTrailerOffsetInvariant(t *testing.T) {
+	if binary.InternalKeyTrailerLen-1 != 8 {
+		t.Fatalf("InternalKeyTrailerLen - 1 must be 8, got %d", binary.InternalKeyTrailerLen-1)
+	}
+}
+

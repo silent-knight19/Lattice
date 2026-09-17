@@ -3,8 +3,6 @@ package binary
 import (
 	"bytes"
 	"fmt"
-
-	"github.com/silent-knight19/lattice/internal/errors"
 )
 
 // InternalKeyTrailerLen is the fixed size in bytes of the sequence number (8 bytes)
@@ -154,6 +152,13 @@ func CompareInternalKey(a, b InternalKey) int {
 // AppendInternalKey serializes key into dst and returns the extended slice.
 // Layout: [ UserKey (Var bytes) | SeqNum (8 bytes, Big-Endian) | OpType (1 byte) ]
 // Total appended length is len(key.UserKey) + InternalKeyTrailerLen.
+//
+// Operational Contract:
+// The caller must ensure key.UserKey satisfies ValidateKey and key.OpType is a
+// valid OpType. For maximum throughput on hot append paths, this function does
+// not perform redundant validation of its input. Callers that obtain InternalKey
+// via NewInternalKey or DecodeInternalKey have already satisfied these invariants.
+// Callers constructing InternalKey via struct literal must validate prior to calling.
 func AppendInternalKey(dst []byte, key InternalKey) []byte {
 	dst = append(dst, key.UserKey...)
 	var trailer [InternalKeyTrailerLen]byte
@@ -170,23 +175,22 @@ func EncodeInternalKey(key InternalKey) []byte {
 }
 
 // DecodeInternalKey deserializes a byte slice into an InternalKey.
-// The input slice must contain at least MinKeyLen + InternalKeyTrailerLen (10) bytes.
+// The input slice must contain at least MinKeyLen + InternalKeyTrailerLen (10) bytes
+// and at most MaxEncodedInternalKeyLen (65,544) bytes.
 //
 // DecodeInternalKey creates an owned copy of the UserKey slice so the returned
 // InternalKey does not retain a reference to a potentially large transient buffer.
 func DecodeInternalKey(data []byte) (InternalKey, error) {
-	if len(data) < MinKeyLen+InternalKeyTrailerLen {
-		return InternalKey{}, errors.ErrInternalKeyTruncated
+	if err := ValidateEncodedInternalKey(data); err != nil {
+		return InternalKey{}, err
 	}
 
 	userKeyLen := len(data) - InternalKeyTrailerLen
 	userKey := data[:userKeyLen]
-	if err := ValidateKey(userKey); err != nil {
-		return InternalKey{}, err
-	}
 
-	seqNum := SeqNum(GetUint64(data[userKeyLen : userKeyLen+8]))
-	opType, err := ParseOpType(data[userKeyLen+8])
+	trailerOffset := userKeyLen + InternalKeyTrailerLen - 1
+	seqNum := SeqNum(GetUint64(data[userKeyLen:trailerOffset]))
+	opType, err := ParseOpType(data[trailerOffset])
 	if err != nil {
 		return InternalKey{}, err
 	}

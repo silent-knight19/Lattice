@@ -98,7 +98,14 @@ type RecoveryReport struct {
 //     honestly reflecting the physical filesystem state.
 //  10. Quiescent Startup Assumption:
 //     Assumes WAL segments are quiescent (no concurrent RotatingWriter is running).
+// RecoverWAL coordinates multi-segment crash recovery across a database WAL directory.
 func RecoverWAL(dbPath string, sink ReplaySink) (RecoveryReport, error) {
+	return RecoverWALFrom(dbPath, sink, 1)
+}
+
+// RecoverWALFrom coordinates multi-segment crash recovery expecting the first segment ID to be expectedStartID.
+// If expectedStartID is 0, DefaultInitialSegmentID (1) is used.
+func RecoverWALFrom(dbPath string, sink ReplaySink, expectedStartID uint64) (RecoveryReport, error) {
 	if dbPath == "" {
 		return RecoveryReport{}, fmt.Errorf("%w: db path cannot be empty", os.ErrInvalid)
 	}
@@ -117,7 +124,7 @@ func RecoverWAL(dbPath string, sink ReplaySink) (RecoveryReport, error) {
 	}
 
 	// Step 3: Validate segment ID continuity (no duplicates, no gaps)
-	if err := ValidateSegmentContinuity(ids); err != nil {
+	if err := ValidateSegmentContinuityFrom(ids, expectedStartID); err != nil {
 		return RecoveryReport{}, err
 	}
 
@@ -260,12 +267,22 @@ func RecoverWAL(dbPath string, sink ReplaySink) (RecoveryReport, error) {
 // ValidateSegmentContinuity validates that a sorted slice of segment IDs has no duplicates and no gaps,
 // and enforces that a non-empty segment chain begins at initial segment ID 1 (P07-SEC-013).
 func ValidateSegmentContinuity(ids []uint64) error {
+	return ValidateSegmentContinuityFrom(ids, 1)
+}
+
+// ValidateSegmentContinuityFrom validates that a sorted slice of segment IDs has no duplicates and no gaps,
+// and enforces that a non-empty segment chain begins at expectedStart.
+// If expectedStart <= 0, default initial segment ID 1 is used.
+func ValidateSegmentContinuityFrom(ids []uint64, expectedStart uint64) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	if ids[0] != 1 {
+	if expectedStart <= 0 {
+		expectedStart = 1
+	}
+	if ids[0] != expectedStart {
 		return &errors.SegmentGapError{
-			Expected: 1,
+			Expected: expectedStart,
 			Actual:   ids[0],
 		}
 	}

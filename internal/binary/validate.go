@@ -80,7 +80,7 @@ func ValidateEncodedInternalKey(data []byte) error {
 	if err := ValidateKey(data[:userKeyLen]); err != nil {
 		return err
 	}
-	opTypeByte := data[userKeyLen+8]
+	opTypeByte := data[userKeyLen+InternalKeyTrailerLen-1]
 	_, err := ParseOpType(opTypeByte)
 	return err
 }

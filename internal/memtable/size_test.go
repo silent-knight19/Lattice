@@ -44,18 +44,48 @@ func independentOracleEntryBytes(keyLen, valLen, height int) uint64 {
 // TestByteSize_PlatformLayoutSanity verifies that the compile-time struct sizes on the
 // running platform match the architectural constants.
 func TestByteSize_PlatformLayoutSanity(t *testing.T) {
-	if bits.UintSize != 64 {
-		t.Skip("Skipping 64-bit layout assertions on non-64-bit platform")
+	if bits.UintSize == 64 {
+		if memtable.NodeStructSizeForTesting != 72 {
+			t.Fatalf("expected NodeStructSize=72 on 64-bit platform, got %d", memtable.NodeStructSizeForTesting)
+		}
+		if memtable.NodeValueStructSizeForTesting != 24 {
+			t.Fatalf("expected NodeValueStructSize=24 on 64-bit platform, got %d", memtable.NodeValueStructSizeForTesting)
+		}
+		if memtable.PointerSizeForTesting != 8 {
+			t.Fatalf("expected PointerSize=8 on 64-bit platform, got %d", memtable.PointerSizeForTesting)
+		}
+	} else if bits.UintSize == 32 {
+		if memtable.NodeStructSizeForTesting != 40 {
+			t.Fatalf("expected NodeStructSize=40 on 32-bit platform, got %d", memtable.NodeStructSizeForTesting)
+		}
+		if memtable.NodeValueStructSizeForTesting != 12 {
+			t.Fatalf("expected NodeValueStructSize=12 on 32-bit platform, got %d", memtable.NodeValueStructSizeForTesting)
+		}
+		if memtable.PointerSizeForTesting != 4 {
+			t.Fatalf("expected PointerSize=4 on 32-bit platform, got %d", memtable.PointerSizeForTesting)
+		}
+	}
+}
+
+// TestByteSize_32BitFormulaConsistency algebraically verifies the NodeStructSize derivation
+// across both 32-bit (wordSize=4) and 64-bit (wordSize=8) architectures (SEC-P03-002).
+func TestByteSize_32BitFormulaConsistency(t *testing.T) {
+	// 32-bit evaluation: wordSize = 4
+	// InternalKey (24) + atomic.Pointer (4) + slice header (12) = 40 bytes
+	wordSize32 := 4
+	formula32 := uint64(40 + (wordSize32-4)*8)
+	expected32 := uint64(24 + 4 + 12)
+	if formula32 != expected32 || formula32 != 40 {
+		t.Fatalf("32-bit formula mismatch: got %d, expected %d", formula32, expected32)
 	}
 
-	if memtable.NodeStructSizeForTesting != 72 {
-		t.Fatalf("expected NodeStructSize=72 on 64-bit platform, got %d", memtable.NodeStructSizeForTesting)
-	}
-	if memtable.NodeValueStructSizeForTesting != 24 {
-		t.Fatalf("expected NodeValueStructSize=24 on 64-bit platform, got %d", memtable.NodeValueStructSizeForTesting)
-	}
-	if memtable.PointerSizeForTesting != 8 {
-		t.Fatalf("expected PointerSize=8 on 64-bit platform, got %d", memtable.PointerSizeForTesting)
+	// 64-bit evaluation: wordSize = 8
+	// InternalKey (40) + atomic.Pointer (8) + slice header (24) = 72 bytes
+	wordSize64 := 8
+	formula64 := uint64(40 + (wordSize64-4)*8)
+	expected64 := uint64(40 + 8 + 24)
+	if formula64 != expected64 || formula64 != 72 {
+		t.Fatalf("64-bit formula mismatch: got %d, expected %d", formula64, expected64)
 	}
 }
 

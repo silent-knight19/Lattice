@@ -43,3 +43,12 @@ func SetOpenSyncDirFnForTesting(fn func(dirPath string) error) func() {
 		openSyncDirFn = prev
 	}
 }
+
+// SetInitSyncParentDirFnForTesting overrides initSyncParentDirFn for testing parent directory sync during InitDir.
+func SetInitSyncParentDirFnForTesting(fn func(dirPath string) error) func() {
+	prev := initSyncParentDirFn
+	initSyncParentDirFn = fn
+	return func() {
+		initSyncParentDirFn = prev
+	}
+}

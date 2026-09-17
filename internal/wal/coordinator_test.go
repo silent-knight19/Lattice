@@ -1460,3 +1460,53 @@ func TestCoordinator_EmptyDBPath(t *testing.T) {
 		t.Errorf("expected os.ErrInvalid, got: %v", err)
 	}
 }
+
+// TestSEC_P02_002_CustomInitialSegmentID verifies that custom initial segment ID deployments
+// can be recovered using RecoverWALFrom while preserving default P07-SEC-013 strictness on RecoverWAL.
+func TestSEC_P02_002_CustomInitialSegmentID(t *testing.T) {
+	dbPath := t.TempDir()
+
+	opts := wal.Options{
+		InitialSegmentID: 100,
+	}
+	writer, err := wal.OpenRotatingWriter(dbPath, opts)
+	if err != nil {
+		t.Fatalf("failed to open rotating writer with custom InitialSegmentID: %v", err)
+	}
+
+	rec1 := testRecord(1, "k1", "v1")
+	if err := writer.AppendSync(rec1); err != nil {
+		_ = writer.Close()
+		t.Fatalf("append failed: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+
+	// 1. RecoverWAL expects segment 1 (P07-SEC-013) -> must fail with SegmentGapError
+	_, err = wal.RecoverWAL(dbPath, nil)
+	if err == nil {
+		t.Fatalf("expected RecoverWAL to reject segment starting at 100 under default policy, got nil")
+	}
+	if !stdErrors.Is(err, errors.ErrSegmentGap) {
+		t.Errorf("expected ErrSegmentGap, got %v", err)
+	}
+
+	// 2. ValidateSegmentContinuityFrom directly
+	if err := wal.ValidateSegmentContinuityFrom([]uint64{100, 101, 102}, 100); err != nil {
+		t.Errorf("ValidateSegmentContinuityFrom failed: %v", err)
+	}
+
+	// 3. RecoverWALFrom with expected start ID 100 -> succeeds
+	sink := &recordingSink{}
+	report, err := wal.RecoverWALFrom(dbPath, sink, 100)
+	if err != nil {
+		t.Fatalf("RecoverWALFrom failed: %v", err)
+	}
+	if report.SegmentCount != 1 || report.HighestSegmentID != 100 {
+		t.Errorf("unexpected report: count=%d highest=%d", report.SegmentCount, report.HighestSegmentID)
+	}
+	if report.ValidRecords != 1 || len(sink.records) != 1 {
+		t.Errorf("expected 1 record recovered, got valid=%d replayed=%d", report.ValidRecords, len(sink.records))
+	}
+}

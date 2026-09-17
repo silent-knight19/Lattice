@@ -100,7 +100,7 @@ func recoverSegmentWithSeams(
 	}
 
 	// Open descriptor for in-place read/truncate without O_CREATE or O_TRUNC
-	f, err := os.OpenFile(cleanPath, os.O_RDWR, 0)
+	f, err := openFileNoFollow(cleanPath, os.O_RDWR, 0)
 	if err != nil {
 		return res, fmt.Errorf("wal: failed to open recovery file %s: %w", cleanPath, err)
 	}
@@ -123,7 +123,10 @@ func recoverSegmentWithSeams(
 	if lstatErr != nil {
 		return res, fmt.Errorf("wal: failed to lstat recovery file %s: %w", cleanPath, lstatErr)
 	}
-	if !os.SameFile(finfo, postInfo) {
+	if postInfo.Mode()&os.ModeSymlink != 0 {
+		return res, fmt.Errorf("wal: recovery file %s was replaced with symlink: %w", cleanPath, os.ErrInvalid)
+	}
+	if !os.SameFile(finfo, postInfo) || !os.SameFile(finfo, info) {
 		return res, fmt.Errorf("wal: recovery file %s was replaced during open: %w", cleanPath, os.ErrInvalid)
 	}
 

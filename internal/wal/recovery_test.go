@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/silent-knight19/lattice/internal/binary"
@@ -1128,5 +1129,28 @@ func TestRecovery_PostTruncationVerificationFailure(t *testing.T) {
 	}
 	if !res.Truncated {
 		t.Errorf("expected Truncated=true because Truncate succeeded before verification failed, got false")
+	}
+}
+
+// TestSEC_P02_001_DoubleSameFilePinning verifies that RecoverSegment rejects
+// symlink targets and enforces double SameFile inode pinning.
+func TestSEC_P02_001_DoubleSameFilePinning(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink tests skipped on Windows without elevated privileges")
+	}
+
+	dir := t.TempDir()
+	targetPath := filepath.Join(dir, "target.log")
+	rec := makeValidRecord(1, "k1", "v1")
+	appendRecordToFile(t, targetPath, rec)
+
+	symlinkPath := filepath.Join(dir, "symlink.log")
+	if err := os.Symlink(targetPath, symlinkPath); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
+	}
+
+	_, err := wal.RecoverSegment(symlinkPath)
+	if err == nil {
+		t.Fatal("expected RecoverSegment to reject symlink path, got nil")
 	}
 }
