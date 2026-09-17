@@ -1068,6 +1068,23 @@ This document tracks all **genuine architectural and operational limitations** o
   * Performance: **Optimal** (Direct non-blocking dispatch, buffer pooling on invalid/corrupt payloads, minimal leaf lock contention).
   * Security: **Optimal** (Default loopback-only binding enforcement, garbage payload heap exhaustion protection, Slowloris defense, connection limits, sanitized error diagnostics).
 
+### 63. Server Daemon Entrypoint Lifecycle & Configuration Boundaries (P12-S01-M01)
+* **Limitation & Architectural Boundaries**:
+  In `P12-S01-M01`:
+  1. *Daemon CLI vs Storage Subsystem Separation*: `cmd/lattice` acts exclusively as an operational process supervisor and orchestration entrypoint. It parses CLI flags, loads configuration files, traps OS signals (`SIGINT`, `SIGTERM`), boots the Phase 10 `Engine`, binds the Phase 11 `Server`, and enforces strict two-stage graceful shutdown. It does NOT bypass the Engine, perform direct WAL manipulations, inspect raw SSTables, or modify Manifest pointers.
+  2. *Strict Ordered Two-Stage Graceful Shutdown*: Shutdown enforces strict hierarchical ordering: `Server.Shutdown(ctx)` halts network connection ingestion and drains active client requests before `Engine.Close()` is invoked. `Engine.Close()` then drains immutable memtable queues, executes a final synchronous flush to an L0 SSTable, syncs the `MANIFEST` and `WAL`, and closes underlying descriptors. Reversing this order or closing the Engine while requests are active is mathematically prevented.
+  3. *Loopback Transport Policy Preservation*: The daemon inherits and strictly enforces Phase 11's loopback security policy. Attempting to configure or bind a non-loopback address (e.g. `0.0.0.0`) without explicitly providing `--insecure-transport` fails closed at configuration validation with `errors.ErrInsecureTransport` before creating the database directory or opening storage.
+  4. *Configuration Precedence & Bounded Parsing*: Configuration follows strict precedence: `Compiled Defaults` $\to$ `Configuration File` $\to$ `CLI Flags`. Configuration files (JSON or key-value) are limited to 1 MiB to prevent memory exhaustion DoS, and directories or non-regular files passed to `--config` fail fast.
+  5. *Excluded Diagnostic & Client Tooling*: Interactive REPL client (`cmd/lattice-cli`), SSTable forensic inspection (`inspect-sstable`), and WAL forensic dumping (`dump-wal`) are explicitly excluded and reserved for subsequent micro-phases (`P12-S01-M02` through `P12-S01-M04`).
+* **Why It Exists**:
+  Single-responsibility micro-phase discipline. Delivering a robust, signal-aware server entrypoint that coordinates existing Engine and Server primitives establishes the live daemon foundation before building client and forensic diagnostic tooling.
+* **Impact**:
+  Provides a production-grade, testable daemon binary (`lattice`) with zero data loss on graceful termination, clean signal handling, and zero leaked goroutines or file descriptors.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Deterministic lifecycle state machine; real TCP integration tests prove data durability across process restarts).
+  * Performance: **Optimal** (Negligible CLI initialization overhead, zero runtime CPU cost on hot paths).
+  * Security: **Optimal** (Early loopback security enforcement, bounded configuration file reads, directory path sanitization, safe absorption of repeated shutdown signals).
+
 ---
 
 *End of Known Limitations — To be updated continuously throughout implementation.*

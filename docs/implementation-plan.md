@@ -2236,7 +2236,12 @@ TOTAL: 176 Discrete, Testable Micro-Phases
 * **Dependencies**: Phase 11.
 
 * **P12-S01-M01: Server Daemon CLI Entrypoint (`cmd/lattice`)**
-  * *Objective*: Implement CLI flag parsing (`--config`, `--data-dir`, `--port`), signal handling (`SIGINT`, `SIGTERM`).
+  * *Status*: **Completed**
+  * *Objective*: Implement CLI flag parsing (`--config`, `--data-dir`, `--port`, `--address`, `--insecure-transport`), signal handling (`SIGINT`, `SIGTERM`), Engine initialization, and ordered graceful shutdown.
+  * *Changes*: `cmd/lattice/main.go`, `cmd/lattice/config.go`, `cmd/lattice/daemon.go`, `cmd/lattice/daemon_test.go`.
+  * *Security*: Enforces loopback security constraint fail-closed (`errors.ErrInsecureTransport`) unless `--insecure-transport` is explicitly provided; bounds config files to 1 MiB to prevent memory exhaustion DoS; sanitizes and normalizes paths via `filepath.Clean`; safe absorption of repeated signals.
+  * *Tests*: Flag parsing and defaults, boundary port validation (`-1`, `0`, `65535`, `65536`), config precedence (defaults $\to$ config file $\to$ CLI flags), key-value & JSON config parsing, loopback security enforcement, port collision handling, full lifecycle real TCP PUT/GET/DELETE integration, durability restart verification, and real subprocess signal shutdown.
+  * *Completion*: Server daemon entrypoint and lifecycle orchestration verified.
 * **P12-S01-M02: Interactive REPL Client (`cmd/lattice-cli`)**
   * *Objective*: Interactive prompt supporting `PUT`, `GET`, `DELETE`, `EXISTS`, `STATS` commands with colored output.
 * **P12-S01-M03: SSTable Forensic Inspection Tool (`lattice inspect-sstable`)**
