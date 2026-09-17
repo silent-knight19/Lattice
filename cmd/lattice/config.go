@@ -229,7 +229,13 @@ func (c *Config) Validate() error {
 func loadConfigFile(path string) (*Config, error) {
 	cleanPath := filepath.Clean(path)
 
-	info, err := os.Stat(cleanPath)
+	f, err := os.Open(cleanPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
 	if err != nil {
 		return nil, err
 	}
@@ -239,12 +245,6 @@ func loadConfigFile(path string) (*Config, error) {
 	if info.Size() > MaxConfigFileSize {
 		return nil, fmt.Errorf("configuration file size %d exceeds maximum limit %d bytes", info.Size(), MaxConfigFileSize)
 	}
-
-	f, err := os.Open(cleanPath)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
 
 	data, err := io.ReadAll(io.LimitReader(f, MaxConfigFileSize+1))
 	if err != nil {
