@@ -104,7 +104,13 @@ func FormatValue(val []byte) string {
 			isPrintable = false
 			break
 		}
-		if !strconv.IsPrint(r) && r != '\n' && r != '\r' && r != '\t' {
+		if r == '\r' {
+			// Bare carriage return without newline is treated as non-printable to prevent terminal line rewriting
+			if i+1 >= len(val) || val[i+1] != '\n' {
+				isPrintable = false
+				break
+			}
+		} else if !strconv.IsPrint(r) && r != '\n' && r != '\t' {
 			isPrintable = false
 			break
 		}

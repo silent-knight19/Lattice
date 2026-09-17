@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/filter"
@@ -477,5 +478,36 @@ func TestBinarySubprocess_InspectSSTable(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "Status            : CORRUPT") {
 		t.Errorf("expected CORRUPT in output, got: %s", string(out))
+	}
+}
+
+// TestInspectSSTable_FIFORejection verifies SEC-P12-001:
+// Pointing inspect-sstable at a named pipe (FIFO) fails immediately with an error
+// and does not block indefinitely in os.Open.
+func TestInspectSSTable_FIFORejection(t *testing.T) {
+	tempDir := t.TempDir()
+	fifoPath := filepath.Join(tempDir, "test.fifo")
+
+	cmd := exec.Command("mkfifo", fifoPath)
+	if err := cmd.Run(); err != nil {
+		t.Skipf("mkfifo not supported in test environment: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		var report ForensicReport
+		done <- InspectSSTable(fifoPath, &report)
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected error on FIFO, got nil")
+		}
+		if !strings.Contains(err.Error(), "not a regular file") {
+			t.Errorf("expected 'not a regular file' error, got: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("CRITICAL: InspectSSTable blocked indefinitely on FIFO!")
 	}
 }

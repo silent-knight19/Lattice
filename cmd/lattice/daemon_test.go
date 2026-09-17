@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -161,6 +162,32 @@ func TestFlagParsing_LoopbackSecurityEnforcement(t *testing.T) {
 	}
 	if cfg.Address != "0.0.0.0:9099" || !cfg.InsecureTransport {
 		t.Fatalf("unexpected config: %+v", cfg)
+	}
+}
+
+// TestFlagParsing_UnexpectedPositionalArguments verifies SEC-P12-002:
+// Unrecognized subcommands and unexpected positional arguments are rejected with an error.
+func TestFlagParsing_UnexpectedPositionalArguments(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"unknown_subcommand", []string{"foobar"}},
+		{"misspelled_subcommand", []string{"dump_wal"}},
+		{"extra_trailing_arg", []string{"--port", "9099", "trailing_value"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stdout, stderr := bytes.NewBuffer(nil), bytes.NewBuffer(nil)
+			_, _, err := ParseFlags(tc.args, stdout, stderr)
+			if err == nil {
+				t.Fatalf("expected error for args %v, got nil", tc.args)
+			}
+			if !strings.Contains(err.Error(), "unexpected argument") {
+				t.Errorf("expected 'unexpected argument' error, got: %v", err)
+			}
+		})
 	}
 }
 

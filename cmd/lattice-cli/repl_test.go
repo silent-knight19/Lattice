@@ -401,6 +401,16 @@ func TestFormatValue(t *testing.T) {
 		t.Errorf("expected %q, got %q", "hello\nworld\t1", got)
 	}
 
+	// String with CRLF newlines and tabs
+	if got := FormatValue([]byte("hello\r\nworld\t1")); got != "hello\r\nworld\t1" {
+		t.Errorf("expected %q, got %q", "hello\r\nworld\t1", got)
+	}
+
+	// Bare carriage return without newline is escaped to prevent terminal line overwriting
+	if got := FormatValue([]byte("hello\rworld")); got != `"hello\rworld"` {
+		t.Errorf("expected escaped bare CR %q, got %q", `"hello\rworld"`, got)
+	}
+
 	// Binary data with non-printable bytes
 	bin := []byte{0x00, 0x01, 'A', 0xff}
 	got := FormatValue(bin)

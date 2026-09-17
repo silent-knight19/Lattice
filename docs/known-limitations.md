@@ -1140,6 +1140,21 @@ This document tracks all **genuine architectural and operational limitations** o
   * Performance: **Optimal** (Single-pass sequential streaming, $O(1)$ memory consumption, minimal allocations).
   * Security: **Optimal** (Read-only immutability, TOCTOU inode pinning, bounded payload allocations, terminal injection prevention).
 
+### 67. Security Remediation for Phase 12 CLI and Forensic Handlers (SEC-P12-001, SEC-P12-002)
+* **Limitation & Architectural Boundaries**:
+  Post-Phase 12 security audit hardening resolved:
+  1. *FIFO Pre-Open Validation (`SEC-P12-001`)*: `InspectSSTable` performs pre-open inspection via `os.Stat(cleanPath)` before calling `os.Open()`, immediately rejecting non-regular files (FIFOs, sockets, device nodes) and eliminating kernel open blocking when targeted at named pipes without writers.
+  2. *Strict Root Subcommand Validation (`SEC-P12-002`)*: `ParseFlags` validates that trailing positional argument slice `fs.Args()` is strictly empty. Unrecognized subcommands or misspelled arguments (e.g. `lattice dump_wal`) fail fast with a configuration error instead of defaulting to daemon server startup.
+  3. *Bare Carriage Return Sanitization*: `FormatValue` in `lattice-cli` classifies bare carriage returns (`\r` not followed by `\n`) as non-printable, preventing terminal line rewriting attacks while maintaining clean support for CRLF newlines.
+* **Why It Exists**:
+  Protects local operators and automation pipelines from unintentional hangs, terminal spoofing, or unintended daemon background execution caused by syntax typos or named pipes.
+* **Impact**:
+  Strengthens defensive boundaries across all CLI tools (`cmd/lattice` and `cmd/lattice-cli`).
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Fail-fast rejection on unknown commands and non-regular files).
+  * Performance: **Optimal** (Zero open blocking; minimal stat overhead).
+  * Security: **Optimal** (Mitigates local DoS from FIFOs, port occupation from typos, and terminal spoofing from bare CR).
+
 ---
 
 *End of Known Limitations — To be updated continuously throughout implementation.*

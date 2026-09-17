@@ -186,6 +186,11 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 		cfg.Address = net.JoinHostPort(DefaultHost, strconv.Itoa(cfg.Port))
 	}
 
+	// Reject unexpected positional arguments (e.g. typos like 'lattice dump_wal' or unknown subcommands)
+	if len(fs.Args()) > 0 {
+		return nil, false, fmt.Errorf("config error: unexpected argument %q (see --help for usage)", fs.Args()[0])
+	}
+
 	// Step 4: Validate Normalized Configuration
 	if err := cfg.Validate(); err != nil {
 		return nil, false, err

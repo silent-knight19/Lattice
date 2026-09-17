@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -145,7 +146,19 @@ func FormatBytes(b []byte) string {
 // InspectSSTable performs a read-only forensic inspection of an SSTable file at path.
 // It populates a ForensicReport without mutating the file or initializing the storage Engine.
 func InspectSSTable(path string, report *ForensicReport) error {
-	file, err := os.Open(path)
+	cleanPath := filepath.Clean(path)
+
+	// Pre-open stat: verify target exists and is a regular file before calling os.Open.
+	// This prevents blocking indefinitely on named pipes (FIFOs) waiting for a writer (SEC-P12-001).
+	info, err := os.Stat(cleanPath)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("path %q is not a regular file (mode: %s)", cleanPath, info.Mode())
+	}
+
+	file, err := os.Open(cleanPath)
 	if err != nil {
 		return err
 	}
@@ -156,10 +169,10 @@ func InspectSSTable(path string, report *ForensicReport) error {
 		return err
 	}
 	if !stat.Mode().IsRegular() {
-		return fmt.Errorf("path %q is not a regular file (mode: %s)", path, stat.Mode())
+		return fmt.Errorf("path %q is not a regular file (mode: %s)", cleanPath, stat.Mode())
 	}
 
-	report.Path = path
+	report.Path = cleanPath
 	report.FileSize = stat.Size()
 	fileSize := stat.Size()
 
