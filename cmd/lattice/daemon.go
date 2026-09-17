@@ -36,6 +36,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 // runWithContext executes the daemon lifecycle with context and optional readiness signal.
 func runWithContext(ctx context.Context, args []string, stdout, stderr io.Writer, readyCh chan<- struct{}) int {
+	if len(args) > 0 && args[0] == "inspect-sstable" {
+		return runInspectSSTable(args[1:], stdout, stderr)
+	}
+
 	cfg, isHelpOrVersion, err := ParseFlags(args, stdout, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "lattice: %v\n", err)

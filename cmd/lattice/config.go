@@ -99,7 +99,10 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 
 	fs.Usage = func() {
 		fmt.Fprintf(stdout, "Usage of lattice:\n")
-		fmt.Fprintf(stdout, "  lattice [flags]\n\n")
+		fmt.Fprintf(stdout, "  lattice [flags]\n")
+		fmt.Fprintf(stdout, "  lattice <command> [arguments]\n\n")
+		fmt.Fprintf(stdout, "Commands:\n")
+		fmt.Fprintf(stdout, "  inspect-sstable  Inspect physical SSTable file\n\n")
 		fmt.Fprintf(stdout, "Flags:\n")
 		fs.SetOutput(stdout)
 		fs.PrintDefaults()

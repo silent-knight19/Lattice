@@ -2248,7 +2248,11 @@ TOTAL: 176 Discrete, Testable Micro-Phases
   * *Tests*: Flag parsing and overrides, single and double quote tokenization, escape sequences (`\n`, `\t`, `\r`, `\xHH`), empty value vs missing arg preservation, command validation, mock client execution, scripted REPL loop, EOF handling, sequence ID and opcode mismatch detection, live storage engine TCP integration, binary subprocess tests (server unavailable, help/version, scripted stdin pipeline).
   * *Completion*: Interactive REPL client implemented and verified.
 * **P12-S01-M03: SSTable Forensic Inspection Tool (`lattice inspect-sstable`)**
-  * *Objective*: Read raw SSTable file, print block counts, key ranges, Bloom filter stats, and restart points.
+  * *Objective*: Read raw SSTable file, print block counts, key ranges, Bloom filter stats, restart points, and verify checksums.
+  * *Changes*: `cmd/lattice/inspect.go`, `cmd/lattice/daemon.go`, `cmd/lattice/config.go`, `cmd/lattice/inspect_test.go`, `cmd/lattice/inspect_fuzz_test.go`.
+  * *Security*: Strictly read-only file access (`os.Open`, `O_RDONLY`); zero mutation or repair paths; integer overflow guards on all offset/size arithmetic; bounded memory allocation (`MaxDataBlockSize` 8 MiB, `MaxIndexBlockSize` 8 MiB, `MaxRestartCount` 65536); terminal escape protection via `FormatBytes` (`\xHH` escaping); zero Engine or transport subsystem imports.
+  * *Tests*: Valid single-block and multi-block SSTable inspection, binary key inspection, byte-for-byte SHA-256 read-only immutability verification, comprehensive corruption matrix (truncated file, corrupted magic, invalid padding, corrupted index CRC, corrupted data block CRC, excessive restart count), CLI flag and usage tests, real binary subprocess verification, and native Go fuzzing (`FuzzInspectSSTable`).
+  * *Completion*: SSTable forensic inspection tool implemented and verified.
 * **P12-S01-M04: WAL Forensic Dump Tool (`lattice dump-wal`)**
   * *Objective*: Decode and print every WAL record, sequence number, and CRC status for debugging corruptions.
 

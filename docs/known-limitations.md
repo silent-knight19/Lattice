@@ -1103,6 +1103,24 @@ This document tracks all **genuine architectural and operational limitations** o
   * Performance: **Optimal** (Streaming bounded tokenization, zero unnecessary buffer allocations).
   * Security: **Optimal** (5 MiB input bounds, no command injection/shell invocation, non-TTY color suppression, no credential leakage via shell history).
 
+### 65. SSTable Forensic Inspection Tool Boundaries & Read-Only Invariants (P12-S01-M03)
+* **Limitation & Architectural Boundaries**:
+  In `P12-S01-M03`:
+  1. *Strict Read-Only Guarantee*: `lattice inspect-sstable` opens target files strictly with `O_RDONLY`. It never repairs, rewrites, compacts, deletes, syncs, or truncates inspected SSTables. Byte-for-byte SHA-256 immutability is verified across inspections.
+  2. *Single-Artifact Scope*: Operates strictly on the single file path provided by the user. Automatic data directory recursion, manifest-driven table resolution, and bulk database verification are excluded.
+  3. *Independent Diagnostic Tooling*: Does not initialize the `Engine`, `VersionSet`, `MemTable`, `WAL`, or `BlockCache`. Operates directly on the raw on-disk SSTable structures (`Footer`, `BlockIndex`, `MetaIndex`, `BloomFilter`, `DataBlocks`).
+  4. *Defensive Memory Bounds & Anti-DoS*: Rejects block sizes exceeding `MaxDataBlockSize` (8 MiB) and `MaxIndexBlockSize` (8 MiB), restart counts exceeding `MaxRestartCount` (65,536), and bit counts exceeding `MaxBitsetBytes` (256 MiB) prior to memory allocation.
+  5. *Binary Output Safety*: All key bytes in forensic output are escaped with `\xHH` when non-printable, preventing terminal control sequence manipulation attacks.
+  6. *Excluded Forensic Tooling*: WAL forensic dumping (`dump-wal`) remains excluded and deferred to `P12-S01-M04`.
+* **Why It Exists**:
+  Guarantees that diagnostic and forensic inspection can be safely performed on suspect or corrupted SSTable files without triggering unwanted mutations, engine side-effects, or terminal crashes.
+* **Impact**:
+  Provides a secure, deterministic, offline diagnostic tool for inspecting physical SSTables and diagnosing corruptions.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Exact physical format decoding; comprehensive CRC, magic, padding, and restart point validation).
+  * Performance: **Optimal** (Targeted positional `ReadAt` reads; minimal memory allocation).
+  * Security: **Optimal** (Read-only immutability, integer overflow protection on all block handle offsets, bounded memory allocations, terminal injection protection).
+
 ---
 
 *End of Known Limitations — To be updated continuously throughout implementation.*
