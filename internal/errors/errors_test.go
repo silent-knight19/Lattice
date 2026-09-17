@@ -1875,3 +1875,94 @@ func TestManifestCorruptedError(t *testing.T) {
 		t.Errorf("nil *ManifestCorruptedError must match ErrManifestCorrupted via Is")
 	}
 }
+
+func TestTransportFramingErrors(t *testing.T) {
+	// 1. Sentinels
+	transportSentinels := []struct {
+		err error
+		msg string
+	}{
+		{errors.ErrInvalidMagic, "invalid protocol magic: expected 0x4C415454"},
+		{errors.ErrFrameTooLarge, "frame payload exceeds maximum allowed size"},
+		{errors.ErrInvalidOpCode, "invalid operation code"},
+		{errors.ErrFrameTruncated, "frame truncated or incomplete"},
+		{errors.ErrInvalidPayload, "invalid frame payload"},
+		{errors.ErrInvalidStatus, "invalid response status code"},
+	}
+	for _, tc := range transportSentinels {
+		if tc.err == nil {
+			t.Fatal("expected non-nil error")
+		}
+		if tc.err.Error() != tc.msg {
+			t.Errorf("got msg %q, want %q", tc.err.Error(), tc.msg)
+		}
+		if !stdErrors.Is(tc.err, tc.err) {
+			t.Errorf("sentinel must match itself")
+		}
+	}
+
+	// 2. InvalidMagicError
+	magicErr := &errors.InvalidMagicError{Expected: 0x4C415454, Actual: 0x12345678}
+	if !stdErrors.Is(magicErr, errors.ErrInvalidMagic) {
+		t.Error("magicErr must match ErrInvalidMagic")
+	}
+	if !strings.Contains(magicErr.Error(), "0x4c415454") {
+		t.Errorf("unexpected magic error msg: %s", magicErr.Error())
+	}
+	var nilMagic *errors.InvalidMagicError
+	if nilMagic.Error() != errors.ErrInvalidMagic.Error() || !nilMagic.Is(errors.ErrInvalidMagic) {
+		t.Error("nilMagic mismatch")
+	}
+
+	// 3. FrameTooLargeError
+	largeErr := &errors.FrameTooLargeError{PayloadSize: 6000000, MaxSize: 5242880}
+	if !stdErrors.Is(largeErr, errors.ErrFrameTooLarge) {
+		t.Error("largeErr must match ErrFrameTooLarge")
+	}
+	if !strings.Contains(largeErr.Error(), "6000000") {
+		t.Errorf("unexpected large error msg: %s", largeErr.Error())
+	}
+	var nilLarge *errors.FrameTooLargeError
+	if nilLarge.Error() != errors.ErrFrameTooLarge.Error() || !nilLarge.Is(errors.ErrFrameTooLarge) {
+		t.Error("nilLarge mismatch")
+	}
+
+	// 4. InvalidOpCodeError
+	opErr := &errors.InvalidOpCodeError{OpCode: 0xFF}
+	if !stdErrors.Is(opErr, errors.ErrInvalidOpCode) {
+		t.Error("opErr must match ErrInvalidOpCode")
+	}
+	if !strings.Contains(opErr.Error(), "0xff") {
+		t.Errorf("unexpected op error msg: %s", opErr.Error())
+	}
+	var nilOp *errors.InvalidOpCodeError
+	if nilOp.Error() != errors.ErrInvalidOpCode.Error() || !nilOp.Is(errors.ErrInvalidOpCode) {
+		t.Error("nilOp mismatch")
+	}
+
+	// 5. InvalidPayloadError
+	payloadErr := &errors.InvalidPayloadError{Reason: "key too short"}
+	if !stdErrors.Is(payloadErr, errors.ErrInvalidPayload) {
+		t.Error("payloadErr must match ErrInvalidPayload")
+	}
+	if !strings.Contains(payloadErr.Error(), "key too short") {
+		t.Errorf("unexpected payload error msg: %s", payloadErr.Error())
+	}
+	var nilPayload *errors.InvalidPayloadError
+	if nilPayload.Error() != errors.ErrInvalidPayload.Error() || !nilPayload.Is(errors.ErrInvalidPayload) {
+		t.Error("nilPayload mismatch")
+	}
+
+	// 6. InvalidStatusError
+	statusErr := &errors.InvalidStatusError{Status: 0xFE}
+	if !stdErrors.Is(statusErr, errors.ErrInvalidStatus) {
+		t.Error("statusErr must match ErrInvalidStatus")
+	}
+	if !strings.Contains(statusErr.Error(), "0xfe") {
+		t.Errorf("unexpected status error msg: %s", statusErr.Error())
+	}
+	var nilStatus *errors.InvalidStatusError
+	if nilStatus.Error() != errors.ErrInvalidStatus.Error() || !nilStatus.Is(errors.ErrInvalidStatus) {
+		t.Error("nilStatus mismatch")
+	}
+}

@@ -1019,6 +1019,30 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 61. Wire Protocol Codec Framing & Storage Engine Boundary (P11-S01-M01)
+* **Limitation & Architectural Boundaries**:
+  In `P11-S01-M01`:
+  1. *Pure Framing Codec*: Implements the length-prefixed binary wire protocol foundation (`internal/transport`), 18-byte fixed header (`0x4C415454`), 4-byte CRC32-IEEE checksum trailer, and typed Request/Response codec without network listeners or socket management (scheduled for `P11-S01-M02`).
+  2. *Pre-Allocation Frame Bounding*: Strict $5\text{MB}$ payload ceiling enforced upon header decode *before* memory allocation. Claims $>5\text{MB}$ fail closed with `ErrFrameTooLarge` and zero payload allocation.
+  3. *Unspecified Wire Contract Resolution*:
+     - `OP_PUT`: Encoded as `[ KeyLen (2B uint16 Big-Endian) | Key (KeyLen B) | Value (remainder B) ]`. Eliminates redundant value length headers and guarantees consistency with total payload length.
+     - `OP_GET`, `OP_DELETE`, `OP_EXISTS`: Encoded as `[ Key (PayloadLength B) ]` directly utilizing the frame payload length.
+     - `OP_BATCH`: Encoded as `[ Count (4B uint32) | Entries... ]` with entries storing `[ OpType (1B) | KeyLen (2B) | Key | ValLen (4B) | Val ]`. Bounded to $\le 1024$ ops and $\le 5\text{MB}$. Storage-level atomic multi-operation execution remains dependent on a future Engine `WriteBatch` API.
+     - `OP_STATS`: Validated with zero payload; unexpected bytes rejected.
+     - `Response`: Symmetrically framed with 18-byte header where byte 5 is `StatusCode` (`StatusOk=0x00`, `StatusKeyNotFound=0x01`, `StatusError=0x02`, `StatusInvalidRequest=0x03`, `StatusThrottled=0x04`, `StatusServerClosed=0x05`), echoing `SeqID` and `OpCode` with a 4-byte CRC32 trailer. Success GET carries raw value; EXISTS carries 1-byte boolean; failures carry diagnostic message string.
+  4. *Buffer Ownership*: `DecodeRequest` and `DecodeResponse` strictly return independent, defensive slice copies of keys, values, and batches. Source frame buffers may be safely recycled without corrupting decoded structs.
+* **Why It Exists**:
+  Separates transport serialization and adversarial framing defense from socket lifecycle and storage engine mechanics.
+* **Impact**:
+  Decouples the wire codec completely from storage engine internals; guarantees bounded allocations under malicious payloads; eliminates slice aliasing races.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Binary transparency, exact round-trip, bit-flip detection, stream fragmentation safety verified under `-race` and fuzzing).
+  * Performance: **Optimal** (Zero-allocation header decode and incremental CRC32 update; single contiguous write framing).
+  * Security: **Optimal** (Pre-allocation $5\text{MB}$ ceiling, integer overflow checks, fail-closed unknown opcodes, defensive buffer copies).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*
+
 
 

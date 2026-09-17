@@ -361,6 +361,24 @@ var (
 	// ErrRecoveryBatchLimitExceeded indicates that a single WAL batch during recovery exceeded
 	// the maximum allowed record count or memory byte budget.
 	ErrRecoveryBatchLimitExceeded = stdErrors.New("recovery batch limit exceeded")
+
+	// ErrInvalidMagic indicates that a network frame header magic number does not match 0x4C415454 ("LATT").
+	ErrInvalidMagic = stdErrors.New("invalid protocol magic: expected 0x4C415454")
+
+	// ErrFrameTooLarge indicates that a network frame's declared payload length exceeds the maximum ceiling (5 MB).
+	ErrFrameTooLarge = stdErrors.New("frame payload exceeds maximum allowed size")
+
+	// ErrInvalidOpCode indicates that a network frame specifies an unrecognized or unsupported operation code.
+	ErrInvalidOpCode = stdErrors.New("invalid operation code")
+
+	// ErrFrameTruncated indicates that a network frame ended prematurely before its declared header, payload, or trailer.
+	ErrFrameTruncated = stdErrors.New("frame truncated or incomplete")
+
+	// ErrInvalidPayload indicates that a network frame payload violates structural or length constraints for its operation.
+	ErrInvalidPayload = stdErrors.New("invalid frame payload")
+
+	// ErrInvalidStatus indicates that a network response specifies an unrecognized or invalid status code.
+	ErrInvalidStatus = stdErrors.New("invalid response status code")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing
@@ -1154,4 +1172,99 @@ func (e *RecoveryBatchLimitError) Error() string {
 // Is reports whether this error matches target sentinel ErrRecoveryBatchLimitExceeded.
 func (e *RecoveryBatchLimitError) Is(target error) bool {
 	return target == ErrRecoveryBatchLimitExceeded
+}
+
+// InvalidMagicError provides structured context when a network frame magic check fails.
+// It matches ErrInvalidMagic when interrogated with errors.Is().
+type InvalidMagicError struct {
+	Expected uint32
+	Actual   uint32
+}
+
+func (e *InvalidMagicError) Error() string {
+	if e == nil {
+		return ErrInvalidMagic.Error()
+	}
+	return fmt.Sprintf("invalid protocol magic: expected 0x%08x, got 0x%08x", e.Expected, e.Actual)
+}
+
+// Is reports whether this error matches target sentinel ErrInvalidMagic.
+func (e *InvalidMagicError) Is(target error) bool {
+	return target == ErrInvalidMagic
+}
+
+// FrameTooLargeError provides structured context when a frame payload exceeds the ceiling limit.
+// It matches ErrFrameTooLarge when interrogated with errors.Is().
+type FrameTooLargeError struct {
+	PayloadSize uint32
+	MaxSize     uint32
+}
+
+func (e *FrameTooLargeError) Error() string {
+	if e == nil {
+		return ErrFrameTooLarge.Error()
+	}
+	return fmt.Sprintf("frame payload size %d bytes exceeds maximum allowed size of %d bytes", e.PayloadSize, e.MaxSize)
+}
+
+// Is reports whether this error matches target sentinel ErrFrameTooLarge.
+func (e *FrameTooLargeError) Is(target error) bool {
+	return target == ErrFrameTooLarge
+}
+
+// InvalidOpCodeError provides structured context when an unrecognized operation code is encountered.
+// It matches ErrInvalidOpCode when interrogated with errors.Is().
+type InvalidOpCodeError struct {
+	OpCode byte
+}
+
+func (e *InvalidOpCodeError) Error() string {
+	if e == nil {
+		return ErrInvalidOpCode.Error()
+	}
+	return fmt.Sprintf("invalid operation code: 0x%02x", e.OpCode)
+}
+
+// Is reports whether this error matches target sentinel ErrInvalidOpCode.
+func (e *InvalidOpCodeError) Is(target error) bool {
+	return target == ErrInvalidOpCode
+}
+
+// InvalidPayloadError provides structured context when a frame payload violates operation constraints.
+// It matches ErrInvalidPayload when interrogated with errors.Is().
+type InvalidPayloadError struct {
+	Reason string
+}
+
+func (e *InvalidPayloadError) Error() string {
+	if e == nil {
+		return ErrInvalidPayload.Error()
+	}
+	if e.Reason != "" {
+		return fmt.Sprintf("invalid frame payload: %s", e.Reason)
+	}
+	return ErrInvalidPayload.Error()
+}
+
+// Is reports whether this error matches target sentinel ErrInvalidPayload.
+func (e *InvalidPayloadError) Is(target error) bool {
+	return target == ErrInvalidPayload
+}
+
+// InvalidStatusError provides structured context when an unrecognized response status code is encountered.
+// It matches ErrInvalidStatus when interrogated with errors.Is().
+type InvalidStatusError struct {
+	Status byte
+}
+
+func (e *InvalidStatusError) Error() string {
+	if e == nil {
+		return ErrInvalidStatus.Error()
+	}
+	return fmt.Sprintf("invalid response status code: 0x%02x", e.Status)
+}
+
+// Is reports whether this error matches target sentinel ErrInvalidStatus.
+func (e *InvalidStatusError) Is(target error) bool {
+	return target == ErrInvalidStatus
 }

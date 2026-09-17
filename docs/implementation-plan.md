@@ -2215,11 +2215,12 @@ TOTAL: 184 Discrete, Testable Micro-Phases
 
 ### Sub-Phase 11.1: Frame Parsing & Protocol State Machine
 * **P11-S01-M01: 18-Byte Header Decoder & CRC32 Validator**
+  * *Status*: **Completed**
   * *Objective*: Decode magic (`0x4C415454`), OpCode, SeqID, PayloadLen, and verify frame CRC32.
-  * *Changes*: `FrameDecoder.DecodeHeader(r io.Reader) (*Header, error)`.
-  * *Security*: Rejects unknown magic immediately; rejects `PayloadLength > 5MB` with `ErrFrameTooLarge`.
-  * *Tests*: Test valid frames; test oversized frames; test CRC corruption.
-  * *Completion*: Frame decoder verified.
+  * *Changes*: `DecodeHeader`, `DecodeFrame`, `EncodeFrame`, `DecodeRequest`, `EncodeRequest`, `DecodeResponse`, `EncodeResponse` in `internal/transport/`.
+  * *Security*: Rejects unknown magic immediately; rejects `PayloadLength > 5MB` with `ErrFrameTooLarge` before memory allocation; incremental CRC32-IEEE calculation; zero-allocation header decode; defensive slice copies.
+  * *Tests*: Binary layout, magic probe rejection, 5MB+1 & 2GB & MaxUint32 frame bombs, bit-flip CRC detection, stream truncation, 1-byte fragmented reads, coalesced frames, opcode validation, malformed payload rejection, buffer ownership immutability, stream pipe round-trips, native Go fuzzing (2M+ execs).
+  * *Completion*: Frame decoder and defensive request codec verified.
 * **P11-S01-M02: TCP Listener & Goroutine Connection Pool**
   * *Objective*: Accept TCP connections, assign dedicated reader goroutine, dispatch requests to engine.
   * *Changes*: `Server.Listen(addr string) error`.
