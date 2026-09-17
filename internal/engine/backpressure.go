@@ -110,8 +110,8 @@ func (bc *BackpressureController) Acquire(ctx context.Context, bytesNeeded uint6
 	hardCeiling := uint64(float64(bc.cfg.MaxMemoryBytes) * bc.cfg.HardWatermark)
 	highWatermark := uint64(float64(bc.cfg.MaxMemoryBytes) * bc.cfg.HighWatermark)
 
-	// Quick check: if single write exceeds total ceiling, reject immediately
-	if bytesNeeded > hardCeiling {
+	// Quick check: if single write exceeds total ceiling or max memory, reject immediately (LAT-003)
+	if bytesNeeded > hardCeiling || bytesNeeded > bc.cfg.MaxMemoryBytes {
 		bc.rejectedCount.Add(1)
 		return errors.ErrMemoryLimitExceeded
 	}
@@ -124,6 +124,13 @@ func (bc *BackpressureController) Acquire(ctx context.Context, bytesNeeded uint6
 
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
+
+	var waitTimer *time.Timer
+	defer func() {
+		if waitTimer != nil {
+			waitTimer.Stop()
+		}
+	}()
 
 	for {
 		if bc.closed.Load() {
@@ -143,13 +150,16 @@ func (bc *BackpressureController) Acquire(ctx context.Context, bytesNeeded uint6
 				ratio := float64(cur+bytesNeeded-highWatermark) / float64(hardCeiling-highWatermark)
 				delay := time.Duration(ratio * float64(50*time.Millisecond))
 				if delay > 0 {
+					throttleTimer := time.NewTimer(delay)
 					select {
-					case <-time.After(delay):
+					case <-throttleTimer.C:
 					case <-ctx.Done():
+						throttleTimer.Stop()
 						// Release acquired memory on aborted delay
 						bc.Release(bytesNeeded)
 						return ctx.Err()
 					}
+					throttleTimer.Stop()
 				}
 				bc.mu.Lock()
 			}
@@ -157,7 +167,8 @@ func (bc *BackpressureController) Acquire(ctx context.Context, bytesNeeded uint6
 		}
 
 		// Hard limit exceeded: check timeout and context
-		if time.Since(startTime) >= timeout {
+		remaining := timeout - time.Since(startTime)
+		if remaining <= 0 {
 			bc.rejectedCount.Add(1)
 			return errors.ErrMemoryLimitExceeded
 		}
@@ -166,13 +177,25 @@ func (bc *BackpressureController) Acquire(ctx context.Context, bytesNeeded uint6
 			return ctx.Err()
 		}
 
+		if waitTimer == nil {
+			waitTimer = time.NewTimer(remaining)
+		} else {
+			if !waitTimer.Stop() {
+				select {
+				case <-waitTimer.C:
+				default:
+				}
+			}
+			waitTimer.Reset(remaining)
+		}
+
 		ch := bc.notifyCh
 		bc.mu.Unlock()
 
 		select {
 		case <-ch:
 			bc.mu.Lock()
-		case <-time.After(timeout - time.Since(startTime)):
+		case <-waitTimer.C:
 			bc.mu.Lock()
 			bc.rejectedCount.Add(1)
 			return errors.ErrMemoryLimitExceeded

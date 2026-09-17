@@ -199,3 +199,51 @@ func TestBackpressure_NoGoroutineLeakOnTimeout(t *testing.T) {
 		t.Fatalf("failed to acquire after release: %v", err)
 	}
 }
+
+func TestBackpressure_TimerResourceManagementAndOversizedRejection(t *testing.T) {
+	cfg := engine.BackpressureConfig{
+		MaxMemoryBytes: 10 * 1024,
+		HighWatermark:  0.80,
+		HardWatermark:  0.90,
+		MaxWaitTimeout: 50 * time.Millisecond,
+	}
+	bc := engine.NewBackpressureController(cfg)
+	defer bc.Close()
+
+	ctx := context.Background()
+
+	// 1. Verify oversized request exceeds MaxMemoryBytes rejected immediately (LAT-003)
+	if err := bc.Acquire(ctx, 20*1024); !errors.Is(err, domainErrors.ErrMemoryLimitExceeded) {
+		t.Fatalf("expected ErrMemoryLimitExceeded for > MaxMemoryBytes, got: %v", err)
+	}
+
+	// 2. Fill to hard capacity
+	if err := bc.Acquire(ctx, 9*1024); err != nil {
+		t.Fatalf("failed initial acquire: %v", err)
+	}
+
+	// 3. Test context cancellation while blocked on timer (LAT-001 cleanup)
+	cancelCtx, cancel := context.WithCancel(ctx)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- bc.Acquire(cancelCtx, 512)
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled, got: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for cancelled Acquire")
+	}
+
+	// 4. Release and verify subsequent acquire succeeds smoothly
+	bc.Release(5 * 1024)
+	if err := bc.Acquire(ctx, 1024); err != nil {
+		t.Fatalf("expected acquire after release to succeed: %v", err)
+	}
+}
