@@ -5,6 +5,7 @@ import (
 	stdErrors "errors"
 	"fmt"
 	"hash/crc32"
+	"math"
 	"testing"
 
 	"github.com/silent-knight19/lattice/internal/binary"
@@ -529,3 +530,69 @@ func BenchmarkFilterBlockCodec(b *testing.B) {
 		})
 	}
 }
+
+// TestFilterBlock_AdversarialParameterDesync verifies that the reader and writer share identical
+// parameter definitions, and that hostile, desynced, or out-of-spec parameters (k != 7, bitCount overflows,
+// or payload length mismatches) fail closed immediately without false negatives or undefined behavior (SEC-P05-001).
+func TestFilterBlock_AdversarialParameterDesync(t *testing.T) {
+	// 1. Invariant: Writer and reader share the identical Murmur3 seed and hash functions
+	if filter.DefaultMurmur3Seed != 0 {
+		t.Fatalf("DefaultMurmur3Seed changed: got %d, want 0", filter.DefaultMurmur3Seed)
+	}
+	if filter.DefaultHashFunctions != 7 || filter.HashFunctions != 7 {
+		t.Fatalf("DefaultHashFunctions changed: got %d, want 7", filter.DefaultHashFunctions)
+	}
+
+	// 2. Reject all desynced k values (k != 7)
+	testKeys := [][]byte{[]byte("apple"), []byte("banana"), []byte("cherry")}
+	f := filter.NewBloomFilter(len(testKeys))
+	for _, k := range testKeys {
+		f.Add(k)
+	}
+	validBlock := f.Encode()
+
+	hostileKs := []byte{0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 16, 32, 64, 128, 255}
+	for _, hostileK := range hostileKs {
+		// Craft block with hostile k and recalculated valid CRC
+		corrupted := independentOracleEncode(f.Bitset(), f.BitCount(), hostileK)
+		decoded, err := filter.DecodeFilterBlock(corrupted)
+		if !stdErrors.Is(err, errors.ErrUnsupportedHashCount) {
+			t.Errorf("hostile k=%d: expected ErrUnsupportedHashCount, got err=%v, decoded=%+v", hostileK, err, decoded)
+		}
+		if decoded != nil {
+			t.Errorf("hostile k=%d: expected nil decoded filter on error", hostileK)
+		}
+	}
+
+	// 3. BitCount mismatches and arithmetic overflows
+	mismatchedBitCounts := []uint64{
+		0,                                   // declared 0 bits but has 4-byte payload
+		f.BitCount() - 10,                   // 20 bits requires 3 bytes != 4 bytes
+		f.BitCount() + 10,                   // 40 bits requires 5 bytes != 4 bytes
+		math.MaxUint64,                      // max uint64 overflow
+		math.MaxUint64 - 7,                  // near max uint64
+		uint64(filter.MaxBitsetBytes)*8 + 8, // exceeds max bitset capacity
+	}
+	for _, bc := range mismatchedBitCounts {
+		corrupted := independentOracleEncode(f.Bitset(), bc, 7)
+		decoded, err := filter.DecodeFilterBlock(corrupted)
+		if !stdErrors.Is(err, errors.ErrFilterBlockCorrupted) {
+			t.Errorf("hostile bitCount=%d: expected ErrFilterBlockCorrupted, got err=%v", bc, err)
+		}
+		if decoded != nil {
+			t.Errorf("hostile bitCount=%d: expected nil decoded filter on error", bc)
+		}
+	}
+
+	// 4. Honest filter decode must have 0 false negatives
+	honestDecoded, err := filter.DecodeFilterBlock(validBlock)
+	if err != nil {
+		t.Fatalf("honest filter decode failed: %v", err)
+	}
+	for _, k := range testKeys {
+		if !honestDecoded.MayContain(k) {
+			t.Fatalf("honest decoded filter produced false negative for key %q", k)
+		}
+	}
+}
+

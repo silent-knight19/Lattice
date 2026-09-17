@@ -192,6 +192,7 @@ type RotatingWriter struct {
 	activeID  uint64
 	activeLen int64
 	closed    bool
+	dirInfo   os.FileInfo
 
 	// createWriterFn is an internal test seam for injecting creation failures.
 	createWriterFn func(path string) (*WALWriter, error)
@@ -218,8 +219,15 @@ func OpenRotatingWriter(dbPath string, opts Options) (*RotatingWriter, error) {
 	cleanDBPath := filepath.Clean(dbPath)
 
 	// Ensure WAL directory is safely initialized with 0700 permissions
-	if _, err := InitDir(cleanDBPath); err != nil {
+	walDirPath, err := InitDir(cleanDBPath)
+	if err != nil {
 		return nil, fmt.Errorf("wal: failed to initialize directory for rotating writer: %w", err)
+	}
+
+	// Capture authoritative directory file info for inode pinning across rotations
+	dirInfo, err := os.Lstat(walDirPath)
+	if err != nil {
+		return nil, fmt.Errorf("wal: failed to stat initialized wal directory: %w", err)
 	}
 
 	// Normalize configuration options
@@ -278,6 +286,7 @@ func OpenRotatingWriter(dbPath string, opts Options) (*RotatingWriter, error) {
 		activeID:       activeID,
 		activeLen:      activeLen,
 		closed:         false,
+		dirInfo:        dirInfo,
 		createWriterFn: CreateWriter,
 		syncDirFn:      SyncDir,
 	}
@@ -493,6 +502,26 @@ func (rw *RotatingWriter) rotateLocked() error {
 			rw.active = nil
 			return fmt.Errorf("wal: failed to close segment %d during rotation: %w", oldID, err)
 		}
+	}
+
+	// Step 1.5: Verify parent directory has not been replaced with a symlink or swapped
+	walDir := Dir(rw.dbPath)
+	curDirInfo, err := os.Lstat(walDir)
+	if err != nil {
+		rw.active = nil
+		return fmt.Errorf("wal: failed to inspect directory during rotation: %w", err)
+	}
+	if !isSystemSymlinkPrefix(walDir) && curDirInfo.Mode()&os.ModeSymlink != 0 {
+		rw.active = nil
+		return fmt.Errorf("%w: wal directory %q is a symlink", errors.ErrParentDirectorySymlink, walDir)
+	}
+	if !curDirInfo.IsDir() {
+		rw.active = nil
+		return &errors.NotADirectoryError{Path: walDir, Mode: curDirInfo.Mode()}
+	}
+	if rw.dirInfo != nil && !os.SameFile(rw.dirInfo, curDirInfo) {
+		rw.active = nil
+		return fmt.Errorf("%w: wal directory swapped during rotation", errors.ErrParentDirectorySwapped)
 	}
 
 	// Step 2: Create next segment N+1 with atomic exclusive creation

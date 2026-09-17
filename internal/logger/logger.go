@@ -96,30 +96,41 @@ const RedactedPlaceholder = "[REDACTED]"
 
 // defaultSensitiveKeys is the baseline set of attribute keys that are automatically redacted.
 var defaultSensitiveKeys = map[string]struct{}{
-	"password":      {},
-	"passwd":        {},
-	"pass":          {},
-	"passphrase":    {},
-	"secret":        {},
-	"token":         {},
-	"auth":          {},
-	"authorization": {},
-	"api_key":       {},
-	"apikey":        {},
-	"private_key":   {},
-	"credential":    {},
-	"credentials":   {},
-	"access_token":  {},
-	"refresh_token": {},
-	"session":       {},
-	"session_id":    {},
-	"sessionid":     {},
-	"cookie":        {},
-	"card":          {},
-	"cvv":           {},
-	"ssn":           {},
-	"salt":          {},
-	"nonce":         {},
+	"password":       {},
+	"passwd":         {},
+	"pass":           {},
+	"passphrase":     {},
+	"pwd":            {},
+	"secret":         {},
+	"secret_key":     {},
+	"master_key":     {},
+	"signing_key":    {},
+	"encryption_key": {},
+	"access_key":     {},
+	"token":          {},
+	"auth":           {},
+	"authorization":  {},
+	"api_key":        {},
+	"apikey":         {},
+	"private_key":    {},
+	"privatekey":     {},
+	"credential":     {},
+	"credentials":    {},
+	"access_token":   {},
+	"refresh_token":  {},
+	"session":        {},
+	"session_id":     {},
+	"sessionid":      {},
+	"cookie":         {},
+	"set_cookie":     {},
+	"card":           {},
+	"cvv":            {},
+	"cvc":            {},
+	"ssn":            {},
+	"salt":           {},
+	"nonce":          {},
+	"mnemonic":       {},
+	"seed":           {},
 }
 
 // Config specifies configuration options for initializing a Logger.
@@ -170,35 +181,35 @@ type defaultLogger struct {
 }
 
 func (l *defaultLogger) Debug(msg string, args ...any) {
-	l.inner.Debug(msg, args...)
+	l.inner.Debug(scrubString(msg), args...)
 }
 
 func (l *defaultLogger) Info(msg string, args ...any) {
-	l.inner.Info(msg, args...)
+	l.inner.Info(scrubString(msg), args...)
 }
 
 func (l *defaultLogger) Warn(msg string, args ...any) {
-	l.inner.Warn(msg, args...)
+	l.inner.Warn(scrubString(msg), args...)
 }
 
 func (l *defaultLogger) Error(msg string, args ...any) {
-	l.inner.Error(msg, args...)
+	l.inner.Error(scrubString(msg), args...)
 }
 
 func (l *defaultLogger) DebugContext(ctx context.Context, msg string, args ...any) {
-	l.inner.DebugContext(ctx, msg, args...)
+	l.inner.DebugContext(ctx, scrubString(msg), args...)
 }
 
 func (l *defaultLogger) InfoContext(ctx context.Context, msg string, args ...any) {
-	l.inner.InfoContext(ctx, msg, args...)
+	l.inner.InfoContext(ctx, scrubString(msg), args...)
 }
 
 func (l *defaultLogger) WarnContext(ctx context.Context, msg string, args ...any) {
-	l.inner.WarnContext(ctx, msg, args...)
+	l.inner.WarnContext(ctx, scrubString(msg), args...)
 }
 
 func (l *defaultLogger) ErrorContext(ctx context.Context, msg string, args ...any) {
-	l.inner.ErrorContext(ctx, msg, args...)
+	l.inner.ErrorContext(ctx, scrubString(msg), args...)
 }
 
 func (l *defaultLogger) With(args ...any) Logger {
@@ -286,6 +297,14 @@ func isAuth(canonical string) bool {
 		strings.Contains(canonical, "_auth_")
 }
 
+// isWord checks if canonical contains word as a discrete segment separated by underscores or at edges.
+func isWord(canonical, word string) bool {
+	return canonical == word ||
+		strings.HasPrefix(canonical, word+"_") ||
+		strings.HasSuffix(canonical, "_"+word) ||
+		strings.Contains(canonical, "_"+word+"_")
+}
+
 // isSensitiveKey checks whether an attribute key matches exact or compound sensitive patterns.
 func isSensitiveKey(key string, exactMap map[string]struct{}) bool {
 	canonical := normalizeKey(key)
@@ -307,23 +326,40 @@ func isSensitiveKey(key string, exactMap map[string]struct{}) bool {
 		strings.Contains(canonical, "passphrase") ||
 		strings.Contains(stripped, "password") ||
 		strings.Contains(stripped, "passwd") ||
+		isWord(canonical, "pwd") ||
 		strings.Contains(canonical, "secret") ||
 		strings.Contains(canonical, "credential") ||
 		strings.Contains(canonical, "private_key") ||
 		strings.Contains(canonical, "privatekey") ||
 		strings.Contains(canonical, "api_key") ||
 		strings.Contains(canonical, "apikey") ||
+		strings.Contains(canonical, "secret_key") ||
+		strings.Contains(canonical, "secretkey") ||
+		strings.Contains(canonical, "master_key") ||
+		strings.Contains(canonical, "masterkey") ||
+		strings.Contains(canonical, "signing_key") ||
+		strings.Contains(canonical, "signingkey") ||
+		strings.Contains(canonical, "encryption_key") ||
+		strings.Contains(canonical, "encryptionkey") ||
+		strings.Contains(canonical, "access_key") ||
+		strings.Contains(canonical, "accesskey") ||
 		strings.Contains(canonical, "authorization") ||
-		strings.Contains(canonical, "session_id") ||
+		canonical == "session" ||
+		strings.HasPrefix(canonical, "session_") ||
+		strings.HasSuffix(canonical, "_session") ||
+		strings.Contains(canonical, "_session_") ||
 		strings.Contains(canonical, "sessionid") ||
 		strings.HasSuffix(canonical, "_token") ||
 		canonical == "token" ||
-		canonical == "cookie" ||
-		canonical == "card" ||
-		canonical == "cvv" ||
-		canonical == "ssn" ||
-		canonical == "salt" ||
-		canonical == "nonce" ||
+		strings.Contains(canonical, "cookie") ||
+		isWord(canonical, "card") ||
+		isWord(canonical, "cvv") ||
+		isWord(canonical, "cvc") ||
+		isWord(canonical, "ssn") ||
+		isWord(canonical, "salt") ||
+		isWord(canonical, "nonce") ||
+		strings.Contains(canonical, "mnemonic") ||
+		isWord(canonical, "seed") ||
 		isAuth(canonical) {
 		return true
 	}
@@ -332,7 +368,7 @@ func isSensitiveKey(key string, exactMap map[string]struct{}) bool {
 }
 
 var (
-	sensitiveKVRegex = regexp.MustCompile(`(?i)\b(password|passwd|secret|token|credential|api_key|apikey|private_key|authorization|auth_token|access_token|refresh_token)\b\s*[:=]\s*([^\s,;\"'}{]+)`)
+	sensitiveKVRegex = regexp.MustCompile(`(?i)\b(password|passwd|pass|pwd|passphrase|secret|token|credential|credentials|api_key|apikey|private_key|privatekey|secret_key|signing_key|encryption_key|master_key|access_key|authorization|auth_token|access_token|refresh_token|cookie|set_cookie|session|session_id|sessionid|cvv|cvc|ssn|salt|nonce|mnemonic|seed)\b\s*[:=]\s*([^\s,;\"'}{]+)`)
 	bearerRegex      = regexp.MustCompile(`(?i)\b(Bearer\s+)([^\s,;\"'}{]+)`)
 )
 
@@ -472,6 +508,29 @@ func scrubValue(v any, redactedMap map[string]struct{}) any {
 	return v
 }
 
+// scrubGroupAttrs recursively scrubs attributes within a slog.Group,
+// redacting sensitive keys at any nesting depth and preserving GroupValue hierarchy.
+func scrubGroupAttrs(attrs []slog.Attr, redactedMap map[string]struct{}) []slog.Attr {
+	scrubbedAttrs := make([]slog.Attr, len(attrs))
+	for i, attr := range attrs {
+		if attr.Key == "" {
+			scrubbedAttrs[i] = attr
+			continue
+		}
+		if isSensitiveKey(attr.Key, redactedMap) {
+			scrubbedAttrs[i] = slog.String(attr.Key, RedactedPlaceholder)
+		} else if attr.Value.Kind() == slog.KindGroup {
+			scrubbedAttrs[i] = slog.Attr{
+				Key:   attr.Key,
+				Value: slog.GroupValue(scrubGroupAttrs(attr.Value.Group(), redactedMap)...),
+			}
+		} else {
+			scrubbedAttrs[i] = slog.Any(attr.Key, scrubValue(attr.Value.Any(), redactedMap))
+		}
+	}
+	return scrubbedAttrs
+}
+
 // makeReplaceAttr builds an attribute replacement function that masks sensitive keys
 // and recursively traverses nested structures.
 //
@@ -504,20 +563,11 @@ func makeReplaceAttr(customRedacted []string) func(groups []string, a slog.Attr)
 			return slog.String(a.Key, RedactedPlaceholder)
 		}
 
-		// Precedence 2: Slog group
+		// Precedence 2: Slog group (recursively redact nested groups at any depth)
 		if a.Value.Kind() == slog.KindGroup {
-			attrs := a.Value.Group()
-			scrubbedAttrs := make([]slog.Attr, len(attrs))
-			for i, attr := range attrs {
-				if isSensitiveKey(attr.Key, redactedMap) {
-					scrubbedAttrs[i] = slog.String(attr.Key, RedactedPlaceholder)
-				} else {
-					scrubbedAttrs[i] = slog.Any(attr.Key, scrubValue(attr.Value.Any(), redactedMap))
-				}
-			}
 			return slog.Attr{
 				Key:   a.Key,
-				Value: slog.GroupValue(scrubbedAttrs...),
+				Value: slog.GroupValue(scrubGroupAttrs(a.Value.Group(), redactedMap)...),
 			}
 		}
 

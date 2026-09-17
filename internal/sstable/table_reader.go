@@ -92,9 +92,11 @@ type TableReader struct {
 	footer     Footer
 	index      *BlockIndex
 	readAtFn   func(p []byte, off int64) (int, error)
-	closed     bool
-	fileNum    uint64
-	blockCache BlockCache
+	closed       bool
+	fileNum      uint64
+	blockCache   BlockCache
+	filterLoaded bool
+	cachedFilter *filter.BloomFilter
 }
 
 // parseTableFilename attempts to extract the 6-digit numeric file number from an SSTable filename (e.g. "000042.sst").
@@ -436,6 +438,8 @@ func (r *TableReader) Close() error {
 		return nil
 	}
 	r.closed = true
+	r.cachedFilter = nil
+	r.filterLoaded = false
 
 	if r.file != nil {
 		return r.file.Close()
@@ -1021,14 +1025,31 @@ func (r *TableReader) ReadFilterBlock() (*filter.BloomFilter, error) {
 		return nil, errors.ErrNilReceiver
 	}
 	r.mu.RLock()
-	defer r.mu.RUnlock()
+	if r.closed {
+		r.mu.RUnlock()
+		return nil, errors.ErrTableReaderClosed
+	}
+	if r.filterLoaded {
+		f := r.cachedFilter
+		r.mu.RUnlock()
+		return f, nil
+	}
+	r.mu.RUnlock()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.closed {
 		return nil, errors.ErrTableReaderClosed
+	}
+	if r.filterLoaded {
+		return r.cachedFilter, nil
 	}
 
 	metaHandle := r.footer.MetaIndexHandle
 	if metaHandle.Size == 0 || metaHandle.Size == MetaIndexTrailerSize {
 		// Empty MetaIndex block (entryCount = 0)
+		r.filterLoaded = true
+		r.cachedFilter = nil
 		return nil, nil
 	}
 	if metaHandle.Size > MaxIndexBlockSize || metaHandle.Size > MaxBlockSize || metaHandle.Size > math.MaxInt || metaHandle.Offset > math.MaxInt64 {
@@ -1051,6 +1072,8 @@ func (r *TableReader) ReadFilterBlock() (*filter.BloomFilter, error) {
 		return nil, err
 	}
 	if !found {
+		r.filterLoaded = true
+		r.cachedFilter = nil
 		return nil, nil
 	}
 
@@ -1095,5 +1118,11 @@ func (r *TableReader) ReadFilterBlock() (*filter.BloomFilter, error) {
 	}
 
 	// Decode and validate filter block
-	return filter.DecodeFilterBlock(filterBuf)
+	bf, err := filter.DecodeFilterBlock(filterBuf)
+	if err != nil {
+		return nil, err
+	}
+	r.filterLoaded = true
+	r.cachedFilter = bf
+	return bf, nil
 }

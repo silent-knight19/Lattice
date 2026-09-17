@@ -2,6 +2,8 @@ package binary
 
 import (
 	"hash/crc32"
+
+	"github.com/silent-knight19/lattice/internal/errors"
 )
 
 // Checksum computes the 32-bit Cyclic Redundancy Check (CRC32) checksum of data
@@ -26,4 +28,19 @@ func Checksum(data []byte) uint32 {
 //   - Non-mutating: does not modify the provided byte slice.
 func Verify(data []byte, expected uint32) bool {
 	return crc32.ChecksumIEEE(data) == expected
+}
+
+// VerifyChecksum calculates the CRC32-IEEE checksum of data and compares it to expected.
+// If the calculated checksum matches expected, it returns nil.
+// If the checksum does not match, it returns *errors.ChecksumMismatchError (which satisfies
+// errors.Is(err, errors.ErrChecksumMismatch)), strictly enforcing fail-closed verification semantics.
+func VerifyChecksum(data []byte, expected uint32) error {
+	actual := crc32.ChecksumIEEE(data)
+	if actual != expected {
+		return &errors.ChecksumMismatchError{
+			Expected: expected,
+			Actual:   actual,
+		}
+	}
+	return nil
 }

@@ -980,3 +980,60 @@ func TestVarint32_Errors(t *testing.T) {
 		t.Fatalf("expected ErrVarintNonCanonical, got: %v", err)
 	}
 }
+
+// FuzzDecodeVarint fuzzes all varint decoders with arbitrary byte sequences,
+// proving bounded execution, zero panics, and strict error classification.
+func FuzzDecodeVarint(f *testing.F) {
+	// Seed corpus with representative vectors
+	f.Add([]byte{})
+	f.Add([]byte{0x00})
+	f.Add([]byte{0x7F})
+	f.Add([]byte{0x80, 0x01})
+	f.Add([]byte{0xFF, 0xFF, 0xFF, 0xFF, 0x0F})
+	f.Add([]byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01})
+	f.Add([]byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80}) // 11 bytes continuation
+	f.Add(bytes.Repeat([]byte{0xFF}, 20))
+	f.Add(bytes.Repeat([]byte{0x80}, 100))
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		// Must not panic on any arbitrary input
+		val64, n64, err64 := binary.GetVarint64(data)
+		if err64 == nil {
+			if n64 <= 0 || n64 > binary.MaxVarintLen64 || n64 > len(data) {
+				t.Fatalf("invalid bytesConsumed: %d for len %d", n64, len(data))
+			}
+			// Roundtrip validation
+			var roundtripBuf [binary.MaxVarintLen64]byte
+			encLen := binary.PutVarint64(roundtripBuf[:], val64)
+			if encLen > n64 {
+				t.Fatalf("roundtrip encoding length %d exceeds consumed bytes %d", encLen, n64)
+			}
+		} else {
+			if !stdErrors.Is(err64, errors.ErrVarintTruncated) && !stdErrors.Is(err64, errors.ErrVarintOverflow) {
+				t.Fatalf("unexpected error type: %v", err64)
+			}
+		}
+
+		// Test 32-bit decoder
+		val32, n32, err32 := binary.GetVarint32(data)
+		if err32 == nil {
+			if n32 <= 0 || n32 > binary.MaxVarintLen32 || n32 > len(data) {
+				t.Fatalf("invalid bytesConsumed for varint32: %d", n32)
+			}
+			var roundtripBuf [binary.MaxVarintLen32]byte
+			encLen := binary.PutVarint32(roundtripBuf[:], val32)
+			if encLen > n32 {
+				t.Fatalf("roundtrip varint32 encoding length %d exceeds consumed bytes %d", encLen, n32)
+			}
+		} else {
+			if !stdErrors.Is(err32, errors.ErrVarintTruncated) && !stdErrors.Is(err32, errors.ErrVarintOverflow) {
+				t.Fatalf("unexpected varint32 error type: %v", err32)
+			}
+		}
+
+		// Test canonical decoders
+		_, _, _ = binary.GetVarint64Canonical(data)
+		_, _, _ = binary.GetVarint32Canonical(data)
+	})
+}
+

@@ -345,3 +345,62 @@ func TestMetaIndexBlock_Codec(t *testing.T) {
 		}
 	})
 }
+
+// TestSSTable_ReadFilterBlock_Caching verifies that TableReader.ReadFilterBlock
+// caches the decoded BloomFilter across repeated calls, preventing read amplification
+// and heap reallocations (SEC-P04-003).
+func TestSSTable_ReadFilterBlock_Caching(t *testing.T) {
+	dir := t.TempDir()
+	sstPath := filepath.Join(dir, "000042.sst")
+
+	filterBuilder := filter.NewFilterBlockBuilder(50)
+	opts := sstable.DefaultTableWriterOptions()
+	opts.FilterBuilder = filterBuilder
+
+	writer, err := sstable.NewTableWriter(sstPath, opts)
+	if err != nil {
+		t.Fatalf("failed to create writer: %v", err)
+	}
+
+	for i := 0; i < 50; i++ {
+		ik := binary.InternalKey{
+			UserKey: []byte(fmt.Sprintf("cache_key_%03d", i)),
+			SeqNum:  binary.SeqNum(i + 1),
+			OpType:  binary.OpTypePut,
+		}
+		if err := writer.Add(ik, []byte("val")); err != nil {
+			t.Fatalf("writer.Add failed: %v", err)
+		}
+	}
+
+	if _, err := writer.Finish(); err != nil {
+		t.Fatalf("writer.Finish failed: %v", err)
+	}
+
+	reader, err := sstable.OpenTableReader(sstPath)
+	if err != nil {
+		t.Fatalf("failed to open reader: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+
+	// First call loads and decodes
+	bf1, err := reader.ReadFilterBlock()
+	if err != nil {
+		t.Fatalf("first ReadFilterBlock failed: %v", err)
+	}
+	if bf1 == nil {
+		t.Fatalf("expected non-nil BloomFilter")
+	}
+
+	// Repeated calls must return the identical cached instance
+	for i := 0; i < 10; i++ {
+		bfNext, err := reader.ReadFilterBlock()
+		if err != nil {
+			t.Fatalf("iteration %d: ReadFilterBlock failed: %v", i, err)
+		}
+		if bfNext != bf1 {
+			t.Fatalf("iteration %d: expected identical cached instance (%p != %p)", i, bfNext, bf1)
+		}
+	}
+}
+

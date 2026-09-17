@@ -63,7 +63,7 @@
 * **Attack Surface**: Public/internal TCP listener (`:9099`).
 * **Impact**: Critical (Total database service denial).
 * **Likelihood**: High (Common network scanner and fuzzer vector).
-* **Existing Mitigation**: Strict payload ceiling validation in `P11-S01-M01`. Any frame advertising `PayloadLength > 5,242,880 (5MB)` or `PayloadLength < 0` immediately triggers socket termination with zero heap allocation.
+* **Existing Mitigation**: Strict payload ceiling validation in `P11-S01-M01`. Any frame advertising `PayloadLength > 5,242,880 (5MB)` or `PayloadLength < 0` immediately triggers socket termination with zero heap allocation. At the in-memory storage layer, the MemTable enforces hard byte caps (`MaxMemTableSize = 64MB`) and record count caps (`MaxMemTableEntries = 1M`) with pre-allocation rejection, as specified in [`docs/memtable-concurrency-spec.md`](file:///Users/sachinkumarsingh/Projectss/Lattice/docs/memtable-concurrency-spec.md).
 * **Automated Test**: Unit and fuzz tests transmitting oversized length values; assert connection closed instantly with memory allocations $= 0$.
 * **Residual Risk**: Low.
 
@@ -87,7 +87,7 @@
 * **Attack Surface**: Local storage media and persistent file recovery subsystem.
 * **Impact**: High (Silent data corruption or state regression).
 * **Likelihood**: Medium (Disk bit rot, firmware bugs, sudden power loss).
-* **Existing Mitigation**: Every WAL record and every 4KB SSTable block contains a hardware-accelerated CRC32-IEEE checksum. During startup recovery, records are verified before processing. EOF torn writes are truncated safely; mid-log corruptions halt the engine with `ErrChecksumMismatch`.
+* **Existing Mitigation**: Every WAL record, every 4KB SSTable block, and every MANIFEST record contains a hardware-accelerated CRC32-IEEE checksum. During startup recovery, records are verified before processing. EOF torn writes are truncated safely; mid-log corruptions halt the engine with `ErrChecksumMismatch`. The authoritative physical wire formats, recovery protocols, and checksum invariants are documented in [`docs/wal-record-format.md`](file:///Users/sachinkumarsingh/Projectss/Lattice/docs/wal-record-format.md), [`docs/sstable-format-spec.md`](file:///Users/sachinkumarsingh/Projectss/Lattice/docs/sstable-format-spec.md), [`docs/bloom-filter-format.md`](file:///Users/sachinkumarsingh/Projectss/Lattice/docs/bloom-filter-format.md), [`docs/manifest-format-spec.md`](file:///Users/sachinkumarsingh/Projectss/Lattice/docs/manifest-format-spec.md), and [`docs/recovery-spec.md`](file:///Users/sachinkumarsingh/Projectss/Lattice/docs/recovery-spec.md).
 * **Automated Test**: Mutation fuzzing tests flipping random bits in WAL and SSTable files; assert 100% detection.
 * **Residual Risk**: Low (CRC32 detects all single, double, and burst errors up to 32 bits).
 

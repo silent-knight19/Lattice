@@ -179,3 +179,23 @@ func SyncDir(dirPath string) error {
 	}
 	return nil
 }
+
+// isSystemSymlinkPrefix checks if a path component is a standard Darwin/macOS system symlink
+// (such as /var -> /private/var, /tmp -> /private/tmp, /etc -> /private/etc).
+func isSystemSymlinkPrefix(path string) bool {
+	if runtime.GOOS == "darwin" {
+		clean := filepath.Clean(path)
+		// Direct match
+		if clean == "/var" || clean == "/tmp" || clean == "/etc" {
+			return true
+		}
+		// For relative paths, resolve to absolute and check
+		abs, err := filepath.Abs(clean)
+		if err == nil {
+			if abs == "/var" || abs == "/tmp" || abs == "/etc" {
+				return true
+			}
+		}
+	}
+	return false
+}

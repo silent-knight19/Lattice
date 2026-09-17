@@ -3,9 +3,12 @@ package binary
 import (
 	"bytes"
 	"encoding/hex"
+	stdErrors "errors"
 	"hash/crc32"
 	"sync"
 	"testing"
+
+	"github.com/silent-knight19/lattice/internal/errors"
 )
 
 // referenceCRC32IEEE computes CRC32-IEEE using a classic bit-by-bit software simulation.
@@ -441,3 +444,53 @@ func fillPseudoRandom(buf []byte, seed int64) {
 		buf[i] = byte(s >> 33)
 	}
 }
+
+// TestVerifyChecksum_FailClosed verifies that VerifyChecksum enforces fail-closed semantics
+// by returning *errors.ChecksumMismatchError (matching errors.ErrChecksumMismatch) on corruption.
+func TestVerifyChecksum_FailClosed(t *testing.T) {
+	data := []byte("critical storage payload for checksum verification")
+	expected := Checksum(data)
+
+	// 1. Exact match returns nil
+	if err := VerifyChecksum(data, expected); err != nil {
+		t.Fatalf("expected nil error on valid checksum, got: %v", err)
+	}
+
+	// 2. Bit flip in data fails closed
+	corrupted := append([]byte(nil), data...)
+	corrupted[0] ^= 0x01
+	err := VerifyChecksum(corrupted, expected)
+	if err == nil {
+		t.Fatalf("expected error on single bit flip in data, got nil")
+	}
+	if !stdErrors.Is(err, errors.ErrChecksumMismatch) {
+		t.Fatalf("expected error to match ErrChecksumMismatch, got: %v", err)
+	}
+
+	// Verify structured error diagnostics
+	var mismatchErr *errors.ChecksumMismatchError
+	if !stdErrors.As(err, &mismatchErr) {
+		t.Fatalf("expected error to be *errors.ChecksumMismatchError, got: %T", err)
+	}
+	if mismatchErr.Expected != expected {
+		t.Errorf("expected Expected=0x%08X, got 0x%08X", expected, mismatchErr.Expected)
+	}
+	if mismatchErr.Actual != Checksum(corrupted) {
+		t.Errorf("expected Actual=0x%08X, got 0x%08X", Checksum(corrupted), mismatchErr.Actual)
+	}
+
+	// 3. Mismatched expected checksum fails closed
+	if err := VerifyChecksum(data, expected^0xFFFFFFFF); err == nil {
+		t.Fatalf("expected error on inverted expected checksum, got nil")
+	}
+
+	// 4. Empty and nil payloads
+	nilCRC := Checksum(nil)
+	if err := VerifyChecksum(nil, nilCRC); err != nil {
+		t.Fatalf("expected nil error for nil slice with matching CRC, got: %v", err)
+	}
+	if err := VerifyChecksum(nil, nilCRC+1); err == nil {
+		t.Fatalf("expected error for nil slice with wrong CRC, got nil")
+	}
+}
+

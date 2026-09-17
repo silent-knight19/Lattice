@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build, Vet, & Race Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache: true
+
+      - name: Verify Go Module Hermeticity
+        run: |
+          go mod verify
+          # Assert zero external runtime dependencies
+          DEPS=$(go list -m all | wc -l | tr -d ' ')
+          if [ "$DEPS" -ne 1 ]; then
+            echo "Error: external dependencies detected in go list -m all: $DEPS"
+            go list -m all
+            exit 1
+          fi
+
+      - name: Go Vet
+        run: go vet ./...
+
+      - name: Run Test Suite with Race Detector
+        run: go test -v -race -short -timeout 10m ./...

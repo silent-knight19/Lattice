@@ -84,6 +84,19 @@ func OpenWriter(path string) (*WALWriter, error) {
 
 	cleanPath := filepath.Clean(path)
 
+	// Parent directory validation: ensure parent directory exists, is a directory, and is not an unpermitted symlink
+	parentDir := filepath.Dir(cleanPath)
+	pInfo, pErr := os.Lstat(parentDir)
+	if pErr != nil {
+		return nil, fmt.Errorf("wal: failed to inspect parent directory %s: %w", parentDir, pErr)
+	}
+	if !isSystemSymlinkPrefix(parentDir) && pInfo.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("%w: parent directory %q is a symlink", errors.ErrParentDirectorySymlink, parentDir)
+	}
+	if !pInfo.IsDir() {
+		return nil, &errors.NotADirectoryError{Path: parentDir, Mode: pInfo.Mode()}
+	}
+
 	// Pre-open inspection: reject symlinks and directories (SEC-WAL-01: pin inode for double SameFile).
 	var preInfo os.FileInfo
 	if info, err := os.Lstat(cleanPath); err == nil {
@@ -105,6 +118,13 @@ func OpenWriter(path string) (*WALWriter, error) {
 	f, err := openFileNoFollow(cleanPath, flags, FileMode)
 	if err != nil {
 		return nil, fmt.Errorf("wal: failed to open file %s: %w", cleanPath, err)
+	}
+
+	// Re-verify parent directory was not displaced during file open
+	postParentInfo, postPErr := os.Lstat(parentDir)
+	if postPErr != nil || !os.SameFile(pInfo, postParentInfo) {
+		_ = f.Close()
+		return nil, fmt.Errorf("%w: parent directory %q swapped during open", errors.ErrParentDirectorySwapped, parentDir)
 	}
 
 	// Verify the opened file descriptor references a genuine regular file
@@ -170,6 +190,19 @@ func CreateWriter(path string) (*WALWriter, error) {
 
 	cleanPath := filepath.Clean(path)
 
+	// Parent directory validation: ensure parent directory exists, is a directory, and is not an unpermitted symlink
+	parentDir := filepath.Dir(cleanPath)
+	pInfo, pErr := os.Lstat(parentDir)
+	if pErr != nil {
+		return nil, fmt.Errorf("wal: failed to inspect parent directory %s: %w", parentDir, pErr)
+	}
+	if !isSystemSymlinkPrefix(parentDir) && pInfo.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("%w: parent directory %q is a symlink", errors.ErrParentDirectorySymlink, parentDir)
+	}
+	if !pInfo.IsDir() {
+		return nil, &errors.NotADirectoryError{Path: parentDir, Mode: pInfo.Mode()}
+	}
+
 	// Pre-creation inspection: reject existing paths immediately before open attempt
 	if info, err := os.Lstat(cleanPath); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
@@ -191,6 +224,13 @@ func CreateWriter(path string) (*WALWriter, error) {
 	f, err := openFileNoFollow(cleanPath, flags, FileMode)
 	if err != nil {
 		return nil, fmt.Errorf("wal: failed to create segment file %s: %w", cleanPath, err)
+	}
+
+	// Re-verify parent directory was not displaced during file creation
+	postParentInfo, postPErr := os.Lstat(parentDir)
+	if postPErr != nil || !os.SameFile(pInfo, postParentInfo) {
+		_ = f.Close()
+		return nil, fmt.Errorf("%w: parent directory %q swapped during create", errors.ErrParentDirectorySwapped, parentDir)
 	}
 
 	// Verify the opened file descriptor references a genuine regular file

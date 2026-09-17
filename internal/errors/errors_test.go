@@ -1970,3 +1970,65 @@ func TestTransportFramingErrors(t *testing.T) {
 		t.Error("nilStatus mismatch")
 	}
 }
+
+// TestWALWriterPoisonedError verifies error formatting, path sanitization, and wrapping invariants.
+func TestWALWriterPoisonedError(t *testing.T) {
+	underlying := stdErrors.New("disk full: write failed")
+	fullPath := "/var/lib/lattice/wal/wal_000000000001.log"
+
+	err := &errors.WALWriterPoisonedError{
+		Path:   fullPath,
+		Reason: underlying,
+	}
+
+	// 1. Check Sentinel matching
+	if !stdErrors.Is(err, errors.ErrWriterPoisoned) {
+		t.Error("expected err to match ErrWriterPoisoned")
+	}
+
+	// 2. Check Unwrap
+	if !stdErrors.Is(err, underlying) {
+		t.Error("expected err to unwrap to underlying error")
+	}
+
+	// 3. Check Path sanitization (SEC-P02-003): must not leak full directory path
+	errMsg := err.Error()
+	if strings.Contains(errMsg, "/var/lib/lattice/wal") {
+		t.Errorf("error message leaked absolute host directory path: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "wal_000000000001.log") {
+		t.Errorf("expected error message to contain segment basename: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "disk full: write failed") {
+		t.Errorf("expected error message to contain reason: %s", errMsg)
+	}
+
+	// 4. Test without reason
+	errNoReason := &errors.WALWriterPoisonedError{
+		Path: fullPath,
+	}
+	msgNoReason := errNoReason.Error()
+	if strings.Contains(msgNoReason, "/var/lib/lattice/wal") {
+		t.Errorf("error message leaked absolute host path: %s", msgNoReason)
+	}
+	if !strings.Contains(msgNoReason, "wal_000000000001.log") {
+		t.Errorf("expected error message to contain segment basename: %s", msgNoReason)
+	}
+
+	// 5. Test with empty path
+	errEmptyPath := &errors.WALWriterPoisonedError{
+		Reason: underlying,
+	}
+	if !strings.Contains(errEmptyPath.Error(), "wal segment") {
+		t.Errorf("expected fallback name for empty path: %s", errEmptyPath.Error())
+	}
+
+	// 6. Test nil receiver
+	var nilErr *errors.WALWriterPoisonedError
+	if nilErr.Error() != errors.ErrWriterPoisoned.Error() {
+		t.Errorf("nil error mismatch: got %q, want %q", nilErr.Error(), errors.ErrWriterPoisoned.Error())
+	}
+	if nilErr.Unwrap() != nil {
+		t.Errorf("expected nil unwrap for nil receiver")
+	}
+}

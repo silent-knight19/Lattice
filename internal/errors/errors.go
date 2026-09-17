@@ -4,6 +4,7 @@ import (
 	stdErrors "errors"
 	"fmt"
 	"io/fs"
+	"path/filepath"
 )
 
 // Sentinel errors representing fundamental domain failure conditions in Lattice.
@@ -927,10 +928,14 @@ func (e *WALWriterPoisonedError) Error() string {
 	if e == nil {
 		return ErrWriterPoisoned.Error()
 	}
-	if e.Reason != nil {
-		return fmt.Sprintf("wal writer at %q is poisoned: %v", e.Path, e.Reason)
+	name := filepath.Base(e.Path)
+	if name == "" || name == "." {
+		name = "wal segment"
 	}
-	return fmt.Sprintf("wal writer at %q is poisoned", e.Path)
+	if e.Reason != nil {
+		return fmt.Sprintf("wal writer for %q is poisoned: %v", name, e.Reason)
+	}
+	return fmt.Sprintf("wal writer for %q is poisoned", name)
 }
 
 // Is reports whether this error matches target sentinel ErrWriterPoisoned.
