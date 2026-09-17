@@ -1,6 +1,9 @@
 package sstable
 
 import (
+	stdErrors "errors"
+	"fmt"
+
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
 )
@@ -10,10 +13,75 @@ const (
 	// 16 bytes (MetaIndexHandle) + 16 bytes (IndexHandle) + 8 bytes (Padding) + 8 bytes (Magic) = 48 bytes.
 	FooterSize = 48
 
+	// FormatVersion1 is the initial SSTable physical format version.
+	FormatVersion1 uint8 = 1
+
+	// CurrentFormatVersion represents the active SSTable physical format version.
+	CurrentFormatVersion = FormatVersion1
+
+	// FooterMagicBase is the authoritative 56-bit Big-Endian magic prefix: 0x4C41545453535400 ("LATT_SST_\x00").
+	FooterMagicBase uint64 = 0x4C41545453535400
+
 	// FooterMagic is the authoritative 64-bit Big-Endian magic number anchoring every
-	// Lattice SSTable file: 0x4C41545453535401 ("LATT_SST_1" in ASCII Big-Endian).
-	FooterMagic uint64 = 0x4C41545453535401
+	// Lattice SSTable file: FooterMagicBase | uint64(CurrentFormatVersion) = 0x4C41545453535401 ("LATT_SST_1").
+	FooterMagic uint64 = FooterMagicBase | uint64(CurrentFormatVersion)
 )
+
+// ErrUnsupportedFormatVersion indicates that an SSTable footer specifies an unsupported format version.
+var ErrUnsupportedFormatVersion = stdErrors.New("sstable: unsupported format version")
+
+// UnsupportedFormatVersionError provides structured context when an SSTable footer specifies an unknown format version.
+// It matches ErrUnsupportedFormatVersion, ErrInvalidFooter, and ErrInvalidFooterMagic when interrogated with errors.Is().
+type UnsupportedFormatVersionError struct {
+	Version  uint8
+	Expected uint8
+}
+
+func (e *UnsupportedFormatVersionError) Error() string {
+	if e == nil {
+		return ErrUnsupportedFormatVersion.Error()
+	}
+	return fmt.Sprintf("sstable: unsupported format version %d (current: %d)", e.Version, e.Expected)
+}
+
+// Is reports whether this error matches target sentinels.
+func (e *UnsupportedFormatVersionError) Is(target error) bool {
+	return target == ErrUnsupportedFormatVersion ||
+		target == errors.ErrInvalidFooter ||
+		target == errors.ErrInvalidFooterMagic
+}
+
+// As supports unboxing into *errors.InvalidFooterMagicError for backward compatibility.
+func (e *UnsupportedFormatVersionError) As(target any) bool {
+	if ptr, ok := target.(**errors.InvalidFooterMagicError); ok {
+		*ptr = &errors.InvalidFooterMagicError{
+			Expected: FooterMagic,
+			Actual:   FooterMagicBase | uint64(e.Version),
+		}
+		return true
+	}
+	return false
+}
+
+// FormatVersionFromMagic extracts the format version from an SSTable footer magic number.
+// Returns an *errors.InvalidFooterMagicError if the magic base does not match FooterMagicBase,
+// or an *UnsupportedFormatVersionError if the version is unrecognized.
+func FormatVersionFromMagic(magic uint64) (uint8, error) {
+	if (magic &^ 0xFF) != FooterMagicBase {
+		return 0, &errors.InvalidFooterMagicError{
+			Expected: FooterMagic,
+			Actual:   magic,
+		}
+	}
+	version := uint8(magic & 0xFF)
+	if version != CurrentFormatVersion {
+		return version, &UnsupportedFormatVersionError{
+			Version:  version,
+			Expected: CurrentFormatVersion,
+		}
+	}
+	return version, nil
+}
 
 // Footer represents the fixed 48-byte trailer anchored at the exact physical end of every
 // SSTable file (file_size - 48 bytes).
@@ -91,13 +159,10 @@ func (f *Footer) Decode(src []byte) error {
 		}
 	}
 
-	// 1. Verify Magic Number (bytes 40..47)
+	// 1. Verify Magic Number (bytes 40..47) and Format Version
 	magic := binary.GetUint64(src[40:48])
-	if magic != FooterMagic {
-		return &errors.InvalidFooterMagicError{
-			Expected: FooterMagic,
-			Actual:   magic,
-		}
+	if _, err := FormatVersionFromMagic(magic); err != nil {
+		return err
 	}
 
 	// 2. Verify Padding (bytes 32..39 must be all zero)

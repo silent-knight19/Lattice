@@ -127,6 +127,20 @@ func (b *FilterBlockBuilder) AddedKeys() int {
 	return b.addedKeys
 }
 
+// ExpectedKeys returns the nominal key capacity for which the underlying Bloom filter was sized.
+// Returns 0 if the receiver or underlying filter is nil.
+//
+// Note on Capacity vs False Positive Rate (FPR):
+// If AddedKeys exceeds ExpectedKeys, the Bloom filter remains mathematically sound (zero false negatives)
+// but its empirical false positive rate will degrade above the nominal ~1% design baseline as the bitset
+// approaches saturation.
+func (b *FilterBlockBuilder) ExpectedKeys() int {
+	if b == nil || b.filter == nil {
+		return 0
+	}
+	return b.filter.KeyCount()
+}
+
 // Finished reports whether the builder has transitioned to the sealed/finished state.
 func (b *FilterBlockBuilder) Finished() bool {
 	if b == nil {

@@ -310,38 +310,69 @@ func NewManifestWriter(file *os.File) (*ManifestWriter, error) {
 }
 
 // Path returns the canonical filesystem path of the active MANIFEST file.
+// Returns "" if the receiver is nil.
 func (w *ManifestWriter) Path() string {
+	if w == nil {
+		return ""
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.path
 }
 
 // Offset returns the current logical write offset (file size) of the MANIFEST file.
+// Returns 0 if the receiver is nil.
 func (w *ManifestWriter) Offset() int64 {
+	if w == nil {
+		return 0
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.offset
 }
 
 // RecordCount returns the total number of VersionEdit records successfully logged and synced.
+// Returns 0 if the receiver is nil.
 func (w *ManifestWriter) RecordCount() uint64 {
+	if w == nil {
+		return 0
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.recordCount
 }
 
 // IsClosed reports whether the writer has been closed.
+// Returns true if the receiver is nil.
 func (w *ManifestWriter) IsClosed() bool {
+	if w == nil {
+		return true
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.closed
 }
 
 // IsPoisoned reports whether the writer has entered an unrecoverable error state due to a write or sync failure.
+// Returns false if the receiver is nil.
 func (w *ManifestWriter) IsPoisoned() bool {
+	if w == nil {
+		return false
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.poisoned
+}
+
+// PoisonError returns a structured ManifestWriterPoisonedError if the writer is poisoned,
+// or errors.ErrNilReceiver if the receiver is nil, or nil if the writer is healthy.
+func (w *ManifestWriter) PoisonError() error {
+	if w == nil {
+		return errors.ErrNilReceiver
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.checkPoisonLocked()
 }
 
 // poisonLocked transitions the writer into an unrecoverable poisoned state,
@@ -371,6 +402,7 @@ func (w *ManifestWriter) checkPoisonLocked() error {
 //
 // Return Contract:
 //   - Returns nil IF AND ONLY IF all record bytes were written AND fdatasync succeeded.
+//   - If the receiver is nil, returns errors.ErrNilReceiver.
 //   - If the writer is closed, returns errors.ErrManifestWriterClosed.
 //   - If the writer is poisoned, returns errors.ErrManifestWriterPoisoned.
 //   - If write fails or produces a short write, poisons the writer and returns the write error.
@@ -378,12 +410,19 @@ func (w *ManifestWriter) checkPoisonLocked() error {
 //   - Thread-safe: concurrent invocations are serialized by an internal mutex to ensure
 //     monotonic append ordering and atomic record boundaries.
 func (w *ManifestWriter) LogEdit(edit VersionEdit) error {
+	if w == nil {
+		return errors.ErrNilReceiver
+	}
 	return w.logEditInternal(&edit)
 }
 
 // LogEditPtr appends edit to the MANIFEST file with durability synchronization,
 // accepting a pointer to avoid copying the VersionEdit struct.
+// Returns errors.ErrNilReceiver if the receiver is nil.
 func (w *ManifestWriter) LogEditPtr(edit *VersionEdit) error {
+	if w == nil {
+		return errors.ErrNilReceiver
+	}
 	if edit == nil {
 		return fmt.Errorf("%w: version edit cannot be nil", os.ErrInvalid)
 	}
@@ -465,7 +504,11 @@ func (w *ManifestWriter) logEditInternal(edit *VersionEdit) error {
 
 // Sync executes the fdatasync durability barrier on the active MANIFEST file,
 // ensuring that all previously written bytes are persisted to stable physical media.
+// Returns errors.ErrNilReceiver if the receiver is nil.
 func (w *ManifestWriter) Sync() error {
+	if w == nil {
+		return errors.ErrNilReceiver
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -485,9 +528,15 @@ func (w *ManifestWriter) Sync() error {
 }
 
 // Close flushes data, executes the durability barrier, and closes the underlying file descriptor.
+// If the writer is already poisoned, durability sync is intentionally skipped to avoid cascading failures
+// and preserve root-cause diagnostic state, while the underlying descriptor is safely closed.
 // Subsequent operations on the writer return errors.ErrManifestWriterClosed.
 // Close is idempotent: repeated calls return nil.
+// Returns errors.ErrNilReceiver if the receiver is nil.
 func (w *ManifestWriter) Close() error {
+	if w == nil {
+		return errors.ErrNilReceiver
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 

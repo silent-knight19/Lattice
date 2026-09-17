@@ -146,9 +146,16 @@ type Engine struct {
 	// first Close when terminal cleanup completes; concurrent closers wait on
 	// it and receive the same remembered result. closeErr is the terminal
 	// shutdown error (nil on success), guarded by mu.
-	closeDone chan struct{}
-	closeErr  error
+	closeDone       chan struct{}
+	closeErr        error
+	shutdownTimeout time.Duration
 }
+
+const (
+	// DefaultShutdownTimeout is the maximum duration Engine.Close waits for the
+	// flush queue to drain before aborting to prevent hanging the shutdown process (SEC-P10-003).
+	DefaultShutdownTimeout = 10 * time.Second
+)
 
 // EngineOptions specifies configuration parameters for initializing an Engine instance.
 type EngineOptions struct {
@@ -162,6 +169,9 @@ type EngineOptions struct {
 	// BlockCache is the single shared Phase 09 ShardedCache passed to transient
 	// TableReaders. When nil, persistent reads go directly to disk.
 	BlockCache *cache.ShardedCache
+	// ShutdownTimeout bounds the duration spent draining immutable MemTables
+	// during Engine.Close. Defaults to DefaultShutdownTimeout (10s) when <= 0.
+	ShutdownTimeout time.Duration
 }
 
 // NewEngine constructs an Engine instance backed by the given backpressure configuration.
@@ -180,14 +190,19 @@ func NewEngineWithOptions(opts EngineOptions) *Engine {
 	if opts.DBPath != "" {
 		cleanDBPath = filepath.Clean(opts.DBPath)
 	}
+	shutTimeout := opts.ShutdownTimeout
+	if shutTimeout <= 0 {
+		shutTimeout = DefaultShutdownTimeout
+	}
 	eng := &Engine{
-		dbPath:       cleanDBPath,
-		activeMem:    memtable.NewSkipList(),
-		backpressure: bc,
-		vset:         vset,
-		wal:          opts.WAL,
-		blockCache:   opts.BlockCache,
-		closeDone:    make(chan struct{}),
+		dbPath:          cleanDBPath,
+		activeMem:       memtable.NewSkipList(),
+		backpressure:    bc,
+		vset:            vset,
+		wal:             opts.WAL,
+		blockCache:      opts.BlockCache,
+		shutdownTimeout: shutTimeout,
+		closeDone:       make(chan struct{}),
 	}
 	eng.l0Override.Store(-1)
 	return eng

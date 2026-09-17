@@ -5,6 +5,8 @@ import (
 	stdErrors "errors"
 	"fmt"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -972,4 +974,89 @@ func TestVersionSet_ActiveVersions_DeadNodeSkipped(t *testing.T) {
 		t.Errorf("expected active[0] == v2, got %v", active[0])
 	}
 	active[0].Unref()
+}
+
+// TestVersion_Files_DeepCopyImmutability verifies that Version.Files returns an independent
+// deep copy of FileMetadata structs, ensuring mutating the returned keys does not mutate internal Version state.
+func TestVersion_Files_DeepCopyImmutability(t *testing.T) {
+	var levels [NumLevels][]FileMetadata
+	origSmallest := []byte("original_smallest_key")
+	origLargest := []byte("original_largest_key")
+	levels[1] = []FileMetadata{
+		{
+			FileNum:     10,
+			FileSize:    500,
+			SmallestKey: append([]byte(nil), origSmallest...),
+			LargestKey:  append([]byte(nil), origLargest...),
+		},
+	}
+
+	v := NewVersion(levels)
+	files1 := v.Files(1)
+	if len(files1) != 1 {
+		t.Fatalf("expected 1 file at level 1, got %d", len(files1))
+	}
+
+	// Mutate the returned slices
+	files1[0].SmallestKey[0] ^= 0xFF
+	files1[0].LargestKey[0] ^= 0xFF
+
+	// Fetch again from Version; internal state must remain completely pristine
+	files2 := v.Files(1)
+	if !bytes.Equal(files2[0].SmallestKey, origSmallest) {
+		t.Fatalf("Version.Files leaked mutable slice: SmallestKey corrupted: got %q, want %q",
+			files2[0].SmallestKey, origSmallest)
+	}
+	if !bytes.Equal(files2[0].LargestKey, origLargest) {
+		t.Fatalf("Version.Files leaked mutable slice: LargestKey corrupted: got %q, want %q",
+			files2[0].LargestKey, origLargest)
+	}
+}
+
+// TestVersionSet_LogAndApply_PoisonDiagnostic asserts that LogAndApply propagates the structured
+// *ManifestWriterPoisonedError with root cause when the underlying writer is poisoned.
+func TestVersionSet_LogAndApply_PoisonDiagnostic(t *testing.T) {
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "MANIFEST-000001")
+	w, err := CreateManifestWriter(manifestPath)
+	if err != nil {
+		t.Fatalf("CreateManifestWriter failed: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	vs := NewVersionSet()
+	vs.manifest = w
+	v0 := NewVersion([NumLevels][]FileMetadata{})
+	if err := vs.AppendVersion(v0); err != nil {
+		t.Fatalf("initial AppendVersion failed: %v", err)
+	}
+
+	// Poison the writer via simulated I/O failure
+	rootCause := stdErrors.New("simulated low-level disk I/O failure")
+	w.SetWriteFnForTesting(func(f *os.File, p []byte) (int, error) {
+		return 0, rootCause
+	})
+	edit := NewVersionEdit()
+	edit.SetNextFileNum(100)
+	_ = w.LogEditPtr(edit)
+
+	if !w.IsPoisoned() {
+		t.Fatalf("expected writer to be poisoned")
+	}
+
+	// LogAndApply should return the structured poisoned error containing rootCause
+	applyErr := vs.LogAndApply(edit)
+	if applyErr == nil {
+		t.Fatalf("expected LogAndApply to fail on poisoned writer, got nil")
+	}
+	if !stdErrors.Is(applyErr, errors.ErrManifestWriterPoisoned) {
+		t.Fatalf("expected ErrManifestWriterPoisoned sentinel, got: %v", applyErr)
+	}
+	var poisonedErr *errors.ManifestWriterPoisonedError
+	if !stdErrors.As(applyErr, &poisonedErr) {
+		t.Fatalf("expected *errors.ManifestWriterPoisonedError, got: %T (%v)", applyErr, applyErr)
+	}
+	if !stdErrors.Is(poisonedErr.Reason, rootCause) {
+		t.Fatalf("expected root cause %v, got %v", rootCause, poisonedErr.Reason)
+	}
 }

@@ -21,9 +21,22 @@ type CompactorOption func(*Compactor)
 
 // WithTableOpener configures a TableOpener for exact physical SSTable existence checks.
 // When omitted, Compactor operates in pure metadata-only conservative mode.
+// Note: If opener allocates a new TableReader on each call (unpooled), callers must also
+// configure WithCloseTableReaders(true) or use WithTransientTableOpener to prevent file
+// descriptor leaks.
 func WithTableOpener(opener TableOpener) CompactorOption {
 	return func(c *Compactor) {
 		c.tableOpener = opener
+	}
+}
+
+// WithTransientTableOpener configures an unpooled TableOpener that allocates a new TableReader
+// per call. It automatically configures the compactor to close the TableReader immediately
+// after checking key existence, preventing file descriptor leaks.
+func WithTransientTableOpener(opener TableOpener) CompactorOption {
+	return func(c *Compactor) {
+		c.tableOpener = opener
+		c.closeTableReaders = true
 	}
 }
 

@@ -59,7 +59,15 @@ func (e *manifestNotFoundError) Unwrap() error {
 	return e.underlying
 }
 
-// Test seams for deterministic fault injection and race simulation
+// Test seams for deterministic fault injection and race simulation.
+//
+// Architectural Note on Subsystem-Scoped Test Seams (SEC-P07-004):
+// Lattice maintains independent, package-private test seams for filesystem operations
+// (`bootLstatFn`, `currentLstatFn`, `replayLstatFn`, and `vs.lstatFn`) rather than a single
+// global hook. This design enforces subsystem isolation during fault injection: tests
+// targeting boot discovery, atomic pointer publication, or log replay can inject simulated
+// filesystem mutations without unintended cross-talk or side-effects on concurrent operations
+// across other subsystems.
 var (
 	bootLstatFn      = os.Lstat
 	bootOpenFn       = openFileNoFollow

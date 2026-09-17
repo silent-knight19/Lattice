@@ -1041,3 +1041,43 @@ func TestReplayManifest_UnreferencedExtraSSTable(t *testing.T) {
 		t.Fatalf("unexpected files in L0: %+v", res.Version.Files(0))
 	}
 }
+
+// TestReplayManifest_DuplicateSameLevelFileRejected asserts that replaying a manifest with
+// two additions of the same file number at the same level fails with ErrCorruptedVersionEdit.
+func TestReplayManifest_DuplicateSameLevelFileRejected(t *testing.T) {
+	dir := t.TempDir()
+
+	e1 := NewVersionEdit()
+	e1.SetNextFileNum(100)
+	_ = e1.AddFile(1, FileMetadata{
+		FileNum:        5,
+		FileSize:       100,
+		SmallestKey:    makeTestIK("k1", 1, binary.OpTypePut),
+		LargestKey:     makeTestIK("k2", 2, binary.OpTypePut),
+		SmallestSeqNum: 1,
+		LargestSeqNum:  2,
+	})
+
+	e2 := NewVersionEdit()
+	_ = e2.AddFile(1, FileMetadata{
+		FileNum:        5, // duplicate file 5 at level 1!
+		FileSize:       200,
+		SmallestKey:    makeTestIK("k1", 3, binary.OpTypePut),
+		LargestKey:     makeTestIK("k2", 4, binary.OpTypePut),
+		SmallestSeqNum: 3,
+		LargestSeqNum:  4,
+	})
+
+	createDummySSTable(t, dir, 5, 100)
+
+	disc := setupTestManifest(t, dir, 1, []*VersionEdit{e1, e2})
+	defer func() { _ = disc.Close() }()
+
+	_, err := ReplayManifest(disc)
+	if err == nil {
+		t.Fatalf("expected ReplayManifest to fail on same-level duplicate file, got nil")
+	}
+	if !stdErrors.Is(err, errors.ErrCorruptedVersionEdit) {
+		t.Fatalf("expected ErrCorruptedVersionEdit, got: %v", err)
+	}
+}

@@ -42,21 +42,6 @@ var (
 	manifestReplayMaxFiles   = MaxManifestLiveFiles
 )
 
-// SetManifestReplayLimitsForTesting configures custom limits for testing and returns a restore function.
-func SetManifestReplayLimitsForTesting(maxBytes int64, maxRecords int, maxFiles int) func() {
-	prevBytes := manifestReplayMaxBytes
-	prevRecords := manifestReplayMaxRecords
-	prevFiles := manifestReplayMaxFiles
-	manifestReplayMaxBytes = maxBytes
-	manifestReplayMaxRecords = maxRecords
-	manifestReplayMaxFiles = maxFiles
-	return func() {
-		manifestReplayMaxBytes = prevBytes
-		manifestReplayMaxRecords = prevRecords
-		manifestReplayMaxFiles = prevFiles
-	}
-}
-
 // TableFilename returns the canonical SSTable filename for a given sequential file number.
 // In accordance with Lattice architecture, the filename is formatted as "%06d.sst" with 6 zero-padded digits.
 func TableFilename(fileNum uint64) string {
@@ -227,6 +212,12 @@ func (b *versionBuilder) applyEdit(edit *VersionEdit, recordIndex int, offset in
 	for _, a := range edit.AddedFiles() {
 		if a.Level >= NumLevels {
 			return &errors.InvalidLevelError{Level: a.Level, MaxLevel: NumLevels - 1}
+		}
+
+		// Check if file already exists at target level (single-level duplicate prohibition)
+		if _, exists := b.levels[a.Level][a.Meta.FileNum]; exists {
+			return fmt.Errorf("%w: file %d already exists at level %d, cannot add",
+				errors.ErrCorruptedVersionEdit, a.Meta.FileNum, a.Level)
 		}
 
 		// Enforce single-level identity: a file number cannot be active in multiple levels simultaneously

@@ -1,8 +1,6 @@
 package sstable
 
 import (
-	"math"
-
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
 )
@@ -231,7 +229,7 @@ func (b *BlockBuilder) addEncodedKey(currKeyBytes []byte, key binary.InternalKey
 	}
 	projectedRestarts := len(b.restartOffsets) + additionalRestarts
 	projectedTrailerBytes := uint64(projectedRestarts)*uint64(RestartOffsetSize) + uint64(RestartCountSize) + uint64(BlockTrailerSize)
-	if uint64(len(b.buf))+uint64(entryTotalBytes)+projectedTrailerBytes > math.MaxUint32 {
+	if uint64(len(b.buf))+uint64(entryTotalBytes)+projectedTrailerBytes > MaxDataBlockSize {
 		return errors.ErrBlockOverflow
 	}
 

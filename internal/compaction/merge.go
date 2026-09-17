@@ -158,21 +158,24 @@ func newMergingIteratorInternal(iters []Iterator, raw bool) *MergingIterator {
 		}
 	}
 
+	// Filter out nil children upfront to align slice capacities and indices
+	nonNilIters := make([]Iterator, 0, len(iters))
+	for _, child := range iters {
+		if child != nil {
+			nonNilIters = append(nonNilIters, child)
+		}
+	}
+
 	it := &MergingIterator{
 		raw:                raw,
 		state:              mergeStateUninitialized,
-		children:           make([]Iterator, 0, len(iters)),
-		childPrevKeys:      make([]binary.InternalKey, len(iters)),
-		childRepeatCount:   make([]int, len(iters)),
+		children:           nonNilIters,
+		childPrevKeys:      make([]binary.InternalKey, len(nonNilIters)),
+		childRepeatCount:   make([]int, len(nonNilIters)),
 		lastEmittedUserKey: make([]byte, 0, 64),
 	}
 
-	for i, child := range iters {
-		if child == nil {
-			continue
-		}
-		it.children = append(it.children, child)
-
+	for i, child := range nonNilIters {
 		// Check if child is already in a failed state
 		if er, ok := child.(interface{ Err() error }); ok {
 			if err := er.Err(); err != nil {

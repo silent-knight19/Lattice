@@ -877,7 +877,7 @@ func FuzzManifestRecordDecode(f *testing.F) {
 	// Seed 5: Large length field
 	f.Add([]byte{0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01})
 
-	f.Fuzz(func(t *testing.T, data []byte) {
+		f.Fuzz(func(t *testing.T, data []byte) {
 		r := bytes.NewReader(data)
 		payload, _, err := decodeManifestRecord(r)
 		if err == nil {
@@ -885,4 +885,66 @@ func FuzzManifestRecordDecode(f *testing.F) {
 			_, _ = DecodeVersionEdit(payload)
 		}
 	})
+}
+
+// TestManifestWriter_NilReceiverSafety asserts that all exported methods on a nil
+// *ManifestWriter return safe zero values or ErrNilReceiver without panicking.
+func TestManifestWriter_NilReceiverSafety(t *testing.T) {
+	var w *ManifestWriter
+
+	if p := w.Path(); p != "" {
+		t.Fatalf("expected empty path for nil writer, got %q", p)
+	}
+	if off := w.Offset(); off != 0 {
+		t.Fatalf("expected 0 offset for nil writer, got %d", off)
+	}
+	if cnt := w.RecordCount(); cnt != 0 {
+		t.Fatalf("expected 0 record count for nil writer, got %d", cnt)
+	}
+	if !w.IsClosed() {
+		t.Fatalf("expected IsClosed() == true for nil writer")
+	}
+	if w.IsPoisoned() {
+		t.Fatalf("expected IsPoisoned() == false for nil writer")
+	}
+	if err := w.PoisonError(); !stdErrors.Is(err, errors.ErrNilReceiver) {
+		t.Fatalf("expected ErrNilReceiver from PoisonError, got %v", err)
+	}
+	if err := w.LogEdit(VersionEdit{}); !stdErrors.Is(err, errors.ErrNilReceiver) {
+		t.Fatalf("expected ErrNilReceiver from LogEdit, got %v", err)
+	}
+	if err := w.LogEditPtr(&VersionEdit{}); !stdErrors.Is(err, errors.ErrNilReceiver) {
+		t.Fatalf("expected ErrNilReceiver from LogEditPtr, got %v", err)
+	}
+	if err := w.Sync(); !stdErrors.Is(err, errors.ErrNilReceiver) {
+		t.Fatalf("expected ErrNilReceiver from Sync, got %v", err)
+	}
+	if err := w.Close(); !stdErrors.Is(err, errors.ErrNilReceiver) {
+		t.Fatalf("expected ErrNilReceiver from Close, got %v", err)
+	}
+}
+
+// TestScanManifest_SymlinkRejection verifies that scanManifest fails closed with an error
+// when attempting to read or recover a manifest that is a symbolic link.
+func TestScanManifest_SymlinkRejection(t *testing.T) {
+	dir := t.TempDir()
+	realPath := filepath.Join(dir, "REAL_MANIFEST")
+	if err := os.WriteFile(realPath, []byte("fake_manifest_data"), 0600); err != nil {
+		t.Fatalf("failed to write real file: %v", err)
+	}
+
+	symlinkPath := filepath.Join(dir, "MANIFEST-000001")
+	if err := os.Symlink(realPath, symlinkPath); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
+	}
+
+	_, err := ReadManifest(symlinkPath)
+	if err == nil {
+		t.Fatalf("expected ReadManifest to reject symlink, got nil")
+	}
+
+	_, err = RecoverManifest(symlinkPath)
+	if err == nil {
+		t.Fatalf("expected RecoverManifest to reject symlink, got nil")
+	}
 }

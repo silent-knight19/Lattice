@@ -6,6 +6,7 @@ import (
 	"math"
 	"testing"
 
+	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
 	"github.com/silent-knight19/lattice/internal/sstable"
 )
@@ -462,6 +463,77 @@ func TestFooter_ValidateAgainstFileSize(t *testing.T) {
 	t.Run("well within bounds accepted", func(t *testing.T) {
 		if err := footer.ValidateAgainstFileSize(10000); err != nil {
 			t.Fatalf("expected valid footer within large file, got %v", err)
+		}
+	})
+}
+
+// TestFooter_FormatVersionValidation asserts that DecodeFooter distinguishes between invalid magic and unsupported format version.
+func TestFooter_FormatVersionValidation(t *testing.T) {
+	baseFooter := sstable.Footer{
+		MetaIndexHandle: sstable.BlockHandle{Offset: 0, Size: 100},
+		IndexHandle:     sstable.BlockHandle{Offset: 100, Size: 100},
+	}
+	validBytes := baseFooter.Encode()
+
+	t.Run("valid format version 1 extracted successfully", func(t *testing.T) {
+		decoded, err := sstable.DecodeFooter(validBytes[:])
+		if err != nil {
+			t.Fatalf("expected valid footer, got: %v", err)
+		}
+		if decoded.IndexHandle != baseFooter.IndexHandle {
+			t.Fatalf("unexpected index handle: %+v", decoded.IndexHandle)
+		}
+		ver, err := sstable.FormatVersionFromMagic(sstable.FooterMagic)
+		if err != nil || ver != sstable.FormatVersion1 {
+			t.Fatalf("expected version 1, got ver=%d err=%v", ver, err)
+		}
+	})
+
+	t.Run("unsupported format version 0xFF returns ErrUnsupportedFormatVersion", func(t *testing.T) {
+		corrupted := validBytes
+		futureMagic := sstable.FooterMagicBase | uint64(0xFF)
+		binary.PutUint64(corrupted[40:48], futureMagic)
+
+		_, err := sstable.DecodeFooter(corrupted[:])
+		if err == nil {
+			t.Fatal("expected error for unsupported format version 0xFF, got nil")
+		}
+		if !stdErrors.Is(err, sstable.ErrUnsupportedFormatVersion) {
+			t.Fatalf("expected ErrUnsupportedFormatVersion, got: %v", err)
+		}
+		var verErr *sstable.UnsupportedFormatVersionError
+		if !stdErrors.As(err, &verErr) {
+			t.Fatalf("expected *UnsupportedFormatVersionError, got: %T (%v)", err, err)
+		}
+		if verErr.Version != 0xFF {
+			t.Fatalf("expected version 0xFF, got: %d", verErr.Version)
+		}
+		if verErr.Expected != sstable.CurrentFormatVersion {
+			t.Fatalf("expected expected version %d, got: %d", sstable.CurrentFormatVersion, verErr.Expected)
+		}
+	})
+
+	t.Run("unsupported format version 2 returns ErrUnsupportedFormatVersion", func(t *testing.T) {
+		corrupted := validBytes
+		v2Magic := sstable.FooterMagicBase | uint64(2)
+		binary.PutUint64(corrupted[40:48], v2Magic)
+
+		_, err := sstable.DecodeFooter(corrupted[:])
+		if !stdErrors.Is(err, sstable.ErrUnsupportedFormatVersion) {
+			t.Fatalf("expected ErrUnsupportedFormatVersion, got: %v", err)
+		}
+	})
+
+	t.Run("completely corrupted magic does not match ErrUnsupportedFormatVersion", func(t *testing.T) {
+		corrupted := validBytes
+		binary.PutUint64(corrupted[40:48], 0xDEADBEEFCAFE0001)
+
+		_, err := sstable.DecodeFooter(corrupted[:])
+		if stdErrors.Is(err, sstable.ErrUnsupportedFormatVersion) {
+			t.Fatal("unexpected ErrUnsupportedFormatVersion match for random magic")
+		}
+		if !stdErrors.Is(err, errors.ErrInvalidFooterMagic) {
+			t.Fatalf("expected ErrInvalidFooterMagic for corrupt magic, got: %v", err)
 		}
 	})
 }

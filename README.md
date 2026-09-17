@@ -2,7 +2,7 @@
 
 > **A High-Performance Distributed Key-Value Storage Engine Being Built from the Ground Up**
 
-[![Status: Phase 00 & 01 Complete](https://img.shields.io/badge/Status-Phase%2000%20%26%2001%20Complete-blue.svg)](#)
+[![Status: Phases 00–12 Complete](https://img.shields.io/badge/Status-Phases%2000--12%20Complete-brightgreen.svg)](#)
 [![Design Spec](https://img.shields.io/badge/Docs-Architecture%20Spec-blue.svg)](docs/architecture-spec.md)
 [![Implementation Plan](https://img.shields.io/badge/Docs-Implementation%20Plan-green.svg)](docs/implementation-plan.md)
 [![Interview Knowledge](https://img.shields.io/badge/Docs-Interview%20Defense-purple.svg)](docs/interview-knowledge.md)
@@ -81,17 +81,17 @@ The system design specifies the following architectural targets (currently under
 * [x] **System Security Threat Model** — Completed in [`docs/threat-model.md`](docs/threat-model.md)
 * [x] **Phase 00: Repository & Engineering Foundations** — Completed (Audit: Pass with Remediations)
 * [x] **Phase 01: Core Storage Primitives & Binary Encodings** — Completed (Audit: Pass with Remediations)
-* [ ] **Phase 02: Write-Ahead Log (WAL) & Durability Subsystem**
-* [ ] **Phase 03: In-Memory MemTable & Concurrent SkipList**
-* [ ] **Phase 04: Persistent SSTable Subsystem**
-* [ ] **Phase 05: Probabilistic Bloom Filter Subsystem**
-* [ ] **Phase 06: Manifest Log & VersionSet Management**
-* [ ] **Phase 07: Crash Recovery & Integrity Verification**
-* [ ] **Phase 08: Leveled Compaction Subsystem**
-* [ ] **Phase 09: Sharded LRU Read Block Cache**
-* [ ] **Phase 10: Single-Node Storage Engine Integration**
-* [ ] **Phase 11: TCP Binary Wire Protocol & Networking**
-* [ ] **Phase 12: CLI, Interactive REPL & Forensic Diagnostics**
+* [x] **Phase 02: Write-Ahead Log (WAL) & Durability Subsystem** — Completed (Audit: Pass with Remediations)
+* [x] **Phase 03: In-Memory MemTable & Concurrent SkipList** — Completed (Audit: Pass with Remediations)
+* [x] **Phase 04: Persistent SSTable Subsystem** — Completed (Audit: Pass with Remediations)
+* [x] **Phase 05: Probabilistic Bloom Filter Subsystem** — Completed (Audit: Pass with Remediations)
+* [x] **Phase 06: Manifest Log & VersionSet Management** — Completed (Audit: Pass with Remediations)
+* [x] **Phase 07: Crash Recovery & Integrity Verification** — Completed (Audit: Pass with Remediations)
+* [x] **Phase 08: Leveled Compaction Subsystem** — Completed (Audit: Pass with Remediations)
+* [x] **Phase 09: Sharded LRU Read Block Cache** — Completed (Audit: Pass with Remediations)
+* [x] **Phase 10: Single-Node Storage Engine Integration** — Completed (Audit: Pass with Remediations)
+* [x] **Phase 11: TCP Binary Wire Protocol & Networking** — Completed (Audit: Pass with Remediations)
+* [x] **Phase 12: CLI, Interactive REPL & Forensic Diagnostics** — Completed (Audit: Pass with Remediations)
 * [ ] **Phase 13: Benchmarking Suite & Performance Profiling**
 * [ ] **Phase 14: Distributed Cluster Foundations & Node Topology**
 * [ ] **Phase 15: Raft Consensus Engine (V1.1)**

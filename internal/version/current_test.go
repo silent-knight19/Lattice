@@ -1490,3 +1490,43 @@ func TestCurrentLockRegistry_Lifecycle(t *testing.T) {
 		t.Errorf("expected 0 active locks after second release, got %d", count)
 	}
 }
+
+// TestSetCurrentManifest_PreRenameSwapDetection asserts that SetCurrentManifest detects if
+// CURRENT.tmp is replaced or swapped before the atomic rename, aborting without modifying CURRENT.
+func TestSetCurrentManifest_PreRenameSwapDetection(t *testing.T) {
+	dir := t.TempDir()
+
+	// Establish initial valid CURRENT pointer
+	if err := SetCurrentManifest(dir, 1); err != nil {
+		t.Fatalf("initial SetCurrentManifest failed: %v", err)
+	}
+
+	// Intercept close to swap CURRENT.tmp with a different file
+	restoreClose := SetCurrentCloseFnForTesting(func(f *os.File) error {
+		// Close the real file first
+		_ = f.Close()
+		tmpPath := filepath.Join(dir, CurrentTempFilename)
+		_ = os.Remove(tmpPath)
+		// Attacker writes a rogue file
+		if err := os.WriteFile(tmpPath, []byte("MANIFEST-999999\n"), 0600); err != nil {
+			return err
+		}
+		return nil
+	})
+	defer restoreClose()
+
+	// Update attempt must fail closed due to pre-rename identity mismatch
+	err := SetCurrentManifest(dir, 2)
+	if err == nil {
+		t.Fatalf("expected SetCurrentManifest to fail on swapped tmpPath, got nil")
+	}
+
+	// Invariant: original CURRENT pointer must remain completely pristine ("MANIFEST-000001\n")
+	name, raw := readCurrentForTesting(t, dir)
+	if name != "MANIFEST-000001" {
+		t.Fatalf("CURRENT pointer hijacked: got %q, want MANIFEST-000001", name)
+	}
+	if string(raw) != "MANIFEST-000001\n" {
+		t.Fatalf("raw CURRENT corrupted: got %q", string(raw))
+	}
+}

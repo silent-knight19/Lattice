@@ -2,8 +2,11 @@ package engine
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/silent-knight19/lattice/internal/binary"
 	lerrors "github.com/silent-knight19/lattice/internal/errors"
@@ -137,4 +140,55 @@ func TestAudit_FlushOneFileNumOverflowPreCheck(t *testing.T) {
 	for _, en := range entries {
 		t.Fatalf("overflow must not create files, found %s", en.Name())
 	}
+}
+
+// TestAudit_DrainForShutdown_Timeout verifies that a stalled flush causes drainForShutdown
+// to abort cleanly within the configured ShutdownTimeout (SEC-P10-003).
+func TestAudit_DrainForShutdown_Timeout(t *testing.T) {
+	dir := t.TempDir()
+	e := NewEngineWithOptions(EngineOptions{
+		DBPath:          dir,
+		Backpressure:    DefaultBackpressureConfig(),
+		ShutdownTimeout: 30 * time.Millisecond,
+	})
+
+	// Inject a slow versionApply that sleeps longer than ShutdownTimeout
+	e.flushCfgMu.Lock()
+	e.versionApply = func(edit *version.VersionEdit) error {
+		time.Sleep(100 * time.Millisecond)
+		return nil
+	}
+	e.flushCfgMu.Unlock()
+
+	// Queue two immutable memtables
+	for i := 0; i < 2; i++ {
+		imm := memtable.NewSkipList()
+		ik, err := binary.NewInternalKey([]byte(fmt.Sprintf("k%d", i)), binary.SeqNum(i+1), binary.OpTypePut)
+		if err != nil {
+			t.Fatalf("NewInternalKey: %v", err)
+		}
+		if err := imm.Insert(ik, []byte("v")); err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+		imm.Freeze()
+		e.mu.Lock()
+		e.immMems = append(e.immMems, imm)
+		e.mu.Unlock()
+	}
+
+	start := time.Now()
+	err := e.drainForShutdown()
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected drainForShutdown to return timeout error, got nil")
+	}
+	if !strings.Contains(err.Error(), "shutdown drain timeout exceeded") {
+		t.Fatalf("expected timeout error message, got: %v", err)
+	}
+	// Verify that the second generation was not flushed due to timeout abort
+	if qLen := e.FlushQueueLen(); qLen == 0 {
+		t.Fatal("expected remaining generations to stay queued upon timeout abort")
+	}
+	t.Logf("drain timeout aborted in %v as expected: %v", elapsed, err)
 }

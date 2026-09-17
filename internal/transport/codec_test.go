@@ -583,3 +583,41 @@ func TestCodec_StreamPipeIntegration(t *testing.T) {
 		t.Fatalf("pipe response mismatch: got %+v, want %+v", receivedResp, expectedResp)
 	}
 }
+
+func TestEncodeResponse_MaxPayloadLengthExceeded(t *testing.T) {
+	// Test error message exceeding MaxPayloadLength
+	hugeMsg := string(make([]byte, transport.MaxPayloadLength+1))
+	resp := &transport.Response{
+		OpCode:  transport.OpGet,
+		Status:  transport.StatusError,
+		SeqID:   1,
+		Message: hugeMsg,
+	}
+
+	_, err := transport.EncodeResponse(resp)
+	if err == nil {
+		t.Fatal("expected FrameTooLargeError for oversized response message, got nil")
+	}
+	var frameErr *errors.FrameTooLargeError
+	if !stdErrors.As(err, &frameErr) {
+		t.Fatalf("expected *errors.FrameTooLargeError, got: %T (%v)", err, err)
+	}
+	if frameErr.PayloadSize != transport.MaxPayloadLength+1 {
+		t.Fatalf("expected PayloadSize %d, got %d", transport.MaxPayloadLength+1, frameErr.PayloadSize)
+	}
+
+	// Test stats payload exceeding MaxPayloadLength
+	statsResp := &transport.Response{
+		OpCode: transport.OpStats,
+		Status: transport.StatusOk,
+		SeqID:  2,
+		Value:  make([]byte, transport.MaxPayloadLength+1),
+	}
+	_, err = transport.EncodeResponse(statsResp)
+	if err == nil {
+		t.Fatal("expected FrameTooLargeError for oversized stats response, got nil")
+	}
+	if !stdErrors.As(err, &frameErr) {
+		t.Fatalf("expected *errors.FrameTooLargeError, got: %T (%v)", err, err)
+	}
+}

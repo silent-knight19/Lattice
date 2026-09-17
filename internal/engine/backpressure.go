@@ -59,7 +59,7 @@ type BackpressureStats struct {
 type BackpressureController struct {
 	cfg            BackpressureConfig
 	mu             sync.Mutex
-	cond           *sync.Cond
+	notifyCh       chan struct{}
 	currentBytes   atomic.Uint64
 	activeWriters  atomic.Int64
 	throttledCount atomic.Uint64
@@ -83,10 +83,17 @@ func NewBackpressureController(cfg BackpressureConfig) *BackpressureController {
 	}
 
 	bc := &BackpressureController{
-		cfg: cfg,
+		cfg:      cfg,
+		notifyCh: make(chan struct{}),
 	}
-	bc.cond = sync.NewCond(&bc.mu)
 	return bc
+}
+
+func (bc *BackpressureController) broadcastLocked() {
+	if bc.notifyCh != nil {
+		close(bc.notifyCh)
+	}
+	bc.notifyCh = make(chan struct{})
 }
 
 // Acquire requests permission to allocate bytesNeeded for an incoming write.
@@ -159,32 +166,18 @@ func (bc *BackpressureController) Acquire(ctx context.Context, bytesNeeded uint6
 			return ctx.Err()
 		}
 
-		// Non-blocking wait using Wait with timeout goroutine or Broadcast signaling
-		waitChan := make(chan struct{})
-		go func() {
-			bc.mu.Lock()
-			defer bc.mu.Unlock()
-			select {
-			case <-waitChan:
-				return
-			default:
-				bc.cond.Wait()
-				close(waitChan)
-			}
-		}()
-
+		ch := bc.notifyCh
 		bc.mu.Unlock()
+
 		select {
-		case <-waitChan:
+		case <-ch:
 			bc.mu.Lock()
 		case <-time.After(timeout - time.Since(startTime)):
 			bc.mu.Lock()
-			bc.cond.Broadcast()
 			bc.rejectedCount.Add(1)
 			return errors.ErrMemoryLimitExceeded
 		case <-ctx.Done():
 			bc.mu.Lock()
-			bc.cond.Broadcast()
 			return ctx.Err()
 		}
 	}
@@ -209,7 +202,7 @@ func (bc *BackpressureController) Release(bytesFreed uint64) {
 	}
 
 	bc.mu.Lock()
-	bc.cond.Broadcast()
+	bc.broadcastLocked()
 	bc.mu.Unlock()
 }
 
@@ -221,7 +214,7 @@ func (bc *BackpressureController) RecordUsage(totalBytes uint64) {
 	prev := bc.currentBytes.Swap(totalBytes)
 	if totalBytes < prev {
 		bc.mu.Lock()
-		bc.cond.Broadcast()
+		bc.broadcastLocked()
 		bc.mu.Unlock()
 	}
 }
@@ -279,6 +272,6 @@ func (bc *BackpressureController) Close() {
 	}
 	bc.closed.Store(true)
 	bc.mu.Lock()
-	bc.cond.Broadcast()
+	bc.broadcastLocked()
 	bc.mu.Unlock()
 }

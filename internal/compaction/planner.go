@@ -114,6 +114,11 @@ func (p *Planner) PickCompaction(v *version.Version) (*CompactionPlan, error) {
 			return cmp.Compare(a.FileNum, b.FileNum)
 		})
 	} else {
+		for _, f := range sortedFiles {
+			if _, _, err := ExtractUserKeyRange(f); err != nil {
+				return nil, err
+			}
+		}
 		slices.SortFunc(sortedFiles, func(a, b version.FileMetadata) int {
 			ikA, _ := binary.DecodeInternalKey(a.SmallestKey)
 			ikB, _ := binary.DecodeInternalKey(b.SmallestKey)
@@ -190,6 +195,13 @@ func (p *Planner) PlanCompaction(v *version.Version, sourceLevel int, seedFiles 
 		finalSourceFiles = make([]version.FileMetadata, 0, len(dedupMap))
 		for _, f := range dedupMap {
 			finalSourceFiles = append(finalSourceFiles, f)
+		}
+
+		// Pre-validate finalSourceFiles user key ranges
+		for _, f := range finalSourceFiles {
+			if _, _, err := ExtractUserKeyRange(f); err != nil {
+				return nil, err
+			}
 		}
 
 		// Sort canonically by SmallestKey

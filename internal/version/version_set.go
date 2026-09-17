@@ -621,8 +621,8 @@ func (vs *VersionSet) LogAndApply(edit *VersionEdit) error {
 	if vs.manifest.IsClosed() {
 		return errors.ErrManifestWriterClosed
 	}
-	if vs.manifest.IsPoisoned() {
-		return errors.ErrManifestWriterPoisoned
+	if err := vs.manifest.PoisonError(); err != nil {
+		return err
 	}
 
 	// 2. Validate edit structure

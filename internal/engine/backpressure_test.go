@@ -154,3 +154,48 @@ func TestEngine_PutGetBackpressureEnforcement(t *testing.T) {
 		t.Fatalf("expected 128 bytes, got %d", len(val))
 	}
 }
+
+func TestBackpressure_NoGoroutineLeakOnTimeout(t *testing.T) {
+	cfg := engine.BackpressureConfig{
+		MaxMemoryBytes: 10 * 1024, // 10 KiB
+		HighWatermark:  0.80,
+		HardWatermark:  0.90, // 9 KiB
+		MaxWaitTimeout: 20 * time.Millisecond,
+	}
+
+	bc := engine.NewBackpressureController(cfg)
+	defer bc.Close()
+
+	ctx := context.Background()
+
+	// Fill to hard capacity
+	if err := bc.Acquire(ctx, 9*1024); err != nil {
+		t.Fatalf("failed to acquire initial bytes: %v", err)
+	}
+
+	// Launch 20 concurrent writers that will all exceed capacity and time out
+	var wg sync.WaitGroup
+	timeoutErrors := make([]error, 20)
+
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			timeoutErrors[idx] = bc.Acquire(ctx, 1024)
+		}(i)
+	}
+
+	wg.Wait()
+
+	for i, err := range timeoutErrors {
+		if !errors.Is(err, domainErrors.ErrMemoryLimitExceeded) {
+			t.Fatalf("writer %d expected ErrMemoryLimitExceeded, got: %v", i, err)
+		}
+	}
+
+	// Verify that release subsequently works without deadlocks
+	bc.Release(5 * 1024)
+	if err := bc.Acquire(ctx, 2*1024); err != nil {
+		t.Fatalf("failed to acquire after release: %v", err)
+	}
+}

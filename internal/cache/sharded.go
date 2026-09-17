@@ -55,6 +55,11 @@ type ShardedBlockCache = ShardedCache
 //     base = capacity / 16, remainder = capacity % 16.
 //     Shards 0 through remainder-1 receive base + 1 capacity; the remaining shards receive base.
 //     The sum of all shard capacities strictly equals the configured global capacity.
+//
+// Capacity Accounting Model:
+// Capacity is tracked in number of block entries (assuming ~4KB standard SSTable data blocks).
+// If SSTables contain oversized data blocks (up to sstable.MaxDataBlockSize), memory footprint
+// scales accordingly as each block counts as 1 entry.
 func NewShardedCache(capacity int) (*ShardedCache, error) {
 	if capacity < 0 {
 		return nil, &errors.InvalidCacheCapacityError{Capacity: capacity}
@@ -92,7 +97,8 @@ func NewShardedBlockCache(capacity int) (*ShardedCache, error) {
 // Implementation:
 //   - Serializes FileNum (8B, Big-Endian) and Offset (8B, Big-Endian) into a 16-byte stack buffer.
 //   - Hashes using filter.Murmur3_128 with canonical seed 0 (zero heap allocations).
-//   - Extracts 4 high bits: int((h1 >> 28) & 0x0F) guaranteeing [0, 15] range.
+//   - Extracts 4 bits (bits 28..31) from the 64-bit hash h1: int((h1 >> 28) & 0x0F),
+//     guaranteeing a uniform, deterministic shard index in [0, 15] across the 16 shards.
 func ShardIndex(key BlockKey) int {
 	var buf [16]byte
 	binary.BigEndian.PutUint64(buf[0:8], key.FileNum)
@@ -196,8 +202,15 @@ func (c *ShardedCache) Capacity() int {
 
 // Clear purges all entries from all 16 shards.
 // Locks and resets shards sequentially (0..15).
-// A nil receiver is a no-op. Concurrent Get/Put observe per-shard
-// serialization; Clear provides no global snapshot.
+// A nil receiver is a no-op.
+//
+// Concurrency Semantics:
+// Clear acquires and releases each shard mutex sequentially without holding a global
+// cache lock, avoiding global contention and deadlocks. However, Clear does NOT provide
+// an atomic barrier against concurrent writers; if concurrent goroutines invoke Put
+// while Clear is running, previously cleared shards may receive new entries. Callers
+// requiring a strictly quiescent, empty cache state (such as during test setup or engine
+// shutdown) must synchronize or pause concurrent write operations.
 func (c *ShardedCache) Clear() {
 	if c == nil {
 		return

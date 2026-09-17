@@ -1,6 +1,7 @@
 package sstable
 
 import (
+	stdErrors "errors"
 	"fmt"
 	"math"
 	"os"
@@ -144,6 +145,7 @@ type TableWriter struct {
 
 	parentDirFile *os.File
 	parentDirStat os.FileInfo
+	stagingStat   os.FileInfo
 
 	// Test seams for deterministic fault injection
 	writeFn       func(f *os.File, p []byte) (int, error)
@@ -173,6 +175,8 @@ func NewTableWriter(dstPath string, opts TableWriterOptions) (*TableWriter, erro
 
 	if opts.TargetBlockSize <= 0 {
 		opts.TargetBlockSize = TargetBlockSize
+	} else if opts.TargetBlockSize > MaxDataBlockSize {
+		return nil, fmt.Errorf("sstable: target block size %d exceeds MaxDataBlockSize %d: %w", opts.TargetBlockSize, MaxDataBlockSize, os.ErrInvalid)
 	}
 	if opts.RestartInterval <= 0 {
 		opts.RestartInterval = DefaultRestartInterval
@@ -237,6 +241,17 @@ func NewTableWriter(dstPath string, opts TableWriterOptions) (*TableWriter, erro
 	if !os.SameFile(parentStat, pLstat) {
 		_ = parentFile.Close()
 		return nil, errors.ErrParentDirectorySwapped
+	}
+
+	// Tighten existing directory permissions to 0700 if group/others have permission bits (SEC-P04-005)
+	if runtime.GOOS != "windows" && parentStat.Mode().Perm()&0077 != 0 {
+		if err := parentFile.Chmod(DefaultDirMode); err != nil {
+			_ = parentFile.Close()
+			return nil, fmt.Errorf("failed to tighten parent directory permissions on %q: %w", parentDir, err)
+		}
+		if updatedStat, err := parentFile.Stat(); err == nil {
+			parentStat = updatedStat
+		}
 	}
 
 	// Secure staging file creation:
@@ -319,6 +334,7 @@ func NewTableWriter(dstPath string, opts TableWriterOptions) (*TableWriter, erro
 		file:             file,
 		parentDirFile:    parentFile,
 		parentDirStat:    parentStat,
+		stagingStat:      fi,
 		dataBlockBuilder: dataBuilder,
 		indexBuilder:     NewIndexBuilder(),
 		filterBuilder:    opts.FilterBuilder,
@@ -375,6 +391,8 @@ func NewTableWriterWithFile(file *os.File, opts TableWriterOptions) (*TableWrite
 
 	if opts.TargetBlockSize <= 0 {
 		opts.TargetBlockSize = TargetBlockSize
+	} else if opts.TargetBlockSize > MaxDataBlockSize {
+		return nil, fmt.Errorf("sstable: target block size %d exceeds MaxDataBlockSize %d: %w", opts.TargetBlockSize, MaxDataBlockSize, os.ErrInvalid)
 	}
 	if opts.RestartInterval <= 0 {
 		opts.RestartInterval = DefaultRestartInterval
@@ -461,9 +479,18 @@ func (w *TableWriter) Add(key binary.InternalKey, value []byte) error {
 		}
 	}
 
-	// 3. Add to data block builder
+	// 3. Add to data block builder (flush and retry if block would overflow MaxDataBlockSize)
 	if err := w.dataBlockBuilder.Add(key, value); err != nil {
-		return err
+		if stdErrors.Is(err, errors.ErrBlockOverflow) && !w.dataBlockBuilder.IsEmpty() {
+			if flushErr := w.flushDataBlock(); flushErr != nil {
+				return flushErr
+			}
+			if retryErr := w.dataBlockBuilder.Add(key, value); retryErr != nil {
+				return retryErr
+			}
+		} else {
+			return err
+		}
 	}
 
 	// Add user key to filter builder if configured (VULN-003 / SEC-008 remediation)
@@ -531,6 +558,17 @@ func (w *TableWriter) Build(iter Iterator) (*SSTableMetadata, error) {
 		}
 		if !iter.Next() {
 			break
+		}
+	}
+
+	// Propagate error from iterators that expose Err() error (SEC-P05-003)
+	type errorableIterator interface {
+		Err() error
+	}
+	if errIter, ok := iter.(errorableIterator); ok {
+		if err := errIter.Err(); err != nil {
+			_ = w.Close()
+			return nil, fmt.Errorf("iterator error during table build: %w", err)
 		}
 	}
 
@@ -771,6 +809,27 @@ func (w *TableWriter) Finish() (*SSTableMetadata, error) {
 			w.err = err
 			_ = w.cleanupStaging()
 			return nil, fmt.Errorf("failed to check destination path %q: %w", w.dstPath, err)
+		}
+
+		// Verify staging file has not been replaced or swapped before atomic link (SEC-P04-001)
+		curTmpStat, err := os.Lstat(w.tmpPath)
+		if err != nil {
+			w.state = stateError
+			w.err = fmt.Errorf("failed to stat staging file %q: %w", w.tmpPath, err)
+			_ = w.cleanupStaging()
+			return nil, w.err
+		}
+		if curTmpStat.Mode()&os.ModeSymlink != 0 {
+			w.state = stateError
+			w.err = fmt.Errorf("staging file %q was replaced with a symlink", w.tmpPath)
+			_ = w.cleanupStaging()
+			return nil, w.err
+		}
+		if w.stagingStat != nil && !os.SameFile(w.stagingStat, curTmpStat) {
+			w.state = stateError
+			w.err = fmt.Errorf("staging file %q was replaced before publication: %w", w.tmpPath, os.ErrInvalid)
+			_ = w.cleanupStaging()
+			return nil, w.err
 		}
 
 		// Use atomic link(2) to publish the SSTable without TOCTOU overwrite races.

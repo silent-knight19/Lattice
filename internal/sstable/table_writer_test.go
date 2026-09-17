@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/silent-knight19/lattice/internal/binary"
@@ -773,4 +774,111 @@ func stdErrorsIs(err, target error) bool {
 
 func stdErrorsAs(err error, target any) bool {
 	return stdErrors.As(err, target)
+}
+
+// TestTableWriter_TargetBlockSizeBounds verifies that TargetBlockSize > MaxDataBlockSize
+// is rejected by both NewTableWriter and NewTableWriterWithFile (SEC-P04-004).
+func TestTableWriter_TargetBlockSizeBounds(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "oversized.sst")
+	opts := sstable.DefaultTableWriterOptions()
+	opts.TargetBlockSize = sstable.MaxDataBlockSize + 1
+
+	_, err := sstable.NewTableWriter(p, opts)
+	if err == nil {
+		t.Fatal("expected NewTableWriter to reject TargetBlockSize > MaxDataBlockSize, got nil")
+	}
+
+	f, err := os.CreateTemp(dir, "testfile_*")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	_, err = sstable.NewTableWriterWithFile(f, opts)
+	if err == nil {
+		t.Fatal("expected NewTableWriterWithFile to reject TargetBlockSize > MaxDataBlockSize, got nil")
+	}
+}
+
+// TestTableWriter_TightenExistingParentDir verifies that NewTableWriter tightens permissions
+// of an existing loose parent directory to DefaultDirMode (0700) (SEC-P04-005).
+func TestTableWriter_TightenExistingParentDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission tightening skipped on Windows")
+	}
+
+	base := t.TempDir()
+	parentDir := filepath.Join(base, "loose_parent")
+	if err := os.MkdirAll(parentDir, 0777); err != nil {
+		t.Fatalf("failed to create loose parent dir: %v", err)
+	}
+
+	dst := filepath.Join(parentDir, "table.sst")
+	w, err := sstable.NewTableWriter(dst, sstable.DefaultTableWriterOptions())
+	if err != nil {
+		t.Fatalf("NewTableWriter failed: %v", err)
+	}
+	_ = w.Close()
+
+	fi, err := os.Stat(parentDir)
+	if err != nil {
+		t.Fatalf("os.Stat on parentDir failed: %v", err)
+	}
+	if fi.Mode().Perm()&0077 != 0 {
+		t.Fatalf("expected parent dir permissions to be tightened to 0700, got %04o", fi.Mode().Perm())
+	}
+}
+
+// failingIterator mocks an iterator that fails mid-iteration with an Err() error.
+type failingIterator struct {
+	valid bool
+	count int
+	err   error
+}
+
+func (it *failingIterator) Valid() bool {
+	return it.valid
+}
+
+func (it *failingIterator) Next() bool {
+	if it.count > 0 {
+		it.valid = false
+		it.err = stdErrors.New("disk read failure during merge iteration")
+		return false
+	}
+	it.count++
+	it.valid = true
+	return true
+}
+
+func (it *failingIterator) Key() binary.InternalKey {
+	k, _ := binary.NewInternalKey([]byte("key1"), 1, binary.OpTypePut)
+	return k
+}
+
+func (it *failingIterator) Value() []byte {
+	return []byte("val1")
+}
+
+func (it *failingIterator) Err() error {
+	return it.err
+}
+
+// TestTableWriter_BuildErrorPropagation verifies that Build propagates errors
+// from iterators that expose an Err() error method (SEC-P05-003).
+func TestTableWriter_BuildErrorPropagation(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "build_err.sst")
+	w, err := sstable.NewTableWriter(p, sstable.DefaultTableWriterOptions())
+	if err != nil {
+		t.Fatalf("NewTableWriter failed: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	iter := &failingIterator{}
+	_, err = w.Build(iter)
+	if err == nil {
+		t.Fatal("expected Build to fail when iterator exposes non-nil Err(), got nil")
+	}
 }

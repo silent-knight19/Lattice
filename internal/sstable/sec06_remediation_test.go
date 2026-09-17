@@ -664,10 +664,11 @@ func TestSEC006_ObjectIdentityMatrix(t *testing.T) {
 			_ = os.Remove(capturedTmp)
 			return os.WriteFile(capturedTmp, []byte("replaced_inode"), 0600)
 		})
-		// When the inode changes, link will publish the replaced file.
-		// This is a best-effort detection test; on some platforms
-		// the link may succeed with a different inode.
-		_, _ = w.Finish()
+		// Verify that replacing the staging inode causes Finish to fail closed
+		_, err = w.Finish()
+		if err == nil {
+			t.Fatal("expected Finish to reject publication when staging inode is replaced, got nil")
+		}
 	})
 
 	t.Run("08_DestinationAlreadyExists_Reject", func(t *testing.T) {

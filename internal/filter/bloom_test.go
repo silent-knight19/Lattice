@@ -585,3 +585,76 @@ func TestBloomFilter_ZeroAllocations_Membership(t *testing.T) {
 		t.Fatalf("f.MayContain allocated %f objects/op; want 0", allocsMayContain)
 	}
 }
+
+// TestFormatKey_MinIntHandling verifies that FormatKey safely formats keys for all integer
+// values without two's complement overflow, especially math.MinInt and negative numbers.
+func TestFormatKey_MinIntHandling(t *testing.T) {
+	testCases := []struct {
+		name     string
+		prefix   string
+		id       int
+		expected string
+	}{
+		{"zero", "key:", 0, "key:0000000000"},
+		{"positive_one", "key:", 1, "key:0000000001"},
+		{"negative_one", "key:", -1, "key:0000000001"},
+		{"positive_large", "key:", 123456789, "key:0123456789"},
+		{"negative_large", "key:", -123456789, "key:0123456789"},
+		{"math_max_int", "key:", math.MaxInt, fmt.Sprintf("key:%010d", uint64(math.MaxInt)%10000000000)},
+		{"math_min_int", "key:", math.MinInt, fmt.Sprintf("key:%010d", (uint64(-(math.MinInt+1))+1)%10000000000)},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := make([]byte, len(tc.prefix)+10)
+			res := filter.FormatKey(buf, tc.prefix, tc.id)
+			if string(res) != tc.expected {
+				t.Fatalf("FormatKey(%d) = %q; want %q", tc.id, string(res), tc.expected)
+			}
+			// Verify all 10 trailing digits are valid ASCII decimal digits ('0'..'9')
+			suffix := res[len(tc.prefix):]
+			for idx, b := range suffix {
+				if b < '0' || b > '9' {
+					t.Fatalf("non-digit byte at offset %d: 0x%02x (%c)", idx, b, b)
+				}
+			}
+		})
+	}
+}
+
+// TestFilterBlockBuilder_ExpectedKeys verifies that ExpectedKeys returns the nominal capacity
+// and documents non-destructive behavior when AddedKeys exceeds ExpectedKeys.
+func TestFilterBlockBuilder_ExpectedKeys(t *testing.T) {
+	b := filter.NewFilterBlockBuilder(50)
+	if b.ExpectedKeys() != 50 {
+		t.Fatalf("expected ExpectedKeys = 50, got %d", b.ExpectedKeys())
+	}
+	if b.AddedKeys() != 0 {
+		t.Fatalf("expected AddedKeys = 0, got %d", b.AddedKeys())
+	}
+
+	for i := 0; i < 60; i++ {
+		if err := b.AddKey([]byte(fmt.Sprintf("key-%d", i))); err != nil {
+			t.Fatalf("AddKey failed: %v", err)
+		}
+	}
+
+	if b.AddedKeys() != 60 {
+		t.Fatalf("expected AddedKeys = 60, got %d", b.AddedKeys())
+	}
+	if b.ExpectedKeys() != 50 {
+		t.Fatalf("expected ExpectedKeys = 50, got %d", b.ExpectedKeys())
+	}
+
+	// Verify all 60 keys are still present (zero false negatives)
+	block := b.Finish()
+	decoded, err := filter.DecodeFilterBlock(block)
+	if err != nil {
+		t.Fatalf("DecodeFilterBlock failed: %v", err)
+	}
+	for i := 0; i < 60; i++ {
+		if !decoded.MayContain([]byte(fmt.Sprintf("key-%d", i))) {
+			t.Fatalf("false negative for key-%d after overfill", i)
+		}
+	}
+}

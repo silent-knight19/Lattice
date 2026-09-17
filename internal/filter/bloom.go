@@ -21,11 +21,11 @@ const (
 
 	// MaxBitsetBytes is the maximum physical byte size permitted for an in-memory Bloom filter (256 MiB).
 	// This bounds heap allocations to prevent denial-of-service memory exhaustion attacks while easily
-	// accommodating up to ~209.7 million keys per SSTable filter block.
+	// accommodating up to ~214.7 million keys per SSTable filter block.
 	MaxBitsetBytes = 256 * 1024 * 1024
 
 	// MaxKeyCount is the maximum key count supported for physical Bloom filter allocation.
-	// Calculated as (MaxBitsetBytes * 8) / BitsPerKey = 209,715,200 keys.
+	// Calculated as (MaxBitsetBytes * 8) / BitsPerKey = 214,748,364 keys (~214.7M keys).
 	MaxKeyCount = (MaxBitsetBytes * 8) / BitsPerKey
 
 	// FilterBlockTrailerSize is the serialized length of the trailing metadata and CRC32 fields.
@@ -94,7 +94,7 @@ func OptimalBitsetSize(keyCount int) (uint64, int, bool) {
 // Input Semantics & Safety Boundaries:
 //   - If keyCount < 0: returns nil (negative key cardinality is invalid; fail-closed).
 //   - If keyCount == 0: returns a valid empty BloomFilter with 0 bits, 0 bytes, and 7 hash functions.
-//   - If keyCount > MaxKeyCount (~209.7M keys): returns nil to prevent memory exhaustion DoS and
+//   - If keyCount > MaxKeyCount (~214.7M keys): returns nil to prevent memory exhaustion DoS and
 //     guarantee integer arithmetic bounds.
 //   - For valid keyCount in [0, MaxKeyCount]: allocates a zero-initialized byte slice of length
 //     byteCount, ensuring the filter represents an empty set where no bits are set.
@@ -166,8 +166,13 @@ func (f *BloomFilter) ByteSize() int {
 	return len(f.bitset)
 }
 
-// Bitset returns a slice to the underlying bitset storage.
+// Bitset returns a direct slice to the underlying bitset storage.
 // Returns nil if the receiver is nil.
+//
+// Caution: The returned slice references internal mutable filter state. Callers MUST treat
+// the returned slice as strictly read-only. Mutating bytes in the returned slice corrupts
+// filter membership data and will induce silent false negatives or false positives across
+// all concurrent readers sharing this filter instance.
 func (f *BloomFilter) Bitset() []byte {
 	if f == nil {
 		return nil

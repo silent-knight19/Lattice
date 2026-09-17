@@ -60,13 +60,6 @@ func (s *LRUShard) ensureInitializedLocked() {
 	}
 }
 
-// NewLRUShard initializes a new LRUShard with the given block capacity.
-//
-// Capacity Contract:
-//   - If capacity < 0, returns *errors.InvalidCacheCapacityError.
-//   - If capacity == 0, returns a valid zero-capacity shard where Put immediately discards and Get always misses.
-//   - If capacity > 0, returns a shard configured to hold at most capacity block entries.
-//
 // initLRUShard initializes the internal map and sentinel list for an LRUShard.
 func initLRUShard(shard *LRUShard, capacity int) {
 	shard.capacity = capacity
@@ -81,6 +74,11 @@ func initLRUShard(shard *LRUShard, capacity int) {
 //   - If capacity < 0, returns *errors.InvalidCacheCapacityError.
 //   - If capacity == 0, returns a valid zero-capacity shard where Put immediately discards and Get always misses.
 //   - If capacity > 0, returns a shard configured to hold at most capacity block entries.
+//
+// Capacity Accounting Model:
+// Capacity is tracked in count of block entries (assuming ~4KB standard SSTable data blocks).
+// If SSTables contain oversized data blocks (up to sstable.MaxDataBlockSize), memory footprint
+// scales accordingly as each block counts as 1 entry.
 func NewLRUShard(capacity int) (*LRUShard, error) {
 	if capacity < 0 {
 		return nil, &errors.InvalidCacheCapacityError{Capacity: capacity}

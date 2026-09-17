@@ -299,6 +299,11 @@ func (p *CompactionPlan) Validate() error {
 		return fmt.Errorf("%w: plan total byte size mismatch", errors.ErrInvalidCompactionPlan)
 	}
 
+	// 9. Priority score validation
+	if math.IsNaN(p.score) || math.IsInf(p.score, 0) || p.score < 0.0 {
+		return fmt.Errorf("%w: invalid compaction score %f", errors.ErrInvalidCompactionPlan, p.score)
+	}
+
 	return nil
 }
 

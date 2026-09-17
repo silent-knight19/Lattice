@@ -64,13 +64,11 @@ func scanManifest(path string, allowTruncate bool) (ManifestReadResult, error) {
 		return res, fmt.Errorf("manifest: path %s is not a regular file (mode: %s): %w", cleanPath, info.Mode(), os.ErrInvalid)
 	}
 
-	openFlags := os.O_RDONLY
 	var f *os.File
 	if allowTruncate {
-		f, err = os.OpenFile(cleanPath, os.O_RDWR, 0)
+		f, err = openFileNoFollow(cleanPath, os.O_RDWR, 0)
 	} else {
-		f, err = os.OpenFile(cleanPath, os.O_RDONLY, 0)
-		_ = openFlags
+		f, err = openFileNoFollow(cleanPath, os.O_RDONLY, 0)
 	}
 	if err != nil {
 		return res, fmt.Errorf("manifest: failed to open file %s: %w", cleanPath, err)

@@ -469,7 +469,16 @@ func (e *Engine) drainForShutdown() error {
 	e.mu.Unlock()
 
 	var firstErr error
+	timeout := e.shutdownTimeout
+	if timeout <= 0 {
+		timeout = DefaultShutdownTimeout
+	}
+	startTime := time.Now()
 	for {
+		if time.Since(startTime) >= timeout {
+			firstErr = fmt.Errorf("shutdown drain timeout exceeded after %v (%d generations remaining)", timeout, e.FlushQueueLen())
+			break
+		}
 		imm := e.takeOldestImm()
 		if imm == nil {
 			break

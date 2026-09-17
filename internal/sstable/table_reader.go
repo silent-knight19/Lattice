@@ -38,12 +38,17 @@ type TableReaderOptions struct {
 	// FileNum is the physical SSTable sequential file number (e.g. 1 for "000001.sst").
 	// If FileNum is 0, NewTableReaderWithOptions attempts to parse FileNum from the filename.
 	//
-	// Cache identity: cached blocks are keyed by (FileNum, Offset). FileNum 0
-	// disables block caching for that reader (reads go directly to disk) because
-	// 0 is the unassigned sentinel and cannot distinguish distinct files.
-	// When sharing one BlockCache across readers, every reader MUST use a
-	// distinct non-zero FileNum; two different files using the same FileNum
-	// would return each other's cached blocks.
+	// Cache identity & Collision Safety:
+	// Cached blocks are keyed globally by (FileNum, Offset). FileNum 0 disables block
+	// caching for that reader (reads go directly to disk) because 0 is the unassigned sentinel
+	// and cannot distinguish distinct files.
+	//
+	// WARNING (Cross-File Cache Collision):
+	// When sharing a single BlockCache across readers, every reader MUST use a distinct,
+	// non-zero FileNum. Two different files sharing the same FileNum will cause block key
+	// collisions: blocks from file A will be served as blocks of file B, leading to silent data
+	// corruption. Higher-level engine components (e.g., VersionSet / TableCache) are responsible
+	// for strictly enforcing monotonic allocation and globally unique FileNum assignment.
 	FileNum uint64
 
 	// BlockCache is the optional BlockCache (e.g. *cache.ShardedCache) to use for data blocks.

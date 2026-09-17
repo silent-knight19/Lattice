@@ -104,16 +104,19 @@ func ZScore(trials int, successes int, pTheoretical float64) float64 {
 
 // FormatKey formats a deterministic key with prefix and a 10-digit zero-padded id into dst.
 // dst must have capacity of at least len(prefix) + 10 bytes.
-// This function executes with zero heap allocations.
+// This function executes with zero heap allocations and safely handles all integer values
+// including math.MinInt without two's complement overflow.
 func FormatKey(dst []byte, prefix string, id int) []byte {
 	n := copy(dst, prefix)
-	val := id
-	if val < 0 {
-		val = -val
+	var uval uint64
+	if id < 0 {
+		uval = uint64(-(id + 1)) + 1
+	} else {
+		uval = uint64(id)
 	}
 	for i := 9; i >= 0; i-- {
-		dst[n+i] = byte('0' + (val % 10))
-		val /= 10
+		dst[n+i] = byte('0' + (uval % 10))
+		uval /= 10
 	}
 	return dst[:n+10]
 }

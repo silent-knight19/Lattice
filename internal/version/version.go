@@ -174,9 +174,11 @@ func (v *Version) NumFiles(level int) int {
 	return len(v.levels[level])
 }
 
-// Files returns a defensive copy of the FileMetadata slice at the designated level.
+// Files returns an independent deep defensive copy of the FileMetadata slice at the designated level.
+// Each FileMetadata is cloned via Clone(), ensuring SmallestKey and LargestKey byte slices are decoupled
+// and callers cannot mutate internal Version state.
 func (v *Version) Files(level int) []FileMetadata {
-	if level < 0 || level >= NumLevels {
+	if v == nil || level < 0 || level >= NumLevels {
 		return nil
 	}
 	files := v.levels[level]
@@ -184,6 +186,8 @@ func (v *Version) Files(level int) []FileMetadata {
 		return nil
 	}
 	cp := make([]FileMetadata, len(files))
-	copy(cp, files)
+	for i, f := range files {
+		cp[i] = f.Clone()
+	}
 	return cp
 }

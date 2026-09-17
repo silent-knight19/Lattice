@@ -3,6 +3,7 @@ package transport
 import (
 	"fmt"
 	"io"
+	"math"
 
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
@@ -390,6 +391,17 @@ func EncodeResponse(resp *Response) (*Frame, error) {
 		}
 	} else {
 		payload = []byte(resp.Message)
+	}
+
+	if uint64(len(payload)) > uint64(MaxPayloadLength) {
+		pSize := uint32(math.MaxUint32)
+		if len(payload) <= math.MaxUint32 {
+			pSize = uint32(len(payload))
+		}
+		return nil, &errors.FrameTooLargeError{
+			PayloadSize: pSize,
+			MaxSize:     MaxPayloadLength,
+		}
 	}
 
 	return &Frame{

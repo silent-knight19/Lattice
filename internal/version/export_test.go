@@ -167,3 +167,18 @@ func SetReplayLstatFnForTesting(fn func(name string) (os.FileInfo, error)) func(
 	replayLstatFn = fn
 	return func() { replayLstatFn = orig }
 }
+
+// SetManifestReplayLimitsForTesting configures custom limits for testing and returns a restore function.
+func SetManifestReplayLimitsForTesting(maxBytes int64, maxRecords int, maxFiles int) func() {
+	prevBytes := manifestReplayMaxBytes
+	prevRecords := manifestReplayMaxRecords
+	prevFiles := manifestReplayMaxFiles
+	manifestReplayMaxBytes = maxBytes
+	manifestReplayMaxRecords = maxRecords
+	manifestReplayMaxFiles = maxFiles
+	return func() {
+		manifestReplayMaxBytes = prevBytes
+		manifestReplayMaxRecords = prevRecords
+		manifestReplayMaxFiles = prevFiles
+	}
+}

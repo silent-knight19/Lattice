@@ -358,11 +358,25 @@ func SetCurrentManifest(dir string, manifestNum uint64) error {
 		return fmt.Errorf("current: close of %s failed: %w", tmpPath, err)
 	}
 
-	// 8a. Pre-rename verification: ensure currentPath is not a symlink immediately before rename
+	// 8a. Pre-rename verification: ensure currentPath is not a symlink, and verify tmpPath identity
 	if cInfo, err := currentLstatFn(currentPath); err == nil {
 		if cInfo.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("%w: target %s is a symlink before rename", errors.ErrCurrentSymlink, currentPath)
 		}
+	}
+
+	curTmpStat, err := currentLstatFn(tmpPath)
+	if err != nil {
+		return fmt.Errorf("current: failed to lstat temporary file %s before rename: %w", tmpPath, err)
+	}
+	if curTmpStat.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: temporary file %s was replaced with a symlink before rename", errors.ErrCurrentSymlink, tmpPath)
+	}
+	if !curTmpStat.Mode().IsRegular() {
+		return fmt.Errorf("current: temporary path %s is not a regular file before rename: %w", tmpPath, os.ErrInvalid)
+	}
+	if !os.SameFile(finfo, curTmpStat) {
+		return fmt.Errorf("%w: temporary file object identity mismatch before rename", os.ErrInvalid)
 	}
 
 	// 8b. Atomically replace CURRENT with CURRENT.tmp anchored to parent directory descriptor (SEC-P07-03)
@@ -382,12 +396,15 @@ func SetCurrentManifest(dir string, manifestNum uint64) error {
 		return fmt.Errorf("current: failed to stat %s post-rename: %w", currentPath, err)
 	}
 	if postStat.Mode()&os.ModeSymlink != 0 {
+		_ = removeAt(parentDirFile, CurrentFilename)
 		return fmt.Errorf("%w: target %s was replaced with a symlink post-rename", errors.ErrCurrentSymlink, currentPath)
 	}
 	if !postStat.Mode().IsRegular() {
+		_ = removeAt(parentDirFile, CurrentFilename)
 		return fmt.Errorf("current: target %s is not a regular file post-rename", currentPath)
 	}
 	if !os.SameFile(finfo, postStat) {
+		_ = removeAt(parentDirFile, CurrentFilename)
 		return fmt.Errorf("%w: CURRENT file object identity mismatch post-rename", os.ErrInvalid)
 	}
 
