@@ -2268,7 +2268,19 @@ TOTAL: 176 Discrete, Testable Micro-Phases
 * **Dependencies**: Phase 11.
 
 * **P13-S01-M01: Zipfian Key Distribution Generator**
+  * *Status*: **Completed**
   * *Objective*: Generate non-uniform key access patterns ($s=0.99$) to simulate real-world read/write hotspots.
+  * *Mathematical Model*: Finite discrete Zipfian distribution over keyspace $N$ ($i \in [0, N-1]$) with skew parameter $\theta = 0.99$:
+    $$P(\text{rank} = r) = \frac{r^{-\theta}}{\sum_{j=1}^N j^{-\theta}} = \frac{r^{-\theta}}{H_{N, \theta}}$$
+  * *Sampling Algorithm*: Jim Gray et al. (SIGMOD 1994) / YCSB (Cooper et al., 2010) finite Zipfian inversion algorithm executing in $O(1)$ expected time and $O(1)$ auxiliary space.
+  * *Changes*: `internal/benchmark/doc.go`, `internal/benchmark/zipf.go`, `internal/benchmark/zipf_test.go`, `internal/benchmark/statistical_test.go`, `internal/benchmark/zipf_bench_test.go`, `internal/benchmark/zipf_fuzz_test.go`.
+  * *Invariants & Properties*:
+    - *P13-S01-INV-01*: Strict bounds enforcement: sampled rank $r \in [0, N-1]$ for all $N \ge 1$.
+    - *P13-S01-INV-02*: Deterministic seed reproducibility: identical seeds produce identical sample sequences.
+    - *P13-S01-INV-03*: Isolated RNG state: zero global mutable RNG state; independent generators run concurrent and thread-safe without mutexes.
+    - *P13-S01-INV-04*: Zero allocation hot path: `NextKeyBuf` performs $0\text{ B/op}$ and $0\text{ allocs/op}$ with caller-provided buffer.
+    - *P13-S01-INV-05*: Lattice key compatibility: generated keys formatted as `key:%010d` pass `binary.ValidateKey` and preserve numeric rank ordering lexicographically.
+  * *Tests*: Parameter validation ($N=0$, $N > 10^9$, invalid $\theta$), keyspace matrix ($N \in \{1, 2, 3, 5, 10, 50, 100, 500, 1000, 10000, 100000\}$), seed determinism, RNG isolation, multi-threaded concurrency under `-race`, 80/20 hotspot concentration ($\approx 75-80\%$ of traffic on top 20% of keys), rank-frequency monotonicity, Chi-Square goodness-of-fit validation, uniform distribution regression rejection, native Go fuzzing (`FuzzNewZipfGenerator`, 1.7M+ iterations), and microbenchmarks (`BenchmarkZipf_Next` ~27-36 ns/op, `BenchmarkZipf_NextKeyBuf` ~46 ns/op, $0\text{ allocs/op}$).
 * **P13-S01-M02: High-Resolution Latency Histogram Collector**
   * *Objective*: Record nanosecond operation latencies into logarithmic buckets without GC allocation overhead.
 * **P13-S01-M03: Standalone Benchmark Load Runner**

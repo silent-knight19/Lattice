@@ -1155,6 +1155,22 @@ This document tracks all **genuine architectural and operational limitations** o
   * Performance: **Optimal** (Zero open blocking; minimal stat overhead).
   * Security: **Optimal** (Mitigates local DoS from FIFOs, port occupation from typos, and terminal spoofing from bare CR).
 
+### 68. Zipfian Key Distribution Generator Scope and Mathematical Model (P13-S01-M01)
+* **Limitation & Architectural Boundaries**:
+  `ZipfGenerator` in `internal/benchmark/zipf.go` provides non-uniform access pattern generation following a discrete Zipfian (power-law) distribution with skew parameter $\theta = 0.99$.
+  1. *Mathematical Model & Standard Library Incompatibility*: Go's standard library `math/rand.NewZipf` requires $s > 1$ and returns `nil` for $s \le 1$. Lattice implements the Jim Gray et al. (SIGMOD 1994) / YCSB (Cooper et al., 2010) finite Zipfian inversion algorithm, operating over a finite discrete domain $r \in [1, N]$ ($i \in [0, N-1]$) with generalized harmonic normalization $H_{N, \theta} = \sum_{j=1}^N j^{-\theta}$.
+  2. *Single-Consumer Concurrency Model*: `ZipfGenerator` is backed by an isolated `*rand.Rand` PRNG source and is intentionally not thread-safe. Concurrent benchmark drivers (Phase 13 M03) must instantiate one generator per worker goroutine to achieve zero-contention, lock-free workload generation.
+  3. *Zero-Allocation Hot Path*: `NextKeyBuf` formats keys into a caller-supplied slice with $0\text{ allocs/op}$ and $0\text{ B/op}$. `NextKey` provides an allocating alternative.
+  4. *Decoupled Subsystems*: Latency tracking (P13-S01-M02), TCP client load running (P13-S01-M03), and `pprof` profiling endpoints (P13-S01-M04) are strictly decoupled and reserved for subsequent micro-phases.
+* **Why It Exists**:
+  Provides an efficient, deterministic, $O(1)$ sampling primitive modeling real-world access hotspots (80/20 rule) without introducing memory distortion, GC pressure, or mutex contention into benchmark measurements.
+* **Impact**:
+  Enables reproducible, non-uniform workload benchmarking across arbitrary keyspaces up to $10^9$ keys.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Strict bounds $r \in [0, N-1]$, seed reproducibility, Chi-Square goodness-of-fit validation).
+  * Performance: **Optimal** (~27-36 ns/op sampling, ~46 ns/op zero-allocation key formatting).
+  * Security: **Optimal** (Isolated RNG state, bounded keyspace, no filesystem or network side effects).
+
 ---
 
 *End of Known Limitations — To be updated continuously throughout implementation.*
