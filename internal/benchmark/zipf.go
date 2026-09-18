@@ -15,6 +15,11 @@ const (
 	// DefaultKeyPrefix is the default string prefix for generated benchmark keys.
 	DefaultKeyPrefix = "key:"
 
+	// MaxPrefixLen defines the maximum permitted key prefix length in bytes (64 bytes).
+	// This bounds memory allocation in generated benchmark keys while accommodating
+	// standard benchmark key namespacing (e.g. "usertable:user:", "benchmark:key:").
+	MaxPrefixLen = 64
+
 	// MaxKeyspace defines the maximum permitted keyspace size (1 billion keys).
 	MaxKeyspace uint64 = 1_000_000_000
 
@@ -35,6 +40,9 @@ var (
 
 	// ErrInvalidZipfTheta indicates that the skew parameter theta is outside (0.0, 1.0).
 	ErrInvalidZipfTheta = errors.New("benchmark: zipfian theta must be in range (0.0, 1.0)")
+
+	// ErrInvalidPrefix indicates that the key prefix is empty or exceeds MaxPrefixLen.
+	ErrInvalidPrefix = errors.New("benchmark: invalid key prefix")
 )
 
 // ZipfGenerator generates discrete key ranks and formatted keys following a
@@ -50,8 +58,14 @@ var (
 //
 //	H(N, theta) = sum_{j=1}^N j^(-theta)
 //
-// When theta = 0.99, the distribution exhibits strong non-uniformity modeling
-// real-world access hotspots (e.g. the top 20% of keys account for ~75-80% of operations).
+// Skew & Access Concentration:
+// When theta = 0.99 (canonical YCSB skew), the distribution exhibits strong
+// non-uniformity modeling real-world access hotspots. For large keyspaces (N >= 1,000),
+// the top 20% of keys receive ~75-80% of total accesses, approximating the Pareto 80/20 rule.
+// Because normalization H(N, theta) is computed over finite discrete ranks, the exact
+// top-20% access share scales with domain size N (e.g. ~51% for N=10, ~65% for N=50,
+// ~69% for N=100, and ~78% for N=1,000). Benchmark harnesses must not assume a fixed
+// universal cache-hit ratio across small keyspaces based solely on theta = 0.99.
 //
 // Sampling Algorithm:
 // Implements the Jim Gray et al. (SIGMOD 1994) / YCSB (Cooper et al., 2010)
@@ -86,6 +100,7 @@ func NewZipfGenerator(n uint64, theta float64, seed int64) (*ZipfGenerator, erro
 }
 
 // NewZipfGeneratorWithPrefix constructs a ZipfGenerator with custom keyspace, skew, seed, and prefix.
+// The prefix must be non-empty and at most MaxPrefixLen (64 bytes).
 func NewZipfGeneratorWithPrefix(n uint64, theta float64, seed int64, prefix string) (*ZipfGenerator, error) {
 	if n < MinKeyspace {
 		return nil, ErrInvalidKeyspace
@@ -95,6 +110,12 @@ func NewZipfGeneratorWithPrefix(n uint64, theta float64, seed int64, prefix stri
 	}
 	if theta <= 0.0 || theta >= 1.0 || math.IsNaN(theta) || math.IsInf(theta, 0) {
 		return nil, ErrInvalidZipfTheta
+	}
+	if prefix == "" {
+		return nil, fmt.Errorf("%w: prefix cannot be empty", ErrInvalidPrefix)
+	}
+	if len(prefix) > MaxPrefixLen {
+		return nil, fmt.Errorf("%w: prefix length (%d bytes) exceeds maximum supported length (%d bytes)", ErrInvalidPrefix, len(prefix), MaxPrefixLen)
 	}
 
 	alpha := 1.0 / (1.0 - theta)

@@ -38,8 +38,13 @@ func TestZipf_RankFrequencyMonotonicity(t *testing.T) {
 	}
 }
 
-// TestZipf_HotspotConcentration80_20 verifies the canonical Zipfian access concentration:
-// approximately 75-80% of all operations target the top 20% of the keyspace.
+// TestZipf_HotspotConcentration80_20 verifies that in a sufficiently large
+// keyspace (N = 1000), empirical sampling with canonical skew theta = 0.99
+// concentrates approximately 75-80% of accesses in the top 20% of the keyspace,
+// demonstrating asymptotic alignment with the Pareto 80/20 property.
+//
+// Note: In smaller domains (e.g. N <= 100), finite harmonic sum normalization
+// yields lower top-20% shares (e.g. ~69% for N=100, ~51% for N=10).
 func TestZipf_HotspotConcentration80_20(t *testing.T) {
 	const n = 1000
 	const samples = 200000
@@ -60,9 +65,47 @@ func TestZipf_HotspotConcentration80_20(t *testing.T) {
 	}
 
 	ratio := float64(top20Accesses) / float64(samples)
-	// For N=1000 and theta=0.99, theoretical top 20% share is ~74-78%
+	// For N=1000 and theta=0.99, theoretical top 20% share is ~77.89%
 	if ratio < 0.70 || ratio > 0.85 {
 		t.Fatalf("expected top 20%% of keys to receive ~75-80%% of accesses, observed %.2f%%", ratio*100)
+	}
+}
+
+// TestZipf_TheoreticalConcentration_DomainScaling verifies the exact discrete
+// mathematical CDF across varying keyspace sizes N, demonstrating that the
+// theoretical top-20% access share scales monotonically with domain size N
+// and approaches ~78% asymptotically as N grows large.
+func TestZipf_TheoreticalConcentration_DomainScaling(t *testing.T) {
+	cases := []struct {
+		n               uint64
+		top20Ranks      uint64
+		expectedMinFrac float64
+		expectedMaxFrac float64
+	}{
+		{n: 10, top20Ranks: 2, expectedMinFrac: 0.50, expectedMaxFrac: 0.52},     // ~50.86%
+		{n: 50, top20Ranks: 10, expectedMinFrac: 0.64, expectedMaxFrac: 0.66},   // ~64.59%
+		{n: 100, top20Ranks: 20, expectedMinFrac: 0.68, expectedMaxFrac: 0.70},  // ~68.81%
+		{n: 1000, top20Ranks: 200, expectedMinFrac: 0.77, expectedMaxFrac: 0.79}, // ~77.89%
+	}
+
+	const theta = benchmark.DefaultZipfTheta
+
+	for _, tc := range cases {
+		var zetan float64
+		for r := uint64(1); r <= tc.n; r++ {
+			zetan += 1.0 / math.Pow(float64(r), theta)
+		}
+
+		var top20Sum float64
+		for r := uint64(1); r <= tc.top20Ranks; r++ {
+			top20Sum += 1.0 / math.Pow(float64(r), theta)
+		}
+
+		theoreticalShare := top20Sum / zetan
+		if theoreticalShare < tc.expectedMinFrac || theoreticalShare > tc.expectedMaxFrac {
+			t.Fatalf("N=%d: theoretical top 20%% share = %f, want [%f, %f]",
+				tc.n, theoreticalShare, tc.expectedMinFrac, tc.expectedMaxFrac)
+		}
 	}
 }
 
@@ -100,14 +143,15 @@ func TestZipf_UniformDistributionRegression(t *testing.T) {
 		t.Fatalf("unexpected uniform ratio: %f", uniformRatio)
 	}
 
-	// Zipf top 20% must exceed 70%
-	if zipfRatio < 0.70 {
-		t.Fatalf("zipf generator failed hotspot test: ratio = %f", zipfRatio)
+	// Zipf top 20% for N=100 (theoretical discrete top 20% is ~68.8%)
+	// Must substantially exceed the uniform ~20%
+	if zipfRatio < 0.60 {
+		t.Fatalf("zipf generator failed hotspot test: ratio = %f (expected ~0.68-0.71)", zipfRatio)
 	}
 
-	// The difference must be vast (> 45 percentage points)
+	// The difference must be vast (> 40 percentage points)
 	diff := zipfRatio - uniformRatio
-	if diff < 0.45 {
+	if diff < 0.40 {
 		t.Fatalf("failed to distinguish Zipfian generator from uniform random sampler! diff = %f", diff)
 	}
 }

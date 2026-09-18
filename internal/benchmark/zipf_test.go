@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"testing"
 
@@ -244,5 +245,103 @@ func TestZipf_LexicographicalSortingOrder(t *testing.T) {
 	}
 	if bytes.Compare(k10, k99) >= 0 {
 		t.Fatalf("expected %q < %q", k10, k99)
+	}
+}
+
+// TestZipf_PrefixValidation verifies prefix bounds enforcement and error semantics
+// as specified in SEC-P13-M01-001.
+func TestZipf_PrefixValidation(t *testing.T) {
+	t.Run("ValidPrefixes", func(t *testing.T) {
+		validCases := []struct {
+			name   string
+			prefix string
+		}{
+			{name: "MinValid1Byte", prefix: "k"},
+			{name: "DefaultPrefix", prefix: benchmark.DefaultKeyPrefix},
+			{name: "Namespaced28Bytes", prefix: "benchmark:usertable:account:"},
+			{name: "Padded32Bytes", prefix: strings.Repeat("x", 32)},
+			{name: "ExactMaxPrefixLen64Bytes", prefix: strings.Repeat("p", benchmark.MaxPrefixLen)},
+		}
+
+		for _, tc := range validCases {
+			t.Run(tc.name, func(t *testing.T) {
+				gen, err := benchmark.NewZipfGeneratorWithPrefix(100, benchmark.DefaultZipfTheta, 42, tc.prefix)
+				if err != nil {
+					t.Fatalf("expected valid generator for prefix length %d, got err: %v", len(tc.prefix), err)
+				}
+				if gen == nil {
+					t.Fatal("expected non-nil generator")
+				}
+
+				key := gen.NextKey()
+				if !bytes.HasPrefix(key, []byte(tc.prefix)) {
+					t.Fatalf("key %q does not start with prefix %q", string(key), tc.prefix)
+				}
+				expectedLen := len(tc.prefix) + 10
+				if len(key) != expectedLen {
+					t.Fatalf("key length %d != expected %d (possible truncation)", len(key), expectedLen)
+				}
+			})
+		}
+	})
+
+	t.Run("InvalidPrefixes", func(t *testing.T) {
+		invalidCases := []struct {
+			name        string
+			prefix      string
+			errContains string
+		}{
+			{name: "EmptyPrefix", prefix: "", errContains: "empty"},
+			{name: "MaxPlusOne65Bytes", prefix: strings.Repeat("x", benchmark.MaxPrefixLen+1), errContains: "exceeds maximum"},
+			{name: "SignificantlyOversized1KiB", prefix: strings.Repeat("a", 1024), errContains: "exceeds maximum"},
+			{name: "SubstantiallyOversized1MiB", prefix: strings.Repeat("b", 1024*1024), errContains: "exceeds maximum"},
+		}
+
+		for _, tc := range invalidCases {
+			t.Run(tc.name, func(t *testing.T) {
+				gen, err := benchmark.NewZipfGeneratorWithPrefix(100, benchmark.DefaultZipfTheta, 42, tc.prefix)
+				if err == nil {
+					t.Fatalf("expected error for prefix length %d, got nil", len(tc.prefix))
+				}
+				if !errors.Is(err, benchmark.ErrInvalidPrefix) {
+					t.Fatalf("expected error wrapping ErrInvalidPrefix, got: %v", err)
+				}
+				if gen != nil {
+					t.Fatal("expected nil generator on error")
+				}
+				if !strings.Contains(err.Error(), tc.errContains) {
+					t.Fatalf("expected error message to contain %q, got: %v", tc.errContains, err)
+				}
+			})
+		}
+	})
+}
+
+// TestZipf_NextKeyBuf_ScratchBufferCompatibility verifies that NextKeyBuf does not
+// truncate keys even when the caller-provided buffer capacity is smaller than len(prefix) + 10.
+func TestZipf_NextKeyBuf_ScratchBufferCompatibility(t *testing.T) {
+	prefix := strings.Repeat("p", benchmark.MaxPrefixLen) // 64 bytes
+	gen, err := benchmark.NewZipfGeneratorWithPrefix(100, benchmark.DefaultZipfTheta, 42, prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Small scratch buffer (cap 16 < 64+10=74)
+	smallBuf := make([]byte, 0, 16)
+	result := gen.NextKeyBuf(smallBuf)
+	if len(result) != 74 {
+		t.Fatalf("expected full key length 74, got %d (truncation occurred!)", len(result))
+	}
+	if !bytes.HasPrefix(result, []byte(prefix)) {
+		t.Fatalf("key missing full prefix: %q", string(result))
+	}
+
+	// 2. Sufficient scratch buffer (cap 80 >= 74) has zero allocations
+	bigBuf := make([]byte, 0, 80)
+	allocs := testing.AllocsPerRun(1000, func() {
+		bigBuf = gen.NextKeyBuf(bigBuf)
+	})
+	if allocs > 0 {
+		t.Fatalf("expected 0 allocs/op with sufficient capacity, got %f", allocs)
 	}
 }
