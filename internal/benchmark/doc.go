@@ -28,6 +28,21 @@
 // over a dynamic range spanning 1 ns to ~4.88 hours. Recording executes in O(1) time
 // with 0 heap allocations.
 //
+// Mean Accuracy & Overflow Defensibility:
+// Mean() provides exact integer arithmetic (totalNs / count) with nanosecond truncation
+// for all cumulative sums up to math.MaxUint64 (~584.5 years of cumulative duration).
+// If cumulative total duration or observation count exceeds math.MaxUint64, Mean() transitions
+// to a numerically defensible bounded approximation: regular logarithmic buckets use midpoint
+// estimation (bounding relative approximation error <= 1/256 = 0.390625%), while overflow-bucket
+// observations maintain exact cumulative tracking via dedicated uint64 accumulator before
+// extreme fallback estimation.
+//
+// Counter Overflow & Merge Semantics:
+// Counter fields (Count and individual bucket counters) employ saturating arithmetic at
+// math.MaxUint64 rather than silent 64-bit modular wraparound. In multi-worker Merge
+// aggregation, saturated counters indicate true values >= math.MaxUint64, preserving
+// statistical monotonicity and defensibility across repeated aggregations.
+//
 // Concurrency Model:
 // Workload generators (ZipfGenerator) and latency collectors (LatencyHistogram) in this package
 // are single-consumer primitives intentionally designed without internal locking.

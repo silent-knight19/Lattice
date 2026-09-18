@@ -92,12 +92,15 @@ var (
 // Zero Value:
 // The zero value of LatencyHistogram is initialized, valid, and immediately ready for use.
 type LatencyHistogram struct {
-	count          uint64
-	totalNs        uint64
-	minNs          int64
-	maxNs          int64
-	totalOverflown bool
-	buckets        [totalBuckets]uint64
+	count             uint64
+	totalNs           uint64
+	minNs             int64
+	maxNs             int64
+	overflowTotalNs   uint64
+	totalOverflown    bool
+	countOverflown    bool
+	overflowOverflown bool
+	buckets           [totalBuckets]uint64
 }
 
 // NewLatencyHistogram constructs and returns a new empty LatencyHistogram.
@@ -131,23 +134,42 @@ func (h *LatencyHistogram) RecordNano(ns int64) {
 			h.maxNs = ns
 		}
 	}
-	h.count++
+
+	if h.count < math.MaxUint64 {
+		h.count++
+	} else {
+		h.countOverflown = true
+	}
 
 	if !h.totalOverflown {
 		uns := uint64(ns)
-		if math.MaxUint64-h.totalNs < uns {
-			h.totalNs = math.MaxUint64
+		var over bool
+		h.totalNs, over = saturatingAddUint64(h.totalNs, uns)
+		if over {
 			h.totalOverflown = true
-		} else {
-			h.totalNs += uns
 		}
 	}
 
 	b := valueToBucket(ns)
-	h.buckets[b]++
+	if h.buckets[b] < math.MaxUint64 {
+		h.buckets[b]++
+	}
+
+	if b >= overflowBucketIndex {
+		if !h.overflowOverflown {
+			uns := uint64(ns)
+			var over bool
+			h.overflowTotalNs, over = saturatingAddUint64(h.overflowTotalNs, uns)
+			if over {
+				h.overflowOverflown = true
+			}
+		}
+	}
 }
 
 // Count returns the total number of valid recorded observations.
+// If cumulative observations exceed math.MaxUint64, Count saturates at math.MaxUint64,
+// guaranteeing that the true count is at least math.MaxUint64.
 func (h *LatencyHistogram) Count() uint64 {
 	return h.count
 }
@@ -172,40 +194,83 @@ func (h *LatencyHistogram) Max() time.Duration {
 
 // Mean returns the arithmetic mean duration of all recorded observations.
 // Returns 0 if the histogram is empty.
-// If the cumulative nanosecond sum overflew uint64, it computes a safe approximation from bucket midpoints.
+//
+// Accuracy Guarantees:
+//  1. Exact Normal Path (!totalOverflown && !countOverflown):
+//     Computed via exact integer arithmetic (totalNs / count) with nanosecond truncation.
+//     Guaranteed exact for cumulative totals up to math.MaxUint64 (~584.5 years of latency).
+//  2. Bounded Approximation Path (totalOverflown || countOverflown):
+//     When cumulative latency or count exceeds math.MaxUint64, Mean reconstructs the aggregate
+//     sum from bucket distributions:
+//     - Regular logarithmic buckets (0 to 4,863) use bucket midpoints (l_i + u_i)/2.
+//     Because octave sub-bucket relative width is <= 1/128 (0.78125%), regular bucket
+//     midpoint estimation has a maximum relative error bounded by <= 1/256 (0.390625%).
+//     - Overflow bucket (index 4,864, latencies >= 2^44 ns ~4.88 hours):
+//     If overflowTotalNs has not overflowed, its contribution is EXACT (overflowTotalNs).
+//     If overflowTotalNs itself exceeded math.MaxUint64, the maximum observation contributes
+//     exact maxNs, and remaining (c-1) observations use midpoint estimation between
+//     the overflow lower bound (2^44 ns) and maxNs.
+//  3. Saturated Extrema:
+//     If the resulting mean exceeds math.MaxInt64, it saturates at math.MaxInt64 without wrapping.
 func (h *LatencyHistogram) Mean() time.Duration {
 	if h.count == 0 {
 		return 0
 	}
-	if !h.totalOverflown {
+	if !h.totalOverflown && !h.countOverflown {
 		return time.Duration(h.totalNs / h.count)
 	}
 
-	// Fallback when cumulative nanoseconds exceeded MaxUint64: estimate from bucket midpoints
+	// Fallback when cumulative nanoseconds or count exceeded MaxUint64:
+	// reconstruct weighted sum from bucket distributions.
 	var weightedSum float64
 	for i := 0; i < totalBuckets; i++ {
 		c := h.buckets[i]
 		if c == 0 {
 			continue
 		}
-		var mid float64
 		if i == 0 {
-			mid = 0
+			// Bucket 0 is exact 0ns
+			continue
 		} else if i < subBucketCount {
-			mid = float64(i)
+			// Linear base octave [1, 127] ns: exact 1ns width, midpoint == i
+			weightedSum += float64(c) * float64(i)
 		} else if i >= overflowBucketIndex {
-			mid = float64(h.maxNs)
+			// Overflow bucket: captures latencies >= 2^44 ns (~4.88h).
+			// SEC-P13-M02-001 Remediation:
+			// Do not uniformly assume all c observations equal maxNs.
+			if h.overflowTotalNs > 0 && !h.overflowOverflown {
+				// Exact sum of overflow bucket observations is preserved
+				weightedSum += float64(h.overflowTotalNs)
+			} else {
+				// Extreme fallback: 1 observation at exact maxNs, remaining (c-1) at midpoint
+				if c == 1 {
+					weightedSum += float64(h.maxNs)
+				} else {
+					overflowLower := float64(maxTrackableNs + 1)
+					maxVal := float64(h.maxNs)
+					if maxVal < overflowLower {
+						maxVal = overflowLower
+					}
+					estMid := (overflowLower + maxVal) / 2.0
+					weightedSum += maxVal + float64(c-1)*estMid
+				}
+			}
 		} else {
+			// Regular logarithmic sub-buckets: midpoint (l + u) / 2
 			u := bucketToUpper(i)
 			group := i / subBucketCount
 			msb := group + subBucketBits - 1
 			shift := msb - subBucketBits
 			l := (int64(1) << msb) + (int64(i%subBucketCount) << shift)
-			mid = float64(l+u) / 2.0
+			mid := float64(l+u) / 2.0
+			weightedSum += float64(c) * mid
 		}
-		weightedSum += float64(c) * mid
 	}
+
 	meanNs := weightedSum / float64(h.count)
+	if math.IsNaN(meanNs) || meanNs < 0 {
+		return 0
+	}
 	if meanNs > float64(math.MaxInt64) {
 		return time.Duration(math.MaxInt64)
 	}
@@ -240,7 +305,7 @@ func (h *LatencyHistogram) Percentile(p float64) (time.Duration, error) {
 
 	var accum uint64
 	for i := 0; i < totalBuckets; i++ {
-		accum += h.buckets[i]
+		accum, _ = saturatingAddUint64(accum, h.buckets[i])
 		if accum >= targetRank {
 			if i >= overflowBucketIndex {
 				return time.Duration(h.maxNs), nil
@@ -296,6 +361,13 @@ func (h *LatencyHistogram) Snapshot() *LatencyHistogram {
 // If other is nil, it returns ErrNilHistogram.
 // If other is empty, Merge is a no-op.
 // If h is empty, Merge copies other into h.
+//
+// Counter Overflow Semantics (SEC-P13-M02-002):
+// Counters (Count and individual bucket counters) saturate at math.MaxUint64 rather than wrapping.
+// If count or any bucket counter saturates, the true aggregate is at least math.MaxUint64,
+// and the histogram marks countOverflown = true.
+// Cumulative latency totals (totalNs and overflowTotalNs) similarly saturate at math.MaxUint64
+// and transition to safe bounded fallback approximations.
 func (h *LatencyHistogram) Merge(other *LatencyHistogram) error {
 	if other == nil {
 		return ErrNilHistogram
@@ -308,7 +380,14 @@ func (h *LatencyHistogram) Merge(other *LatencyHistogram) error {
 		return nil
 	}
 
-	h.count += other.count
+	// 1. Saturated Count addition
+	var countOver bool
+	h.count, countOver = saturatingAddUint64(h.count, other.count)
+	if countOver || other.countOverflown {
+		h.countOverflown = true
+	}
+
+	// 2. Extrema
 	if other.minNs < h.minNs {
 		h.minNs = other.minNs
 	}
@@ -316,17 +395,44 @@ func (h *LatencyHistogram) Merge(other *LatencyHistogram) error {
 		h.maxNs = other.maxNs
 	}
 
-	if h.totalOverflown || other.totalOverflown || math.MaxUint64-h.totalNs < other.totalNs {
+	// 3. Saturated Cumulative Total Latency addition
+	if h.totalOverflown || other.totalOverflown {
 		h.totalNs = math.MaxUint64
 		h.totalOverflown = true
 	} else {
-		h.totalNs += other.totalNs
+		var totalOver bool
+		h.totalNs, totalOver = saturatingAddUint64(h.totalNs, other.totalNs)
+		if totalOver {
+			h.totalOverflown = true
+		}
 	}
 
+	// 4. Saturated Overflow Bucket Total Latency addition
+	if h.overflowOverflown || other.overflowOverflown {
+		h.overflowTotalNs = math.MaxUint64
+		h.overflowOverflown = true
+	} else {
+		var overflowTotalOver bool
+		h.overflowTotalNs, overflowTotalOver = saturatingAddUint64(h.overflowTotalNs, other.overflowTotalNs)
+		if overflowTotalOver {
+			h.overflowOverflown = true
+		}
+	}
+
+	// 5. Saturated Bucket Counters addition
 	for i := 0; i < totalBuckets; i++ {
-		h.buckets[i] += other.buckets[i]
+		h.buckets[i], _ = saturatingAddUint64(h.buckets[i], other.buckets[i])
 	}
 	return nil
+}
+
+// saturatingAddUint64 adds a and b. If the sum overflows uint64,
+// it returns math.MaxUint64 and true. Otherwise it returns a+b and false.
+func saturatingAddUint64(a, b uint64) (uint64, bool) {
+	if math.MaxUint64-a < b {
+		return math.MaxUint64, true
+	}
+	return a + b, false
 }
 
 // valueToBucket maps a positive nanosecond latency to its bucket index in [0, totalBuckets-1].
