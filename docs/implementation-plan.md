@@ -2284,7 +2284,16 @@ TOTAL: 176 Discrete, Testable Micro-Phases
 * **P13-S01-M02: High-Resolution Latency Histogram Collector**
   * *Objective*: Record nanosecond operation latencies into logarithmic buckets without GC allocation overhead.
 * **P13-S01-M03: Standalone Benchmark Load Runner**
+  * *Status*: **Completed**
   * *Objective*: Multi-threaded client driver configurable by concurrency, read/write ratio, and duration.
+  * *Changes*: `cmd/lattice-bench/doc.go`, `cmd/lattice-bench/main.go`, `cmd/lattice-bench/config.go`, `cmd/lattice-bench/client.go`, `cmd/lattice-bench/runner.go`, `cmd/lattice-bench/report.go`, `cmd/lattice-bench/config_test.go`, `cmd/lattice-bench/config_fuzz_test.go`, `cmd/lattice-bench/runner_test.go`, `cmd/lattice-bench/bench_test.go`.
+  * *Invariants & Properties*:
+    - *P13-S03-INV-01*: Bounded worker concurrency ($C \in [1, 1024]$) with 1 persistent TCP connection per worker.
+    - *P13-S03-INV-02*: Strict single-consumer isolation: each worker owns an independent RNG, Zipf generator, and local GET/PUT `LatencyHistogram` instances. Zero lock contention on the hot path.
+    - *P13-S03-INV-03*: Measured latency window strictly encompasses client-observed round-trip time ($T_1 - T_0$), excluding pre-population, setup, key generation, and histogram recording.
+    - *P13-S03-INV-04*: Failure isolation: non-OK responses and network errors increment dedicated error counters and are excluded from success latency percentiles.
+    - *P13-S03-INV-05*: Zero-allocation hot path: key buffer reuse, static value buffer reuse, and lock-free nanosecond recording.
+  * *Tests*: Parameter validation, bounds rejection (concurrency, duration, keyspace, value size, timeout), Bernoulli read-ratio convergence, seed determinism, report formatting, context cancellation, full E2E integration test against live transport server and LSM engine, native fuzzing (`FuzzParseFlags`), and microbenchmarks ($0\text{ allocs/op}$ on key gen, op selection, and recording).
 * **P13-S01-M04: `pprof` CPU & Memory Profiling Integration**
   * *Objective*: Expose `/debug/pprof` endpoints on server; document profiling runbook.
 
