@@ -214,6 +214,8 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 	if pprofSrv != nil {
 		if pprofErr := pprofSrv.Shutdown(shutCtx); pprofErr != nil {
 			fmt.Fprintf(stderr, "lattice: warning: pprof server shutdown error: %v\n", pprofErr)
+		} else if sErr := pprofSrv.Err(); sErr != nil {
+			fmt.Fprintf(stderr, "lattice: warning: pprof server accept error: %v\n", sErr)
 		}
 	}
 

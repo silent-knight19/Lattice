@@ -224,3 +224,6 @@ Because Lattice strictly forbids binding `pprof` to public or external network i
 | **CPU Profiling (`?seconds=30`)** | ~1% - 3% | Low | **Safe** (Targeted investigations) |
 | **Execution Trace (`?seconds=5`)** | ~5% - 15% (event stream) | High disk write throughput | **Use with caution** (< 10s runs) |
 
+> [!NOTE]
+> **Evidence Classification & Benchmarking Note (SEC-P13-M04-003)**: The figures in the table above represent standard Go runtime profiling heuristics and industry operational guidelines (Tier 1 Design Targets). In accordance with the Lattice Evidence Classification System (`docs/implementation-plan.md` Section 2), empirical profiling overhead benchmarks captured on concrete hardware/OS environments will be recorded during production performance characterization.
+

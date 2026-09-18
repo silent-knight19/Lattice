@@ -317,3 +317,87 @@ func TestPprofServer_ConcurrentRequests(t *testing.T) {
 
 	wg.Wait()
 }
+
+// TestPprofServer_ErrAccessor verifies that Err() accurately returns nil when healthy,
+// and is safe to call concurrently.
+func TestPprofServer_ErrAccessor(t *testing.T) {
+	srv, err := NewPprofServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create PprofServer: %v", err)
+	}
+	if srv.Err() != nil {
+		t.Fatalf("expected initial Err() to be nil, got: %v", srv.Err())
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("failed to start: %v", err)
+	}
+	if srv.Err() != nil {
+		t.Fatalf("expected running Err() to be nil, got: %v", srv.Err())
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown failed: %v", err)
+	}
+	if srv.Err() != nil {
+		t.Fatalf("expected post-shutdown Err() to be nil, got: %v", srv.Err())
+	}
+}
+
+// TestPprofServer_ConcurrentShutdownWait verifies that multiple concurrent callers to
+// Shutdown all wait cleanly until the server is fully closed, and all return nil.
+func TestPprofServer_ConcurrentShutdownWait(t *testing.T) {
+	srv, err := NewPprofServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create PprofServer: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("failed to start: %v", err)
+	}
+
+	const callers = 10
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	errs := make([]error, callers)
+
+	for i := 0; i < callers; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			errs[idx] = srv.Shutdown(ctx)
+		}(i)
+	}
+
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("caller %d encountered error during concurrent shutdown: %v", i, err)
+		}
+	}
+}
+
+// TestPprofServer_PostBindLoopbackVerification verifies that bound socket addresses
+// are genuinely loopback IPs.
+func TestPprofServer_PostBindLoopbackVerification(t *testing.T) {
+	srv, err := NewPprofServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create PprofServer: %v", err)
+	}
+	defer func() { _ = srv.Shutdown(context.Background()) }()
+
+	addr := srv.Addr()
+	if addr == nil {
+		t.Fatalf("expected non-nil Addr()")
+	}
+	tcpAddr, ok := addr.(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("expected *net.TCPAddr, got %T", addr)
+	}
+	if !tcpAddr.IP.IsLoopback() {
+		t.Fatalf("bound address %v is not a loopback IP", tcpAddr.IP)
+	}
+}

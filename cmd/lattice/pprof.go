@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -44,6 +45,14 @@ func NewPprofServer(addr string) (*PprofServer, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("pprof server error: failed to listen on %s: %w", addr, err)
+	}
+
+	// Post-bind verification (SEC-P13-M04-002): ensure the kernel bound to a loopback interface
+	if tcpAddr, ok := ln.Addr().(*net.TCPAddr); ok {
+		if !tcpAddr.IP.IsLoopback() {
+			_ = ln.Close()
+			return nil, fmt.Errorf("pprof server error: bound address %s is not a loopback interface", tcpAddr.IP)
+		}
 	}
 
 	mux := http.NewServeMux()
@@ -104,10 +113,18 @@ func (s *PprofServer) Start() error {
 			s.mu.Lock()
 			s.serveErr = err
 			s.mu.Unlock()
+			fmt.Fprintf(os.Stderr, "lattice: pprof diagnostics server error: %v\n", err)
 		}
 	}()
 
 	return nil
+}
+
+// Err returns any error encountered by the background accept loop, if one occurred.
+func (s *PprofServer) Err() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.serveErr
 }
 
 // Addr returns the bound network address of the pprof listener, or nil if uninitialized.
@@ -123,15 +140,26 @@ func (s *PprofServer) Addr() net.Addr {
 // active connections are drained, it forcefully closes the server.
 func (s *PprofServer) Shutdown(ctx context.Context) error {
 	if !s.closed.CompareAndSwap(false, true) {
-		return nil
+		select {
+		case <-s.done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 
-	if !s.started.Load() {
+	s.mu.Lock()
+	started := s.started.Load()
+	if !started {
+		close(s.done)
+		var err error
 		if s.listener != nil {
-			return s.listener.Close()
+			err = s.listener.Close()
 		}
-		return nil
+		s.mu.Unlock()
+		return err
 	}
+	s.mu.Unlock()
 
 	shutdownErr := make(chan error, 1)
 	go func() {
