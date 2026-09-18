@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"math/rand"
+	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -46,7 +48,7 @@ func TestBenchmarkE2E_RealServer(t *testing.T) {
 	cfg.Concurrency = 4
 	cfg.Duration = 1 * time.Second
 	cfg.Keyspace = 500
-	cfg.PopulateKeys = 100
+	cfg.PopulateKeys = 500
 	cfg.Populate = true
 	cfg.ValSize = 128
 	cfg.ReadRatio = 0.75
@@ -67,6 +69,9 @@ func TestBenchmarkE2E_RealServer(t *testing.T) {
 	}
 	if res.PutCount == 0 {
 		t.Errorf("expected non-zero PUT operations, got 0")
+	}
+	if res.GetErrors != 0 {
+		t.Errorf("expected 0 GET errors with full pre-population, got %d", res.GetErrors)
 	}
 
 	// 2. Verify Counters Match Histograms
@@ -222,4 +227,195 @@ func BenchmarkReport_Format(b *testing.B) {
 
 func stringsContains(s, substr string) bool {
 	return len(s) >= len(substr) && bytes.Contains([]byte(s), []byte(substr))
+}
+
+// TestRunner_ReconnectFailure_NoPanic tests that when a server drops an active connection
+// and rejects subsequent reconnects, the worker loop does NOT panic (no nil pointer dereference)
+// and shuts down gracefully upon context cancellation (remediating SEC-P13-M03-001).
+func TestRunner_ReconnectFailure_NoPanic(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	var reqCount atomic.Int32
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		// Read one request, send OK response, then close connection and listener
+		req, err := transport.ReadRequest(conn)
+		if err == nil {
+			reqCount.Add(1)
+			_ = transport.WriteResponse(conn, &transport.Response{
+				OpCode: req.OpCode,
+				Status: transport.StatusOk,
+				SeqID:  req.SeqID,
+			})
+		}
+		_ = conn.Close()
+		_ = ln.Close() // Reject all reconnect attempts
+	}()
+
+	cfg := DefaultConfig()
+	cfg.Address = ln.Addr().String()
+	cfg.Concurrency = 1
+	cfg.Duration = 300 * time.Millisecond
+	cfg.Timeout = 100 * time.Millisecond
+	cfg.Populate = false
+	cfg.Workload = WorkloadWrite
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("PANIC detected on reconnect failure: %v", r)
+		}
+	}()
+
+	var stdout, stderr bytes.Buffer
+	res, err := Run(context.Background(), &cfg, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("unexpected Run error: %v", err)
+	}
+	if res.NetErrors == 0 {
+		t.Errorf("expected non-zero NetErrors after server dropped connection")
+	}
+}
+
+// TestRunner_DurationOverrun_Bounded verifies that stalled network I/O does not overrun
+// the benchmark duration by the 5-second per-operation timeout (remediating SEC-P13-M03-003).
+func TestRunner_DurationOverrun_Bounded(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	// Server accepts connection and reads request, but deliberately stalls (sends no response)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = transport.ReadRequest(conn)
+		// Stalled: do not respond, block until caller closes connection
+		buf := make([]byte, 1)
+		_, _ = conn.Read(buf)
+	}()
+
+	cfg := DefaultConfig()
+	cfg.Address = ln.Addr().String()
+	cfg.Concurrency = 1
+	cfg.Duration = 200 * time.Millisecond
+	cfg.Timeout = 5 * time.Second // 5s timeout >> 200ms duration
+	cfg.Populate = false
+	cfg.Workload = WorkloadWrite
+
+	start := time.Now()
+	var stdout, stderr bytes.Buffer
+	res, err := Run(context.Background(), &cfg, &stdout, &stderr)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("unexpected Run error: %v", err)
+	}
+
+	// Must finish shortly after 200ms (e.g. < 1.5s) and NOT wait for 5s timeout
+	if elapsed > 1500*time.Millisecond {
+		t.Fatalf("benchmark duration overrun: took %v (expected < 1.5s, timeout was 5s)", elapsed)
+	}
+	if res.NetErrors == 0 {
+		t.Errorf("expected net error from stalled request")
+	}
+}
+
+// TestRunner_WorkerInitLeak_DefensiveCleanup proves that worker initialization errors
+// (e.g. invalid keyspace passed directly to Run) defensively close the dialed TCP connection (remediating SEC-P13-M03-004).
+func TestRunner_WorkerInitLeak_DefensiveCleanup(t *testing.T) {
+	tempDir := t.TempDir()
+	eng := engine.NewEngineWithOptions(engine.EngineOptions{DBPath: tempDir})
+	if err := eng.Open(); err != nil {
+		t.Fatalf("engine open: %v", err)
+	}
+	defer eng.Close()
+
+	srvCfg := transport.DefaultServerConfig()
+	srvCfg.Address = "127.0.0.1:0"
+	srv, err := transport.NewServer(srvCfg, eng)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	if err := srv.Listen("127.0.0.1:0"); err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer srv.Close()
+
+	cfg := DefaultConfig()
+	cfg.Address = srv.Addr().String()
+	cfg.Concurrency = 1
+	cfg.Populate = false
+	// Deliberately invalid keyspace to cause NewZipfGenerator to fail after Dial succeeds
+	cfg.Keyspace = 0
+
+	_, err = Run(context.Background(), &cfg, nil, nil)
+	if err == nil {
+		t.Fatalf("expected error from invalid keyspace")
+	}
+
+	// Verify server detects closed connection and drops active connection count to 0
+	deadline := time.Now().Add(1000 * time.Millisecond)
+	for srv.ActiveConnections() > 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if active := srv.ActiveConnections(); active != 0 {
+		t.Fatalf("connection leak detected: server still reports %d active connections", active)
+	}
+}
+
+// TestPrepopulation_FullKeyspaceCoverage proves that full keyspace pre-population prevents
+// StatusKeyNotFound errors during subsequent read operations (remediating SEC-P13-M03-002).
+func TestPrepopulation_FullKeyspaceCoverage(t *testing.T) {
+	tempDir := t.TempDir()
+	eng := engine.NewEngineWithOptions(engine.EngineOptions{DBPath: tempDir})
+	if err := eng.Open(); err != nil {
+		t.Fatalf("engine open: %v", err)
+	}
+	defer eng.Close()
+
+	srvCfg := transport.DefaultServerConfig()
+	srvCfg.Address = "127.0.0.1:0"
+	srv, err := transport.NewServer(srvCfg, eng)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	if err := srv.Listen("127.0.0.1:0"); err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer srv.Close()
+
+	cfg := DefaultConfig()
+	cfg.Address = srv.Addr().String()
+	cfg.Concurrency = 2
+	cfg.Duration = 500 * time.Millisecond
+	cfg.Keyspace = 200
+	cfg.PopulateKeys = 200
+	cfg.Populate = true
+	cfg.Workload = WorkloadRead // Pure read workload
+
+	var stdout, stderr bytes.Buffer
+	res, err := Run(context.Background(), &cfg, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	if res.GetCount == 0 {
+		t.Fatalf("expected positive GET count, got 0")
+	}
+	if res.GetErrors != 0 {
+		t.Fatalf("expected 0 GET errors with 100%% populated keyspace, got %d", res.GetErrors)
+	}
+	if res.PopulatedCount != 200 {
+		t.Errorf("expected 200 populated keys, got %d", res.PopulatedCount)
+	}
 }

@@ -35,8 +35,8 @@ func TestParseFlags_Defaults(t *testing.T) {
 	if cfg.KeyDistribution != DistributionZipfian {
 		t.Errorf("expected default distribution zipfian, got %v", cfg.KeyDistribution)
 	}
-	if cfg.Keyspace != 100_000 {
-		t.Errorf("expected default keyspace 100000, got %d", cfg.Keyspace)
+	if cfg.Keyspace != 10_000 {
+		t.Errorf("expected default keyspace 10000, got %d", cfg.Keyspace)
 	}
 	if cfg.ValSize != 256 {
 		t.Errorf("expected default val-size 256, got %d", cfg.ValSize)
@@ -123,7 +123,7 @@ func TestParseFlags_WorkloadWrite(t *testing.T) {
 }
 
 func TestParseFlags_KeyspaceAlias(t *testing.T) {
-	args := []string{"--keyspace=25000"}
+	args := []string{"--keyspace=25000", "--populate-keys=25000"}
 	var stdout, stderr bytes.Buffer
 	cfg, _, err := ParseFlags(args, &stdout, &stderr)
 	if err != nil {
@@ -268,6 +268,26 @@ func TestParseFlags_ValidationErrors(t *testing.T) {
 			args:    []string{"--keys=500", "--populate-keys=1000"},
 			wantErr: "populate-keys (1000) cannot exceed total keyspace (500)",
 		},
+		{
+			name:    "keyspace exceeds default cap without explicit populate keys for mixed workload",
+			args:    []string{"--keys=50000"},
+			wantErr: "exceeds default populate cap",
+		},
+		{
+			name:    "keyspace exceeds default cap without explicit populate keys for read workload",
+			args:    []string{"--workload=read", "--keys=50000"},
+			wantErr: "exceeds default populate cap",
+		},
+		{
+			name:    "partial prepopulation rejected for mixed workload",
+			args:    []string{"--keys=50000", "--populate-keys=10000"},
+			wantErr: "partial pre-population",
+		},
+		{
+			name:    "partial prepopulation rejected for read workload",
+			args:    []string{"--workload=read", "--keys=50000", "--populate-keys=10000"},
+			wantErr: "partial pre-population",
+		},
 	}
 
 	for _, tt := range tests {
@@ -291,6 +311,85 @@ func TestParseFlags_SmallKeyspacePopulateHeuristic(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if cfg.PopulateKeys != 500 {
-		t.Errorf("expected populate-keys to clamp to small keyspace 500, got %d", cfg.PopulateKeys)
+		t.Errorf("expected populate-keys to match small keyspace 500, got %d", cfg.PopulateKeys)
+	}
+}
+
+func TestParseFlags_PrepopulationSemantics(t *testing.T) {
+	tests := []struct {
+		name         string
+		args         []string
+		wantPopulate bool
+		wantKeys     uint64
+		wantPopKeys  uint64
+	}{
+		{
+			name:         "default configuration populates 100% of keyspace",
+			args:         []string{},
+			wantPopulate: true,
+			wantKeys:     10_000,
+			wantPopKeys:  10_000,
+		},
+		{
+			name:         "keyspace 1",
+			args:         []string{"--keys=1"},
+			wantPopulate: true,
+			wantKeys:     1,
+			wantPopKeys:  1,
+		},
+		{
+			name:         "keyspace 100",
+			args:         []string{"--keys=100"},
+			wantPopulate: true,
+			wantKeys:     100,
+			wantPopKeys:  100,
+		},
+		{
+			name:         "keyspace 10000 explicitly equal",
+			args:         []string{"--keys=10000", "--populate-keys=10000"},
+			wantPopulate: true,
+			wantKeys:     10_000,
+			wantPopKeys:  10_000,
+		},
+		{
+			name:         "large keyspace with explicit full population",
+			args:         []string{"--keys=50000", "--populate-keys=50000"},
+			wantPopulate: true,
+			wantKeys:     50_000,
+			wantPopKeys:  50_000,
+		},
+		{
+			name:         "large keyspace with populate disabled",
+			args:         []string{"--keys=50000", "--populate=false"},
+			wantPopulate: false,
+			wantKeys:     50_000,
+			wantPopKeys:  0,
+		},
+		{
+			name:         "large keyspace with write workload",
+			args:         []string{"--workload=write", "--keys=50000"},
+			wantPopulate: true,
+			wantKeys:     50_000,
+			wantPopKeys:  0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			cfg, _, err := ParseFlags(tt.args, &stdout, &stderr)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cfg.Populate != tt.wantPopulate {
+				t.Errorf("got Populate %v, want %v", cfg.Populate, tt.wantPopulate)
+			}
+			if cfg.Keyspace != tt.wantKeys {
+				t.Errorf("got Keyspace %d, want %d", cfg.Keyspace, tt.wantKeys)
+			}
+			if cfg.PopulateKeys != tt.wantPopKeys {
+				t.Errorf("got PopulateKeys %d, want %d", cfg.PopulateKeys, tt.wantPopKeys)
+			}
+		})
 	}
 }

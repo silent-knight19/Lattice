@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"time"
@@ -19,7 +20,25 @@ type BenchClient struct {
 // Dial establishes a persistent TCP connection to address with the specified timeout.
 // Configures TCP_NODELAY and Keep-Alive to minimize latency distortion.
 func Dial(address string, timeout time.Duration) (*BenchClient, error) {
-	conn, err := net.DialTimeout("tcp", address, timeout)
+	return DialContext(context.Background(), address, timeout)
+}
+
+// DialContext establishes a persistent TCP connection respecting ctx and timeout.
+// Configures TCP_NODELAY and Keep-Alive to minimize latency distortion.
+func DialContext(ctx context.Context, address string, timeout time.Duration) (*BenchClient, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	var dialer net.Dialer
+	deadline := time.Now().Add(timeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		dialer.Deadline = ctxDeadline
+	} else {
+		dialer.Timeout = timeout
+	}
+
+	conn, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
 		return nil, fmt.Errorf("dial tcp %s: %w", address, err)
 	}
@@ -36,8 +55,26 @@ func Dial(address string, timeout time.Duration) (*BenchClient, error) {
 	}, nil
 }
 
+// effectiveDeadline calculates the earliest deadline between per-operation timeout
+// and the benchmark context deadline, ensuring network I/O never overruns duration.
+func (c *BenchClient) effectiveDeadline(ctx context.Context) time.Time {
+	opDeadline := time.Now().Add(c.timeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(opDeadline) {
+		return ctxDeadline
+	}
+	return opDeadline
+}
+
 // Get issues an OpGet request for key and awaits the verified server response.
-func (c *BenchClient) Get(key []byte) (*transport.Response, error) {
+// Network deadlines strictly respect min(now + timeout, ctx.Deadline()).
+func (c *BenchClient) Get(ctx context.Context, key []byte) (*transport.Response, error) {
+	if c == nil || c.conn == nil {
+		return nil, fmt.Errorf("bench client is nil or closed")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	c.seqID++
 	req := transport.Request{
 		OpCode: transport.OpGet,
@@ -45,15 +82,18 @@ func (c *BenchClient) Get(key []byte) (*transport.Response, error) {
 		Key:    key,
 	}
 
-	if err := c.conn.SetWriteDeadline(time.Now().Add(c.timeout)); err != nil {
-		return nil, fmt.Errorf("set write deadline: %w", err)
+	if err := c.conn.SetDeadline(c.effectiveDeadline(ctx)); err != nil {
+		return nil, fmt.Errorf("set deadline: %w", err)
 	}
 	if err := transport.WriteRequest(c.conn, &req); err != nil {
 		return nil, fmt.Errorf("write get request: %w", err)
 	}
 
-	if err := c.conn.SetReadDeadline(time.Now().Add(c.timeout)); err != nil {
-		return nil, fmt.Errorf("set read deadline: %w", err)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := c.conn.SetDeadline(c.effectiveDeadline(ctx)); err != nil {
+		return nil, fmt.Errorf("set deadline: %w", err)
 	}
 	resp, err := transport.ReadResponse(c.conn)
 	if err != nil {
@@ -71,7 +111,15 @@ func (c *BenchClient) Get(key []byte) (*transport.Response, error) {
 }
 
 // Put issues an OpPut request for key and val and awaits the verified server response.
-func (c *BenchClient) Put(key, val []byte) (*transport.Response, error) {
+// Network deadlines strictly respect min(now + timeout, ctx.Deadline()).
+func (c *BenchClient) Put(ctx context.Context, key, val []byte) (*transport.Response, error) {
+	if c == nil || c.conn == nil {
+		return nil, fmt.Errorf("bench client is nil or closed")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	c.seqID++
 	req := transport.Request{
 		OpCode: transport.OpPut,
@@ -80,15 +128,18 @@ func (c *BenchClient) Put(key, val []byte) (*transport.Response, error) {
 		Value:  val,
 	}
 
-	if err := c.conn.SetWriteDeadline(time.Now().Add(c.timeout)); err != nil {
-		return nil, fmt.Errorf("set write deadline: %w", err)
+	if err := c.conn.SetDeadline(c.effectiveDeadline(ctx)); err != nil {
+		return nil, fmt.Errorf("set deadline: %w", err)
 	}
 	if err := transport.WriteRequest(c.conn, &req); err != nil {
 		return nil, fmt.Errorf("write put request: %w", err)
 	}
 
-	if err := c.conn.SetReadDeadline(time.Now().Add(c.timeout)); err != nil {
-		return nil, fmt.Errorf("set read deadline: %w", err)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := c.conn.SetDeadline(c.effectiveDeadline(ctx)); err != nil {
+		return nil, fmt.Errorf("set deadline: %w", err)
 	}
 	resp, err := transport.ReadResponse(c.conn)
 	if err != nil {
@@ -107,8 +158,10 @@ func (c *BenchClient) Put(key, val []byte) (*transport.Response, error) {
 
 // Close terminates the client connection.
 func (c *BenchClient) Close() error {
-	if c.conn != nil {
-		return c.conn.Close()
+	if c != nil && c.conn != nil {
+		err := c.conn.Close()
+		c.conn = nil
+		return err
 	}
 	return nil
 }

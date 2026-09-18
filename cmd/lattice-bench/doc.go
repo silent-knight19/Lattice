@@ -22,6 +22,16 @@
 // eliminating connection establishment overhead during the timed measurement window.
 // Wire communication uses Lattice's binary protocol (internal/transport), ensuring
 // strict FIFO request/response sequencing per connection with TCP_NODELAY enabled.
+// If a connection drops, the worker safely initiates reconnection with bounded exponential
+// backoff (10ms to 1s) without panicking on nil client states or retrying failed operations.
+// All network socket deadlines strictly respect min(now + timeout, context deadline),
+// preventing benchmark duration overruns on stalled servers.
+//
+// Keyspace Pre-Population & Dataset Integrity:
+// To ensure valid read benchmarks without cache-hit survivorship bias or false StatusKeyNotFound
+// misses, pre-population guarantees that the entire configured keyspace is populated
+// (default 10,000 keys matching DefaultPopulateCap) before timed execution begins. Partial
+// pre-population for read and mixed workloads is strictly rejected.
 //
 // Latency Measurement Semantics:
 // Measured latency encompasses the client-observed round-trip interval: from immediately
@@ -33,7 +43,7 @@
 //
 // Relationship to M01 (Zipfian Key Distribution):
 // Keys are generated using internal/benchmark.ZipfGenerator, modeling access hotspots
-// with canonical skew theta = 0.99 over a finite keyspace (default 100,000 keys).
+// with canonical skew theta = 0.99 over a finite keyspace (default 10,000 keys).
 // Uniform distribution is also supported. Each worker owns an independent generator
 // seeded deterministically to guarantee reproducible, zero-contention key generation.
 //

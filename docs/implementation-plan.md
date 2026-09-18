@@ -2293,7 +2293,10 @@ TOTAL: 176 Discrete, Testable Micro-Phases
     - *P13-S03-INV-03*: Measured latency window strictly encompasses client-observed round-trip time ($T_1 - T_0$), excluding pre-population, setup, key generation, and histogram recording.
     - *P13-S03-INV-04*: Failure isolation: non-OK responses and network errors increment dedicated error counters and are excluded from success latency percentiles.
     - *P13-S03-INV-05*: Zero-allocation hot path: key buffer reuse, static value buffer reuse, and lock-free nanosecond recording.
-  * *Tests*: Parameter validation, bounds rejection (concurrency, duration, keyspace, value size, timeout), Bernoulli read-ratio convergence, seed determinism, report formatting, context cancellation, full E2E integration test against live transport server and LSM engine, native fuzzing (`FuzzParseFlags`), and microbenchmarks ($0\text{ allocs/op}$ on key gen, op selection, and recording).
+    - *P13-S03-INV-06*: Context-aware duration enforcement: socket deadlines strictly observe $\min(\text{now} + \text{timeout}, \text{context deadline})$, preventing benchmark duration overruns on stalled servers.
+    - *P13-S03-INV-07*: Full pre-population integrity: for read/mixed workloads with pre-population enabled, the full keyspace is populated (default 10,000 keys), strictly rejecting partial pre-population to prevent cache-hit survivorship bias.
+    - *P13-S03-INV-08*: Safe reconnection & resource cleanup: failed reconnects apply bounded exponential backoff ($10\text{ms}$ to $1\text{s}$) with zero nil-pointer dereferences; worker initialization errors defensively close all dialed sockets.
+  * *Tests*: Parameter validation, bounds rejection (concurrency, duration, keyspace, value size, timeout), Bernoulli read-ratio convergence, seed determinism, report formatting, context cancellation, full E2E integration test against live transport server and LSM engine, failure injection (reconnect failure panic-safety, socket duration overrun bounds, worker initialization connection leak cleanup, full pre-population coverage), native fuzzing (`FuzzParseFlags`), and microbenchmarks ($0\text{ allocs/op}$ on key gen, op selection, and recording).
 * **P13-S01-M04: `pprof` CPU & Memory Profiling Integration**
   * *Objective*: Expose `/debug/pprof` endpoints on server; document profiling runbook.
 

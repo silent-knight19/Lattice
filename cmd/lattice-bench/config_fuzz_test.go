@@ -36,6 +36,11 @@ func FuzzParseFlags(f *testing.F) {
 			if cfg.ValSize < MinValSize || cfg.ValSize > MaxValSize {
 				t.Fatalf("fuzz invariant violated: invalid val-size %d accepted", cfg.ValSize)
 			}
+			if cfg.Populate && cfg.Workload != WorkloadWrite {
+				if cfg.PopulateKeys != cfg.Keyspace {
+					t.Fatalf("fuzz invariant violated: partial pre-population %d < %d accepted", cfg.PopulateKeys, cfg.Keyspace)
+				}
+			}
 		}
 	})
 }

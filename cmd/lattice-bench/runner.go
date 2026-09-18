@@ -34,6 +34,9 @@ type worker struct {
 // Run coordinates the benchmark execution: optional pre-population, worker connection
 // establishment, synchronized duration loop, and post-run histogram aggregation.
 func Run(ctx context.Context, cfg *Config, stdout, stderr io.Writer) (*Result, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if cfg == nil {
 		return nil, fmt.Errorf("config cannot be nil")
 	}
@@ -65,12 +68,13 @@ func Run(ctx context.Context, cfg *Config, stdout, stderr io.Writer) (*Result, e
 	// Step 2: Establish Worker Connections
 	workers := make([]*worker, cfg.Concurrency)
 	for i := 0; i < cfg.Concurrency; i++ {
-		client, err := Dial(cfg.Address, cfg.Timeout)
+		client, err := DialContext(ctx, cfg.Address, cfg.Timeout)
 		if err != nil {
 			// Cleanup previously established connections
 			for j := 0; j < i; j++ {
 				if workers[j] != nil && workers[j].client != nil {
 					_ = workers[j].client.Close()
+					workers[j].client = nil
 				}
 			}
 			return nil, fmt.Errorf("worker %d failed to connect to %s: %w", i, cfg.Address, err)
@@ -83,9 +87,11 @@ func Run(ctx context.Context, cfg *Config, stdout, stderr io.Writer) (*Result, e
 
 		zipfGen, err := benchmark.NewZipfGenerator(cfg.Keyspace, benchmark.DefaultZipfTheta, workerSeed)
 		if err != nil {
-			for j := 0; j <= i; j++ {
+			_ = client.Close()
+			for j := 0; j < i; j++ {
 				if workers[j] != nil && workers[j].client != nil {
 					_ = workers[j].client.Close()
+					workers[j].client = nil
 				}
 			}
 			return nil, fmt.Errorf("worker %d zipf initialization failed: %w", i, err)
@@ -150,12 +156,18 @@ func Run(ctx context.Context, cfg *Config, stdout, stderr io.Writer) (*Result, e
 	return result, nil
 }
 
+const (
+	minReconnectBackoff = 10 * time.Millisecond
+	maxReconnectBackoff = 1 * time.Second
+)
+
 // run executes the worker measurement loop until runCtx expires.
 func (w *worker) run(runCtx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer func() {
 		if w.client != nil {
 			_ = w.client.Close()
+			w.client = nil
 		}
 	}()
 
@@ -164,11 +176,24 @@ func (w *worker) run(runCtx context.Context, wg *sync.WaitGroup) {
 	isZipfian := w.cfg.KeyDistribution == DistributionZipfian
 	readRatio := w.cfg.ReadRatio
 
+	backoff := minReconnectBackoff
+
 	for {
 		select {
 		case <-runCtx.Done():
 			return
 		default:
+		}
+
+		// Check client availability. If disconnected, attempt reconnection with bounded backoff.
+		if w.client == nil {
+			if !w.reconnect(runCtx, &backoff) {
+				// Reconnection failed or runCtx cancelled; retry in next iteration (which checks runCtx.Done())
+				// and NEVER proceed to execute an operation with a nil client.
+				continue
+			}
+			// Successful reconnection: reset backoff interval
+			backoff = minReconnectBackoff
 		}
 
 		// 1. Operation Selection (hot path)
@@ -197,15 +222,19 @@ func (w *worker) run(runCtx context.Context, wg *sync.WaitGroup) {
 		// 3. Timed Request/Response Execution
 		t0 := time.Now()
 		if isRead {
-			resp, err := w.client.Get(key)
+			resp, err := w.client.Get(runCtx, key)
 			latency := time.Since(t0)
 
 			if err != nil {
 				w.netErrors++
-				if runCtx.Err() == nil {
-					w.reconnect(runCtx)
+				if w.client != nil {
+					_ = w.client.Close()
+					w.client = nil
 				}
-			} else if resp.Status == transport.StatusOk {
+				continue
+			}
+
+			if resp.Status == transport.StatusOk {
 				w.gets++
 				w.getHist.RecordNano(latency.Nanoseconds())
 			} else {
@@ -213,15 +242,19 @@ func (w *worker) run(runCtx context.Context, wg *sync.WaitGroup) {
 				w.getErrors++
 			}
 		} else {
-			resp, err := w.client.Put(key, w.valBuf)
+			resp, err := w.client.Put(runCtx, key, w.valBuf)
 			latency := time.Since(t0)
 
 			if err != nil {
 				w.netErrors++
-				if runCtx.Err() == nil {
-					w.reconnect(runCtx)
+				if w.client != nil {
+					_ = w.client.Close()
+					w.client = nil
 				}
-			} else if resp.Status == transport.StatusOk {
+				continue
+			}
+
+			if resp.Status == transport.StatusOk {
 				w.puts++
 				w.putHist.RecordNano(latency.Nanoseconds())
 			} else {
@@ -232,28 +265,38 @@ func (w *worker) run(runCtx context.Context, wg *sync.WaitGroup) {
 }
 
 // reconnect attempts to re-establish a dropped TCP connection within runCtx.
-func (w *worker) reconnect(runCtx context.Context) {
+// Returns true on success, or false if dial failed or runCtx was cancelled.
+// Applies bounded exponential backoff between reconnect attempts.
+func (w *worker) reconnect(runCtx context.Context, backoff *time.Duration) bool {
 	if w.client != nil {
 		_ = w.client.Close()
 		w.client = nil
 	}
 
-	// Try reconnection with small backoff, honoring cancellation
 	select {
 	case <-runCtx.Done():
-		return
-	case <-time.After(10 * time.Millisecond):
+		return false
+	case <-time.After(*backoff):
 	}
 
-	c, err := Dial(w.cfg.Address, w.cfg.Timeout)
-	if err == nil {
-		w.client = c
+	nextBackoff := *backoff * 2
+	if nextBackoff > maxReconnectBackoff {
+		nextBackoff = maxReconnectBackoff
 	}
+	*backoff = nextBackoff
+
+	c, err := DialContext(runCtx, w.cfg.Address, w.cfg.Timeout)
+	if err != nil {
+		return false
+	}
+
+	w.client = c
+	return true
 }
 
 // runPrepopulation sequentially writes keys [0, count-1] using a dedicated client connection.
 func runPrepopulation(ctx context.Context, cfg *Config) error {
-	client, err := Dial(cfg.Address, cfg.Timeout)
+	client, err := DialContext(ctx, cfg.Address, cfg.Timeout)
 	if err != nil {
 		return fmt.Errorf("pre-population dial: %w", err)
 	}
@@ -277,7 +320,7 @@ func runPrepopulation(ctx context.Context, cfg *Config) error {
 		}
 
 		key := zipf.FormatKey(keyBuf[:0], i)
-		resp, err := client.Put(key, valBuf)
+		resp, err := client.Put(ctx, key, valBuf)
 		if err != nil {
 			return fmt.Errorf("pre-population put key %d: %w", i, err)
 		}

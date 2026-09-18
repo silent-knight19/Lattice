@@ -38,7 +38,7 @@ const (
 	DefaultKeyDistribution = "zipfian"
 
 	// DefaultKeyspace is the default size of the benchmark key domain.
-	DefaultKeyspace uint64 = 100_000
+	DefaultKeyspace uint64 = 10_000
 
 	// DefaultValSize is the default payload size for PUT operations (256 bytes).
 	DefaultValSize = 256
@@ -127,7 +127,7 @@ func DefaultConfig() Config {
 		Seed:            DefaultSeed,
 		Timeout:         DefaultTimeout,
 		Populate:        DefaultPopulate,
-		PopulateKeys:    0,
+		PopulateKeys:    DefaultKeyspace,
 	}
 }
 
@@ -171,7 +171,7 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 	fs.Int64Var(&flagSeed, "seed", cfg.Seed, "Base random seed for reproducibility")
 	fs.DurationVar(&flagTimeout, "timeout", cfg.Timeout, "Per-operation network timeout [100ms, 60s]")
 	fs.BoolVar(&flagPopulate, "populate", cfg.Populate, "Pre-populate keyspace before timed execution")
-	fs.Uint64Var(&flagPopulateKeys, "populate-keys", cfg.PopulateKeys, "Number of keys to pre-populate (0 = default heuristic)")
+	fs.Uint64Var(&flagPopulateKeys, "populate-keys", 0, "Number of keys to pre-populate (0 = match keyspace up to cap)")
 	fs.BoolVar(&flagHelp, "help", false, "Display usage instructions and exit")
 	fs.BoolVar(&flagHelpShort, "h", false, "Display usage instructions and exit")
 	fs.BoolVar(&flagVersion, "version", false, "Display version information and exit")
@@ -193,7 +193,7 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 		fmt.Fprintf(stdout, "  --seed int                 PRNG base seed for deterministic runs (default %d)\n", DefaultSeed)
 		fmt.Fprintf(stdout, "  --timeout duration         Per-operation network timeout (default %v)\n", DefaultTimeout)
 		fmt.Fprintf(stdout, "  --populate                 Pre-populate keyspace before timed execution (default %v)\n", DefaultPopulate)
-		fmt.Fprintf(stdout, "  --populate-keys uint       Number of keys to pre-populate (0 = default cap %d)\n", DefaultPopulateCap)
+		fmt.Fprintf(stdout, "  --populate-keys uint       Number of keys to pre-populate (0 = match keyspace up to cap %d)\n", DefaultPopulateCap)
 		fmt.Fprintf(stdout, "  -h, --help                 Display usage instructions and exit\n")
 		fmt.Fprintf(stdout, "  -v, --version              Display version information and exit\n")
 	}
@@ -297,17 +297,34 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 
 	// 10. Populate Configuration
 	cfg.Populate = flagPopulate
-	if flagPopulateKeys > 0 {
-		if flagPopulateKeys > cfg.Keyspace {
-			return nil, false, fmt.Errorf("populate-keys (%d) cannot exceed total keyspace (%d)", flagPopulateKeys, cfg.Keyspace)
-		}
-		cfg.PopulateKeys = flagPopulateKeys
-	} else {
-		// Heuristic: min(keyspace, DefaultPopulateCap)
-		if cfg.Keyspace < DefaultPopulateCap {
-			cfg.PopulateKeys = cfg.Keyspace
+	if !cfg.Populate || cfg.Workload == WorkloadWrite {
+		// When populate is disabled or workload is write-only, pre-population is skipped.
+		if flagPopulateKeys > 0 {
+			if flagPopulateKeys > cfg.Keyspace {
+				return nil, false, fmt.Errorf("populate-keys (%d) cannot exceed total keyspace (%d)", flagPopulateKeys, cfg.Keyspace)
+			}
+			cfg.PopulateKeys = flagPopulateKeys
 		} else {
-			cfg.PopulateKeys = DefaultPopulateCap
+			cfg.PopulateKeys = 0
+		}
+	} else {
+		// For read and mixed workloads with Populate == true:
+		// Enforce the full pre-population invariant (no silent partial datasets).
+		if flagPopulateKeys > 0 {
+			if flagPopulateKeys > cfg.Keyspace {
+				return nil, false, fmt.Errorf("populate-keys (%d) cannot exceed total keyspace (%d)", flagPopulateKeys, cfg.Keyspace)
+			}
+			if flagPopulateKeys < cfg.Keyspace {
+				return nil, false, fmt.Errorf("partial pre-population (%d < %d) is not permitted for %s workload: either populate the entire keyspace (--populate-keys=%d) or disable pre-population (--populate=false)", flagPopulateKeys, cfg.Keyspace, cfg.Workload, cfg.Keyspace)
+			}
+			cfg.PopulateKeys = flagPopulateKeys
+		} else {
+			// flagPopulateKeys == 0 (default):
+			if cfg.Keyspace <= DefaultPopulateCap {
+				cfg.PopulateKeys = cfg.Keyspace
+			} else {
+				return nil, false, fmt.Errorf("keyspace %d exceeds default populate cap %d: for %s workload, either explicitly specify full pre-population (--populate-keys=%d) or disable pre-population (--populate=false)", cfg.Keyspace, DefaultPopulateCap, cfg.Workload, cfg.Keyspace)
+			}
 		}
 	}
 

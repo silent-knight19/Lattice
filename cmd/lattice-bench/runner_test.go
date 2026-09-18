@@ -188,3 +188,33 @@ func TestRun_InvalidAddressFailsFast(t *testing.T) {
 		t.Fatalf("expected error connecting to unreachable port")
 	}
 }
+
+func TestRun_PreCancelledContext(t *testing.T) {
+	cfg := DefaultConfig()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel before Run
+
+	_, err := Run(ctx, &cfg, nil, nil)
+	if err == nil {
+		t.Fatalf("expected error on pre-cancelled context, got nil")
+	}
+}
+
+func TestBenchClient_NilSafe(t *testing.T) {
+	var client *BenchClient
+	ctx := context.Background()
+
+	_, err := client.Get(ctx, []byte("key"))
+	if err == nil {
+		t.Errorf("expected error on nil client Get")
+	}
+
+	_, err = client.Put(ctx, []byte("key"), []byte("val"))
+	if err == nil {
+		t.Errorf("expected error on nil client Put")
+	}
+
+	if err := client.Close(); err != nil {
+		t.Errorf("unexpected error on nil client Close: %v", err)
+	}
+}
