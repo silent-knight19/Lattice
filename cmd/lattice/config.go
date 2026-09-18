@@ -41,6 +41,7 @@ type Config struct {
 	Port              int    `json:"port"`
 	ConfigPath        string `json:"-"`
 	InsecureTransport bool   `json:"insecure_transport"`
+	PprofAddress      string `json:"pprof_address"`
 }
 
 // DefaultConfig returns production-hardened defaults for the Lattice daemon.
@@ -81,6 +82,7 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 		flagAddress           string
 		flagConfig            string
 		flagInsecureTransport bool
+		flagPprofAddress      string
 		flagHelp              bool
 		flagHelpShort         bool
 		flagVersion           bool
@@ -92,6 +94,7 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 	fs.StringVar(&flagAddress, "address", "", "TCP bind address (e.g. 127.0.0.1:9099)")
 	fs.StringVar(&flagConfig, "config", "", "Path to configuration file (JSON or key-value)")
 	fs.BoolVar(&flagInsecureTransport, "insecure-transport", false, "Explicit opt-in permitting unencrypted plaintext TCP on non-loopback addresses")
+	fs.StringVar(&flagPprofAddress, "pprof-address", "", "TCP bind address for HTTP pprof profiling diagnostics (e.g. 127.0.0.1:6060, loopback only)")
 	fs.BoolVar(&flagHelp, "help", false, "Display usage instructions and exit")
 	fs.BoolVar(&flagHelpShort, "h", false, "Display usage instructions and exit")
 	fs.BoolVar(&flagVersion, "version", false, "Display version information and exit")
@@ -159,6 +162,9 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 	if provided["insecure-transport"] {
 		cfg.InsecureTransport = flagInsecureTransport
 	}
+	if provided["pprof-address"] {
+		cfg.PprofAddress = flagPprofAddress
+	}
 
 	// Step 3: Normalize Address and Port
 	if provided["address"] && !provided["port"] {
@@ -219,6 +225,29 @@ func (c *Config) Validate() error {
 	// Unencrypted plaintext TCP is prohibited on non-loopback addresses without explicit opt-in.
 	if !c.InsecureTransport && !isLoopback(host) {
 		return errors.ErrInsecureTransport
+	}
+
+	// Phase 13 M04 Pprof Security Policy:
+	// Pprof profiling HTTP server must bind strictly to a loopback address.
+	// InsecureTransport opt-in DOES NOT permit non-loopback pprof endpoints.
+	if c.PprofAddress != "" {
+		pHost, pPortStr, err := net.SplitHostPort(c.PprofAddress)
+		if err != nil {
+			return fmt.Errorf("config error: invalid --pprof-address %q (expected host:port): %w", c.PprofAddress, err)
+		}
+		pPort, err := strconv.Atoi(pPortStr)
+		if err != nil || pPort < 0 || pPort > 65535 {
+			return fmt.Errorf("config error: invalid port in --pprof-address %q (must be between 0 and 65535)", c.PprofAddress)
+		}
+		if !isLoopback(pHost) {
+			return fmt.Errorf("config error: --pprof-address %q must resolve to a local loopback interface (127.0.0.1, ::1, localhost)", c.PprofAddress)
+		}
+
+		// Prevent port conflict between storage server and pprof HTTP server when both use the same port > 0
+		srvHost, srvPortStr, _ := net.SplitHostPort(c.Address)
+		if pPort != 0 && pPortStr == srvPortStr && (pHost == srvHost || (isLoopback(pHost) && isLoopback(srvHost))) {
+			return fmt.Errorf("config error: --pprof-address port %s conflicts with server --address port %s", pPortStr, srvPortStr)
+		}
 	}
 
 	return nil
@@ -303,6 +332,8 @@ func loadConfigFile(path string) (*Config, error) {
 				return nil, fmt.Errorf("invalid boolean value on line %d: %q", lineNum, val)
 			}
 			cfg.InsecureTransport = b
+		case "pprof_address", "pprof-address", "server.pprof_address", "server.pprof-address":
+			cfg.PprofAddress = val
 		default:
 			// Ignore unrecognized or higher-level nesting keys (e.g. "server:", "storage:")
 			if val == "" {

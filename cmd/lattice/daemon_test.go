@@ -3,12 +3,16 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -783,6 +787,83 @@ func TestDaemon_SubprocessBinary(t *testing.T) {
 			t.Fatalf("subprocess hung on repeated signals")
 		}
 	}
+
+	// Test 7: Real subprocess with --pprof-address
+	{
+		dataDir := t.TempDir()
+		l1, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to get port: %v", err)
+		}
+		srvPort := l1.Addr().(*net.TCPAddr).Port
+		_ = l1.Close()
+
+		l2, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to get pprof port: %v", err)
+		}
+		pprofPort := l2.Addr().(*net.TCPAddr).Port
+		_ = l2.Close()
+
+		cmd := exec.Command(binPath,
+			"--data-dir", dataDir,
+			"--port", strconv.Itoa(srvPort),
+			"--pprof-address", fmt.Sprintf("127.0.0.1:%d", pprofPort),
+		)
+		stdoutPipe, err := cmd.StdoutPipe()
+		if err != nil {
+			t.Fatalf("failed to get stdout pipe: %v", err)
+		}
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("failed to start subprocess: %v", err)
+		}
+
+		// Read startup output until both servers announce
+		buf := make([]byte, 1024)
+		n, err := stdoutPipe.Read(buf)
+		if err != nil {
+			_ = cmd.Process.Kill()
+			t.Fatalf("failed to read subprocess startup: %v", err)
+		}
+		outputStr := string(buf[:n])
+		if !strings.Contains(outputStr, "pprof diagnostics listening on") {
+			_ = cmd.Process.Kill()
+			t.Fatalf("expected pprof announcement, got: %s", outputStr)
+		}
+
+		// Verify HTTP pprof endpoint is responding
+		httpClient := &http.Client{Timeout: 2 * time.Second}
+		resp, err := httpClient.Get(fmt.Sprintf("http://127.0.0.1:%d/debug/pprof/goroutine", pprofPort))
+		if err != nil {
+			_ = cmd.Process.Kill()
+			t.Fatalf("failed to query pprof endpoint on subprocess: %v", err)
+		}
+		resp.Body.Close()
+		httpClient.CloseIdleConnections()
+		if resp.StatusCode != http.StatusOK {
+			_ = cmd.Process.Kill()
+			t.Fatalf("pprof endpoint returned status %d", resp.StatusCode)
+		}
+
+		// Send SIGTERM
+		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			_ = cmd.Process.Kill()
+			t.Fatalf("failed to send SIGTERM: %v", err)
+		}
+
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("subprocess did not exit cleanly on SIGTERM: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			_ = cmd.Process.Kill()
+			t.Fatalf("subprocess timed out waiting for SIGTERM exit")
+		}
+	}
 }
 
 // TestDaemon_StartupFailure_InvalidDataDir verifies that if the data directory
@@ -823,5 +904,307 @@ func TestDaemon_EarlyContextCancel(t *testing.T) {
 	code := runWithContext(ctx, args, stdout, stderr, nil)
 	if code != ExitSuccess {
 		t.Fatalf("expected ExitSuccess (%d), got %d (stderr: %s)", ExitSuccess, code, stderr.String())
+	}
+}
+
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *safeBuffer) Write(p []byte) (n int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+// TestFlagParsing_PprofAddress verifies flag parsing and validation for --pprof-address.
+func TestFlagParsing_PprofAddress(t *testing.T) {
+	// 1. Defaults: pprof is disabled (empty string)
+	{
+		stdout, stderr := bytes.NewBuffer(nil), bytes.NewBuffer(nil)
+		cfg, _, err := ParseFlags([]string{}, stdout, stderr)
+		if err != nil {
+			t.Fatalf("unexpected error parsing defaults: %v", err)
+		}
+		if cfg.PprofAddress != "" {
+			t.Errorf("expected PprofAddress to be empty by default, got %q", cfg.PprofAddress)
+		}
+	}
+
+	// 2. Explicit valid loopback addresses
+	validAddrs := []string{
+		"127.0.0.1:6060",
+		"localhost:6060",
+		"[::1]:6060",
+		"127.0.0.1:0",
+	}
+	for _, addr := range validAddrs {
+		t.Run("Valid_"+addr, func(t *testing.T) {
+			stdout, stderr := bytes.NewBuffer(nil), bytes.NewBuffer(nil)
+			cfg, _, err := ParseFlags([]string{"--pprof-address", addr, "--port", "9099"}, stdout, stderr)
+			if err != nil {
+				t.Fatalf("unexpected error parsing valid pprof address %q: %v", addr, err)
+			}
+			if cfg.PprofAddress != addr {
+				t.Errorf("expected PprofAddress=%q, got %q", addr, cfg.PprofAddress)
+			}
+		})
+	}
+
+	// 3. Reject non-loopback addresses (even if --insecure-transport is provided)
+	invalidAddrs := []string{
+		"0.0.0.0:6060",
+		"::0:6060",
+		"192.168.1.50:6060",
+		"10.0.0.1:6060",
+		"example.com:6060",
+	}
+	for _, addr := range invalidAddrs {
+		t.Run("RejectNonLoopback_"+addr, func(t *testing.T) {
+			stdout, stderr := bytes.NewBuffer(nil), bytes.NewBuffer(nil)
+			_, _, err := ParseFlags([]string{"--pprof-address", addr, "--insecure-transport"}, stdout, stderr)
+			if err == nil {
+				t.Fatalf("expected error binding non-loopback pprof address %q, got nil", addr)
+			}
+		})
+	}
+
+	// 4. Reject invalid port specifications
+	invalidPorts := []string{
+		"127.0.0.1:-1",
+		"127.0.0.1:65536",
+		"127.0.0.1:abc",
+		"no-port-spec",
+	}
+	for _, addr := range invalidPorts {
+		t.Run("RejectInvalidPort_"+addr, func(t *testing.T) {
+			stdout, stderr := bytes.NewBuffer(nil), bytes.NewBuffer(nil)
+			_, _, err := ParseFlags([]string{"--pprof-address", addr}, stdout, stderr)
+			if err == nil {
+				t.Fatalf("expected error for invalid port address %q, got nil", addr)
+			}
+		})
+	}
+
+	// 5. Port conflict between server --address and --pprof-address
+	{
+		stdout, stderr := bytes.NewBuffer(nil), bytes.NewBuffer(nil)
+		_, _, err := ParseFlags([]string{"--address", "127.0.0.1:9099", "--pprof-address", "127.0.0.1:9099"}, stdout, stderr)
+		if err == nil {
+			t.Fatalf("expected error when server address and pprof address have identical ports")
+		}
+	}
+}
+
+// TestConfigFile_PprofAddress verifies loading pprof configuration from files.
+func TestConfigFile_PprofAddress(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// 1. JSON configuration
+	jsonCfgPath := filepath.Join(tempDir, "config.json")
+	if err := os.WriteFile(jsonCfgPath, []byte(`{"data_dir": "./custom_data", "port": 9191, "pprof_address": "127.0.0.1:6061"}`), 0600); err != nil {
+		t.Fatalf("failed to write json config: %v", err)
+	}
+
+	stdout, stderr := bytes.NewBuffer(nil), bytes.NewBuffer(nil)
+	cfg, _, err := ParseFlags([]string{"--config", jsonCfgPath}, stdout, stderr)
+	if err != nil {
+		t.Fatalf("failed to parse json config: %v", err)
+	}
+	if cfg.PprofAddress != "127.0.0.1:6061" {
+		t.Errorf("expected PprofAddress=127.0.0.1:6061, got %q", cfg.PprofAddress)
+	}
+
+	// 2. Key-Value configuration
+	kvCfgPath := filepath.Join(tempDir, "config.conf")
+	kvContent := "data_dir = ./custom_data\nport = 9192\npprof_address = 127.0.0.1:6062\n"
+	if err := os.WriteFile(kvCfgPath, []byte(kvContent), 0600); err != nil {
+		t.Fatalf("failed to write kv config: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	cfg, _, err = ParseFlags([]string{"--config", kvCfgPath}, stdout, stderr)
+	if err != nil {
+		t.Fatalf("failed to parse kv config: %v", err)
+	}
+	if cfg.PprofAddress != "127.0.0.1:6062" {
+		t.Errorf("expected PprofAddress=127.0.0.1:6062, got %q", cfg.PprofAddress)
+	}
+}
+
+// TestDaemon_PprofIntegration verifies that when pprof is enabled, the daemon exposes
+// both the binary TCP data plane and the HTTP diagnostics endpoints simultaneously,
+// and shuts down cleanly on cancellation.
+func TestDaemon_PprofIntegration(t *testing.T) {
+	tempDir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stdout := &safeBuffer{}
+	stderr := &safeBuffer{}
+
+	readyCh := make(chan struct{})
+	doneCh := make(chan int, 1)
+
+	args := []string{
+		"--data-dir", tempDir,
+		"--port", "0",
+		"--pprof-address", "127.0.0.1:0",
+	}
+
+	go func() {
+		doneCh <- runWithContext(ctx, args, stdout, stderr, readyCh)
+	}()
+
+	select {
+	case <-readyCh:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timeout waiting for daemon readiness")
+	}
+
+	out := stdout.String()
+	// Parse server data port
+	// Format: "lattice: server listening on 127.0.0.1:<port> (data-dir: ...)"
+	var srvPort int
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "server listening on") {
+			parts := strings.Fields(line)
+			for i, p := range parts {
+				if p == "on" && i+1 < len(parts) {
+					_, portStr, err := net.SplitHostPort(parts[i+1])
+					if err == nil {
+						srvPort, _ = strconv.Atoi(portStr)
+					}
+				}
+			}
+		}
+	}
+	if srvPort <= 0 {
+		t.Fatalf("failed to parse server listening port from output: %s", out)
+	}
+
+	// Parse pprof HTTP port
+	// Format: "lattice: pprof diagnostics listening on http://127.0.0.1:<port>/debug/pprof/"
+	var pprofPort int
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "pprof diagnostics listening on") {
+			parts := strings.Fields(line)
+			for i, p := range parts {
+				if p == "on" && i+1 < len(parts) {
+					u := strings.TrimPrefix(parts[i+1], "http://")
+					u = strings.TrimSuffix(u, "/debug/pprof/")
+					_, portStr, err := net.SplitHostPort(u)
+					if err == nil {
+						pprofPort, _ = strconv.Atoi(portStr)
+					}
+				}
+			}
+		}
+	}
+	if pprofPort <= 0 {
+		t.Fatalf("failed to parse pprof listening port from output: %s", out)
+	}
+
+	// 1. Verify TCP storage data plane is fully functional
+	dataConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", srvPort), 2*time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial storage server: %v", err)
+	}
+	defer dataConn.Close()
+
+	putReq := &transport.Request{
+		OpCode: transport.OpPut,
+		SeqID:  1,
+		Key:    []byte("pprof_test_key"),
+		Value:  []byte("pprof_test_value"),
+	}
+	if err := transport.WriteRequest(dataConn, putReq); err != nil {
+		t.Fatalf("failed to write put request: %v", err)
+	}
+	putResp, err := transport.ReadResponse(dataConn)
+	if err != nil || putResp.Status != transport.StatusOk {
+		t.Fatalf("put request failed: err=%v, status=%v", err, putResp.Status)
+	}
+
+	getReq := &transport.Request{
+		OpCode: transport.OpGet,
+		SeqID:  2,
+		Key:    []byte("pprof_test_key"),
+	}
+	if err := transport.WriteRequest(dataConn, getReq); err != nil {
+		t.Fatalf("failed to write get request: %v", err)
+	}
+	getResp, err := transport.ReadResponse(dataConn)
+	if err != nil || getResp.Status != transport.StatusOk || string(getResp.Value) != "pprof_test_value" {
+		t.Fatalf("get request failed: err=%v, status=%v, val=%s", err, getResp.Status, string(getResp.Value))
+	}
+	dataConn.Close()
+
+	// 2. Verify HTTP pprof diagnostics endpoint is reachable
+	httpClient := &http.Client{Timeout: 3 * time.Second}
+	defer httpClient.CloseIdleConnections()
+
+	resp, err := httpClient.Get(fmt.Sprintf("http://127.0.0.1:%d/debug/pprof/heap", pprofPort))
+	if err != nil {
+		t.Fatalf("failed to GET pprof heap: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil || resp.StatusCode != http.StatusOK || len(body) == 0 {
+		t.Fatalf("pprof heap failed: status=%d, bodyLen=%d, err=%v", resp.StatusCode, len(body), err)
+	}
+
+	// 3. Graceful shutdown
+	httpClient.CloseIdleConnections()
+	cancel()
+
+	select {
+	case code := <-doneCh:
+		if code != ExitSuccess {
+			t.Fatalf("expected ExitSuccess (%d), got %d (stderr: %s)", ExitSuccess, code, stderr.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timeout waiting for graceful shutdown")
+	}
+}
+
+// TestDaemon_PprofStartupFailure_OccupiedPort verifies that when the configured
+// pprof port is already bound, the daemon fails fast with ExitStartupError and
+// releases the storage engine cleanly.
+func TestDaemon_PprofStartupFailure_OccupiedPort(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// Occupy a loopback port
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on test port: %v", err)
+	}
+	defer l.Close()
+
+	occAddr := l.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stdout := &safeBuffer{}
+	stderr := &safeBuffer{}
+
+	args := []string{
+		"--data-dir", tempDir,
+		"--port", "0",
+		"--pprof-address", occAddr,
+	}
+
+	code := runWithContext(ctx, args, stdout, stderr, nil)
+	if code != ExitStartupError {
+		t.Fatalf("expected ExitStartupError (%d), got %d (stderr: %s)", ExitStartupError, code, stderr.String())
 	}
 }

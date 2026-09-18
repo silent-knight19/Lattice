@@ -2298,7 +2298,17 @@ TOTAL: 176 Discrete, Testable Micro-Phases
     - *P13-S03-INV-08*: Safe reconnection & resource cleanup: failed reconnects apply bounded exponential backoff ($10\text{ms}$ to $1\text{s}$) with zero nil-pointer dereferences; worker initialization errors defensively close all dialed sockets.
   * *Tests*: Parameter validation, bounds rejection (concurrency, duration, keyspace, value size, timeout), Bernoulli read-ratio convergence, seed determinism, report formatting, context cancellation, full E2E integration test against live transport server and LSM engine, failure injection (reconnect failure panic-safety, socket duration overrun bounds, worker initialization connection leak cleanup, full pre-population coverage), native fuzzing (`FuzzParseFlags`), and microbenchmarks ($0\text{ allocs/op}$ on key gen, op selection, and recording).
 * **P13-S01-M04: `pprof` CPU & Memory Profiling Integration**
+  * *Status*: **Completed**
   * *Objective*: Expose `/debug/pprof` endpoints on server; document profiling runbook.
+  * *Changes*: `cmd/lattice/config.go`, `cmd/lattice/pprof.go`, `cmd/lattice/daemon.go`, `cmd/lattice/doc.go`, `cmd/lattice/pprof_test.go`, `cmd/lattice/daemon_test.go`, `docs/pprof-runbook.md`, `docs/known-limitations.md`, `docs/implementation-plan.md`, `docs/interview-knowledge.md`.
+  * *Invariants & Properties*:
+    - *P13-S04-INV-01*: Strict loopback-only binding enforcement: pprof HTTP server rejects wildcards (`0.0.0.0`, `::`) and public/LAN interfaces fail-closed during configuration validation and server instantiation.
+    - *P13-S04-INV-02*: Immune to `--insecure-transport`: `--insecure-transport` permits unencrypted plaintext TCP on storage data plane but strictly does not permit non-loopback pprof endpoints.
+    - *P13-S04-INV-03*: Strict transport isolation: pprof HTTP diagnostics server operates on an independent TCP listener; never multiplexed over the binary TCP storage protocol port (`9099`).
+    - *P13-S04-INV-04*: Dedicated ServeMux isolation: handlers registered exclusively on `http.NewServeMux()`; never uses `http.DefaultServeMux`.
+    - *P13-S04-INV-05*: Opt-in by default: pprof disabled by default (`PprofAddress = ""`).
+    - *P13-S04-INV-06*: Deterministic daemon lifecycle integration: pprof server starts before TCP storage accept loop, drains active requests before closing, and shuts down before the storage engine is flushed and closed.
+  * *Tests*: Endpoint validation (`/debug/pprof/`, `cmdline`, `heap`, `goroutine`, `allocs`, `threadcreate`, `profile?seconds=1`), redirects, 404s, loopback rejection matrix, graceful shutdown, idempotent shutdown, context timeout fallback, double-start error rejection, concurrent profiling under `-race`, config file parsing (JSON & key-value), flag validation, port collision detection, and full compiled binary daemon subprocess integration testing.
 
 ---
 

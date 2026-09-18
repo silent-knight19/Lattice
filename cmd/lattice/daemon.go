@@ -55,19 +55,22 @@ func runWithContext(ctx context.Context, args []string, stdout, stderr io.Writer
 	return runDaemon(ctx, cfg, stdout, stderr, readyCh)
 }
 
-// runDaemon coordinates the strict lifecycle of the Engine and Transport Server:
+// runDaemon coordinates the strict lifecycle of the Engine, Pprof Server, and Transport Server:
 //
 // Startup Order:
 //  1. Validate configuration & loopback policy.
 //  2. Open storage engine (directory initialization, crash recovery replay).
-//  3. Construct and bind TCP transport server.
-//  4. Signal readiness and enter running state.
+//  3. Initialize pprof diagnostics server (if enabled).
+//  4. Construct and bind TCP transport server.
+//  5. Start pprof HTTP server (if enabled).
+//  6. Signal readiness and enter running state.
 //
 // Shutdown Order:
 //  1. Signal received or context cancelled.
-//  2. Server.Shutdown drains active TCP connections within deadline.
-//  3. Engine.Close drains immutable memtables, writes L0 SSTable, and syncs WAL/MANIFEST.
-//  4. Exit with success.
+//  2. Transport Server.Shutdown drains active TCP connections within deadline.
+//  3. Pprof Server.Shutdown drains diagnostics HTTP connections.
+//  4. Engine.Close drains immutable memtables, writes L0 SSTable, and syncs WAL/MANIFEST.
+//  5. Exit with success.
 func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, readyCh chan<- struct{}) int {
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -101,20 +104,38 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 	default:
 	}
 
-	// Step 2: Initialize Transport Server
+	// Step 2: Initialize Pprof Server if configured
+	var pprofSrv *PprofServer
+	if cfg.PprofAddress != "" {
+		var err error
+		pprofSrv, err = NewPprofServer(cfg.PprofAddress)
+		if err != nil {
+			_ = eng.Close()
+			fmt.Fprintf(stderr, "lattice: failed to start pprof listener on %s: %v\n", cfg.PprofAddress, err)
+			return ExitStartupError
+		}
+	}
+
+	// Step 3: Initialize Transport Server
 	srvCfg := transport.DefaultServerConfig()
 	srvCfg.Address = cfg.Address
 	srvCfg.InsecureTransport = cfg.InsecureTransport
 
 	srv, err := transport.NewServer(srvCfg, eng)
 	if err != nil {
+		if pprofSrv != nil {
+			_ = pprofSrv.Shutdown(context.Background())
+		}
 		_ = eng.Close()
 		fmt.Fprintf(stderr, "lattice: failed to initialize transport server: %v\n", err)
 		return ExitStartupError
 	}
 
-	// Step 3: Bind Listener and Start Accept Loop
+	// Step 4: Bind Listener and Start Accept Loop
 	if err := srv.Listen(cfg.Address); err != nil {
+		if pprofSrv != nil {
+			_ = pprofSrv.Shutdown(context.Background())
+		}
 		_ = eng.Close()
 		fmt.Fprintf(stderr, "lattice: failed to start listener on %s: %v\n", cfg.Address, err)
 		return ExitStartupError
@@ -124,17 +145,36 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 	select {
 	case <-ctx.Done():
 		_ = srv.Close()
+		if pprofSrv != nil {
+			_ = pprofSrv.Shutdown(context.Background())
+		}
 		_ = eng.Close()
 		return ExitSuccess
 	case sig := <-sigCh:
 		fmt.Fprintf(stdout, "lattice: received signal %s during startup, shutting down...\n", sig)
 		_ = srv.Close()
+		if pprofSrv != nil {
+			_ = pprofSrv.Shutdown(context.Background())
+		}
 		_ = eng.Close()
 		return ExitSuccess
 	default:
 	}
 
-	// Step 4: Running State Established
+	// Step 5: Start Pprof Server if configured
+	if pprofSrv != nil {
+		if err := pprofSrv.Start(); err != nil {
+			_ = srv.Close()
+			_ = pprofSrv.Shutdown(context.Background())
+			_ = eng.Close()
+			fmt.Fprintf(stderr, "lattice: failed to start pprof server: %v\n", err)
+			return ExitStartupError
+		}
+		pprofAddr := pprofSrv.Addr().String()
+		fmt.Fprintf(stdout, "lattice: pprof diagnostics listening on http://%s/debug/pprof/\n", pprofAddr)
+	}
+
+	// Step 6: Running State Established
 	boundAddr := srv.Addr()
 	addrStr := cfg.Address
 	if boundAddr != nil {
@@ -146,7 +186,7 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 		close(readyCh)
 	}
 
-	// Step 5: Wait for Termination Event
+	// Step 7: Wait for Termination Event
 	select {
 	case sig := <-sigCh:
 		fmt.Fprintf(stdout, "lattice: received signal %s, initiating graceful shutdown...\n", sig)
@@ -161,13 +201,20 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 		}
 	}()
 
-	// Step 6: Ordered Graceful Shutdown
-	// Invariant: Halt network ingestion and drain clients BEFORE closing the storage engine.
+	// Step 8: Ordered Graceful Shutdown
+	// Invariant: Halt network ingestion and drain data clients BEFORE pprof diagnostics,
+	// and close storage engine LAST.
 	shutCtx, cancel := context.WithTimeout(context.Background(), srvCfg.ShutdownTimeout)
 	defer cancel()
 
 	if srvErr := srv.Shutdown(shutCtx); srvErr != nil {
 		fmt.Fprintf(stderr, "lattice: warning: server network shutdown error: %v\n", srvErr)
+	}
+
+	if pprofSrv != nil {
+		if pprofErr := pprofSrv.Shutdown(shutCtx); pprofErr != nil {
+			fmt.Fprintf(stderr, "lattice: warning: pprof server shutdown error: %v\n", pprofErr)
+		}
 	}
 
 	if engErr := eng.Close(); engErr != nil {
