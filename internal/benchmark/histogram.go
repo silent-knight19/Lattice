@@ -44,8 +44,8 @@ const (
 
 const (
 	// MaxTrackableLatency is the upper boundary of regular logarithmic sub-bucket coverage
-	// (~4.88 hours). Latencies >= MaxTrackableLatency are safely captured in the overflow
-	// bucket while preserving exact Max.
+	// (~4.88 hours). Latencies > MaxTrackableLatency (>= 2^44 ns) are safely captured in
+	// the overflow bucket while preserving exact Max.
 	MaxTrackableLatency = time.Duration(maxTrackableNs)
 
 	// SubBucketCount is the number of sub-buckets per octave (128), providing <= 0.78% relative error.
