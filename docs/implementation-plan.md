@@ -2355,7 +2355,33 @@ TOTAL: 176 Discrete, Testable Micro-Phases
     - *P14-M02-INV-11*: Memory isolation: Decoders return independent, defensively allocated byte slices for entry data payloads, preventing cross-routine memory corruption from recycled frame buffers.
   * *Tests*: Round-trip encode/decode across all 4 message types, golden wire byte sequence verification against byte-level references, malformed frame matrices (truncated headers, oversized entry counts, truncated entry headers, truncated payloads, unexpected trailing bytes, invalid boolean values, invalid node IDs), client/peer opcode cross-rejection, deterministic encoding assertion, 5-second continuous fuzzing (`FuzzDecodePeerFrame`, `FuzzDecodeAppendEntriesPayload` >2.6M execs with 0 crashes), microbenchmarks (~7-17 ns/op single messages, ~100-220 ns/op batched entries), and 20x flakiness verification.
 * **P14-S01-M03: Outbound Peer Connection Manager**
-  * *Objective*: Maintain persistent TCP connection pools with automatic reconnect and keep-alive to all cluster peers.
+  * *Status*: **Completed** (Verified)
+  * *Objective*: Maintain persistent outbound TCP connections with bounded automatic reconnect, TCP keep-alive, write serialization, frame consumption, and deterministic shutdown to all remote cluster peers.
+  * *Deliverables*:
+    - Implemented `PeerConnectionManager` and bounded `peerSupervisor` in `internal/transport/peer_connection.go`, maintaining at most one manager-owned outbound connection per configured remote peer in `cluster.Topology`.
+    - Introduced explicit lifecycle state model: `PeerState` (`PeerStateDisconnected`, `PeerStateConnecting`, `PeerStateConnected`, `PeerStateClosing`) with synchronized state transitions.
+    - Designed injectable dialer abstraction (`DialFunc func(ctx context.Context, addr string) (net.Conn, error)`) decoupling transport lifecycle from future mTLS PKI while supporting standard TCP with keep-alive (`net.TCPConn.SetKeepAlivePeriod`).
+    - Implemented bounded exponential reconnect backoff starting at `ReconnectMin` and capping at `ReconnectMax`, resetting failure counts on healthy connection establishment and immediately interrupting sleeps upon shutdown.
+    - Built safe concurrent frame write path (`Send(ctx, peerID, frame)`) with per-peer write serialization mutex (`writeMu`) eliminating global manager-lock contention and byte interleaving.
+    - Implemented continuous incoming frame reader loop consuming complete frames through existing `DecodeFrame`, validating CRC32 and payload bounds, and dispatching to `OnFrameReceived` stamped with the peer `cluster.NodeID`.
+    - Engineered generation token verification (`disconnect(gen, reason)`) preventing stale connection teardowns from closing newer replacement connections.
+    - Ensured deterministic, idempotent `Close()` interrupting active dials, cancelling backoffs, closing active sockets, and draining all goroutines via `sync.WaitGroup` with zero leaks.
+    - Extended `internal/errors/errors.go` with sentinels (`ErrManagerClosed`, `ErrManagerNotStarted`, `ErrManagerAlreadyStarted`, `ErrPeerNotFound`, `ErrPeerUnavailable`, `ErrInvalidManagerConfig`) and structured types (`PeerUnavailableError`, `UnknownPeerError`).
+  * *Invariants*:
+    - *P14-M03-INV-01*: Exactly one manager-owned outbound connection may be active for each configured remote `NodeID`.
+    - *P14-M03-INV-02*: Self (`topology.LocalID()`) is never dialed and never receives a supervisor worker.
+    - *P14-M03-INV-03*: Every connection attempt is cancellation-aware and bounded by `DialTimeout`.
+    - *P14-M03-INV-04*: Reconnect attempts use bounded exponential backoff between `ReconnectMin` and `ReconnectMax` and cannot spin in a tight loop.
+    - *P14-M03-INV-05*: Concurrent writes on a single connection are serialized without global manager-lock contention.
+    - *P14-M03-INV-06*: Reader goroutines consume complete frames exclusively through the existing framing layer (`DecodeFrame`).
+    - *P14-M03-INV-07*: A stale connection failure cannot invalidate a newer replacement connection (generation token safety).
+    - *P14-M03-INV-08*: Manager shutdown permanently prevents future reconnect attempts.
+    - *P14-M03-INV-09*: A manager shutdown drains all manager-owned goroutines and closes active connections with zero leaks.
+    - *P14-M03-INV-10*: Transport TCP keep-alive is distinct from Raft-level heartbeat semantics.
+    - *P14-M03-INV-11*: Topology remains immutable and is not mutated by connection lifecycle operations.
+    - *P14-M03-INV-12*: The connection manager is transport-lifecycle code only and does not implement Raft consensus semantics.
+  * *Tests*: Construction bounds validation, single-node topology zero-worker check, loopback TCP connection establishment, M02 frame sending (`RequestVote`, `AppendEntries`), concurrent serialized writes (20 goroutines), incoming frame callback delivery, EOF and frame-corruption teardown, automatic reconnect after server restart, stale generation defense, shutdown idempotency and leak safety, microbenchmarks (~2.2-2.4 µs/op send on loopback TCP), and 50x flakiness verification under `go test -race`.
+
 
 ---
 

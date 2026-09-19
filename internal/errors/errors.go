@@ -431,6 +431,24 @@ var (
 
 	// ErrInvalidPeerBoolean indicates that a boolean field in a peer message has an invalid wire value (not 0x00 or 0x01).
 	ErrInvalidPeerBoolean = stdErrors.New("invalid peer boolean wire value: must be 0 or 1")
+
+	// ErrManagerClosed indicates that an operation was attempted on a closed peer connection manager.
+	ErrManagerClosed = stdErrors.New("peer connection manager is closed")
+
+	// ErrManagerNotStarted indicates that an operation was attempted before the peer connection manager was started.
+	ErrManagerNotStarted = stdErrors.New("peer connection manager not started")
+
+	// ErrManagerAlreadyStarted indicates that Start was called on an already started peer connection manager.
+	ErrManagerAlreadyStarted = stdErrors.New("peer connection manager already started")
+
+	// ErrPeerNotFound indicates that the target node ID does not exist in the cluster topology.
+	ErrPeerNotFound = stdErrors.New("peer node not found in topology")
+
+	// ErrPeerUnavailable indicates that the target peer connection is disconnected, reconnecting, or closing.
+	ErrPeerUnavailable = stdErrors.New("peer is currently disconnected or unavailable")
+
+	// ErrInvalidManagerConfig indicates that peer connection manager configuration parameters violate required bounds.
+	ErrInvalidManagerConfig = stdErrors.New("invalid peer connection manager configuration")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing
@@ -1505,4 +1523,40 @@ func (e *InvalidPeerEntryError) Error() string {
 
 func (e *InvalidPeerEntryError) Is(target error) bool {
 	return target == ErrInvalidPeerEntry
+}
+
+// PeerUnavailableError provides structured context when an RPC cannot be sent because a peer is not in connected state.
+type PeerUnavailableError struct {
+	NodeID uint64
+	State  string
+}
+
+func (e *PeerUnavailableError) Error() string {
+	if e == nil {
+		return ErrPeerUnavailable.Error()
+	}
+	if e.State != "" {
+		return fmt.Sprintf("peer %d is unavailable: current state %s", e.NodeID, e.State)
+	}
+	return fmt.Sprintf("peer %d is unavailable", e.NodeID)
+}
+
+func (e *PeerUnavailableError) Is(target error) bool {
+	return target == ErrPeerUnavailable
+}
+
+// UnknownPeerError provides structured context when an operation targets a peer not registered in topology.
+type UnknownPeerError struct {
+	NodeID uint64
+}
+
+func (e *UnknownPeerError) Error() string {
+	if e == nil {
+		return ErrPeerNotFound.Error()
+	}
+	return fmt.Sprintf("peer %d not found in cluster topology", e.NodeID)
+}
+
+func (e *UnknownPeerError) Is(target error) bool {
+	return target == ErrPeerNotFound
 }

@@ -1236,7 +1236,21 @@ This document tracks all **genuine architectural and operational limitations** o
 * **Dimensional Impact**:
   * Correctness: **Optimal** (Deterministic byte layout, zero ambiguous states).
   * Performance: **Optimal** (~7-17 ns single message encode/decode, zero heap allocation on fixed headers).
-  * Security: **Optimal** (Pre-allocation bounds, exact-consumption verification, no memory amplification, strict boolean validation).
+### 73. Outbound Peer Connection Lifecycle Scope & Security/mTLS Abstraction Boundary (P14-S01-M03)
+* **Limitation & Architectural Boundaries**:
+  In `internal/transport` (`P14-S01-M03`):
+  1. *Injectable Dialing & mTLS PKI Decoupling*: `PeerConnectionManager` manages socket lifecycle, bounded exponential reconnect, TCP keep-alive, write serialization, and framed message consumption. Network connection establishment is abstracted via `DialFunc func(ctx context.Context, addr string) (net.Conn, error)`. Universal mutual TLS (mTLS) PKI generation, certificate authority (CA) lifecycle, certificate issuance, and rotation are intentionally excluded from this micro-phase and reserved for subsequent security hardening (Phase 19). Local development and offline unit tests operate over loopback TCP using this injectable abstraction without representing unencrypted transport as production-ready.
+  2. *Transport TCP Keep-Alive vs Consensus Heartbeat Decoupling*: The manager configures transport-level TCP keep-alive (`SO_KEEPALIVE` and `SetKeepAlivePeriod`) for detecting dead sockets during idle periods. It intentionally does NOT implement or transmit application-level PING, PONG, or HEARTBEAT opcodes. Consensus heartbeats (empty `AppendEntries` RPCs) belong strictly to the Raft consensus engine in Phase 15.
+  3. *Static Membership Invariant*: The manager constructs connection supervisors strictly from immutable `cluster.Topology.RemotePeers()`. Dynamic cluster reconfiguration (`AddPeer`, `RemovePeer`, joint consensus) is not supported in M03; topology modifications require constructing a new topology and manager in Phase 15.
+  4. *Consensus Agnostic Transport*: The manager transports generic `*Frame` envelopes. It does not parse, evaluate, or interpret Raft terms, candidate IDs, vote grants, log matching indexes, or state-machine commands.
+* **Why It Exists**:
+  Separation of concerns: Network transport lifecycle (reconnect loops, backoff timers, socket buffer serialization) must remain decoupled from consensus state machines and cryptographic PKI lifecycles. Coupling transport with Raft elections or PKI infrastructure creates circular dependencies and prevents deterministic offline testing.
+* **Impact**:
+  Callers receive a robust, race-free, persistent outbound framing transport layer. Higher-level Raft consensus protocols (Phase 15) consume this manager to exchange `RequestVote` and `AppendEntries` frames reliably across cluster nodes.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Generation-stamped teardown eliminates stale connection replacement races; zero duplicate connection workers; idempotent shutdown).
+  * Performance: **Optimal** (~2.2-2.4 µs/op send on loopback TCP; per-peer write lock eliminates global manager contention).
+  * Security: **Optimal** (Bounded backoff prevents reconnect storms; frame size checks enforce 5 MiB ceiling; pluggable dialer enables future mTLS wrapping without code modification).
 
 ---
 

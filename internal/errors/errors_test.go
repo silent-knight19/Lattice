@@ -2245,3 +2245,54 @@ func TestClusterErrors(t *testing.T) {
 		t.Errorf("unexpected bare msg: %s", bareIpeErr.Error())
 	}
 }
+
+func TestPeerConnectionManagerErrors(t *testing.T) {
+	// Sentinels
+	sentinels := []error{
+		errors.ErrManagerClosed,
+		errors.ErrManagerNotStarted,
+		errors.ErrManagerAlreadyStarted,
+		errors.ErrPeerNotFound,
+		errors.ErrPeerUnavailable,
+		errors.ErrInvalidManagerConfig,
+	}
+
+	for _, s := range sentinels {
+		if s == nil || s.Error() == "" {
+			t.Errorf("sentinel must be non-nil with non-empty message: %v", s)
+		}
+		if !stdErrors.Is(s, s) {
+			t.Errorf("sentinel must match itself via errors.Is")
+		}
+	}
+
+	// PeerUnavailableError
+	pue := &errors.PeerUnavailableError{NodeID: 2, State: "Connecting"}
+	if !stdErrors.Is(pue, errors.ErrPeerUnavailable) {
+		t.Error("PeerUnavailableError must match ErrPeerUnavailable")
+	}
+	if !strings.Contains(pue.Error(), "2") || !strings.Contains(pue.Error(), "Connecting") {
+		t.Errorf("unexpected msg: %s", pue.Error())
+	}
+	var nilPue *errors.PeerUnavailableError
+	if nilPue.Error() != errors.ErrPeerUnavailable.Error() {
+		t.Errorf("nil error mismatch: got %q, want %q", nilPue.Error(), errors.ErrPeerUnavailable.Error())
+	}
+	barePue := &errors.PeerUnavailableError{NodeID: 3}
+	if !strings.Contains(barePue.Error(), "3") {
+		t.Errorf("unexpected bare msg: %s", barePue.Error())
+	}
+
+	// UnknownPeerError
+	upe := &errors.UnknownPeerError{NodeID: 42}
+	if !stdErrors.Is(upe, errors.ErrPeerNotFound) {
+		t.Error("UnknownPeerError must match ErrPeerNotFound")
+	}
+	if !strings.Contains(upe.Error(), "42") {
+		t.Errorf("unexpected msg: %s", upe.Error())
+	}
+	var nilUpe *errors.UnknownPeerError
+	if nilUpe.Error() != errors.ErrPeerNotFound.Error() {
+		t.Errorf("nil error mismatch: got %q, want %q", nilUpe.Error(), errors.ErrPeerNotFound.Error())
+	}
+}
