@@ -70,20 +70,85 @@ func ValidateAndCanonicalizeAddress(rawAddr string) (string, error) {
 		}
 	}
 
+	// Normalize trailing dot in FQDNs and lowercase to prevent syntactic aliasing (e.g. "node1." vs "node1", "0.0.0.0." vs "0.0.0.0")
+	h := host
+	if strings.HasSuffix(h, ".") && len(h) > 1 {
+		h = h[:len(h)-1]
+	}
+	h = strings.ToLower(h)
+
 	// Security: Wildcard IPs are prohibited as peer targets (only valid for listeners)
-	if host == "0.0.0.0" || host == "::" || host == "[::]" {
+	if h == "0.0.0.0" || h == "::" || h == "[::]" {
 		return "", fmt.Errorf("%w: wildcard IP address %q forbidden as peer target", errors.ErrWildcardAddress, host)
 	}
 
 	var canonicalHost string
-	if ip := net.ParseIP(host); ip != nil {
+	if ip := net.ParseIP(h); ip != nil {
 		if ip.IsUnspecified() {
 			return "", fmt.Errorf("%w: wildcard IP address %q forbidden as peer target", errors.ErrWildcardAddress, host)
 		}
 		canonicalHost = ip.String()
 	} else {
-		canonicalHost = strings.ToLower(host)
+		// RFC 1123 Hostname Validation
+		if len(h) < 1 || len(h) > 253 {
+			return "", &errors.InvalidPeerAddressError{
+				Address: rawAddr,
+				Reason:  fmt.Sprintf("hostname length %d invalid: must be between 1 and 253 characters", len(h)),
+			}
+		}
+
+		labels := strings.Split(h, ".")
+		// In RFC 1123, a top-level domain (last label) cannot be all-numeric (e.g. invalid IPv4 256.0.0.1 or domain ending in .123)
+		if len(labels) > 1 && isAllDigits(labels[len(labels)-1]) {
+			return "", &errors.InvalidPeerAddressError{
+				Address: rawAddr,
+				Reason:  fmt.Sprintf("hostname TLD %q cannot be all-numeric", labels[len(labels)-1]),
+			}
+		}
+		for _, label := range labels {
+			if len(label) < 1 || len(label) > 63 {
+				return "", &errors.InvalidPeerAddressError{
+					Address: rawAddr,
+					Reason:  fmt.Sprintf("hostname label %q length %d invalid: must be between 1 and 63 characters", label, len(label)),
+				}
+			}
+			// First and last characters of label must be alphanumeric
+			first := label[0]
+			last := label[len(label)-1]
+			if !isAlphanumeric(first) || !isAlphanumeric(last) {
+				return "", &errors.InvalidPeerAddressError{
+					Address: rawAddr,
+					Reason:  fmt.Sprintf("hostname label %q must start and end with an alphanumeric character", label),
+				}
+			}
+			for i := 0; i < len(label); i++ {
+				c := label[i]
+				if !isAlphanumeric(c) && c != '-' {
+					return "", &errors.InvalidPeerAddressError{
+						Address: rawAddr,
+						Reason:  fmt.Sprintf("hostname label %q contains invalid character %q (only [a-z0-9-] permitted)", label, c),
+					}
+				}
+			}
+		}
+		canonicalHost = h
 	}
 
 	return net.JoinHostPort(canonicalHost, strconv.Itoa(port)), nil
+}
+
+func isAlphanumeric(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')
+}
+
+func isAllDigits(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }

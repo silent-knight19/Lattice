@@ -1055,6 +1055,76 @@ func TestClientOpcodeNonCollision(t *testing.T) {
 	}
 }
 
+// TestDecodePeerResponse_StatusAndFlagsValidation verifies that peer response decoders fail-closed
+// when unexpected flags or status codes are received (e.g. client flags or status codes).
+func TestDecodePeerResponse_StatusAndFlagsValidation(t *testing.T) {
+	rvResp := &RequestVoteResponse{Term: 1, VoteGranted: true}
+	rvFrame, err := EncodeRequestVoteResponse(rvResp, 1)
+	if err != nil {
+		t.Fatalf("EncodeRequestVoteResponse failed: %v", err)
+	}
+
+	aeResp := &AppendEntriesResponse{Term: 1, Success: true, MatchIndex: 10}
+	aeFrame, err := EncodeAppendEntriesResponse(aeResp, 2)
+	if err != nil {
+		t.Fatalf("EncodeAppendEntriesResponse failed: %v", err)
+	}
+
+	invalidStatusOrFlags := []byte{0x01, 0x02, 0x05, 0x80, 0xFF}
+	for _, b := range invalidStatusOrFlags {
+		// Test RequestVoteResponse
+		f1 := &Frame{
+			Header: Header{
+				Magic:         Magic,
+				OpCode:        OpCode(PeerOpRequestVoteResponse),
+				Status:        StatusCode(b),
+				Flags:         b,
+				PayloadLength: uint32(len(rvFrame.Payload)),
+			},
+			Payload: append([]byte(nil), rvFrame.Payload...),
+		}
+		if _, err := DecodeRequestVoteResponse(f1); !errors.Is(err, errs.ErrInvalidPeerPayload) {
+			t.Errorf("DecodeRequestVoteResponse with status/flag 0x%02x did not fail with ErrInvalidPeerPayload: %v", b, err)
+		}
+
+		// Test AppendEntriesResponse
+		f2 := &Frame{
+			Header: Header{
+				Magic:         Magic,
+				OpCode:        OpCode(PeerOpAppendEntriesResponse),
+				Status:        StatusCode(b),
+				Flags:         b,
+				PayloadLength: uint32(len(aeFrame.Payload)),
+			},
+			Payload: append([]byte(nil), aeFrame.Payload...),
+		}
+		if _, err := DecodeAppendEntriesResponse(f2); !errors.Is(err, errs.ErrInvalidPeerPayload) {
+			t.Errorf("DecodeAppendEntriesResponse with status/flag 0x%02x did not fail with ErrInvalidPeerPayload: %v", b, err)
+		}
+	}
+}
+
+// TestGenerateNonce_CryptographicEntropy verifies that GenerateNonce produces non-zero,
+// collision-free 64-bit nonces across a large sample size.
+func TestGenerateNonce_CryptographicEntropy(t *testing.T) {
+	const sampleSize = 10000
+	seen := make(map[uint64]struct{}, sampleSize)
+
+	for i := 0; i < sampleSize; i++ {
+		nonce, err := GenerateNonce()
+		if err != nil {
+			t.Fatalf("GenerateNonce failed on iteration %d: %v", i, err)
+		}
+		if nonce == 0 {
+			t.Errorf("iteration %d: generated weak zero nonce", i)
+		}
+		if _, exists := seen[nonce]; exists {
+			t.Fatalf("collision detected on iteration %d: nonce %d already seen", i, nonce)
+		}
+		seen[nonce] = struct{}{}
+	}
+}
+
 // Benchmarks for Peer Protocol framing
 func BenchmarkEncodeRequestVote(b *testing.B) {
 	req := &RequestVoteRequest{

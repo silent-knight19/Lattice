@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -892,6 +893,357 @@ func TestPeerConnectionManager_ShutdownIdempotencyAndLeakSafety(t *testing.T) {
 	// Close again must be no-op
 	if err := mgr.Close(); err != nil {
 		t.Fatalf("repeated Close failed: %v", err)
+	}
+}
+
+func TestPeerConnectionManager_StartCloseRace(t *testing.T) {
+	ln := createTestListener(t)
+	defer ln.Close()
+
+	topo := createTestTopology(t, 1, "127.0.0.1:9001", map[cluster.NodeID]string{
+		2: ln.Addr().String(),
+	})
+
+	for iter := 0; iter < 20; iter++ {
+		cfg := DefaultPeerConnectionConfig()
+		cfg.DialTimeout = 50 * time.Millisecond
+		cfg.ReconnectMin = 10 * time.Millisecond
+		cfg.ReconnectMax = 20 * time.Millisecond
+
+		mgr, err := NewPeerConnectionManager(topo, cfg)
+		if err != nil {
+			t.Fatalf("iter %d: failed to create manager: %v", iter, err)
+		}
+
+		var wg sync.WaitGroup
+		// 10 goroutines calling Start()
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_ = mgr.Start()
+			}()
+		}
+		// 10 goroutines calling Close()
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_ = mgr.Close()
+			}()
+		}
+		wg.Wait()
+
+		// Final check: Close must be completed
+		_ = mgr.Close()
+		if mgr.IsConnected(2) {
+			t.Fatalf("iter %d: peer connected after close", iter)
+		}
+		if err := mgr.Start(); !errors.Is(err, errs.ErrManagerClosed) {
+			t.Fatalf("iter %d: expected ErrManagerClosed, got %v", iter, err)
+		}
+	}
+}
+
+func TestPeerConnectionManager_SendSharedFrameConcurrentNoRace(t *testing.T) {
+	ln2 := createTestListener(t)
+	defer ln2.Close()
+	ln3 := createTestListener(t)
+	defer ln3.Close()
+
+	acceptAndDrain := func(ln net.Listener) {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 4096)
+				for {
+					if _, err := c.Read(buf); err != nil {
+						return
+					}
+				}
+			}(conn)
+		}
+	}
+	go acceptAndDrain(ln2)
+	go acceptAndDrain(ln3)
+
+	topo := createTestTopology(t, 1, "127.0.0.1:9001", map[cluster.NodeID]string{
+		2: ln2.Addr().String(),
+		3: ln3.Addr().String(),
+	})
+
+	cfg := DefaultPeerConnectionConfig()
+	cfg.DialTimeout = 1 * time.Second
+	mgr, err := NewPeerConnectionManager(topo, cfg)
+	if err != nil {
+		t.Fatalf("failed to create manager: %v", err)
+	}
+	defer mgr.Close()
+
+	if err := mgr.Start(); err != nil {
+		t.Fatalf("failed to start manager: %v", err)
+	}
+
+	// Await connections
+	for i := 0; i < 100; i++ {
+		if mgr.IsConnected(2) && mgr.IsConnected(3) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !mgr.IsConnected(2) || !mgr.IsConnected(3) {
+		t.Fatal("failed to establish connections to both peers")
+	}
+
+	// Construct a single shared frame pointer
+	req := &RequestVoteRequest{Term: 5, CandidateID: 1, Nonce: 12345}
+	sharedFrame, err := EncodeRequestVote(req, 100)
+	if err != nil {
+		t.Fatalf("EncodeRequestVote failed: %v", err)
+	}
+
+	// Concurrently broadcast sharedFrame to both peer 2 and peer 3 across 50 goroutines
+	const workers = 50
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	ctx := context.Background()
+
+	for i := 0; i < workers; i++ {
+		peerID := cluster.NodeID(2 + (i % 2))
+		go func(pid cluster.NodeID) {
+			defer wg.Done()
+			if err := mgr.Send(ctx, pid, sharedFrame); err != nil {
+				t.Errorf("Send to peer %d failed: %v", pid, err)
+			}
+		}(peerID)
+	}
+	wg.Wait()
+}
+
+func TestPeerConnectionManager_InsecureTransportPolicy(t *testing.T) {
+	topo := createTestTopology(t, 1, "127.0.0.1:9001", map[cluster.NodeID]string{
+		2: "192.168.1.100:9098",
+	})
+
+	// 1. InsecureTransport = false (default) with default dialer must fail closed
+	cfg := DefaultPeerConnectionConfig()
+	cfg.InsecureTransport = false
+	cfg.DialFunc = nil
+
+	_, err := NewPeerConnectionManager(topo, cfg)
+	if !errors.Is(err, errs.ErrInsecureTransport) {
+		t.Fatalf("expected ErrInsecureTransport for remote peer, got: %v", err)
+	}
+
+	// 2. InsecureTransport = true explicitly opts in to plaintext TCP
+	cfg.InsecureTransport = true
+	mgr, err := NewPeerConnectionManager(topo, cfg)
+	if err != nil {
+		t.Fatalf("expected success with InsecureTransport=true, got: %v", err)
+	}
+	_ = mgr.Close()
+}
+
+func TestPeerConnectionManager_NilConnDialer(t *testing.T) {
+	topo := createTestTopology(t, 1, "127.0.0.1:9001", map[cluster.NodeID]string{
+		2: "127.0.0.1:9098",
+	})
+
+	cfg := DefaultPeerConnectionConfig()
+	cfg.DialTimeout = 50 * time.Millisecond
+	cfg.ReconnectMin = 10 * time.Millisecond
+	cfg.ReconnectMax = 20 * time.Millisecond
+	// Malicious dialer returns (nil, nil)
+	cfg.DialFunc = func(ctx context.Context, addr string) (net.Conn, error) {
+		return nil, nil
+	}
+
+	mgr, err := NewPeerConnectionManager(topo, cfg)
+	if err != nil {
+		t.Fatalf("failed to create manager: %v", err)
+	}
+	defer mgr.Close()
+
+	if err := mgr.Start(); err != nil {
+		t.Fatalf("failed to start manager: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	if mgr.IsConnected(2) {
+		t.Fatal("peer should not be connected when dialer returns nil conn")
+	}
+}
+
+func TestPeerConnectionManager_BackoffOverflowSafety(t *testing.T) {
+	cfg := DefaultPeerConnectionConfig()
+	cfg.ReconnectMin = 50 * time.Millisecond
+	cfg.ReconnectMax = 5 * time.Second
+
+	sup := &peerSupervisor{cfg: cfg}
+
+	testFailures := []int{
+		0, 1, 2, 5, 10, 20, 30, 31, 32, 62, 63, 64, 100, 1000, math.MaxInt32, math.MaxInt,
+	}
+
+	for _, f := range testFailures {
+		delay := sup.calculateBackoff(f)
+		if delay <= 0 {
+			t.Errorf("calculateBackoff(%d) produced non-positive delay: %v", f, delay)
+		}
+		if delay > cfg.ReconnectMax {
+			t.Errorf("calculateBackoff(%d) exceeded ReconnectMax: got %v, max %v", f, delay, cfg.ReconnectMax)
+		}
+	}
+}
+
+func TestPeerConnectionManager_ReplayFilterDirect(t *testing.T) {
+	rf := newPeerReplayFilter(2)
+
+	// 1. Valid first frame with SeqID 1
+	f1 := &Frame{Header: Header{SeqID: 1}}
+	if err := rf.CheckAndRecord(f1); err != nil {
+		t.Fatalf("first frame rejected: %v", err)
+	}
+
+	// 2. Exact same SeqID must be rejected as duplicate
+	if err := rf.CheckAndRecord(f1); !errors.Is(err, errs.ErrReplayedFrame) {
+		t.Fatalf("expected ErrReplayedFrame for duplicate seqID, got: %v", err)
+	}
+
+	// 3. Sequential frames must succeed
+	for s := uint64(2); s <= 100; s++ {
+		f := &Frame{Header: Header{SeqID: s}}
+		if err := rf.CheckAndRecord(f); err != nil {
+			t.Fatalf("seq %d rejected: %v", s, err)
+		}
+	}
+
+	// 4. Stale frame far behind window (> 4096) must be rejected
+	rf.maxSeqID = 10000
+	rf.seenSeqs[10000] = struct{}{}
+	staleFrame := &Frame{Header: Header{SeqID: 10000 - DefaultReplayWindowSize - 1}}
+	if err := rf.CheckAndRecord(staleFrame); !errors.Is(err, errs.ErrReplayedFrame) {
+		t.Fatalf("expected ErrReplayedFrame for stale seqID, got: %v", err)
+	}
+
+	// 5. Nonce duplicate detection on RequestVote
+	req1 := &RequestVoteRequest{Term: 1, CandidateID: 1, Nonce: 0xCAFEBABE}
+	rv1, _ := EncodeRequestVote(req1, 20000)
+	if err := rf.CheckAndRecord(rv1); err != nil {
+		t.Fatalf("rv1 rejected: %v", err)
+	}
+
+	// Replay rv1 with different SeqID but SAME Nonce -> must be rejected
+	rv1Replay, _ := EncodeRequestVote(req1, 20001)
+	if err := rf.CheckAndRecord(rv1Replay); !errors.Is(err, errs.ErrReplayedFrame) {
+		t.Fatalf("expected ErrReplayedFrame for duplicate nonce, got: %v", err)
+	}
+
+	// 6. Memory bounding: insert 10,000 nonces and verify map does not grow unboundedly
+	for i := 0; i < 10000; i++ {
+		req := &RequestVoteRequest{Term: 1, CandidateID: 1, Nonce: uint64(1000000 + i)}
+		f, _ := EncodeRequestVote(req, uint64(30000+i))
+		_ = rf.CheckAndRecord(f)
+	}
+	rf.mu.Lock()
+	nonceCount := len(rf.nonceSet)
+	seqCount := len(rf.seenSeqs)
+	rf.mu.Unlock()
+
+	if nonceCount > DefaultMaxNoncesTracked {
+		t.Fatalf("nonceSet unbounded: got %d, max %d", nonceCount, DefaultMaxNoncesTracked)
+	}
+	if seqCount > int(DefaultReplayWindowSize)+1 {
+		t.Fatalf("seenSeqs unbounded: got %d, max %d", seqCount, DefaultReplayWindowSize)
+	}
+}
+
+func TestPeerConnectionManager_ReplayDropIntegration(t *testing.T) {
+	ln := createTestListener(t)
+	defer ln.Close()
+
+	topo := createTestTopology(t, 1, "127.0.0.1:9001", map[cluster.NodeID]string{
+		2: ln.Addr().String(),
+	})
+
+	serverConnCh := make(chan net.Conn, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err == nil {
+			serverConnCh <- conn
+		}
+	}()
+
+	var receivedCount atomic.Int32
+	cfg := DefaultPeerConnectionConfig()
+	cfg.DialTimeout = 2 * time.Second
+	cfg.OnFrameReceived = func(peerID cluster.NodeID, frame *Frame) {
+		receivedCount.Add(1)
+	}
+
+	mgr, err := NewPeerConnectionManager(topo, cfg)
+	if err != nil {
+		t.Fatalf("failed to create manager: %v", err)
+	}
+	defer mgr.Close()
+
+	if err := mgr.Start(); err != nil {
+		t.Fatalf("failed to start manager: %v", err)
+	}
+
+	var serverConn net.Conn
+	select {
+	case serverConn = <-serverConnCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for server conn")
+	}
+
+	for i := 0; i < 100; i++ {
+		if mgr.IsConnected(2) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !mgr.IsConnected(2) {
+		t.Fatal("client did not connect")
+	}
+
+	// 1. Send first legitimate frame
+	req := &RequestVoteRequest{Term: 1, CandidateID: 2, Nonce: 88888}
+	f, err := EncodeRequestVote(req, 100)
+	if err != nil {
+		t.Fatalf("EncodeRequestVote failed: %v", err)
+	}
+	if err := EncodeFrame(serverConn, f); err != nil {
+		t.Fatalf("failed to send frame from server: %v", err)
+	}
+
+	// Await delivery
+	for i := 0; i < 100; i++ {
+		if receivedCount.Load() == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if receivedCount.Load() != 1 {
+		t.Fatalf("expected 1 frame delivered, got %d", receivedCount.Load())
+	}
+
+	// 2. Re-send the EXACT SAME frame (replay attack)
+	if err := EncodeFrame(serverConn, f); err != nil {
+		t.Fatalf("failed to re-send frame: %v", err)
+	}
+
+	// Allow reader to process
+	time.Sleep(100 * time.Millisecond)
+
+	// Replayed frame must have been dropped by replayFilter; receivedCount MUST still be 1!
+	if receivedCount.Load() != 1 {
+		t.Fatalf("replayed frame was erroneously delivered to OnFrameReceived! count = %d", receivedCount.Load())
 	}
 }
 

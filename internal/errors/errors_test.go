@@ -2255,6 +2255,7 @@ func TestPeerConnectionManagerErrors(t *testing.T) {
 		errors.ErrPeerNotFound,
 		errors.ErrPeerUnavailable,
 		errors.ErrInvalidManagerConfig,
+		errors.ErrReplayedFrame,
 	}
 
 	for _, s := range sentinels {
@@ -2294,5 +2295,22 @@ func TestPeerConnectionManagerErrors(t *testing.T) {
 	var nilUpe *errors.UnknownPeerError
 	if nilUpe.Error() != errors.ErrPeerNotFound.Error() {
 		t.Errorf("nil error mismatch: got %q, want %q", nilUpe.Error(), errors.ErrPeerNotFound.Error())
+	}
+
+	// ReplayedFrameError
+	rfe := &errors.ReplayedFrameError{NodeID: 5, SeqID: 100, Nonce: 999, Reason: "nonce already seen"}
+	if !stdErrors.Is(rfe, errors.ErrReplayedFrame) {
+		t.Error("ReplayedFrameError must match ErrReplayedFrame")
+	}
+	if !strings.Contains(rfe.Error(), "5") || !strings.Contains(rfe.Error(), "100") || !strings.Contains(rfe.Error(), "nonce already seen") {
+		t.Errorf("unexpected msg: %s", rfe.Error())
+	}
+	var nilRfe *errors.ReplayedFrameError
+	if nilRfe.Error() != errors.ErrReplayedFrame.Error() {
+		t.Errorf("nil error mismatch: got %q, want %q", nilRfe.Error(), errors.ErrReplayedFrame.Error())
+	}
+	bareRfe := &errors.ReplayedFrameError{NodeID: 5, SeqID: 100, Nonce: 999}
+	if !strings.Contains(bareRfe.Error(), "5") || !strings.Contains(bareRfe.Error(), "100") {
+		t.Errorf("unexpected bare msg: %s", bareRfe.Error())
 	}
 }

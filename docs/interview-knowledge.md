@@ -3600,4 +3600,84 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
+# 44. Deep Systems Interview Questions & Answers: Phase 14 Adversarial Security Audit & Transport Hardening (SEC-P14-FULL)
+
+### 1. How does a race between `sync.WaitGroup.Add` and `Wait` crash a Go process, and how did Lattice eliminate it?
+* **Question**: In concurrent Go networking systems, what happens if `Start()` calls `wg.Add(1)` while `Close()` is executing `wg.Wait()`, and how does Lattice ensure lifecycle synchronization?
+* **Answer**:
+  - **The Go Runtime Panic**: In Go's `sync.WaitGroup`, calling `Add()` concurrently with `Wait()` triggers an unrecoverable runtime panic: `"panic: sync: WaitGroup misuse: Add called concurrently with Wait"`. In an outbound connection manager, if a caller starts the manager while another goroutine initiates shutdown, a lock-free CAS on `m.started` and `m.closed` can allow `Start()` to invoke `m.wg.Add(1)` after `Close()` has already begun `m.wg.Wait()`.
+  - **Orphaned Goroutine Hazard**: If `Close()` finishes waiting and returns before `Start()` launches its goroutines, those supervisors spawn *after* shutdown, resulting in permanent background goroutine leaks and lingering network sockets.
+  - **Lattice's Lifecycle Mutex Pattern**: `PeerConnectionManager` introduces `lifecycleMu sync.Mutex`. Both `Start()` and `Close()` acquire `lifecycleMu` during state transitions. `Close()` sets `m.closed` to true and cancels the root context before releasing `lifecycleMu` and invoking `m.wg.Wait()`. Any concurrent or subsequent `Start()` call observes `m.closed.Load() == true` under lock and returns `errors.ErrManagerClosed` without touching `m.wg.Add()`.
+
+### 2. Why is a single `w.Write(buf)` call a critical vulnerability in network frame serialization?
+* **Question**: Why can't a framing encoder rely on `w.Write(wireBuf)` returning no error, and what attack or failure mode does this introduce?
+* **Answer**:
+  - **Partial Write Semantics**: In Go's `io.Writer` interface, `Write(p []byte) (n int, err error)` is legally permitted to write fewer than `len(p)` bytes (`n < len(p)`) and return `err == nil`, particularly when writing to non-blocking network sockets, TLS record buffers, or rate-limited streams.
+  - **The Silent Truncation Vulnerability**: If `EncodeFrame` calls `w.Write(wireBuf)` once and returns `nil` when `n < len(wireBuf)`, only a partial fragment of the frame is transmitted over TCP. The sender reports success, but the remote peer receives a truncated frame with missing CRC trailer bytes, desynchronizing the byte stream.
+  - **The Complete Write Loop Pattern**:
+    ```go
+    written := 0
+    for written < len(wireBuf) {
+        n, err := w.Write(wireBuf[written:])
+        written += n
+        if err != nil {
+            return err
+        }
+        if n == 0 {
+            return io.ErrShortWrite
+        }
+    }
+    return nil
+    ```
+    This guarantees that every frame is either transmitted in its entirety or fails with an explicit error, eliminating partial delivery vulnerabilities.
+
+### 3. How does in-place mutation of a `*Frame` create data races during multi-peer broadcasts?
+* **Question**: In a Raft cluster, a leader broadcasts the same `AppendEntries` message to all followers. Why did `EncodeFrame` mutating `f.Header` and `f.CRC` trigger ThreadSanitizer races, and how was it remediated?
+* **Answer**:
+  - **The Shared Memory Hazard**: When broadcasting a consensus message, passing the same pointer `frame *Frame` to multiple peer goroutines (`go m.Send(peerA, frame)`, `go m.Send(peerB, frame)`) is optimal for zero-copy efficiency. However, if `EncodeFrame` writes `f.Header.Magic = Magic`, `f.Header.PayloadLength = uint32(payloadLen)`, and `f.CRC = checksum` directly onto `*f`, multiple goroutines write to the same struct fields concurrently without synchronization, creating a data race.
+  - **Immutable Input Frame Contract**: `EncodeFrame` treats the caller's `*Frame` as strictly read-only. It creates a local stack copy of `f.Header` (`hdr := f.Header`), encodes `hdr` into `wireBuf[:HeaderSize]`, computes the CRC32 directly into `wireBuf`, and leaves `*f` completely unmutated. Broadcasting a single `*Frame` across 50+ concurrent peers is guaranteed data-race-free.
+
+### 4. How does Lattice implement replay defense without unbounded memory growth?
+* **Question**: How does Lattice defend against replayed consensus messages across network reconnects without risking memory exhaustion?
+* **Answer**:
+  - **Multi-Tier Replay Defense in `peerReplayFilter`**:
+    1. *Monotonic Sequence Tracking & Sliding Window*: Each peer maintains `maxSeqID` and a set of observed sequence numbers within a sliding window of `DefaultReplayWindowSize = 4096`. Any frame with a duplicate sequence ID or a sequence ID older than 4096 behind `maxSeqID` is rejected fail-closed with `errors.ErrReplayedFrame`.
+    2. *Cryptographic Nonce Ring Buffer*: For peer requests (`RequestVote` and `AppendEntries`), a 64-bit cryptographic nonce generated via `crypto/rand` is checked against a circular ring buffer and hash set of `DefaultMaxNoncesTracked = 4096` recent nonces. Duplicate nonces are dropped before consensus callbacks are invoked.
+    3. *Bounded Memory Ceiling*: Sequence sets prune entries $\le \text{maxSeqID} - 4096$, and nonces are managed via a fixed-capacity circular FIFO ring. Aggregate memory per peer is bounded to a few kilobytes, eliminating memory exhaustion vectors even after millions of requests.
+    4. *Reconnect Persistence*: Replay filters reside on `peerSupervisor`, surviving socket reconnections to defeat reconnect-and-replay attacks.
+
+### 5. Why must unauthenticated plaintext TCP be prohibited across non-loopback interfaces by default?
+* **Question**: Why does `PeerConnectionManager` reject non-loopback peer addresses with `errors.ErrInsecureTransport` unless `InsecureTransport = true` is explicitly configured?
+* **Answer**:
+  - **Security Boundary & Defense-in-Depth**: Raft consensus traffic carries state-machine mutations, database records, and leader election votes. Transmitting this traffic in plaintext over untrusted networks (LANs, WANs, public clouds) exposes the entire cluster to eavesdropping, packet injection, and consensus hijacking.
+  - **Fail-Closed Default**: While full mutual TLS (mTLS) with automated PKI generation is scheduled for Phase 19, the transport manager must never silently default to unencrypted cleartext on non-loopback addresses. Default configurations require loopback destinations (`127.0.0.1`, `::1`, `localhost`). Operators connecting external nodes over plaintext (e.g. in isolated container networks behind wireguard or IPsec) must explicitly acknowledge the risk by setting `InsecureTransport = true`.
+
+### 6. How does exponential backoff overflow, and how is it prevented?
+* **Question**: What arithmetic bug commonly occurs in `ReconnectMin * (1 << shift)`, and how did Lattice fix it?
+* **Answer**:
+  - **The Overflow Trap**: When a connection suffers many consecutive failures (e.g., during an extended partition), evaluating `s.cfg.ReconnectMin * (1 << shift)` can overflow `time.Duration` (an `int64`) or overflow a 32-bit `int` if shift is $> 30$. Integer overflow wraps into negative values or zero, causing the supervisor to drop its backoff delay and hammer the network in a tight reconnect loop.
+  - **Iterative Doubling with Saturation Guard**:
+    ```go
+    delay := s.cfg.ReconnectMin
+    for i := 1; i < failures; i++ {
+        if delay >= s.cfg.ReconnectMax/2 {
+            return s.cfg.ReconnectMax
+        }
+        delay *= 2
+    }
+    if delay > s.cfg.ReconnectMax {
+        return s.cfg.ReconnectMax
+    }
+    return delay
+    ```
+    This guarantees that `0 < delay <= ReconnectMax` across all failure counts up to `math.MaxInt`.
+
+### 7. What vulnerability was uncovered by fuzzing address canonicalization?
+* **Question**: What subtle vulnerability did `go test -fuzz` discover in `ValidateAndCanonicalizeAddress`, and how was it remediated?
+* **Answer**:
+  - **The Trailing-Dot Wildcard Bypass**: An adversarial input `"0.0.0.0.:9098"` was supplied. Because `net.ParseIP("0.0.0.0.")` returned `nil`, the address bypassed the initial wildcard IP check and was routed to hostname parsing. The hostname parser stripped the trailing dot, producing `"0.0.0.0"`, which was accepted as a valid hostname! Upon re-canonicalization, it resolved as wildcard `0.0.0.0` and caused an inconsistency.
+  - **The Remediation**: Trailing-dot normalization and lowercasing were moved *before* IP parsing and wildcard checks. In addition, RFC 1123 label grammar checks and a prohibition against all-numeric top-level domains (e.g. `256.0.0.1`) were enforced, ensuring that IP addresses and hostnames are disambiguated deterministically.
+
+---
+
 *End of Technical Interview Knowledge Base — Lattice v1.0.0-KNOWLEDGE-BASE*

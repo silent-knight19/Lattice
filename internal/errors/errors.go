@@ -449,6 +449,9 @@ var (
 
 	// ErrInvalidManagerConfig indicates that peer connection manager configuration parameters violate required bounds.
 	ErrInvalidManagerConfig = stdErrors.New("invalid peer connection manager configuration")
+
+	// ErrReplayedFrame indicates that an incoming peer frame was rejected as a duplicate or replayed message.
+	ErrReplayedFrame = stdErrors.New("peer message rejected: duplicate or replayed frame")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing
@@ -1559,4 +1562,26 @@ func (e *UnknownPeerError) Error() string {
 
 func (e *UnknownPeerError) Is(target error) bool {
 	return target == ErrPeerNotFound
+}
+
+// ReplayedFrameError provides structured context when an incoming peer message is rejected by the replay filter.
+type ReplayedFrameError struct {
+	NodeID uint64
+	SeqID  uint64
+	Nonce  uint64
+	Reason string
+}
+
+func (e *ReplayedFrameError) Error() string {
+	if e == nil {
+		return ErrReplayedFrame.Error()
+	}
+	if e.Reason != "" {
+		return fmt.Sprintf("peer %d frame rejected (seq=%d, nonce=%d): %s", e.NodeID, e.SeqID, e.Nonce, e.Reason)
+	}
+	return fmt.Sprintf("peer %d frame rejected: duplicate or replayed frame (seq=%d, nonce=%d)", e.NodeID, e.SeqID, e.Nonce)
+}
+
+func (e *ReplayedFrameError) Is(target error) bool {
+	return target == ErrReplayedFrame
 }

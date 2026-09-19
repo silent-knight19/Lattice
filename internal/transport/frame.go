@@ -199,10 +199,12 @@ func DecodeFrame(r io.Reader) (*Frame, error) {
 // EncodeFrame serializes f into w as a complete on-wire binary frame.
 //
 // Invariants:
-//   - Sets Magic = 0x4C415454 automatically if uninitialized.
-//   - Enforces PayloadLength == len(f.Payload) <= MaxPayloadLength.
+//   - Emits Magic = 0x4C415454.
+//   - Enforces len(f.Payload) <= MaxPayloadLength.
 //   - Calculates CRC32-IEEE over Header (18B) + Payload (Var).
 //   - Writes Header + Payload + CRC Trailer.
+//   - Safe for concurrent callers: does not mutate the input *Frame.
+//   - Loops on partial writes and reports io.ErrShortWrite if zero bytes are written.
 func EncodeFrame(w io.Writer, f *Frame) error {
 	if f == nil {
 		return errors.ErrNilReceiver
@@ -213,21 +215,33 @@ func EncodeFrame(w io.Writer, f *Frame) error {
 		return &errors.FrameTooLargeError{PayloadSize: uint32(payloadLen), MaxSize: MaxPayloadLength}
 	}
 
-	f.Header.Magic = Magic
-	f.Header.PayloadLength = uint32(payloadLen)
+	hdr := f.Header
+	hdr.Magic = Magic
+	hdr.PayloadLength = uint32(payloadLen)
 
 	totalWireSize := HeaderSize + payloadLen + TrailerSize
 	wireBuf := make([]byte, totalWireSize)
 
-	f.Header.Encode(wireBuf[:HeaderSize])
+	hdr.Encode(wireBuf[:HeaderSize])
 	if payloadLen > 0 {
 		copy(wireBuf[HeaderSize:HeaderSize+payloadLen], f.Payload)
 	}
 
 	// Calculate CRC32 over header + payload
-	f.CRC = crc32.ChecksumIEEE(wireBuf[:HeaderSize+payloadLen])
-	binary.PutUint32(wireBuf[HeaderSize+payloadLen:], f.CRC)
+	computedCRC := crc32.ChecksumIEEE(wireBuf[:HeaderSize+payloadLen])
+	binary.PutUint32(wireBuf[HeaderSize+payloadLen:], computedCRC)
 
-	_, err := w.Write(wireBuf)
-	return err
+	// Ensure complete transmission via write loop; fail on partial or zero writes
+	written := 0
+	for written < len(wireBuf) {
+		n, err := w.Write(wireBuf[written:])
+		written += n
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }

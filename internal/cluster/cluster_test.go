@@ -67,6 +67,7 @@ func TestAddressValidation(t *testing.T) {
 		{"valid ipv6 full", "[2001:db8::10]:9098", "[2001:db8::10]:9098", nil},
 		{"valid hostname lowercase", "node1.internal:9098", "node1.internal:9098", nil},
 		{"hostname normalized to lowercase", "NodeA.CLUSTER.Local:9098", "nodea.cluster.local:9098", nil},
+		{"trailing dot normalized", "node1.internal.:9098", "node1.internal:9098", nil},
 		{"max legal port", "10.0.0.1:65535", "10.0.0.1:65535", nil},
 		{"min legal port", "10.0.0.1:1", "10.0.0.1:1", nil},
 
@@ -82,6 +83,12 @@ func TestAddressValidation(t *testing.T) {
 		{"malformed bracketed ipv6", "[::1:9098", "", cluster.ErrInvalidPeerAddress},
 		{"wildcard ipv4 prohibited", "0.0.0.0:9098", "", cluster.ErrWildcardAddress},
 		{"wildcard ipv6 prohibited", "[::]:9098", "", cluster.ErrWildcardAddress},
+		{"hostname label starts with hyphen", "-node.example.com:9098", "", cluster.ErrInvalidPeerAddress},
+		{"hostname label ends with hyphen", "node-.example.com:9098", "", cluster.ErrInvalidPeerAddress},
+		{"hostname consecutive dots", "node..example.com:9098", "", cluster.ErrInvalidPeerAddress},
+		{"hostname invalid char underscore", "node_bad.com:9098", "", cluster.ErrInvalidPeerAddress},
+		{"hostname invalid char symbol", "node@evil.com:9098", "", cluster.ErrInvalidPeerAddress},
+		{"hostname label exceeds 63 chars", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com:9098", "", cluster.ErrInvalidPeerAddress},
 	}
 
 	for _, tt := range tests {

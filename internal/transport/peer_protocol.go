@@ -1,7 +1,9 @@
 package transport
 
 import (
+	crand "crypto/rand"
 	"fmt"
+	"io"
 
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/cluster"
@@ -303,6 +305,11 @@ func DecodeRequestVoteResponse(f *Frame) (*RequestVoteResponse, error) {
 	if PeerMessageType(f.Header.OpCode) != PeerOpRequestVoteResponse {
 		return nil, &errors.InvalidPeerMessageError{OpCode: byte(f.Header.OpCode)}
 	}
+	if f.Header.Status != StatusOk || f.Header.Flags != FlagNone {
+		return nil, &errors.InvalidPeerPayloadError{
+			Reason: fmt.Sprintf("unsupported peer response status/flags: 0x%02x", f.Header.Status),
+		}
+	}
 	if len(f.Payload) != RequestVoteResponseSize {
 		return nil, &errors.InvalidPeerPayloadError{
 			Reason: fmt.Sprintf("RequestVoteResponse payload size %d does not match expected %d", len(f.Payload), RequestVoteResponseSize),
@@ -537,6 +544,11 @@ func DecodeAppendEntriesResponse(f *Frame) (*AppendEntriesResponse, error) {
 	if PeerMessageType(f.Header.OpCode) != PeerOpAppendEntriesResponse {
 		return nil, &errors.InvalidPeerMessageError{OpCode: byte(f.Header.OpCode)}
 	}
+	if f.Header.Status != StatusOk || f.Header.Flags != FlagNone {
+		return nil, &errors.InvalidPeerPayloadError{
+			Reason: fmt.Sprintf("unsupported peer response status/flags: 0x%02x", f.Header.Status),
+		}
+	}
 	if len(f.Payload) != AppendEntriesResponseSize {
 		return nil, &errors.InvalidPeerPayloadError{
 			Reason: fmt.Sprintf("AppendEntriesResponse payload size %d does not match expected %d", len(f.Payload), AppendEntriesResponseSize),
@@ -624,4 +636,14 @@ func DecodePeerMessage(f *Frame) (any, error) {
 	default:
 		return nil, &errors.InvalidPeerMessageError{OpCode: byte(f.Header.OpCode)}
 	}
+}
+
+// GenerateNonce generates a cryptographically secure 64-bit random nonce using crypto/rand.
+// It ensures high entropy to defend against message replay and predictability attacks.
+func GenerateNonce() (uint64, error) {
+	var buf [8]byte
+	if _, err := io.ReadFull(crand.Reader, buf[:]); err != nil {
+		return 0, fmt.Errorf("failed to generate cryptographic nonce: %w", err)
+	}
+	return binary.GetUint64(buf[:]), nil
 }

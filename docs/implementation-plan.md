@@ -2382,6 +2382,24 @@ TOTAL: 176 Discrete, Testable Micro-Phases
     - *P14-M03-INV-12*: The connection manager is transport-lifecycle code only and does not implement Raft consensus semantics.
   * *Tests*: Construction bounds validation, single-node topology zero-worker check, loopback TCP connection establishment, M02 frame sending (`RequestVote`, `AppendEntries`), concurrent serialized writes (20 goroutines), incoming frame callback delivery, EOF and frame-corruption teardown, automatic reconnect after server restart, stale generation defense, shutdown idempotency and leak safety, microbenchmarks (~2.2-2.4 µs/op send on loopback TCP), and 50x flakiness verification under `go test -race`.
 
+* **P14-SEC: Phase 14 Adversarial Security Audit & Subsystem Hardening**
+  * *Status*: **Completed** (Report: `docs/security/p14-full-security-audit.md`)
+  * *Objective*: Discover, prove, and remediate all concurrency races, socket truncation vulnerabilities, memory sharing races, replay gaps, and transport security boundary bypasses across M01, M02, and M03.
+  * *Remediated Findings*:
+    - *FINDING-P14-01 (CRITICAL)*: Guarded `Start()` and `Close()` with `lifecycleMu sync.Mutex` to eliminate `sync.WaitGroup` misuse race panics and prevent orphaned supervisor launches after shutdown.
+    - *FINDING-P14-02 (HIGH)*: Hardened `EncodeFrame` with a complete write loop to prevent silent truncation on partial socket writes, returning `io.ErrShortWrite` on zero progress.
+    - *FINDING-P14-03 (HIGH)*: Converted `EncodeFrame` to treat caller `*Frame` as read-only, eliminating ThreadSanitizer data races during concurrent broadcasts of shared consensus frames.
+    - *FINDING-P14-04 (HIGH)*: Implemented `GenerateNonce()` using `crypto/rand` and integrated a bounded sliding-window sequence and circular nonce replay filter (`peerReplayFilter`) in `peerSupervisor.runReader`. Added `NextSeqID()` to `PeerConnectionManager`.
+    - *FINDING-P14-05 (HIGH)*: Added `InsecureTransport bool` to `PeerConnectionConfig`. Default dialer rejects non-loopback addresses fail-closed with `errors.ErrInsecureTransport` unless opted into.
+    - *FINDING-P14-06 (MEDIUM)*: Replaced bit-shift backoff arithmetic with safe iterative doubling to eliminate `time.Duration` integer overflow and reconnect retry storms.
+    - *FINDING-P14-07 (MEDIUM)*: Added guard against custom `DialFunc` returning `(nil, nil)`, preventing nil pointer dereference panics.
+    - *FINDING-P14-08 (MEDIUM)*: Enforced `f.Header.Status == StatusOk` and `f.Header.Flags == FlagNone` in peer response decoders (`DecodeRequestVoteResponse`, `DecodeAppendEntriesResponse`).
+    - *FINDING-P14-09 (MEDIUM)*: Hardened address canonicalization with RFC 1123 label bounds, numeric TLD rejection, and moved trailing-dot stripping before IP parsing to eliminate wildcard bypasses.
+  * *Verification Suite*:
+    - 50-iteration ThreadSanitizer run (`go test -count=50 -race ./internal/transport/...` passed cleanly in ~104s).
+    - 20-iteration cluster run (`go test -count=20 ./internal/cluster/...` passed).
+    - Native Go fuzzing: `FuzzValidateAndCanonicalizeAddress` (>1.13M execs), `FuzzParsePeersString` (>2.07M execs), `FuzzDecodePeerFrame` (>1.19M execs), `FuzzDecodeAppendEntriesPayload` (>1.18M execs).
+    - `go vet ./...` (clean).
 
 ---
 

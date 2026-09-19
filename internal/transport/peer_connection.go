@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/cluster"
 	"github.com/silent-knight19/lattice/internal/errors"
 )
@@ -75,6 +76,11 @@ type PeerConnectionConfig struct {
 
 	// OnFrameReceived is invoked when a valid frame is received from a remote peer.
 	OnFrameReceived PeerFrameHandler
+
+	// InsecureTransport explicitly permits unauthenticated, plaintext TCP transport to non-loopback
+	// addresses. When false (default), the default dialer rejects any non-loopback peer destination
+	// with ErrInsecureTransport to defend the mTLS transport boundary.
+	InsecureTransport bool
 }
 
 // DefaultPeerConnectionConfig returns production-hardened defaults for peer connections.
@@ -111,29 +117,146 @@ func configureKeepAlive(conn net.Conn, period time.Duration) {
 	}
 }
 
+const (
+	// DefaultReplayWindowSize is the maximum number of recent sequence numbers tracked per peer.
+	DefaultReplayWindowSize = 4096
+	// DefaultMaxNoncesTracked is the maximum number of cryptographic nonces retained in memory per peer.
+	DefaultMaxNoncesTracked = 4096
+)
+
+// peerReplayFilter maintains bounded sliding-window sequence tracking and duplicate nonce detection
+// to defend against message replay and duplication attacks.
+type peerReplayFilter struct {
+	mu         sync.Mutex
+	peerID     cluster.NodeID
+	maxSeqID   uint64
+	seenSeqs   map[uint64]struct{}
+	nonceSet   map[uint64]struct{}
+	nonceRing  []uint64
+	ringHead   int
+	windowSize uint64
+	maxNonces  int
+}
+
+func newPeerReplayFilter(peerID cluster.NodeID) *peerReplayFilter {
+	return &peerReplayFilter{
+		peerID:     peerID,
+		seenSeqs:   make(map[uint64]struct{}, 128),
+		nonceSet:   make(map[uint64]struct{}, 128),
+		nonceRing:  make([]uint64, 0, DefaultMaxNoncesTracked),
+		windowSize: DefaultReplayWindowSize,
+		maxNonces:  DefaultMaxNoncesTracked,
+	}
+}
+
+func (rf *peerReplayFilter) CheckAndRecord(f *Frame) error {
+	if f == nil {
+		return errors.ErrNilReceiver
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	seqID := f.Header.SeqID
+
+	// 1. Sequence Monotonicity & Sliding Window Check
+	if seqID > 0 {
+		if rf.maxSeqID == 0 {
+			rf.maxSeqID = seqID
+			rf.seenSeqs[seqID] = struct{}{}
+		} else if seqID <= rf.maxSeqID {
+			if rf.maxSeqID-seqID >= rf.windowSize {
+				return &errors.ReplayedFrameError{
+					NodeID: uint64(rf.peerID),
+					SeqID:  seqID,
+					Reason: fmt.Sprintf("stale sequence ID: %d falls behind window [%d, %d]", seqID, rf.maxSeqID-rf.windowSize+1, rf.maxSeqID),
+				}
+			}
+			if _, exists := rf.seenSeqs[seqID]; exists {
+				return &errors.ReplayedFrameError{
+					NodeID: uint64(rf.peerID),
+					SeqID:  seqID,
+					Reason: fmt.Sprintf("duplicate sequence ID: %d already processed", seqID),
+				}
+			}
+			rf.seenSeqs[seqID] = struct{}{}
+		} else {
+			rf.maxSeqID = seqID
+			rf.seenSeqs[seqID] = struct{}{}
+
+			// Evict old sequences outside the sliding window
+			if rf.maxSeqID > rf.windowSize {
+				cutoff := rf.maxSeqID - rf.windowSize
+				for s := range rf.seenSeqs {
+					if s <= cutoff {
+						delete(rf.seenSeqs, s)
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Nonce Replay Check for Peer Control Plane Requests
+	var nonce uint64
+	switch PeerMessageType(f.Header.OpCode) {
+	case PeerOpRequestVote:
+		if len(f.Payload) >= RequestVoteRequestSize {
+			nonce = binary.GetUint64(f.Payload[32:40])
+		}
+	case PeerOpAppendEntries:
+		if len(f.Payload) >= AppendEntriesRequestHeaderSize {
+			nonce = binary.GetUint64(f.Payload[40:48])
+		}
+	}
+
+	if nonce != 0 {
+		if _, exists := rf.nonceSet[nonce]; exists {
+			return &errors.ReplayedFrameError{
+				NodeID: uint64(rf.peerID),
+				SeqID:  seqID,
+				Nonce:  nonce,
+				Reason: fmt.Sprintf("duplicate nonce: 0x%016x already seen", nonce),
+			}
+		}
+		if len(rf.nonceRing) < rf.maxNonces {
+			rf.nonceRing = append(rf.nonceRing, nonce)
+		} else {
+			oldest := rf.nonceRing[rf.ringHead]
+			delete(rf.nonceSet, oldest)
+			rf.nonceRing[rf.ringHead] = nonce
+			rf.ringHead = (rf.ringHead + 1) % rf.maxNonces
+		}
+		rf.nonceSet[nonce] = struct{}{}
+	}
+
+	return nil
+}
+
 // peerSupervisor manages the complete connection lifecycle for a single remote peer.
 type peerSupervisor struct {
 	peerID  cluster.NodeID
 	address string
 	cfg     PeerConnectionConfig
 
-	mu         sync.RWMutex
-	state      PeerState
-	conn       net.Conn
-	generation uint64
-	connDoneCh chan struct{}
-	failures   int
+	mu           sync.RWMutex
+	state        PeerState
+	conn         net.Conn
+	generation   uint64
+	connDoneCh   chan struct{}
+	failures     int
+	replayFilter *peerReplayFilter
 
 	writeMu sync.Mutex
 }
 
 func newPeerSupervisor(p cluster.Peer, cfg PeerConnectionConfig) *peerSupervisor {
 	return &peerSupervisor{
-		peerID:   p.ID,
-		address:  p.Address,
-		cfg:      cfg,
-		state:    PeerStateDisconnected,
-		failures: 0,
+		peerID:       p.ID,
+		address:      p.Address,
+		cfg:          cfg,
+		state:        PeerStateDisconnected,
+		failures:     0,
+		replayFilter: newPeerReplayFilter(p.ID),
 	}
 }
 
@@ -145,17 +268,20 @@ func (s *peerSupervisor) getState() PeerState {
 }
 
 // calculateBackoff computes exponential backoff delay based on consecutive failure count.
+// Uses safe doubling to prevent integer overflow for any arbitrary failure count.
 func (s *peerSupervisor) calculateBackoff(failures int) time.Duration {
 	if failures <= 1 {
 		return s.cfg.ReconnectMin
 	}
-	shift := failures - 1
-	if shift > 30 {
-		shift = 30
+	delay := s.cfg.ReconnectMin
+	for i := 1; i < failures; i++ {
+		if delay >= s.cfg.ReconnectMax/2 {
+			return s.cfg.ReconnectMax
+		}
+		delay *= 2
 	}
-	delay := s.cfg.ReconnectMin * (1 << shift)
-	if delay > s.cfg.ReconnectMax || delay < 0 {
-		delay = s.cfg.ReconnectMax
+	if delay > s.cfg.ReconnectMax {
+		return s.cfg.ReconnectMax
 	}
 	return delay
 }
@@ -211,6 +337,10 @@ func (s *peerSupervisor) run(ctx context.Context, wg *sync.WaitGroup) {
 		dialCtx, dialCancel := context.WithTimeout(ctx, s.cfg.DialTimeout)
 		conn, err := s.cfg.DialFunc(dialCtx, s.address)
 		dialCancel()
+
+		if err == nil && conn == nil {
+			err = errors.ErrPeerUnavailable
+		}
 
 		if err != nil {
 			select {
@@ -316,6 +446,11 @@ func (s *peerSupervisor) runReader(ctx context.Context, gen uint64, conn net.Con
 			return
 		}
 
+		// Replay & Duplicate rejection before invoking callbacks or consensus processing
+		if err := s.replayFilter.CheckAndRecord(frame); err != nil {
+			continue
+		}
+
 		if s.cfg.OnFrameReceived != nil {
 			s.cfg.OnFrameReceived(s.peerID, frame)
 		}
@@ -330,6 +465,9 @@ type PeerConnectionManager struct {
 
 	started atomic.Bool
 	closed  atomic.Bool
+
+	lifecycleMu sync.Mutex
+	nextSeqID   atomic.Uint64
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -377,6 +515,18 @@ func NewPeerConnectionManager(topology *cluster.Topology, cfg PeerConnectionConf
 	}
 
 	if cfg.DialFunc == nil {
+		if !cfg.InsecureTransport {
+			for _, p := range topology.RemotePeers() {
+				if topology.IsSelf(p.ID) {
+					continue
+				}
+				if !isLoopbackAddress(p.Address) {
+					return nil, fmt.Errorf("%w: remote peer %d address %q is non-loopback; plaintext transport forbidden without mTLS or InsecureTransport=true",
+						errors.ErrInsecureTransport, p.ID, p.Address)
+				}
+			}
+		}
+
 		dialTimeout := cfg.DialTimeout
 		keepAlivePeriod := cfg.KeepAlivePeriod
 		cfg.DialFunc = func(ctx context.Context, addr string) (net.Conn, error) {
@@ -414,9 +564,17 @@ func NewPeerConnectionManager(topology *cluster.Topology, cfg PeerConnectionConf
 	}, nil
 }
 
+// NextSeqID returns a monotonically increasing sequence ID for framing peer messages.
+func (m *PeerConnectionManager) NextSeqID() uint64 {
+	return m.nextSeqID.Add(1)
+}
+
 // Start initiates supervisor lifecycle loops for all configured remote peers.
 // Returns ErrManagerAlreadyStarted if called more than once, or ErrManagerClosed if already closed.
 func (m *PeerConnectionManager) Start() error {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+
 	if m.closed.Load() {
 		return errors.ErrManagerClosed
 	}
@@ -544,7 +702,9 @@ func (m *PeerConnectionManager) IsConnected(peerID cluster.NodeID) bool {
 // Idempotent: safe to invoke concurrently and repeatedly.
 // Closes all active sockets, interrupts backoffs and dials, and drains all goroutines.
 func (m *PeerConnectionManager) Close() error {
+	m.lifecycleMu.Lock()
 	if !m.closed.CompareAndSwap(false, true) {
+		m.lifecycleMu.Unlock()
 		return nil
 	}
 
@@ -570,6 +730,7 @@ func (m *PeerConnectionManager) Close() error {
 		}
 		sup.mu.Unlock()
 	}
+	m.lifecycleMu.Unlock()
 
 	// Wait for all supervisor and reader goroutines to terminate
 	m.wg.Wait()

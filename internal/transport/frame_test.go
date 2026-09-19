@@ -4,8 +4,10 @@ import (
 	"bytes"
 	stdErrors "errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"math"
+	"sync"
 	"testing"
 
 	"github.com/silent-knight19/lattice/internal/binary"
@@ -216,6 +218,7 @@ func TestFrame_EncodeDecodeRoundTrip(t *testing.T) {
 				t.Fatalf("wire size mismatch: got %d, want %d", buf.Len(), expectedWireLen)
 			}
 
+			wireBytes := append([]byte(nil), buf.Bytes()...)
 			decoded, err := transport.DecodeFrame(&buf)
 			if err != nil {
 				t.Fatalf("DecodeFrame failed: %v", err)
@@ -239,8 +242,9 @@ func TestFrame_EncodeDecodeRoundTrip(t *testing.T) {
 			if !bytes.Equal(decoded.Payload, tc.payload) {
 				t.Errorf("payload content mismatch: got %x, want %x", decoded.Payload, tc.payload)
 			}
-			if decoded.CRC != frame.CRC {
-				t.Errorf("CRC mismatch: got 0x%08x, want 0x%08x", decoded.CRC, frame.CRC)
+			expectedCRC := crc32.ChecksumIEEE(wireBytes[:transport.HeaderSize+len(tc.payload)])
+			if decoded.CRC != expectedCRC {
+				t.Errorf("CRC mismatch: got 0x%08x, want 0x%08x", decoded.CRC, expectedCRC)
 			}
 		})
 	}
@@ -391,5 +395,127 @@ func TestFrame_CoalescedMultipleFramesInStream(t *testing.T) {
 	_, err := transport.DecodeFrame(r)
 	if err != io.EOF {
 		t.Fatalf("expected io.EOF at end of stream, got: %v", err)
+	}
+}
+
+// shortWriter writes at most maxPerWrite bytes per Write call to simulate partial socket writes.
+type shortWriter struct {
+	buf         bytes.Buffer
+	maxPerWrite int
+}
+
+func (sw *shortWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	toWrite := len(p)
+	if toWrite > sw.maxPerWrite {
+		toWrite = sw.maxPerWrite
+	}
+	return sw.buf.Write(p[:toWrite])
+}
+
+// zeroWriter returns (0, nil) to simulate an unprogressing writer.
+type zeroWriter struct{}
+
+func (zw *zeroWriter) Write(p []byte) (int, error) {
+	return 0, nil
+}
+
+// failingWriter fails after a specified number of bytes written.
+type failingWriter struct {
+	limit int
+	total int
+}
+
+func (fw *failingWriter) Write(p []byte) (int, error) {
+	if fw.total >= fw.limit {
+		return 0, io.ErrClosedPipe
+	}
+	n := len(p)
+	if fw.total+n > fw.limit {
+		n = fw.limit - fw.total
+		fw.total += n
+		return n, io.ErrClosedPipe
+	}
+	fw.total += n
+	return n, nil
+}
+
+func TestEncodeFrame_PartialWritesAdversarialWriter(t *testing.T) {
+	frame := &transport.Frame{
+		Header: transport.Header{
+			OpCode: transport.OpPut,
+			Flags:  transport.FlagSnappy,
+			SeqID:  42,
+		},
+		Payload: []byte("payload_requiring_multiple_chunks_to_write"),
+	}
+
+	// 1. Partial writes (1 byte at a time) must succeed completely
+	sw := &shortWriter{maxPerWrite: 1}
+	if err := transport.EncodeFrame(sw, frame); err != nil {
+		t.Fatalf("EncodeFrame with 1-byte writes failed: %v", err)
+	}
+	decoded, err := transport.DecodeFrame(&sw.buf)
+	if err != nil {
+		t.Fatalf("DecodeFrame failed on partial-written frame: %v", err)
+	}
+	if !bytes.Equal(decoded.Payload, frame.Payload) {
+		t.Fatalf("payload mismatch after partial writes")
+	}
+
+	// 2. Zero-byte write with nil error must fail with io.ErrShortWrite rather than infinite looping
+	zw := &zeroWriter{}
+	if err := transport.EncodeFrame(zw, frame); !stdErrors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("expected io.ErrShortWrite, got: %v", err)
+	}
+
+	// 3. Mid-stream write failure must return the error
+	fw := &failingWriter{limit: 5}
+	if err := transport.EncodeFrame(fw, frame); !stdErrors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("expected io.ErrClosedPipe, got: %v", err)
+	}
+}
+
+func TestEncodeFrame_ConcurrentSharedFrameNoRace(t *testing.T) {
+	frame := &transport.Frame{
+		Header: transport.Header{
+			OpCode: transport.OpCode(transport.PeerOpAppendEntries),
+			Flags:  0,
+			SeqID:  12345,
+		},
+		Payload: []byte("shared_consensus_broadcast_payload"),
+	}
+
+	// Encode concurrently across 50 goroutines with the same *Frame pointer
+	const goroutines = 50
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	results := make([][]byte, goroutines)
+	for i := 0; i < goroutines; i++ {
+		idx := i
+		go func() {
+			defer wg.Done()
+			var buf bytes.Buffer
+			if err := transport.EncodeFrame(&buf, frame); err != nil {
+				t.Errorf("goroutine %d: EncodeFrame failed: %v", idx, err)
+				return
+			}
+			results[idx] = buf.Bytes()
+		}()
+	}
+	wg.Wait()
+
+	// Verify all encoded representations are identical and valid
+	expected := results[0]
+	if len(expected) == 0 {
+		t.Fatal("empty wire buffer from goroutine 0")
+	}
+	for i := 1; i < goroutines; i++ {
+		if !bytes.Equal(results[i], expected) {
+			t.Fatalf("divergent encoding between goroutine 0 and %d", i)
+		}
 	}
 }
