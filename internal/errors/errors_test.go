@@ -2161,4 +2161,87 @@ func TestClusterErrors(t *testing.T) {
 	if nilCtlErr.Error() != errors.ErrClusterTooLarge.Error() {
 		t.Errorf("nil error mismatch: got %q, want %q", nilCtlErr.Error(), errors.ErrClusterTooLarge.Error())
 	}
+
+	// Peer Protocol Framing Errors (M02)
+	peerSentinels := []struct {
+		err error
+		msg string
+	}{
+		{errors.ErrInvalidPeerMessage, "invalid or unrecognized peer message type"},
+		{errors.ErrInvalidPeerPayload, "invalid peer message payload"},
+		{errors.ErrInvalidPeerEntry, "invalid peer log entry"},
+		{errors.ErrInvalidPeerBoolean, "invalid peer boolean wire value: must be 0 or 1"},
+	}
+	for _, tc := range peerSentinels {
+		if tc.err.Error() != tc.msg {
+			t.Errorf("got msg %q, want %q", tc.err.Error(), tc.msg)
+		}
+		if !stdErrors.Is(tc.err, tc.err) {
+			t.Errorf("sentinel must match itself")
+		}
+	}
+
+	// InvalidPeerMessageError
+	ipmErr := &errors.InvalidPeerMessageError{OpCode: 0xFF}
+	if !stdErrors.Is(ipmErr, errors.ErrInvalidPeerMessage) {
+		t.Error("InvalidPeerMessageError must match ErrInvalidPeerMessage")
+	}
+	if !strings.Contains(ipmErr.Error(), "0xff") {
+		t.Errorf("unexpected msg: %s", ipmErr.Error())
+	}
+	var nilIpmErr *errors.InvalidPeerMessageError
+	if nilIpmErr.Error() != errors.ErrInvalidPeerMessage.Error() {
+		t.Errorf("nil error mismatch: got %q, want %q", nilIpmErr.Error(), errors.ErrInvalidPeerMessage.Error())
+	}
+
+	// InvalidPeerPayloadError
+	ippErr := &errors.InvalidPeerPayloadError{Reason: "truncated payload"}
+	if !stdErrors.Is(ippErr, errors.ErrInvalidPeerPayload) {
+		t.Error("InvalidPeerPayloadError must match ErrInvalidPeerPayload")
+	}
+	if !strings.Contains(ippErr.Error(), "truncated payload") {
+		t.Errorf("unexpected msg: %s", ippErr.Error())
+	}
+	var nilIppErr *errors.InvalidPeerPayloadError
+	if nilIppErr.Error() != errors.ErrInvalidPeerPayload.Error() {
+		t.Errorf("nil error mismatch: got %q, want %q", nilIppErr.Error(), errors.ErrInvalidPeerPayload.Error())
+	}
+	bareIppErr := &errors.InvalidPeerPayloadError{}
+	if bareIppErr.Error() != errors.ErrInvalidPeerPayload.Error() {
+		t.Errorf("bare error mismatch: got %q, want %q", bareIppErr.Error(), errors.ErrInvalidPeerPayload.Error())
+	}
+
+	// InvalidPeerBooleanError
+	ipbErr := &errors.InvalidPeerBooleanError{Field: "VoteGranted", Value: 2}
+	if !stdErrors.Is(ipbErr, errors.ErrInvalidPeerBoolean) {
+		t.Error("InvalidPeerBooleanError must match ErrInvalidPeerBoolean")
+	}
+	if !strings.Contains(ipbErr.Error(), "VoteGranted") || !strings.Contains(ipbErr.Error(), "0x02") {
+		t.Errorf("unexpected msg: %s", ipbErr.Error())
+	}
+	var nilIpbErr *errors.InvalidPeerBooleanError
+	if nilIpbErr.Error() != errors.ErrInvalidPeerBoolean.Error() {
+		t.Errorf("nil error mismatch: got %q, want %q", nilIpbErr.Error(), errors.ErrInvalidPeerBoolean.Error())
+	}
+	bareIpbErr := &errors.InvalidPeerBooleanError{Value: 3}
+	if !strings.Contains(bareIpbErr.Error(), "0x03") {
+		t.Errorf("unexpected bare msg: %s", bareIpbErr.Error())
+	}
+
+	// InvalidPeerEntryError
+	ipeErr := &errors.InvalidPeerEntryError{Index: 4, Reason: "data truncated"}
+	if !stdErrors.Is(ipeErr, errors.ErrInvalidPeerEntry) {
+		t.Error("InvalidPeerEntryError must match ErrInvalidPeerEntry")
+	}
+	if !strings.Contains(ipeErr.Error(), "index 4") || !strings.Contains(ipeErr.Error(), "data truncated") {
+		t.Errorf("unexpected msg: %s", ipeErr.Error())
+	}
+	var nilIpeErr *errors.InvalidPeerEntryError
+	if nilIpeErr.Error() != errors.ErrInvalidPeerEntry.Error() {
+		t.Errorf("nil error mismatch: got %q, want %q", nilIpeErr.Error(), errors.ErrInvalidPeerEntry.Error())
+	}
+	bareIpeErr := &errors.InvalidPeerEntryError{Index: 2}
+	if !strings.Contains(bareIpeErr.Error(), "index 2") {
+		t.Errorf("unexpected bare msg: %s", bareIpeErr.Error())
+	}
 }

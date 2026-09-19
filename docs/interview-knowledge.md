@@ -39,6 +39,7 @@
 28. [Deep Systems Interview Questions & Answers: Forward Iterator, Express-Lane Seek, & Weak Consistency (P03-S03-M01)](#28-deep-systems-interview-questions--answers-forward-iterator-express-lane-seek--weak-consistency-p03-s03-m01)
 29. [Deep Systems Interview Questions & Answers: Atomic MemTable Freeze, Linearization Points, & In-Place Immutability (P03-S03-M02)](#29-deep-systems-interview-questions--answers-atomic-memtable-freeze-linearization-points--in-place-immutability-p03-s03-m02)
 41. [Deep Systems Interview Questions & Answers: Node Identity & Cluster Configuration Model (P14-S01-M01)](#41-deep-systems-interview-questions--answers-node-identity--cluster-configuration-model-p14-s01-m01)
+42. [Deep Systems Interview Questions & Answers: Peer-to-Peer RPC Framing Protocol (P14-S01-M02)](#42-deep-systems-interview-questions--answers-peer-to-peer-rpc-framing-protocol-p14-s01-m02)
 
 ---
 
@@ -3460,6 +3461,77 @@ Offset 68..71 (4B, CRC32-IEEE):
     - `Address` (`host:port`) is an ephemeral, environmental property that defines *where* the node is currently reachable over TCP.
   - **Network Topology Fluidity**: In modern virtualized infrastructure, nodes frequently change IP addresses due to VM migrations, container pod rescheduling, DHCP lease updates, or multi-homed network failovers. If identity were tied to address, every network reconfiguration would destroy the node's voting identity and consensus log ownership.
   - **Cryptographic & Transport Independence**: Decoupling identity from address allows future transport layers (mTLS) to authenticate nodes via Subject Alternative Names (SANs) or certificate extensions that assert `NodeID` independently of whether connections are routed through proxies, load balancers, or NAT gateways.
+
+---
+
+# 42. Deep Systems Interview Questions & Answers: Peer-to-Peer RPC Framing Protocol (P14-S01-M02)
+
+### 1. Why should a distributed system use explicit binary wire formats?
+* **Question**: Why did you build a custom binary framing protocol for Lattice peer communication instead of using JSON, YAML, or Go's standard `encoding/gob`?
+* **Answer**:
+  - **Zero-Allocation & CPU Efficiency**: Text formats (JSON, YAML) require continuous string allocation, ASCII-to-integer conversion, and reflection over struct tags. In high-throughput consensus paths handling tens of thousands of proposals per second, string parsing consumes CPU and creates massive heap churn that triggers frequent Garbage Collection (GC) pauses, destroying P99/P99.9 latency.
+  - **Deterministic Byte Layout & Cross-Platform Interoperability**: Go's native `gob` format is Go-specific, non-deterministic across compiler revisions, and tightly coupled to Go type definitions. Explicit field-by-field Big-Endian binary layout guarantees identical bit-level representations across heterogeneous CPU architectures (ARM64, x86-64) and enables transparent inspection by protocol analyzers.
+  - **Fail-Fast Boundary Enforcement**: Fixed-width binary headers allow $O(1)$ validation of message types, sequence identifiers, and payload bounds before reading or allocating payload bodies.
+
+### 2. Why must client and peer opcode namespaces be separated?
+* **Question**: Why can't client operations (`PUT`, `GET`, `DELETE`) and peer RPCs (`RequestVote`, `AppendEntries`) share the same numeric opcode enum?
+* **Answer**:
+  - **Accidental Packet Misrouting & Security Perimeter Isolation**: Lattice runs client storage queries on port `:9099` and cluster peer consensus on port `:9098`. If client and peer opcodes shared numeric values (e.g. `0x01` meaning both `PUT` and `RequestVote`), a misconfigured proxy, port-forwarding error, or network bridge could route client packets to a peer listener. A client query could then be erroneously decoded as a Raft election message, inducing term changes or state corruption.
+  - **Strict Disjoint Partitioning**: Client opcodes occupy `0x01..0x06` (`OpPut` through `OpStats`). Peer message types occupy the high-bit space `0x81..0x84` (`PeerOpRequestVote` through `PeerOpAppendEntriesResponse`).
+  - **Fail-Closed Cross-Rejection**: Passing a client frame to the peer decoder fails immediately with `*errors.InvalidPeerMessageError`, and passing a peer frame to the client decoder fails immediately with `*errors.InvalidOpCodeError`.
+
+### 3. Why is length validation required before allocation?
+* **Question**: What is an "Allocation Bomb" (Memory Bomb) in binary protocols, and how does Lattice prevent it?
+* **Answer**:
+  - **The Threat Vector**: If a decoder reads a 4-byte length prefix (e.g. `DataLen = 4,000,000,000`) from an incoming packet and immediately executes `make([]byte, DataLen)` before validating whether those bytes actually exist in the frame, an attacker can send a tiny 22-byte frame that forces the server to allocate gigabytes of RAM. Multiplying this across several concurrent connections trivially crashes the node via the OS Out-Of-Memory (OOM) killer.
+  - **Lattice's Multi-Tier Pre-Allocation Defense**:
+    1. *Global Payload Ceiling*: `PayloadLength` in the frame header is validated to be $\le \text{MaxPayloadLength}$ (5 MiB = 5,242,880 bytes) before allocating any frame payload buffer.
+    2. *Entry Count Ceiling*: In `AppendEntries`, `EntryCount` is verified to be $\le \text{MaxPeerEntries}$ (1024).
+    3. *Mathematical Sufficiency Check*: The decoder proves that `uint64(EntryCount) * 13 <= uint64(len(payload) - 52)`. If the remaining bytes cannot even cover the minimum 13-byte headers, it fails closed before allocating the entry slice header.
+    4. *Per-Entry Data Bound*: Each entry's `DataLen` is verified against `uint64(len(payload) - offset)` before allocating `make([]byte, dataLen)`.
+
+### 4. Why must AppendEntries parsing use exact-consumption semantics?
+* **Question**: Why does the `DecodeAppendEntries` function check that `offset == len(payload)` at the end of decoding and reject trailing unparsed bytes?
+* **Answer**:
+  - **Protocol Smuggling Prevention**: In layered systems, allowing silent trailing garbage permits adversaries or buggy peers to append hidden data, smuggled commands, or malformed fragments that bypass boundary checks. If a proxy or intermediate gateway inspects the payload length while the terminal state machine stops early, an inconsistency ("HTTP/RPC desynchronization") arises.
+  - **Ambiguity-Free Invariant**: In consensus protocols, every byte transmitted in an RPC frame must have an explicit, accounted-for purpose. Requiring exact payload consumption (`offset == len(payload)`) ensures that truncated fields or extraneous trailing data are detected and rejected fail-closed with `*errors.InvalidPeerPayloadError`.
+
+### 5. Why is Raft log index different from transport sequence ID?
+* **Question**: The 18-byte frame header already contains `SeqID uint64`. Why do `AppendEntries` and `RequestVote` also carry `PrevLogIndex`, `LastLogIndex`, and `Nonce`?
+* **Answer**:
+  - **Different Architectural Scopes**:
+    - `Frame SeqID` is **transport-scoped**: It is generated by the network client/dialer to correlate asynchronous request-response pairs across a multiplexed TCP connection.
+    - `Raft Term` is **consensus epoch metadata**: It identifies the logical election epoch.
+    - `LogIndex` is **state-machine ordering metadata**: It marks the absolute positional sequence of a committed entry in the distributed replicated log.
+    - `Nonce` is **message-identity metadata**: It provides a cryptographically secure 64-bit entropy token used for replay defense.
+  - **Separation of Concerns**: If transport retransmissions or heartbeat polls occur, the frame `SeqID` changes with each socket attempt, but the consensus `PrevLogIndex` and log entries remain identical. Conflating transport correlation with log position would break Raft's log matching invariant.
+
+### 6. Why is CRC32 useful even when TLS will exist later?
+* **Question**: If future micro-phases (M03) will wrap peer connections in mutual TLS (mTLS) with cryptographic MACs, why keep CRC32-IEEE framing validation in M02?
+* **Answer**:
+  - **End-to-End Framing Integrity Beyond TLS**: TLS integrity terminates at the socket decrypt boundary (when bytes are read from the TLS record layer into user space). If memory bit-rot, kernel DMA anomalies, or buffer management errors corrupt decrypted bytes in user-space memory, TLS cannot detect it. The frame CRC32 verifies the structural integrity of the frame envelope end-to-end.
+  - **Hermetic Development & Offline Testing**: During local testing, benchmark runs, or internal cluster development, operators can run plaintext transports (`--insecure-transport`). CRC32 guarantees immediate, fail-closed detection of network corruption, misaligned offsets, and truncated frames without requiring certificate infrastructure.
+
+### 7. Why should replay protection not be embedded in a stateless codec?
+* **Question**: `RequestVote` and `AppendEntries` carry a 64-bit `Nonce` field. Why didn't you implement a nonce replay cache directly inside `DecodeRequestVote`?
+* **Answer**:
+  - **Stateless Serialization Principle**: A codec's sole responsibility is converting byte streams into Go memory structures and enforcing syntactic wire invariants.
+  - **Concurrency & Resource Contention**: Embedding a replay cache inside the decoder would require global mutex-protected state or LRU maps within the framing library, creating lock contention on decoding worker threads and introducing memory leak vectors.
+  - **Stateful Boundary Ownership**: Replay defense in distributed systems requires session awareness: verifying whether a connection is authenticated, tracking monotonic peer epoch windows, and correlating nonces with peer TLS certificate identities. This stateful coordination belongs in the authenticated peer connection manager (M03) and Raft consensus layer (Phase 15).
+
+### 8. Why must a protocol decoder never trust attacker-controlled length fields?
+* **Question**: What arithmetic precautions are required when evaluating length fields from untrusted network sources?
+* **Answer**:
+  - **Unsigned Integer Overflow Wraparound**: In naive Go code:
+    ```go
+    if offset + length > totalLen { return err }
+    ```
+    If `offset` is `100` and `length` is `math.MaxUint32 - 50`, the sum overflows and wraps around to `49`, which is $< \text{totalLen}$! The check passes, and subsequent slicing or memory copies trigger out-of-bounds panics.
+  - **Safe Arithmetic Axiom**: Lattice decoders never add untrusted lengths before validation. Instead, decoders validate bounds using safe subtraction:
+    ```go
+    if uint64(dataLen) > uint64(len(payload) - offset) { return err }
+    ```
+    Since `offset <= len(payload)` is proven prior to entry, `len(payload) - offset` cannot underflow, guaranteeing immune protection against integer wraparound.
 
 ---
 

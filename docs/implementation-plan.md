@@ -2334,7 +2334,26 @@ TOTAL: 176 Discrete, Testable Micro-Phases
     - *P14-M01-INV-10*: Single-node backward compatibility: When cluster parameters are omitted (`NodeID == 0`, empty peers), the daemon operates strictly in single-node V1 mode with zero cluster overhead or required TLS certificates.
   * *Tests*: NodeID parsing bounds ($0$, negative, max uint64, whitespace, alpha), address validation matrix (IPv4, IPv6 loopback, full IPv6, hostnames, port bounds $0..65536$, wildcards), peer string parser (`=`, `@`, `:` delimiters), topology reconciliation (self included, self omitted, self address mismatch, duplicate IDs, duplicate addresses, invalid endpoints), determinism across input permutations, slice immutability, lookups by ID and address, JSON config (array & string formats), key-value config, CLI flag overrides, port collision detection (peer vs storage/pprof), native Go fuzzing (`FuzzParsePeersString`, `FuzzValidateAndCanonicalizeAddress`, `FuzzParseFlags`), and 20x flakiness verification.
 * **P14-S01-M02: Peer-to-Peer RPC Framing Protocol**
-  * *Objective*: Implement binary frames for Raft RPCs (`RequestVote`, `AppendEntries`).
+  * *Objective*: Implement binary frames for Raft RPCs (`RequestVote`, `AppendEntries`) over the existing protocol framing layer.
+  * *Status*: Completed
+  * *Changes*:
+    - Introduced peer message opcode namespace in `internal/transport/peer_protocol.go` (`0x81`..`0x84`: `PeerOpRequestVote`, `PeerOpRequestVoteResponse`, `PeerOpAppendEntries`, `PeerOpAppendEntriesResponse`), strictly decoupled from client data-plane operations (`0x01`..`0x06`).
+    - Implemented strongly-typed wire request and response models: `RequestVoteRequest` (40B fixed), `RequestVoteResponse` (9B fixed), `AppendEntriesRequest` (52B header + variable entries), `AppendEntriesResponse` (17B fixed), and `PeerLogEntry` (13B header + variable data).
+    - Designed bounded serialization and deserialization codecs with strict pre-allocation validation, exact payload consumption checks, integer overflow defense, and defensive byte slice copying for memory isolation.
+    - Extended `internal/errors/errors.go` with domain-specific sentinels and contextual typed error types (`ErrInvalidPeerMessage`, `ErrInvalidPeerPayload`, `ErrInvalidPeerEntry`, `ErrInvalidPeerBoolean`, and structured `*InvalidPeerMessageError`, `*InvalidPeerPayloadError`, `*InvalidPeerBooleanError`, `*InvalidPeerEntryError`).
+  * *Invariants*:
+    - *P14-M02-INV-01*: Namespace separation: Peer message opcodes (`0x81`..`0x84`) occupy a disjoint namespace from client operations (`0x01`..`0x06`); cross-namespace frame delivery fails closed.
+    - *P14-M02-INV-02*: Big-Endian fixed-width encoding: All multi-byte integers (`uint16`, `uint32`, `uint64`) use network byte order across all message payloads.
+    - *P14-M02-INV-03*: Global payload bounding: Total serialized frame payload size is strictly bounded by `MaxPayloadLength` (5 MiB = 5,242,880 bytes) prior to buffer allocation.
+    - *P14-M02-INV-04*: Pre-allocation bounds defense: `AppendEntriesRequest` validates that `EntryCount <= MaxPeerEntries (1024)` and verifies that remaining payload bytes can accommodate minimum entry header sizes ($13\text{B}$) before allocating entry slice headers.
+    - *P14-M02-INV-05*: Per-entry data length validation: Each entry's `DataLen` is validated against remaining unconsumed payload bytes before allocating the entry payload buffer.
+    - *P14-M02-INV-06*: Exact-consumption semantics: Decoders verify that the entire advertised payload is consumed exactly; frames containing trailing unparsed garbage fail closed with `*errors.InvalidPeerPayloadError`.
+    - *P14-M02-INV-07*: Strict boolean wire validation: Wire booleans (`VoteGranted`, `Success`) are validated strictly as `0x00` (false) or `0x01` (true); any other byte value fails closed with `*errors.InvalidPeerBooleanError`.
+    - *P14-M02-INV-08*: Frame SeqID transport correlation: Frame-level `SeqID` is preserved strictly for network request-response correlation and is not conflated with Raft terms, log indexes, or message nonces.
+    - *P14-M02-INV-09*: Stateless replay metadata: Cryptographic nonces (`uint64`) are serialized and deserialized as message metadata; stateful replay detection is decoupled and deferred to the session transport layer (M03).
+    - *P14-M02-INV-10*: Frame CRC32 integrity: Frame envelopes preserve CRC32-IEEE checksum calculation and verification over header and payload, detecting transmission bit-rot independently of transport security.
+    - *P14-M02-INV-11*: Memory isolation: Decoders return independent, defensively allocated byte slices for entry data payloads, preventing cross-routine memory corruption from recycled frame buffers.
+  * *Tests*: Round-trip encode/decode across all 4 message types, golden wire byte sequence verification against byte-level references, malformed frame matrices (truncated headers, oversized entry counts, truncated entry headers, truncated payloads, unexpected trailing bytes, invalid boolean values, invalid node IDs), client/peer opcode cross-rejection, deterministic encoding assertion, 5-second continuous fuzzing (`FuzzDecodePeerFrame`, `FuzzDecodeAppendEntriesPayload` >2.6M execs with 0 crashes), microbenchmarks (~7-17 ns/op single messages, ~100-220 ns/op batched entries), and 20x flakiness verification.
 * **P14-S01-M03: Outbound Peer Connection Manager**
   * *Objective*: Maintain persistent TCP connection pools with automatic reconnect and keep-alive to all cluster peers.
 

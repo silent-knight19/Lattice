@@ -1223,8 +1223,21 @@ This document tracks all **genuine architectural and operational limitations** o
   * Performance: **Optimal** (Sub-millisecond configuration parsing).
   * Security: **Optimal** (Bounds cluster size to 256, rejects wildcards and malformed ports, zero network attack surface during parsing).
 
+### 72. Stateless Peer RPC Framing Boundaries & Transport Lifecycle Decoupling (P14-S01-M02)
+* **Limitation & Architectural Boundaries**:
+  In `internal/transport` (`P14-S01-M02`):
+  1. *Stateless Codec Scope*: The peer RPC codec provides binary serialization and deserialization for Raft messages (`RequestVote`, `AppendEntries`, responses) with strict structural validation, pre-allocation length bounds, and CRC32-IEEE integrity verification. It intentionally does not establish network connections (`net.Dial`, `net.Listen`), connection pools, keep-alive loops, or reconnect backoffs (deferred to P14-S01-M03).
+  2. *Replay Cache Decoupling*: Peer RPC frames carry a 64-bit cryptographic `Nonce` field and frame-level `SeqID` metadata, but the codec maintains no in-memory nonce cache or sliding replay window. Stateful replay detection and connection-scoped sequence verification require authenticated session tracking and are deferred to the peer connection manager (P14-S01-M03) and consensus engine (Phase 15).
+  3. *Fixed Wire Layout & Zero Dynamic Negotiation*: The framing protocol uses a fixed, deterministic binary layout (`Magic = 0x4C415454`, fixed 18-byte header, 4-byte CRC32 trailer, fixed payload offsets). Dynamic version negotiation is intentionally omitted; protocol compatibility is enforced through strict opcode namespace partitioning (`0x81..0x84` for peer, `0x01..0x06` for client) and fail-closed rejection of unknown message types.
+* **Why It Exists**:
+  Separation of concerns: Framing codecs must remain purely deterministic, memory-bounded, and stateless. Coupling wire framing with transport networking, TLS cryptographic sessions, or state-machine replay caches introduces lock contention and architectural fragility.
+* **Impact**:
+  Callers consuming M02 framing must not assume raw peer frames provide cryptographic confidentiality, mutual authentication, or replay immunity until integrated with the authenticated mTLS transport layer in P14-S01-M03.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Deterministic byte layout, zero ambiguous states).
+  * Performance: **Optimal** (~7-17 ns single message encode/decode, zero heap allocation on fixed headers).
+  * Security: **Optimal** (Pre-allocation bounds, exact-consumption verification, no memory amplification, strict boolean validation).
+
 ---
 
 *End of Known Limitations — To be updated continuously throughout implementation.*
-
-

@@ -419,6 +419,18 @@ var (
 
 	// ErrEmptyTopology indicates that a cluster topology contains zero nodes.
 	ErrEmptyTopology = stdErrors.New("cluster topology must contain at least one node")
+
+	// ErrInvalidPeerMessage indicates that a peer message opcode is unknown or unrecognized.
+	ErrInvalidPeerMessage = stdErrors.New("invalid or unrecognized peer message type")
+
+	// ErrInvalidPeerPayload indicates that a peer message payload is malformed, truncated, or contains trailing bytes.
+	ErrInvalidPeerPayload = stdErrors.New("invalid peer message payload")
+
+	// ErrInvalidPeerEntry indicates that an entry in an AppendEntries payload is malformed or invalid.
+	ErrInvalidPeerEntry = stdErrors.New("invalid peer log entry")
+
+	// ErrInvalidPeerBoolean indicates that a boolean field in a peer message has an invalid wire value (not 0x00 or 0x01).
+	ErrInvalidPeerBoolean = stdErrors.New("invalid peer boolean wire value: must be 0 or 1")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing
@@ -1418,4 +1430,79 @@ func (e *ClusterTooLargeError) Error() string {
 
 func (e *ClusterTooLargeError) Is(target error) bool {
 	return target == ErrClusterTooLarge
+}
+
+// InvalidPeerMessageError provides structured context when an unrecognized peer message opcode is encountered.
+type InvalidPeerMessageError struct {
+	OpCode byte
+}
+
+func (e *InvalidPeerMessageError) Error() string {
+	if e == nil {
+		return ErrInvalidPeerMessage.Error()
+	}
+	return fmt.Sprintf("invalid peer message type: 0x%02x", e.OpCode)
+}
+
+func (e *InvalidPeerMessageError) Is(target error) bool {
+	return target == ErrInvalidPeerMessage
+}
+
+// InvalidPeerPayloadError provides structured context when a peer message payload is malformed.
+type InvalidPeerPayloadError struct {
+	Reason string
+}
+
+func (e *InvalidPeerPayloadError) Error() string {
+	if e == nil {
+		return ErrInvalidPeerPayload.Error()
+	}
+	if e.Reason != "" {
+		return fmt.Sprintf("invalid peer message payload: %s", e.Reason)
+	}
+	return ErrInvalidPeerPayload.Error()
+}
+
+func (e *InvalidPeerPayloadError) Is(target error) bool {
+	return target == ErrInvalidPeerPayload
+}
+
+// InvalidPeerBooleanError provides structured context when a boolean field in a peer message has an invalid wire value.
+type InvalidPeerBooleanError struct {
+	Field string
+	Value byte
+}
+
+func (e *InvalidPeerBooleanError) Error() string {
+	if e == nil {
+		return ErrInvalidPeerBoolean.Error()
+	}
+	if e.Field != "" {
+		return fmt.Sprintf("invalid peer boolean for field %s: wire value 0x%02x (must be 0 or 1)", e.Field, e.Value)
+	}
+	return fmt.Sprintf("invalid peer boolean: wire value 0x%02x (must be 0 or 1)", e.Value)
+}
+
+func (e *InvalidPeerBooleanError) Is(target error) bool {
+	return target == ErrInvalidPeerBoolean
+}
+
+// InvalidPeerEntryError provides structured context when an entry in an AppendEntries payload is malformed.
+type InvalidPeerEntryError struct {
+	Index  int
+	Reason string
+}
+
+func (e *InvalidPeerEntryError) Error() string {
+	if e == nil {
+		return ErrInvalidPeerEntry.Error()
+	}
+	if e.Reason != "" {
+		return fmt.Sprintf("invalid peer log entry at index %d: %s", e.Index, e.Reason)
+	}
+	return fmt.Sprintf("invalid peer log entry at index %d", e.Index)
+}
+
+func (e *InvalidPeerEntryError) Is(target error) bool {
+	return target == ErrInvalidPeerEntry
 }
