@@ -175,6 +175,11 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 	}
 
 	// Step 6: Running State Established
+	if cfg.Topology != nil {
+		fmt.Fprintf(stdout, "lattice: cluster topology initialized (node_id: %d, peers: %d, endpoint: %s)\n",
+			cfg.Topology.LocalID(), cfg.Topology.Size(), cfg.Topology.LocalAddress())
+	}
+
 	boundAddr := srv.Addr()
 	addrStr := cfg.Address
 	if boundAddr != nil {

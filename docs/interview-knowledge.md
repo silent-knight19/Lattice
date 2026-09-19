@@ -38,6 +38,7 @@
 27. [Deep Systems Interview Questions & Answers: SkipList Node Memory Representation & Geometric Randomizer (P03-S01-M01)](#27-deep-systems-interview-questions--answers-skiplist-node-memory-representation--geometric-randomizer-p03-s01-m01)
 28. [Deep Systems Interview Questions & Answers: Forward Iterator, Express-Lane Seek, & Weak Consistency (P03-S03-M01)](#28-deep-systems-interview-questions--answers-forward-iterator-express-lane-seek--weak-consistency-p03-s03-m01)
 29. [Deep Systems Interview Questions & Answers: Atomic MemTable Freeze, Linearization Points, & In-Place Immutability (P03-S03-M02)](#29-deep-systems-interview-questions--answers-atomic-memtable-freeze-linearization-points--in-place-immutability-p03-s03-m02)
+41. [Deep Systems Interview Questions & Answers: Node Identity & Cluster Configuration Model (P14-S01-M01)](#41-deep-systems-interview-questions--answers-node-identity--cluster-configuration-model-p14-s01-m01)
 
 ---
 
@@ -3410,6 +3411,55 @@ Offset 68..71 (4B, CRC32-IEEE):
     2. *Authoritative Authentication*: Leverages existing bastion/host SSH key authentication and audit logs; eliminates the risk of misconfigured reverse proxy basic-auth or leaked proxy credentials.
     3. *Transient Ephemeral Access*: The tunnel exists only while the engineer is actively diagnosing an issue; terminating the SSH session immediately cuts off access without lingering open ports.
     4. *Defense Against Lateral Movement*: Even if an attacker compromises a neighboring pod or microservice inside the cluster VPC, they cannot reach the pprof port on the database host because it is not exposed on the VPC network.
+
+---
+
+# 41. Deep Systems Interview Questions & Answers: Node Identity & Cluster Configuration Model (P14-S01-M01)
+
+### 1. Why does a distributed database need stable node identity?
+* **Question**: Why can't cluster nodes identify themselves dynamically via ephemeral addresses, hostnames, or randomly generated UUIDs on each process restart?
+* **Answer**:
+  - **Deterministic Membership & Voter Quorums**: In distributed consensus systems (such as Raft or Paxos), voting eligibility, leader terms, and commit quorums ($\lfloor N/2 \rfloor + 1$) depend strictly on a fixed, known set of voter identities. If a node generated an ephemeral UUID or changed its identity on restart, the remaining cluster would perceive the restarted node as an unknown newcomer. The cluster's voter count would expand indefinitely, fracturing majority calculations and permanently stalling leader elections.
+  - **Split-Brain Mitigation & Election Safety**: Raft guarantees at most one leader per term by ensuring each voter grants at most one vote per term. A stable, unambiguous numeric identity (`NodeID uint64`, non-zero) ensures that cast votes and term states persist logically across reconnections and cannot be duplicated by ephemeral actors.
+  - **Compact, Allocation-Free Framing**: A 64-bit unsigned integer (`uint64`) fits directly into CPU registers, Go atomic primitives, and binary wire headers (fixed 8-byte field), avoiding string parsing overhead, heap allocations, and garbage collection pressure in high-throughput RPC and log replication paths.
+
+### 2. Why must NodeID and peer endpoint mapping be one-to-one?
+* **Question**: Why does the Lattice topology parser strictly reject configurations where two NodeIDs share the same IP:Port, or where one NodeID has multiple configured endpoints?
+* **Answer**:
+  - **Ambiguity-Free Routing**: In a consensus cluster, an RPC sent to logical identity `NodeID = 2` must route to exactly one authoritative physical endpoint. If one NodeID mapped to multiple endpoints, outbound transport dialers would suffer non-deterministic dispatch, potentially splitting log replication streams or sending conflicting heartbeats.
+  - **Collision Resistance & State Machine Integrity**: If multiple distinct NodeIDs (e.g., node 2 and node 3) pointed to the exact same physical endpoint (`10.0.0.2:9098`), two distinct consensus actors would collide on the same incoming TCP connection and message listener. Inbound Raft RPCs (such as `RequestVote` and `AppendEntries`) would interleave across two logical identities, leading to term confusion, corrupted state machine updates, and compromised election safety.
+  - **Strict Bijective Invariant**: Lattice enforces a strict mathematical bijection between logical `NodeID` and canonical endpoint `host:port`. Duplicate NodeIDs fail with `*errors.DuplicateNodeIDError`, and duplicate endpoints fail with `*errors.DuplicatePeerAddressError`.
+
+### 3. Why should topology be immutable after validation?
+* **Question**: Once cluster configuration is parsed and validated, why must the `Topology` struct be immutable, with zero runtime mutation APIs (`AddPeer`, `RemovePeer`, `SetPeer`)?
+* **Answer**:
+  - **Lock-Free Concurrency & Thread Safety**: During database execution, dozens of background goroutines (peer connection managers, heartbeat timers, RPC handlers, metrics reporters) concurrently inspect cluster topology. If the topology could be mutated in place, every read would require acquiring a read/write mutex, creating a contention bottleneck on the consensus critical path. Immutability permits safe, lock-free concurrent access across all goroutines.
+  - **Prevention of Ad-Hoc Split-Brain**: Dynamic membership changes in consensus clusters are notoriously subtle and require formal multi-phase consensus protocols (e.g. Raft Joint Consensus) to prevent two disjoint majorities from coexisting during transitions. Exposing ad-hoc runtime mutation methods outside consensus control invites catastrophic split-brain partitions.
+  - **Defensive Copying**: Lattice's `Topology` stores peers in an unexported slice canonically sorted by ascending `NodeID`. Accessor methods (`Peers()`, `RemotePeers()`) return independent defensive copies, preventing external callers from mutating internal slice headers or array elements.
+
+### 4. Why should configuration parsing avoid network/DNS side effects?
+* **Question**: Why does Lattice use purely syntactic address validation (`net.SplitHostPort`, port range checks, IPv4/IPv6 format validation) and strictly prohibit DNS resolution (`net.LookupHost`) during configuration loading?
+* **Answer**:
+  - **Startup Determinism & Cold Boot Resiliency**: In cloud orchestrators (Kubernetes, AWS ECS) or multi-node bare-metal deployments, all cluster nodes often start up simultaneously. If configuration validation performed DNS lookups, transient DNS failures, split-horizon delays, or network partitions during cold boot would cause nodes to fail validation and crash-loop before the network mesh even stabilizes.
+  - **Fail-Fast Startup Latency**: Synchronous DNS resolution introduces unbounded network latency (often 2–5 seconds per lookup on timeout). Evaluating a 5-node cluster topology could stall daemon startup by 20+ seconds. Syntactic validation completes in microseconds.
+  - **Hermetic Testing & Offline Execution**: Unit tests, CLI help commands, configuration linter dry-runs, and offline air-gapped staging environments must operate reliably without external network access or DNS daemons.
+  - **Separation of Concerns**: Configuration validation's sole responsibility is verifying structural schema invariants. Physical network reachability and resolution belong strictly to the transport connection management layer (P14-S01-M03).
+
+### 5. Why must single-node V1 operation remain compatible with the new cluster model?
+* **Question**: Why didn't you make `--node-id` and `--cluster-peers` mandatory across all Lattice instances?
+* **Answer**:
+  - **Backward Compatibility & Developer Experience**: Lattice V1 is an established, high-performance single-node embedded and server LSM storage engine. Forcing developers and existing production deployments to configure mock cluster topologies, assign dummy NodeIDs, and manage cluster ports for a standalone instance introduces unnecessary operational friction.
+  - **Zero Overhead Principle**: In single-node mode (`nodeID == 0` and no cluster flags), `cfg.Topology` is `nil`. No peer listeners are bound, no outbound connection loops are spawned, no Raft consensus logs are allocated, and zero CPU cycles are wasted on distributed coordination.
+  - **Additive Architecture**: Clustering in Lattice is strictly an opt-in capability (Phase 14/15) that builds on top of, rather than displaces, the verified single-node storage engine core.
+
+### 6. Why are peer identity and peer address different concepts?
+* **Question**: Why maintain separate `NodeID` (numeric identifier) and `Address` (network string) concepts rather than using `Address` directly as the peer's cluster identity?
+* **Answer**:
+  - **Logical Identity vs. Physical Location**:
+    - `NodeID` is an intrinsic, invariant property of the consensus participant. It defines *who* the node is across its entire lifecycle.
+    - `Address` (`host:port`) is an ephemeral, environmental property that defines *where* the node is currently reachable over TCP.
+  - **Network Topology Fluidity**: In modern virtualized infrastructure, nodes frequently change IP addresses due to VM migrations, container pod rescheduling, DHCP lease updates, or multi-homed network failovers. If identity were tied to address, every network reconfiguration would destroy the node's voting identity and consensus log ownership.
+  - **Cryptographic & Transport Independence**: Decoupling identity from address allows future transport layers (mTLS) to authenticate nodes via Subject Alternative Names (SANs) or certificate extensions that assert `NodeID` independently of whether connections are routed through proxies, load balancers, or NAT gateways.
 
 ---
 

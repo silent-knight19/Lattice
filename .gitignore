@@ -2,21 +2,39 @@
 
 # Compiled Binaries & Executables
 bin/
+dist/
+build/
+out/
 /lattice
 /lattice-cli
 /lattice-bench
+/lattice-audit
+cmd/lattice/lattice
+cmd/lattice-cli/lattice-cli
+cmd/lattice-bench/lattice-bench
+cmd/lattice-audit/lattice-audit
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
+*.a
+*.o
+
+# Go Workspaces
+go.work
+go.work.sum
 
 # Test & Coverage Artifacts
 *.test
 *.out
 c.out
+coverage.out
 coverage.txt
 coverage.html
+*.coverprofile
+*.cover
+testdata/fuzz/
 
 # Profiling & Diagnostics (pprof)
 *.pprof
@@ -25,47 +43,75 @@ mem.pprof
 block.pprof
 mutex.pprof
 trace.out
+profile.out
 
 # Storage Engine & Database Runtime Directories
 /data/
 /wal/
 *.sst
 *.sst.tmp
+.tmp_*.sst_*
+*.log
 *.log.tmp
 *.tmp
+/CURRENT
+/CURRENT.tmp
+/MANIFEST-*
+MANIFEST-[0-9]*
+MANIFEST.tmp
+/LOCK
+/LOCK.tmp
 node-state.json
 *.state.json
-
 
 # Crash Dumps & Debugging Symbols
 core
 *.core
+core.*
 *.dSYM/
 
 # OS-Specific Files
 .DS_Store
 .DS_Store?
 ._*
+.Spotlight-V100
+.Trashes
 Thumbs.db
 ehthumbs.db
+[Dd]esktop.ini
 
 # IDE & Editor Directories
 .idea/
 .vscode/
+*.code-workspace
 *.swp
 *.swo
+*.swn
+.*.sw?
 *~
+*.sublime-project
+*.sublime-workspace
+.fleet/
+.zed/
+*.iml
+*.ipr
+*.iws
 
 # Credentials & Secrets (Defense-in-Depth)
 *.pem
 *.key
 *.crt
 *.p12
+*.pfx
 .env
 .env.*
+!.env.example
+!.env.template
 
-# Local Version Control / Checkpointing
+# Local Version Control / Checkpointing & Workspace
 .itehaas/
+workspace/
+/workspace/
 
 # Documents & Post-Mortem PDFs
 *.pdf

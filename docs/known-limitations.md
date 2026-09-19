@@ -1207,9 +1207,24 @@ This document tracks all **genuine architectural and operational limitations** o
   * Performance: **Zero overhead when disabled**; ~1-3% CPU overhead only during active CPU sampling.
   * Security: **Fail-closed loopback enforcement**, complete transport isolation, zero risk of remote information disclosure.
 
+### 71. Static Peer Topology Address Canonicalization & Syntactic Aliasing Boundary (P14-S01-M01)
+* **Limitation & Architectural Boundaries**:
+  In `internal/cluster` (`P14-S01-M01`):
+  1. *Syntactic / Structural Canonicalization Only*: Peer endpoint validation and duplicate detection operate strictly syntactically (`net.SplitHostPort`, port range checks $1..65535$, IP normalization via `net.ParseIP`, lowercase host conversion). Zero network I/O or DNS lookups (`net.LookupHost`) are performed during configuration parsing.
+  2. *Hostname Aliasing Boundary*: Because DNS resolution is deliberately avoided during configuration validation to guarantee fast, deterministic, offline-capable startup and eliminate cold-boot deadlock, aliases that resolve to the same underlying IP address (e.g., `127.0.0.1:9098` vs `localhost:9098`, or `node1.internal:9098` vs `10.0.0.1:9098`) cannot be proven equivalent syntactically. If an operator configures two peers where one uses an IP and the other uses an unresolved hostname alias pointing to that IP, syntactic validation cannot detect this duplication at config parse time.
+  3. *Static Membership Invariant*: Dynamic topology reconfiguration (`AddPeer`, `RemovePeer`, `SetPeer`) is explicitly prohibited in M01; cluster topology is frozen and immutable after initial validation. Dynamic membership transitions require future Raft consensus protocols (Phase 15).
+  4. *Bounded Cluster Size*: Cluster topology is constrained to $N \le 256$ peers (`MaxClusterSize`) to prevent memory amplification and resource exhaustion from malicious configuration files.
+* **Why It Exists**:
+  Network calls and DNS dependencies during configuration parsing introduce startup latency, non-deterministic failures during network partitions, and break hermetic offline test suites. Syntactic validation provides microsecond verification and eliminates external dependencies during process boot.
+* **Impact**:
+  Operators configuring static clusters should maintain consistency in address notation across cluster nodes (e.g., exclusively using canonical IP addresses or consistent FQDN hostnames). Duplicate detection at the transport socket level will fail closed if two connections collide during transport initialization in subsequent phases.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Deterministic syntactic validation, zero DNS side effects).
+  * Performance: **Optimal** (Sub-millisecond configuration parsing).
+  * Security: **Optimal** (Bounds cluster size to 256, rejects wildcards and malformed ports, zero network attack surface during parsing).
+
 ---
 
 *End of Known Limitations — To be updated continuously throughout implementation.*
-
 
 

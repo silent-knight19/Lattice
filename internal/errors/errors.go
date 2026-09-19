@@ -392,6 +392,33 @@ var (
 
 	// ErrInsecureTransport indicates that cleartext TCP is prohibited on a non-loopback address without InsecureTransport opt-in.
 	ErrInsecureTransport = stdErrors.New("plaintext TCP forbidden on non-loopback address without InsecureTransport opt-in")
+
+	// ErrInvalidNodeID indicates that a cluster node identifier is 0 or unparseable.
+	ErrInvalidNodeID = stdErrors.New("invalid node ID: must be greater than zero")
+
+	// ErrDuplicateNodeID indicates that multiple peers in a cluster topology share the same numeric node ID.
+	ErrDuplicateNodeID = stdErrors.New("duplicate node ID in cluster topology")
+
+	// ErrDuplicatePeerAddress indicates that multiple peers in a cluster topology share the same network address.
+	ErrDuplicatePeerAddress = stdErrors.New("duplicate peer address in cluster topology")
+
+	// ErrInvalidPeerAddress indicates that a peer network address is malformed or has an invalid port.
+	ErrInvalidPeerAddress = stdErrors.New("invalid peer address: expected host:port")
+
+	// ErrClusterTooLarge indicates that the number of configured peers exceeds the maximum permitted ceiling.
+	ErrClusterTooLarge = stdErrors.New("cluster topology exceeds maximum allowed peers")
+
+	// ErrSelfNotFound indicates that the local node ID was neither declared in cluster peers nor had a local address provided.
+	ErrSelfNotFound = stdErrors.New("local node identity not found in cluster topology")
+
+	// ErrSelfAddressMismatch indicates that the local peer address does not match the address declared for the local node in cluster peers.
+	ErrSelfAddressMismatch = stdErrors.New("local peer address does not match address declared in cluster peers")
+
+	// ErrWildcardAddress indicates that a wildcard IP (e.g. 0.0.0.0, ::) was provided where a specific peer target is required.
+	ErrWildcardAddress = stdErrors.New("wildcard IP address forbidden as peer target")
+
+	// ErrEmptyTopology indicates that a cluster topology contains zero nodes.
+	ErrEmptyTopology = stdErrors.New("cluster topology must contain at least one node")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing
@@ -1292,4 +1319,103 @@ func (e *InvalidStatusError) Error() string {
 // Is reports whether this error matches target sentinel ErrInvalidStatus.
 func (e *InvalidStatusError) Is(target error) bool {
 	return target == ErrInvalidStatus
+}
+
+// InvalidNodeIDError provides structured context when a cluster node ID is invalid or zero.
+type InvalidNodeIDError struct {
+	NodeID uint64
+	Reason string
+}
+
+func (e *InvalidNodeIDError) Error() string {
+	if e == nil {
+		return ErrInvalidNodeID.Error()
+	}
+	if e.Reason != "" {
+		return fmt.Sprintf("invalid node ID %d: %s", e.NodeID, e.Reason)
+	}
+	return fmt.Sprintf("invalid node ID %d: must be greater than zero", e.NodeID)
+}
+
+func (e *InvalidNodeIDError) Is(target error) bool {
+	return target == ErrInvalidNodeID
+}
+
+// DuplicateNodeIDError provides structured context when multiple peers declare the same node ID.
+type DuplicateNodeIDError struct {
+	NodeID uint64
+	Addr1  string
+	Addr2  string
+}
+
+func (e *DuplicateNodeIDError) Error() string {
+	if e == nil {
+		return ErrDuplicateNodeID.Error()
+	}
+	if e.Addr1 != "" && e.Addr2 != "" {
+		return fmt.Sprintf("duplicate node ID %d in cluster topology (%s and %s)", e.NodeID, e.Addr1, e.Addr2)
+	}
+	return fmt.Sprintf("duplicate node ID %d in cluster topology", e.NodeID)
+}
+
+func (e *DuplicateNodeIDError) Is(target error) bool {
+	return target == ErrDuplicateNodeID
+}
+
+// DuplicatePeerAddressError provides structured context when multiple peers declare the same address.
+type DuplicatePeerAddressError struct {
+	Address string
+	Node1   uint64
+	Node2   uint64
+}
+
+func (e *DuplicatePeerAddressError) Error() string {
+	if e == nil {
+		return ErrDuplicatePeerAddress.Error()
+	}
+	if e.Node1 != 0 && e.Node2 != 0 {
+		return fmt.Sprintf("duplicate peer address %s declared for node %d and node %d", e.Address, e.Node1, e.Node2)
+	}
+	return fmt.Sprintf("duplicate peer address %s in cluster topology", e.Address)
+}
+
+func (e *DuplicatePeerAddressError) Is(target error) bool {
+	return target == ErrDuplicatePeerAddress
+}
+
+// InvalidPeerAddressError provides structured context when a peer endpoint is malformed.
+type InvalidPeerAddressError struct {
+	Address string
+	Reason  string
+}
+
+func (e *InvalidPeerAddressError) Error() string {
+	if e == nil {
+		return ErrInvalidPeerAddress.Error()
+	}
+	if e.Reason != "" {
+		return fmt.Sprintf("invalid peer address %q: %s", e.Address, e.Reason)
+	}
+	return fmt.Sprintf("invalid peer address %q", e.Address)
+}
+
+func (e *InvalidPeerAddressError) Is(target error) bool {
+	return target == ErrInvalidPeerAddress
+}
+
+// ClusterTooLargeError provides structured context when cluster peer count exceeds ceiling.
+type ClusterTooLargeError struct {
+	Count int
+	Max   int
+}
+
+func (e *ClusterTooLargeError) Error() string {
+	if e == nil {
+		return ErrClusterTooLarge.Error()
+	}
+	return fmt.Sprintf("cluster topology peer count %d exceeds maximum limit of %d", e.Count, e.Max)
+}
+
+func (e *ClusterTooLargeError) Is(target error) bool {
+	return target == ErrClusterTooLarge
 }

@@ -2068,3 +2068,97 @@ func TestWALWriterPoisonedError(t *testing.T) {
 		t.Errorf("expected nil unwrap for nil receiver")
 	}
 }
+
+func TestClusterErrors(t *testing.T) {
+	clusterSentinels := []struct {
+		err error
+		msg string
+	}{
+		{errors.ErrInvalidNodeID, "invalid node ID: must be greater than zero"},
+		{errors.ErrDuplicateNodeID, "duplicate node ID in cluster topology"},
+		{errors.ErrDuplicatePeerAddress, "duplicate peer address in cluster topology"},
+		{errors.ErrInvalidPeerAddress, "invalid peer address: expected host:port"},
+		{errors.ErrClusterTooLarge, "cluster topology exceeds maximum allowed peers"},
+		{errors.ErrSelfNotFound, "local node identity not found in cluster topology"},
+		{errors.ErrSelfAddressMismatch, "local peer address does not match address declared in cluster peers"},
+		{errors.ErrWildcardAddress, "wildcard IP address forbidden as peer target"},
+		{errors.ErrEmptyTopology, "cluster topology must contain at least one node"},
+	}
+
+	for _, tc := range clusterSentinels {
+		if tc.err == nil {
+			t.Fatal("expected non-nil error")
+		}
+		if tc.err.Error() != tc.msg {
+			t.Errorf("got msg %q, want %q", tc.err.Error(), tc.msg)
+		}
+		if !stdErrors.Is(tc.err, tc.err) {
+			t.Errorf("sentinel must match itself")
+		}
+	}
+
+	// InvalidNodeIDError
+	inErr := &errors.InvalidNodeIDError{NodeID: 0, Reason: "cannot be zero"}
+	if !stdErrors.Is(inErr, errors.ErrInvalidNodeID) {
+		t.Error("InvalidNodeIDError must match ErrInvalidNodeID")
+	}
+	if !strings.Contains(inErr.Error(), "cannot be zero") {
+		t.Errorf("unexpected msg: %s", inErr.Error())
+	}
+	var nilInErr *errors.InvalidNodeIDError
+	if nilInErr.Error() != errors.ErrInvalidNodeID.Error() {
+		t.Errorf("nil error mismatch: got %q, want %q", nilInErr.Error(), errors.ErrInvalidNodeID.Error())
+	}
+
+	// DuplicateNodeIDError
+	dupNodeErr := &errors.DuplicateNodeIDError{NodeID: 1, Addr1: "10.0.0.1:9098", Addr2: "10.0.0.2:9098"}
+	if !stdErrors.Is(dupNodeErr, errors.ErrDuplicateNodeID) {
+		t.Error("DuplicateNodeIDError must match ErrDuplicateNodeID")
+	}
+	if !strings.Contains(dupNodeErr.Error(), "10.0.0.1:9098") {
+		t.Errorf("unexpected msg: %s", dupNodeErr.Error())
+	}
+	var nilDupNodeErr *errors.DuplicateNodeIDError
+	if nilDupNodeErr.Error() != errors.ErrDuplicateNodeID.Error() {
+		t.Errorf("nil error mismatch: got %q, want %q", nilDupNodeErr.Error(), errors.ErrDuplicateNodeID.Error())
+	}
+
+	// DuplicatePeerAddressError
+	dupAddrErr := &errors.DuplicatePeerAddressError{Address: "10.0.0.1:9098", Node1: 1, Node2: 2}
+	if !stdErrors.Is(dupAddrErr, errors.ErrDuplicatePeerAddress) {
+		t.Error("DuplicatePeerAddressError must match ErrDuplicatePeerAddress")
+	}
+	if !strings.Contains(dupAddrErr.Error(), "10.0.0.1:9098") {
+		t.Errorf("unexpected msg: %s", dupAddrErr.Error())
+	}
+	var nilDupAddrErr *errors.DuplicatePeerAddressError
+	if nilDupAddrErr.Error() != errors.ErrDuplicatePeerAddress.Error() {
+		t.Errorf("nil error mismatch: got %q, want %q", nilDupAddrErr.Error(), errors.ErrDuplicatePeerAddress.Error())
+	}
+
+	// InvalidPeerAddressError
+	inAddrErr := &errors.InvalidPeerAddressError{Address: "invalid", Reason: "missing port"}
+	if !stdErrors.Is(inAddrErr, errors.ErrInvalidPeerAddress) {
+		t.Error("InvalidPeerAddressError must match ErrInvalidPeerAddress")
+	}
+	if !strings.Contains(inAddrErr.Error(), "missing port") {
+		t.Errorf("unexpected msg: %s", inAddrErr.Error())
+	}
+	var nilInAddrErr *errors.InvalidPeerAddressError
+	if nilInAddrErr.Error() != errors.ErrInvalidPeerAddress.Error() {
+		t.Errorf("nil error mismatch: got %q, want %q", nilInAddrErr.Error(), errors.ErrInvalidPeerAddress.Error())
+	}
+
+	// ClusterTooLargeError
+	ctlErr := &errors.ClusterTooLargeError{Count: 300, Max: 256}
+	if !stdErrors.Is(ctlErr, errors.ErrClusterTooLarge) {
+		t.Error("ClusterTooLargeError must match ErrClusterTooLarge")
+	}
+	if !strings.Contains(ctlErr.Error(), "300") {
+		t.Errorf("unexpected msg: %s", ctlErr.Error())
+	}
+	var nilCtlErr *errors.ClusterTooLargeError
+	if nilCtlErr.Error() != errors.ErrClusterTooLarge.Error() {
+		t.Errorf("nil error mismatch: got %q, want %q", nilCtlErr.Error(), errors.ErrClusterTooLarge.Error())
+	}
+}

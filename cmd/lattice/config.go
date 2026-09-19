@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/silent-knight19/lattice/internal/cluster"
 	"github.com/silent-knight19/lattice/internal/errors"
 )
 
@@ -34,14 +35,54 @@ const (
 	Version = "v1.0.0-phase12"
 )
 
+// ClusterPeersList is a slice of PeerConfig that supports deserializing from either
+// a JSON array of objects ([{"id": 1, "address": "..."}]) or a delimited string ("1=...").
+type ClusterPeersList []cluster.PeerConfig
+
+// UnmarshalJSON unmarshals either a JSON array or a delimited string of peers.
+func (l *ClusterPeersList) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		*l = nil
+		return nil
+	}
+	if trimmed[0] == '[' {
+		var peers []cluster.PeerConfig
+		if err := json.Unmarshal(trimmed, &peers); err != nil {
+			return err
+		}
+		*l = peers
+		return nil
+	}
+	var str string
+	if err := json.Unmarshal(trimmed, &str); err != nil {
+		return err
+	}
+	peers, err := cluster.ParsePeersString(str)
+	if err != nil {
+		return err
+	}
+	*l = peers
+	return nil
+}
+
 // Config encapsulates process and server configuration for the Lattice daemon.
 type Config struct {
-	DataDir           string `json:"data_dir"`
-	Address           string `json:"address"`
-	Port              int    `json:"port"`
-	ConfigPath        string `json:"-"`
-	InsecureTransport bool   `json:"insecure_transport"`
-	PprofAddress      string `json:"pprof_address"`
+	DataDir           string            `json:"data_dir"`
+	Address           string            `json:"address"`
+	Port              int               `json:"port"`
+	ConfigPath        string            `json:"-"`
+	InsecureTransport bool              `json:"insecure_transport"`
+	PprofAddress      string            `json:"pprof_address"`
+	NodeID            uint64            `json:"node_id"`
+	PeerAddress       string            `json:"peer_address"`
+	ClusterPeers      ClusterPeersList  `json:"cluster_peers"`
+	Topology          *cluster.Topology `json:"-"`
+}
+
+// IsClusterEnabled reports whether clustering configuration is active.
+func (c *Config) IsClusterEnabled() bool {
+	return c.NodeID != 0 || c.PeerAddress != "" || len(c.ClusterPeers) > 0
 }
 
 // DefaultConfig returns production-hardened defaults for the Lattice daemon.
@@ -51,6 +92,10 @@ func DefaultConfig() Config {
 		Address:           net.JoinHostPort(DefaultHost, strconv.Itoa(DefaultPort)),
 		Port:              DefaultPort,
 		InsecureTransport: false,
+		NodeID:            0,
+		PeerAddress:       "",
+		ClusterPeers:      nil,
+		Topology:          nil,
 	}
 }
 
@@ -83,6 +128,9 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 		flagConfig            string
 		flagInsecureTransport bool
 		flagPprofAddress      string
+		flagNodeID            uint64
+		flagPeerAddress       string
+		flagClusterPeers      string
 		flagHelp              bool
 		flagHelpShort         bool
 		flagVersion           bool
@@ -95,6 +143,9 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 	fs.StringVar(&flagConfig, "config", "", "Path to configuration file (JSON or key-value)")
 	fs.BoolVar(&flagInsecureTransport, "insecure-transport", false, "Explicit opt-in permitting unencrypted plaintext TCP on non-loopback addresses")
 	fs.StringVar(&flagPprofAddress, "pprof-address", "", "TCP bind address for HTTP pprof profiling diagnostics (e.g. 127.0.0.1:6060, loopback only)")
+	fs.Uint64Var(&flagNodeID, "node-id", 0, "Cluster node ID (> 0 in cluster mode; 0 for single-node)")
+	fs.StringVar(&flagPeerAddress, "peer-address", "", "TCP bind address for Raft peer transport (e.g. 127.0.0.1:9098)")
+	fs.StringVar(&flagClusterPeers, "cluster-peers", "", "Comma-separated list of cluster peers (format: id=host:port, e.g. 1=10.0.0.1:9098,2=10.0.0.2:9098)")
 	fs.BoolVar(&flagHelp, "help", false, "Display usage instructions and exit")
 	fs.BoolVar(&flagHelpShort, "h", false, "Display usage instructions and exit")
 	fs.BoolVar(&flagVersion, "version", false, "Display version information and exit")
@@ -164,6 +215,19 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 	}
 	if provided["pprof-address"] {
 		cfg.PprofAddress = flagPprofAddress
+	}
+	if provided["node-id"] {
+		cfg.NodeID = flagNodeID
+	}
+	if provided["peer-address"] {
+		cfg.PeerAddress = flagPeerAddress
+	}
+	if provided["cluster-peers"] {
+		peers, err := cluster.ParsePeersString(flagClusterPeers)
+		if err != nil {
+			return nil, false, fmt.Errorf("config error: invalid --cluster-peers: %w", err)
+		}
+		cfg.ClusterPeers = peers
 	}
 
 	// Step 3: Normalize Address and Port
@@ -247,6 +311,35 @@ func (c *Config) Validate() error {
 		srvHost, srvPortStr, _ := net.SplitHostPort(c.Address)
 		if pPort != 0 && pPortStr == srvPortStr && (pHost == srvHost || (isLoopback(pHost) && isLoopback(srvHost))) {
 			return fmt.Errorf("config error: --pprof-address port %s conflicts with server --address port %s", pPortStr, srvPortStr)
+		}
+	}
+
+	// Phase 14 M01 Cluster Topology Policy:
+	// If any cluster parameter is provided, validate cluster configuration.
+	// Single-node V1 operation remains active when unconfigured.
+	if c.IsClusterEnabled() {
+		if c.NodeID == 0 {
+			return fmt.Errorf("config error: --node-id must be greater than zero when clustering is enabled")
+		}
+		topo, err := cluster.NewTopology(cluster.NodeID(c.NodeID), c.PeerAddress, c.ClusterPeers)
+		if err != nil {
+			return fmt.Errorf("config error: invalid cluster topology: %w", err)
+		}
+		c.Topology = topo
+
+		// Port collision prevention between peer listener and storage/pprof servers
+		if c.Topology.LocalAddress() != "" {
+			peerHost, peerPortStr, _ := net.SplitHostPort(c.Topology.LocalAddress())
+			srvHost, srvPortStr, _ := net.SplitHostPort(c.Address)
+			if peerPortStr != "0" && peerPortStr == srvPortStr && (peerHost == srvHost || (isLoopback(peerHost) && isLoopback(srvHost))) {
+				return fmt.Errorf("config error: peer address port %s conflicts with server address port %s", peerPortStr, srvPortStr)
+			}
+			if c.PprofAddress != "" {
+				pHost, pPortStr, _ := net.SplitHostPort(c.PprofAddress)
+				if peerPortStr != "0" && peerPortStr == pPortStr && (peerHost == pHost || (isLoopback(peerHost) && isLoopback(pHost))) {
+					return fmt.Errorf("config error: peer address port %s conflicts with pprof address port %s", peerPortStr, pPortStr)
+				}
+			}
 		}
 	}
 
@@ -334,8 +427,22 @@ func loadConfigFile(path string) (*Config, error) {
 			cfg.InsecureTransport = b
 		case "pprof_address", "pprof-address", "server.pprof_address", "server.pprof-address":
 			cfg.PprofAddress = val
+		case "node_id", "node-id", "raft.node_id", "cluster.node_id":
+			id, err := strconv.ParseUint(val, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid node_id value on line %d: %q", lineNum, val)
+			}
+			cfg.NodeID = id
+		case "peer_address", "peer-address", "raft.peer_address", "cluster.peer_address":
+			cfg.PeerAddress = val
+		case "cluster_peers", "cluster-peers", "raft.cluster_peers", "cluster.cluster_peers":
+			peers, err := cluster.ParsePeersString(val)
+			if err != nil {
+				return nil, fmt.Errorf("invalid cluster_peers on line %d: %w", lineNum, err)
+			}
+			cfg.ClusterPeers = peers
 		default:
-			// Ignore unrecognized or higher-level nesting keys (e.g. "server:", "storage:")
+			// Ignore unrecognized or higher-level nesting keys (e.g. "server:", "storage:", "raft:")
 			if val == "" {
 				continue
 			}

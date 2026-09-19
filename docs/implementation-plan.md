@@ -2318,7 +2318,21 @@ TOTAL: 176 Discrete, Testable Micro-Phases
 * **Dependencies**: Phase 11.
 
 * **P14-S01-M01: Node Identity & Cluster Configuration Model**
+  * *Status*: **Completed**
   * *Objective*: Parse cluster topology (Node IDs, peer IP:Port addresses) from config.
+  * *Changes*: `internal/cluster/doc.go`, `internal/cluster/node.go`, `internal/cluster/peer.go`, `internal/cluster/parse.go`, `internal/cluster/topology.go`, `internal/cluster/errors.go`, `internal/cluster/cluster_test.go`, `internal/cluster/fuzz_test.go`, `internal/errors/errors.go`, `internal/errors/errors_test.go`, `cmd/lattice/config.go`, `cmd/lattice/config_test.go`, `cmd/lattice/daemon.go`, `cmd/lattice/doc.go`, `docs/implementation-plan.md`, `docs/interview-knowledge.md`.
+  * *Invariants & Properties*:
+    - *P14-M01-INV-01*: Node identity validity & uniqueness: `NodeID` is a 64-bit unsigned integer strictly $> 0$ (`0` is reserved for single-node / unconfigured mode); every declared node ID within a cluster topology must be unique.
+    - *P14-M01-INV-02*: Syntactic endpoint validity: Every peer endpoint must be a syntactically valid `host:port` string with port strictly within $1..65535$; port 0, missing ports, and empty hosts are rejected fail-closed.
+    - *P14-M01-INV-03*: One-to-one identity mapping: Every canonical endpoint is bound to exactly one `NodeID`, and every `NodeID` maps to exactly one endpoint; duplicate addresses across distinct node IDs fail closed.
+    - *P14-M01-INV-04*: Wildcard endpoint prohibition: Wildcard IP addresses (`0.0.0.0`, `::`) are strictly forbidden as peer target addresses.
+    - *P14-M01-INV-05*: Deterministic topology ordering: Peers and remote peers are normalized and sorted deterministically in ascending `NodeID` order, eliminating Go map iteration non-determinism.
+    - *P14-M01-INV-06*: Symmetric self-reconciliation: Configuration accepts cluster peer lists containing or omitting self; self is verified for address consistency and normalized internally into `LocalID`, `LocalAddress`, `Peers` (all), and `RemotePeers` (excluding self).
+    - *P14-M01-INV-07*: Topology immutability: Validated `Topology` objects are completely immutable after construction; slice accessors (`Peers()`, `RemotePeers()`) return defensive copies.
+    - *P14-M01-INV-08*: Network and DNS isolation: Address validation and canonicalization are strictly syntactic (IPv4/IPv6 text parsing and lowercase hostname normalization); zero network I/O or DNS lookups occur during parsing.
+    - *P14-M01-INV-09*: Bounded cluster resource allocation: Topologies enforce an upper ceiling of `MaxClusterSize = 256` nodes, bounding memory allocation against hostile or amplified configuration inputs.
+    - *P14-M01-INV-10*: Single-node backward compatibility: When cluster parameters are omitted (`NodeID == 0`, empty peers), the daemon operates strictly in single-node V1 mode with zero cluster overhead or required TLS certificates.
+  * *Tests*: NodeID parsing bounds ($0$, negative, max uint64, whitespace, alpha), address validation matrix (IPv4, IPv6 loopback, full IPv6, hostnames, port bounds $0..65536$, wildcards), peer string parser (`=`, `@`, `:` delimiters), topology reconciliation (self included, self omitted, self address mismatch, duplicate IDs, duplicate addresses, invalid endpoints), determinism across input permutations, slice immutability, lookups by ID and address, JSON config (array & string formats), key-value config, CLI flag overrides, port collision detection (peer vs storage/pprof), native Go fuzzing (`FuzzParsePeersString`, `FuzzValidateAndCanonicalizeAddress`, `FuzzParseFlags`), and 20x flakiness verification.
 * **P14-S01-M02: Peer-to-Peer RPC Framing Protocol**
   * *Objective*: Implement binary frames for Raft RPCs (`RequestVote`, `AppendEntries`).
 * **P14-S01-M03: Outbound Peer Connection Manager**
