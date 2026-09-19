@@ -311,3 +311,119 @@ func FuzzParseFlags(f *testing.F) {
 		}
 	})
 }
+
+func TestConfigFile_UnknownKeysRejection(t *testing.T) {
+	t.Run("JSON with unknown key fails closed", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		cfgPath := filepath.Join(tmpDir, "unknown.json")
+		if err := os.WriteFile(cfgPath, []byte(`{"port": 9099, "unknown_opt": "fail"}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := loadConfigFile(cfgPath)
+		if err == nil {
+			t.Fatal("expected error on unknown JSON key, got nil")
+		}
+		if !strings.Contains(err.Error(), "unknown field") && !strings.Contains(err.Error(), "malformed JSON") {
+			t.Errorf("unexpected error message: %v", err)
+		}
+	})
+
+	t.Run("key-value with unknown key fails closed", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		cfgPath := filepath.Join(tmpDir, "unknown.conf")
+		if err := os.WriteFile(cfgPath, []byte("port: 9099\ninsecure_transprot: true\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := loadConfigFile(cfgPath)
+		if err == nil {
+			t.Fatal("expected error on unknown key-value key, got nil")
+		}
+		if !strings.Contains(err.Error(), "unknown configuration key") {
+			t.Errorf("unexpected error message: %v", err)
+		}
+	})
+
+	t.Run("structural headers without values succeed", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		cfgPath := filepath.Join(tmpDir, "valid_sections.conf")
+		content := "server:\nport: 9099\ncluster:\nnode_id: 1\npeer_address: 127.0.0.1:9098\ncluster_peers: 1=127.0.0.1:9098\n"
+		if err := os.WriteFile(cfgPath, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := loadConfigFile(cfgPath)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Port != 9099 || cfg.NodeID != 1 {
+			t.Fatalf("unexpected config values: %+v", cfg)
+		}
+	})
+}
+
+func TestConfigFile_DuplicateConflictingKeysRejection(t *testing.T) {
+	t.Run("duplicate exact key fails closed", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		cfgPath := filepath.Join(tmpDir, "dup.conf")
+		content := "node_id: 1\nnode_id: 2\n"
+		if err := os.WriteFile(cfgPath, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := loadConfigFile(cfgPath)
+		if err == nil {
+			t.Fatal("expected error on duplicate key, got nil")
+		}
+		if !strings.Contains(err.Error(), "duplicate or conflicting configuration key") {
+			t.Errorf("unexpected error message: %v", err)
+		}
+	})
+
+	t.Run("conflicting alias key fails closed", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		cfgPath := filepath.Join(tmpDir, "conflict.conf")
+		content := "node_id: 1\ncluster.node_id: 2\n"
+		if err := os.WriteFile(cfgPath, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := loadConfigFile(cfgPath)
+		if err == nil {
+			t.Fatal("expected error on conflicting alias, got nil")
+		}
+		if !strings.Contains(err.Error(), "duplicate or conflicting configuration key") {
+			t.Errorf("unexpected error message: %v", err)
+		}
+	})
+}
+
+func TestConfig_WildcardPortCollision(t *testing.T) {
+	t.Run("server wildcard 0.0.0.0:9099 collides with peer 127.0.0.1:9099", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Address = "0.0.0.0:9099"
+		cfg.InsecureTransport = true
+		cfg.NodeID = 1
+		cfg.PeerAddress = "127.0.0.1:9099"
+		cfg.ClusterPeers = []cluster.PeerConfig{{ID: 1, Address: "127.0.0.1:9099"}}
+
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected port collision error between wildcard server and peer, got nil")
+		}
+		if !strings.Contains(err.Error(), "conflicts with server address port") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("server wildcard 0.0.0.0:9099 collides with pprof 127.0.0.1:9099", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Address = "0.0.0.0:9099"
+		cfg.InsecureTransport = true
+		cfg.PprofAddress = "127.0.0.1:9099"
+
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected port collision error between wildcard server and pprof, got nil")
+		}
+		if !strings.Contains(err.Error(), "conflicts with server --address port") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+}

@@ -555,3 +555,100 @@ func TestTopologyLookups(t *testing.T) {
 		t.Error("IsSelf(2) expected false, got true")
 	}
 }
+
+func TestNodeID_AdversarialSecurity(t *testing.T) {
+	tests := []struct {
+		input   string
+		wantErr bool
+		wantID  cluster.NodeID
+	}{
+		{"", true, 0},
+		{" ", true, 0},
+		{"0", true, 0},
+		{"00", true, 0},
+		{"01", true, 0},
+		{"0001", true, 0},
+		{"1", false, 1},
+		{"18446744073709551615", false, 18446744073709551615},
+		{"18446744073709551616", true, 0},
+		{"-1", true, 0},
+		{"+1", true, 0},
+		{" 1 ", false, 1},
+		{"1 ", false, 1},
+		{" 1", false, 1},
+		{"1.0", true, 0},
+		{"0x1", true, 0},
+		{"1e3", true, 0},
+		{"１２３", true, 0},
+		{"1\x00", true, 0},
+		{"999999999999999999999999999999", true, 0},
+	}
+
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("input_%q", tc.input), func(t *testing.T) {
+			id, err := cluster.ParseNodeID(tc.input)
+			if tc.wantErr && err == nil {
+				t.Fatalf("ParseNodeID(%q) expected error, got id %d", tc.input, id)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("ParseNodeID(%q) unexpected error: %v", tc.input, err)
+			}
+			if !tc.wantErr && id != tc.wantID {
+				t.Fatalf("ParseNodeID(%q) = %d, want %d", tc.input, id, tc.wantID)
+			}
+		})
+	}
+}
+
+func TestAddressCanonicalization_IPv4MappedIPv6(t *testing.T) {
+	t.Run("IPv4-mapped IPv6 loopback canonicalizes to IPv4", func(t *testing.T) {
+		cAddr, err := cluster.ValidateAndCanonicalizeAddress("[::ffff:127.0.0.1]:9098")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cAddr != "127.0.0.1:9098" {
+			t.Fatalf("canonical address = %q, want 127.0.0.1:9098", cAddr)
+		}
+	})
+
+	t.Run("IPv4-mapped IPv6 wildcard is rejected fail-closed", func(t *testing.T) {
+		_, err := cluster.ValidateAndCanonicalizeAddress("[::ffff:0.0.0.0]:9098")
+		if err == nil {
+			t.Fatal("expected wildcard error for ::ffff:0.0.0.0, got nil")
+		}
+		if !errors.Is(err, cluster.ErrWildcardAddress) {
+			t.Fatalf("expected ErrWildcardAddress, got %v", err)
+		}
+	})
+
+	t.Run("Topology detects duplicate address via IPv4-mapped IPv6 alias", func(t *testing.T) {
+		peers := []cluster.PeerConfig{
+			{ID: 1, Address: "127.0.0.1:9098"},
+			{ID: 2, Address: "[::ffff:127.0.0.1]:9098"},
+		}
+		_, err := cluster.NewTopology(1, "127.0.0.1:9098", peers)
+		if err == nil {
+			t.Fatal("expected duplicate address error for mapped alias, got nil")
+		}
+		if !errors.Is(err, cluster.ErrDuplicatePeerAddress) {
+			t.Fatalf("expected ErrDuplicatePeerAddress, got %v", err)
+		}
+	})
+}
+
+func TestParsePeersString_PreScanResourceLimit(t *testing.T) {
+	t.Run("huge delimiter string aborts without allocating giant slice", func(t *testing.T) {
+		// 1,000 tokens separated by commas
+		var b strings.Builder
+		for i := 0; i < 1000; i++ {
+			b.WriteString("1=127.0.0.1:9098,")
+		}
+		_, err := cluster.ParsePeersString(b.String())
+		if err == nil {
+			t.Fatal("expected ClusterTooLargeError, got nil")
+		}
+		if !errors.Is(err, cluster.ErrClusterTooLarge) {
+			t.Fatalf("expected ErrClusterTooLarge, got %v", err)
+		}
+	})
+}

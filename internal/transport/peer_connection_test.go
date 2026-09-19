@@ -1325,3 +1325,198 @@ func BenchmarkPeerConnectionManager_Send(b *testing.B) {
 		})
 	})
 }
+
+func TestPeerConnectionManager_ResurrectionDefense(t *testing.T) {
+	topo := createTestTopology(t, 1, "127.0.0.1:9001", map[cluster.NodeID]string{
+		2: "127.0.0.1:9002",
+	})
+
+	dialBlocked := make(chan struct{})
+	dialFinished := make(chan struct{})
+	var dialedConn net.Conn
+
+	cfg := DefaultPeerConnectionConfig()
+	cfg.DialFunc = func(ctx context.Context, addr string) (net.Conn, error) {
+		<-dialBlocked
+		c1, c2 := net.Pipe()
+		go func() {
+			// drain c2
+			io.Copy(io.Discard, c2)
+		}()
+		dialedConn = c1
+		close(dialFinished)
+		return c1, nil
+	}
+
+	mgr, err := NewPeerConnectionManager(topo, cfg)
+	if err != nil {
+		t.Fatalf("failed to create manager: %v", err)
+	}
+
+	if err := mgr.Start(); err != nil {
+		t.Fatalf("failed to start: %v", err)
+	}
+
+	// Close manager while dial is blocked
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		_ = mgr.Close()
+	}()
+
+	time.Sleep(40 * time.Millisecond)
+	close(dialBlocked) // unblock dial after Close initiated
+	<-dialFinished
+
+	// Wait for Close to finish
+	time.Sleep(50 * time.Millisecond)
+
+	state, err := mgr.GetPeerState(2)
+	if !errors.Is(err, errs.ErrManagerClosed) {
+		t.Fatalf("expected ErrManagerClosed, got err=%v, state=%v", err, state)
+	}
+
+	// Verify that dialed socket was closed and not left active/leaked
+	if dialedConn != nil {
+		var b [1]byte
+		_, rErr := dialedConn.Read(b[:])
+		if rErr == nil {
+			t.Fatal("resurrected connection was not closed upon shutdown")
+		}
+	}
+}
+
+func TestPeerConnectionManager_InvalidOpCodeTeardown(t *testing.T) {
+	serverPipe, clientPipe := net.Pipe()
+	defer serverPipe.Close()
+
+	topo := createTestTopology(t, 1, "127.0.0.1:9001", map[cluster.NodeID]string{
+		2: "127.0.0.1:9002",
+	})
+
+	var receivedFrame atomic.Pointer[Frame]
+	cfg := DefaultPeerConnectionConfig()
+	cfg.DialFunc = func(ctx context.Context, addr string) (net.Conn, error) {
+		return clientPipe, nil
+	}
+	cfg.OnFrameReceived = func(peerID cluster.NodeID, frame *Frame) {
+		receivedFrame.Store(frame)
+	}
+
+	mgr, err := NewPeerConnectionManager(topo, cfg)
+	if err != nil {
+		t.Fatalf("failed to create manager: %v", err)
+	}
+	defer mgr.Close()
+
+	if err := mgr.Start(); err != nil {
+		t.Fatalf("failed to start: %v", err)
+	}
+
+	// Await connected
+	for i := 0; i < 50; i++ {
+		if mgr.IsConnected(2) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Send an invalid client OpCode (OpPut = 0x01) over the peer connection from the server side
+	clientFrame := &Frame{
+		Header: Header{
+			Magic:         Magic,
+			OpCode:        OpPut,
+			Flags:         FlagNone,
+			SeqID:         1,
+			PayloadLength: 0,
+		},
+		Payload: nil,
+	}
+	if err := EncodeFrame(serverPipe, clientFrame); err != nil {
+		t.Fatalf("failed to send frame: %v", err)
+	}
+
+	// Verify manager detects invalid opcode and tears down connection
+	for i := 0; i < 50; i++ {
+		if !mgr.IsConnected(2) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if mgr.IsConnected(2) {
+		t.Fatal("expected peer connection to be torn down upon invalid opcode")
+	}
+
+	if receivedFrame.Load() != nil {
+		t.Fatalf("OnFrameReceived must not be invoked for invalid opcode: got %+v", receivedFrame.Load())
+	}
+}
+
+func TestPeerConnectionManager_ReplayFilter_ReconnectSafe(t *testing.T) {
+	rf := newPeerReplayFilter(2)
+
+	// Send frames with SeqID 1..5 on first connection
+	for seq := uint64(1); seq <= 5; seq++ {
+		f := &Frame{
+			Header: Header{
+				Magic:  Magic,
+				OpCode: OpCode(PeerOpRequestVote),
+				Flags:  FlagNone,
+				SeqID:  seq,
+			},
+		}
+		if err := rf.CheckAndRecord(f); err != nil {
+			t.Fatalf("seq %d rejected on conn 1: %v", seq, err)
+		}
+	}
+
+	// In-connection duplicate must fail
+	dupFrame := &Frame{
+		Header: Header{
+			Magic:  Magic,
+			OpCode: OpCode(PeerOpRequestVote),
+			Flags:  FlagNone,
+			SeqID:  3,
+		},
+	}
+	if err := rf.CheckAndRecord(dupFrame); err == nil {
+		t.Fatal("expected duplicate sequence error, got nil")
+	}
+
+	// Reconnect resets sequence tracking
+	rf.ResetSequence()
+
+	// Restarted remote node starts again from SeqID 1
+	for seq := uint64(1); seq <= 5; seq++ {
+		f := &Frame{
+			Header: Header{
+				Magic:  Magic,
+				OpCode: OpCode(PeerOpRequestVote),
+				Flags:  FlagNone,
+				SeqID:  seq,
+			},
+		}
+		if err := rf.CheckAndRecord(f); err != nil {
+			t.Fatalf("seq %d rejected on reconnected conn: %v", seq, err)
+		}
+	}
+}
+
+func TestPeerReplayFilter_ZeroSeqIDRejection(t *testing.T) {
+	rf := newPeerReplayFilter(2)
+	f := &Frame{
+		Header: Header{
+			Magic:  Magic,
+			OpCode: OpCode(PeerOpRequestVote),
+			Flags:  FlagNone,
+			SeqID:  0,
+		},
+	}
+	err := rf.CheckAndRecord(f)
+	if err == nil {
+		t.Fatal("expected error on SeqID=0, got nil")
+	}
+	if !errors.Is(err, errs.ErrReplayedFrame) {
+		t.Fatalf("expected ErrReplayedFrame, got %v", err)
+	}
+}

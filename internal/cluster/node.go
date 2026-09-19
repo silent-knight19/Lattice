@@ -38,6 +38,12 @@ func ParseNodeID(s string) (NodeID, error) {
 			Reason: "node ID cannot be empty",
 		}
 	}
+	if len(trimmed) > 1 && trimmed[0] == '0' {
+		return NodeIDNil, &errors.InvalidNodeIDError{
+			NodeID: 0,
+			Reason: fmt.Sprintf("invalid numeric format %q: leading zeros prohibited to prevent ambiguous representation", trimmed),
+		}
+	}
 	v, err := strconv.ParseUint(trimmed, 10, 64)
 	if err != nil {
 		return NodeIDNil, &errors.InvalidNodeIDError{

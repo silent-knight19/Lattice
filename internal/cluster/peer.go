@@ -87,7 +87,14 @@ func ValidateAndCanonicalizeAddress(rawAddr string) (string, error) {
 		if ip.IsUnspecified() {
 			return "", fmt.Errorf("%w: wildcard IP address %q forbidden as peer target", errors.ErrWildcardAddress, host)
 		}
-		canonicalHost = ip.String()
+		if ip4 := ip.To4(); ip4 != nil {
+			if ip4.IsUnspecified() {
+				return "", fmt.Errorf("%w: wildcard IP address %q forbidden as peer target", errors.ErrWildcardAddress, host)
+			}
+			canonicalHost = ip4.String()
+		} else {
+			canonicalHost = ip.String()
+		}
 	} else {
 		// RFC 1123 Hostname Validation
 		if len(h) < 1 || len(h) > 253 {

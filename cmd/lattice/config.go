@@ -269,6 +269,45 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 	return &cfg, false, nil
 }
 
+// portsCollide reports whether two host:port endpoints will collide upon binding.
+func portsCollide(addr1, addr2 string) bool {
+	h1, p1, err1 := net.SplitHostPort(addr1)
+	h2, p2, err2 := net.SplitHostPort(addr2)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	if p1 == "0" || p2 == "0" || p1 != p2 {
+		return false
+	}
+	if h1 == h2 {
+		return true
+	}
+	isWildcard := func(h string) bool {
+		if h == "0.0.0.0" || h == "::" || h == "[::]" {
+			return true
+		}
+		ip := net.ParseIP(h)
+		return ip != nil && ip.IsUnspecified()
+	}
+	if isWildcard(h1) || isWildcard(h2) {
+		return true
+	}
+	if isLoopback(h1) && isLoopback(h2) {
+		return true
+	}
+	ip1 := net.ParseIP(h1)
+	ip2 := net.ParseIP(h2)
+	if ip1 != nil && ip2 != nil {
+		if ip1.Equal(ip2) {
+			return true
+		}
+		if ip1.To4() != nil && ip2.To4() != nil && ip1.To4().Equal(ip2.To4()) {
+			return true
+		}
+	}
+	return false
+}
+
 // Validate checks configuration invariants.
 func (c *Config) Validate() error {
 	if c.DataDir == "" {
@@ -308,8 +347,8 @@ func (c *Config) Validate() error {
 		}
 
 		// Prevent port conflict between storage server and pprof HTTP server when both use the same port > 0
-		srvHost, srvPortStr, _ := net.SplitHostPort(c.Address)
-		if pPort != 0 && pPortStr == srvPortStr && (pHost == srvHost || (isLoopback(pHost) && isLoopback(srvHost))) {
+		if pPort != 0 && portsCollide(c.PprofAddress, c.Address) {
+			_, srvPortStr, _ := net.SplitHostPort(c.Address)
 			return fmt.Errorf("config error: --pprof-address port %s conflicts with server --address port %s", pPortStr, srvPortStr)
 		}
 	}
@@ -329,16 +368,15 @@ func (c *Config) Validate() error {
 
 		// Port collision prevention between peer listener and storage/pprof servers
 		if c.Topology.LocalAddress() != "" {
-			peerHost, peerPortStr, _ := net.SplitHostPort(c.Topology.LocalAddress())
-			srvHost, srvPortStr, _ := net.SplitHostPort(c.Address)
-			if peerPortStr != "0" && peerPortStr == srvPortStr && (peerHost == srvHost || (isLoopback(peerHost) && isLoopback(srvHost))) {
+			if portsCollide(c.Topology.LocalAddress(), c.Address) {
+				_, peerPortStr, _ := net.SplitHostPort(c.Topology.LocalAddress())
+				_, srvPortStr, _ := net.SplitHostPort(c.Address)
 				return fmt.Errorf("config error: peer address port %s conflicts with server address port %s", peerPortStr, srvPortStr)
 			}
-			if c.PprofAddress != "" {
-				pHost, pPortStr, _ := net.SplitHostPort(c.PprofAddress)
-				if peerPortStr != "0" && peerPortStr == pPortStr && (peerHost == pHost || (isLoopback(peerHost) && isLoopback(pHost))) {
-					return fmt.Errorf("config error: peer address port %s conflicts with pprof address port %s", peerPortStr, pPortStr)
-				}
+			if c.PprofAddress != "" && portsCollide(c.Topology.LocalAddress(), c.PprofAddress) {
+				_, peerPortStr, _ := net.SplitHostPort(c.Topology.LocalAddress())
+				_, pPortStr, _ := net.SplitHostPort(c.PprofAddress)
+				return fmt.Errorf("config error: peer address port %s conflicts with pprof address port %s", peerPortStr, pPortStr)
 			}
 		}
 	}
@@ -381,7 +419,9 @@ func loadConfigFile(path string) (*Config, error) {
 	// Attempt JSON parsing first
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
-		if err := json.Unmarshal(trimmed, &cfg); err != nil {
+		dec := json.NewDecoder(bytes.NewReader(trimmed))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&cfg); err != nil {
 			return nil, fmt.Errorf("malformed JSON in config file: %w", err)
 		}
 		return &cfg, nil
@@ -390,6 +430,7 @@ func loadConfigFile(path string) (*Config, error) {
 	// Line-by-line key-value / YAML-like parser
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	lineNum := 0
+	seenKeys := make(map[string]int)
 	for scanner.Scan() {
 		lineNum++
 		line := strings.TrimSpace(scanner.Text())
@@ -408,45 +449,60 @@ func loadConfigFile(path string) (*Config, error) {
 
 		val = strings.Trim(val, "\"'")
 
+		var canonicalKey string
 		switch strings.ToLower(key) {
 		case "data_dir", "data-dir", "storage.data_dir":
+			canonicalKey = "data_dir"
 			cfg.DataDir = val
 		case "port", "server.port":
+			canonicalKey = "port"
 			p, err := strconv.Atoi(val)
 			if err != nil {
 				return nil, fmt.Errorf("invalid port value on line %d: %q", lineNum, val)
 			}
 			cfg.Port = p
 		case "address", "listen_address", "server.listen_address", "server.address":
+			canonicalKey = "address"
 			cfg.Address = val
 		case "insecure_transport", "insecure-transport", "server.insecure_transport":
+			canonicalKey = "insecure_transport"
 			b, err := strconv.ParseBool(val)
 			if err != nil {
 				return nil, fmt.Errorf("invalid boolean value on line %d: %q", lineNum, val)
 			}
 			cfg.InsecureTransport = b
 		case "pprof_address", "pprof-address", "server.pprof_address", "server.pprof-address":
+			canonicalKey = "pprof_address"
 			cfg.PprofAddress = val
 		case "node_id", "node-id", "raft.node_id", "cluster.node_id":
+			canonicalKey = "node_id"
 			id, err := strconv.ParseUint(val, 10, 64)
 			if err != nil {
 				return nil, fmt.Errorf("invalid node_id value on line %d: %q", lineNum, val)
 			}
 			cfg.NodeID = id
 		case "peer_address", "peer-address", "raft.peer_address", "cluster.peer_address":
+			canonicalKey = "peer_address"
 			cfg.PeerAddress = val
 		case "cluster_peers", "cluster-peers", "raft.cluster_peers", "cluster.cluster_peers":
+			canonicalKey = "cluster_peers"
 			peers, err := cluster.ParsePeersString(val)
 			if err != nil {
 				return nil, fmt.Errorf("invalid cluster_peers on line %d: %w", lineNum, err)
 			}
 			cfg.ClusterPeers = peers
 		default:
-			// Ignore unrecognized or higher-level nesting keys (e.g. "server:", "storage:", "raft:")
+			// Allow structural section headers without values (e.g. "server:", "storage:", "cluster:", "raft:")
 			if val == "" {
 				continue
 			}
+			return nil, fmt.Errorf("unknown configuration key on line %d: %q", lineNum, key)
 		}
+
+		if prevLine, seen := seenKeys[canonicalKey]; seen {
+			return nil, fmt.Errorf("duplicate or conflicting configuration key on line %d: %q (previously defined on line %d)", lineNum, key, prevLine)
+		}
+		seenKeys[canonicalKey] = lineNum
 	}
 
 	if err := scanner.Err(); err != nil {

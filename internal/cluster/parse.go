@@ -26,8 +26,36 @@ func ParsePeersString(s string) ([]PeerConfig, error) {
 	splitter := func(r rune) bool {
 		return r == ',' || r == ';' || r == '\n' || r == '\r' || r == '\t' || r == ' '
 	}
-	tokens := strings.FieldsFunc(trimmed, splitter)
+	// Pre-scan tokens without heap allocation to reject oversized inputs fail-fast
+	tokenCount := 0
+	inToken := false
+	for _, r := range trimmed {
+		if splitter(r) {
+			if inToken {
+				tokenCount++
+				if tokenCount > MaxClusterSize {
+					return nil, &errors.ClusterTooLargeError{
+						Count: tokenCount,
+						Max:   MaxClusterSize,
+					}
+				}
+				inToken = false
+			}
+		} else {
+			inToken = true
+		}
+	}
+	if inToken {
+		tokenCount++
+		if tokenCount > MaxClusterSize {
+			return nil, &errors.ClusterTooLargeError{
+				Count: tokenCount,
+				Max:   MaxClusterSize,
+			}
+		}
+	}
 
+	tokens := strings.FieldsFunc(trimmed, splitter)
 	if len(tokens) > MaxClusterSize {
 		return nil, &errors.ClusterTooLargeError{
 			Count: len(tokens),

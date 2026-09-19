@@ -131,6 +131,8 @@ type peerReplayFilter struct {
 	peerID     cluster.NodeID
 	maxSeqID   uint64
 	seenSeqs   map[uint64]struct{}
+	seqRing    []uint64
+	seqHead    int
 	nonceSet   map[uint64]struct{}
 	nonceRing  []uint64
 	ringHead   int
@@ -142,11 +144,22 @@ func newPeerReplayFilter(peerID cluster.NodeID) *peerReplayFilter {
 	return &peerReplayFilter{
 		peerID:     peerID,
 		seenSeqs:   make(map[uint64]struct{}, 128),
+		seqRing:    make([]uint64, 0, DefaultReplayWindowSize),
 		nonceSet:   make(map[uint64]struct{}, 128),
 		nonceRing:  make([]uint64, 0, DefaultMaxNoncesTracked),
 		windowSize: DefaultReplayWindowSize,
 		maxNonces:  DefaultMaxNoncesTracked,
 	}
+}
+
+// ResetSequence resets connection-scoped sequence tracking upon new connection establishment.
+func (rf *peerReplayFilter) ResetSequence() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.maxSeqID = 0
+	rf.seenSeqs = make(map[uint64]struct{}, 128)
+	rf.seqRing = rf.seqRing[:0]
+	rf.seqHead = 0
 }
 
 func (rf *peerReplayFilter) CheckAndRecord(f *Frame) error {
@@ -159,40 +172,53 @@ func (rf *peerReplayFilter) CheckAndRecord(f *Frame) error {
 
 	seqID := f.Header.SeqID
 
-	// 1. Sequence Monotonicity & Sliding Window Check
-	if seqID > 0 {
-		if rf.maxSeqID == 0 {
-			rf.maxSeqID = seqID
-			rf.seenSeqs[seqID] = struct{}{}
-		} else if seqID <= rf.maxSeqID {
-			if rf.maxSeqID-seqID >= rf.windowSize {
-				return &errors.ReplayedFrameError{
-					NodeID: uint64(rf.peerID),
-					SeqID:  seqID,
-					Reason: fmt.Sprintf("stale sequence ID: %d falls behind window [%d, %d]", seqID, rf.maxSeqID-rf.windowSize+1, rf.maxSeqID),
-				}
-			}
-			if _, exists := rf.seenSeqs[seqID]; exists {
-				return &errors.ReplayedFrameError{
-					NodeID: uint64(rf.peerID),
-					SeqID:  seqID,
-					Reason: fmt.Sprintf("duplicate sequence ID: %d already processed", seqID),
-				}
-			}
-			rf.seenSeqs[seqID] = struct{}{}
-		} else {
-			rf.maxSeqID = seqID
-			rf.seenSeqs[seqID] = struct{}{}
+	// 1. Sequence Monotonicity & Sliding Window Check (O(1) amortized using ring buffer)
+	if seqID == 0 {
+		return &errors.ReplayedFrameError{
+			NodeID: uint64(rf.peerID),
+			SeqID:  0,
+			Reason: "invalid sequence ID: 0 is prohibited",
+		}
+	}
 
-			// Evict old sequences outside the sliding window
-			if rf.maxSeqID > rf.windowSize {
-				cutoff := rf.maxSeqID - rf.windowSize
-				for s := range rf.seenSeqs {
-					if s <= cutoff {
-						delete(rf.seenSeqs, s)
-					}
-				}
+	if rf.maxSeqID == 0 {
+		rf.maxSeqID = seqID
+		rf.seenSeqs[seqID] = struct{}{}
+		rf.seqRing = append(rf.seqRing, seqID)
+	} else if seqID <= rf.maxSeqID {
+		if rf.maxSeqID-seqID >= rf.windowSize {
+			return &errors.ReplayedFrameError{
+				NodeID: uint64(rf.peerID),
+				SeqID:  seqID,
+				Reason: fmt.Sprintf("stale sequence ID: %d falls behind window [%d, %d]", seqID, rf.maxSeqID-rf.windowSize+1, rf.maxSeqID),
 			}
+		}
+		if _, exists := rf.seenSeqs[seqID]; exists {
+			return &errors.ReplayedFrameError{
+				NodeID: uint64(rf.peerID),
+				SeqID:  seqID,
+				Reason: fmt.Sprintf("duplicate sequence ID: %d already processed", seqID),
+			}
+		}
+		rf.seenSeqs[seqID] = struct{}{}
+		if len(rf.seqRing) < int(rf.windowSize) {
+			rf.seqRing = append(rf.seqRing, seqID)
+		} else {
+			oldest := rf.seqRing[rf.seqHead]
+			delete(rf.seenSeqs, oldest)
+			rf.seqRing[rf.seqHead] = seqID
+			rf.seqHead = (rf.seqHead + 1) % int(rf.windowSize)
+		}
+	} else {
+		rf.maxSeqID = seqID
+		rf.seenSeqs[seqID] = struct{}{}
+		if len(rf.seqRing) < int(rf.windowSize) {
+			rf.seqRing = append(rf.seqRing, seqID)
+		} else {
+			oldest := rf.seqRing[rf.seqHead]
+			delete(rf.seenSeqs, oldest)
+			rf.seqRing[rf.seqHead] = seqID
+			rf.seqHead = (rf.seqHead + 1) % int(rf.windowSize)
 		}
 	}
 
@@ -246,7 +272,8 @@ type peerSupervisor struct {
 	failures     int
 	replayFilter *peerReplayFilter
 
-	writeMu sync.Mutex
+	readerWg sync.WaitGroup
+	writeMu  sync.Mutex
 }
 
 func newPeerSupervisor(p cluster.Peer, cfg PeerConnectionConfig) *peerSupervisor {
@@ -288,7 +315,7 @@ func (s *peerSupervisor) calculateBackoff(failures int) time.Duration {
 
 // disconnect tears down the connection for the given generation token.
 // Guarantees that stale failure notifications from older connections cannot disconnect
-// a newer active connection (P14-M03-INV-07).
+// a newer active connection (P14-M03-INV-07), and preserves PeerStateClosing as a terminal state.
 func (s *peerSupervisor) disconnect(gen uint64, reason error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -300,7 +327,9 @@ func (s *peerSupervisor) disconnect(gen uint64, reason error) {
 
 	connToClose := s.conn
 	s.conn = nil
-	s.state = PeerStateDisconnected
+	if s.state != PeerStateClosing {
+		s.state = PeerStateDisconnected
+	}
 
 	if s.connDoneCh != nil {
 		select {
@@ -319,17 +348,12 @@ func (s *peerSupervisor) run(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	for {
-		select {
-		case <-ctx.Done():
-			s.mu.Lock()
+		s.mu.Lock()
+		if s.state == PeerStateClosing || ctx.Err() != nil {
 			s.state = PeerStateClosing
 			s.mu.Unlock()
 			return
-		default:
 		}
-
-		// Transition to Connecting
-		s.mu.Lock()
 		s.state = PeerStateConnecting
 		s.mu.Unlock()
 
@@ -343,16 +367,12 @@ func (s *peerSupervisor) run(ctx context.Context, wg *sync.WaitGroup) {
 		}
 
 		if err != nil {
-			select {
-			case <-ctx.Done():
-				s.mu.Lock()
+			s.mu.Lock()
+			if s.state == PeerStateClosing || ctx.Err() != nil {
 				s.state = PeerStateClosing
 				s.mu.Unlock()
 				return
-			default:
 			}
-
-			s.mu.Lock()
 			s.state = PeerStateDisconnected
 			s.failures++
 			failures := s.failures
@@ -370,22 +390,19 @@ func (s *peerSupervisor) run(ctx context.Context, wg *sync.WaitGroup) {
 			}
 		}
 
-		// Dial succeeded; check if context was cancelled during dial
-		select {
-		case <-ctx.Done():
-			_ = conn.Close()
-			s.mu.Lock()
+		// Dial succeeded; check if context was cancelled or manager closed during dial
+		s.mu.Lock()
+		if s.state == PeerStateClosing || ctx.Err() != nil {
 			s.state = PeerStateClosing
 			s.mu.Unlock()
+			_ = conn.Close()
 			return
-		default:
 		}
 
 		// Configure TCP keep-alive
 		configureKeepAlive(conn, s.cfg.KeepAlivePeriod)
 
 		// Install new active connection with monotonic generation
-		s.mu.Lock()
 		s.generation++
 		curGen := s.generation
 		s.conn = conn
@@ -393,11 +410,12 @@ func (s *peerSupervisor) run(ctx context.Context, wg *sync.WaitGroup) {
 		s.failures = 0
 		doneCh := make(chan struct{})
 		s.connDoneCh = doneCh
+		s.replayFilter.ResetSequence()
 		s.mu.Unlock()
 
-		// Launch reader loop
-		wg.Add(1)
-		go s.runReader(ctx, curGen, conn, wg)
+		// Launch reader loop tracked by supervisor's readerWg
+		s.readerWg.Add(1)
+		go s.runReader(ctx, curGen, conn)
 
 		// Await connection termination or manager shutdown
 		select {
@@ -406,16 +424,16 @@ func (s *peerSupervisor) run(ctx context.Context, wg *sync.WaitGroup) {
 			s.mu.Lock()
 			s.state = PeerStateClosing
 			s.mu.Unlock()
+			s.readerWg.Wait()
 			return
 		case <-doneCh:
-			if ctx.Err() != nil {
-				s.mu.Lock()
+			s.readerWg.Wait()
+			s.mu.Lock()
+			if s.state == PeerStateClosing || ctx.Err() != nil {
 				s.state = PeerStateClosing
 				s.mu.Unlock()
 				return
 			}
-
-			s.mu.Lock()
 			s.failures++
 			failures := s.failures
 			s.mu.Unlock()
@@ -435,8 +453,8 @@ func (s *peerSupervisor) run(ctx context.Context, wg *sync.WaitGroup) {
 }
 
 // runReader continuously consumes framed messages from conn using DecodeFrame.
-func (s *peerSupervisor) runReader(ctx context.Context, gen uint64, conn net.Conn, wg *sync.WaitGroup) {
-	defer wg.Done()
+func (s *peerSupervisor) runReader(ctx context.Context, gen uint64, conn net.Conn) {
+	defer s.readerWg.Done()
 	defer s.disconnect(gen, io.EOF)
 
 	for {
@@ -444,6 +462,26 @@ func (s *peerSupervisor) runReader(ctx context.Context, gen uint64, conn net.Con
 		frame, err := DecodeFrame(conn)
 		if err != nil {
 			return
+		}
+
+		// Opcode namespace check: peer transport connections only accept valid peer RPCs (0x81..0x84)
+		if !PeerMessageType(frame.Header.OpCode).Valid() {
+			s.disconnect(gen, errors.ErrInvalidPeerMessage)
+			return
+		}
+
+		// Flags/status validation
+		switch PeerMessageType(frame.Header.OpCode) {
+		case PeerOpRequestVote, PeerOpAppendEntries:
+			if frame.Header.Flags != FlagNone {
+				s.disconnect(gen, errors.ErrInvalidPeerPayload)
+				return
+			}
+		case PeerOpRequestVoteResponse, PeerOpAppendEntriesResponse:
+			if frame.Header.Status != StatusOk || frame.Header.Flags != FlagNone {
+				s.disconnect(gen, errors.ErrInvalidPeerPayload)
+				return
+			}
 		}
 
 		// Replay & Duplicate rejection before invoking callbacks or consensus processing
@@ -644,7 +682,10 @@ func (m *PeerConnectionManager) Send(ctx context.Context, peerID cluster.NodeID,
 		writeDeadline = ctxDeadline
 	}
 	if ds, ok := conn.(deadlineSetter); ok {
-		_ = ds.SetWriteDeadline(writeDeadline)
+		if err := ds.SetWriteDeadline(writeDeadline); err != nil {
+			sup.disconnect(gen, err)
+			return err
+		}
 		defer func() { _ = ds.SetWriteDeadline(time.Time{}) }()
 	}
 
