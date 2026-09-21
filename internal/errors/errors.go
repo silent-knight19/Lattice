@@ -452,6 +452,30 @@ var (
 
 	// ErrReplayedFrame indicates that an incoming peer frame was rejected as a duplicate or replayed message.
 	ErrReplayedFrame = stdErrors.New("peer message rejected: duplicate or replayed frame")
+
+	// ErrRaftStateClosed indicates that an operation was attempted on closed Raft persistent state.
+	ErrRaftStateClosed = stdErrors.New("raft state storage is closed")
+
+	// ErrRaftTermRegressed indicates that an attempted term update is less than the current term.
+	ErrRaftTermRegressed = stdErrors.New("raft term cannot regress to a lower value")
+
+	// ErrRaftDuplicateVote indicates an attempt to vote for a different node in the same term.
+	ErrRaftDuplicateVote = stdErrors.New("raft node has already cast a vote for a different candidate in this term")
+
+	// ErrRaftLogIndexGap indicates that an appended entry index is not strictly contiguous.
+	ErrRaftLogIndexGap = stdErrors.New("raft log index gap detected: entry index must be contiguous")
+
+	// ErrRaftLogIndexOutOfBounds indicates that an index was requested outside the valid log range.
+	ErrRaftLogIndexOutOfBounds = stdErrors.New("raft log index out of bounds")
+
+	// ErrRaftInvalidEntryType indicates that an entry type byte is unknown or unrecognized.
+	ErrRaftInvalidEntryType = stdErrors.New("invalid raft log entry type")
+
+	// ErrRaftCorruptedState indicates that persistent raft metadata or log records are corrupted.
+	ErrRaftCorruptedState = stdErrors.New("corrupted persistent raft state")
+
+	// ErrRaftEntryTooLarge indicates that a log entry data payload exceeds the maximum allowed limit.
+	ErrRaftEntryTooLarge = stdErrors.New("raft log entry payload exceeds maximum allowed size")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing
