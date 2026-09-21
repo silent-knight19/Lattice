@@ -52,7 +52,7 @@ type Node struct {
 	closed         atomic.Bool
 	transitionHook TransitionHook
 
-	// Election subsystem (P15-S02-M01)
+	// Election subsystem & Quorum (P15-S02-M01 & P15-S02-M02)
 	topology         *cluster.Topology
 	peers            []cluster.NodeID // Remote peer identities strictly excluding localID
 	peerSender       PeerSender
@@ -61,7 +61,16 @@ type Node struct {
 	electionCancel   context.CancelFunc
 	electionLoopWg   sync.WaitGroup
 	timerLifecycleMu sync.Mutex
-	timerRunning     bool
+	timerRunning     atomic.Bool
+	loopCancel       context.CancelFunc
+	loopDone         chan struct{}
+
+	// Volatile election round & leader replication state (P15-S02-M02)
+	electionVotes     map[cluster.NodeID]struct{} // Set of peers that granted votes in this round
+	electionRoundTerm Term                        // Term of current election round
+	electionRoundGen  uint64                      // Monotonically increasing round identifier
+	nextIndex         map[cluster.NodeID]LogIndex // Leader tracking: next log index to send to each remote peer
+	matchIndex        map[cluster.NodeID]LogIndex // Leader tracking: highest log index known replicated on each remote peer
 }
 
 // NodeConfig provides initialization parameters for a Raft Node.
@@ -185,6 +194,57 @@ func (n *Node) Storage() *Storage {
 	return n.storage
 }
 
+// QuorumSize returns the majority quorum size based on configured cluster membership.
+// For N cluster members: quorum = floor(N/2) + 1.
+func (n *Node) QuorumSize() int {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.quorumSizeLocked()
+}
+
+func (n *Node) quorumSizeLocked() int {
+	clusterSize := len(n.peers) + 1
+	return (clusterSize / 2) + 1
+}
+
+// GrantedVotesCount returns the number of granted votes recorded in the current election round.
+// Returns 0 if not currently candidate or round is invalid.
+func (n *Node) GrantedVotesCount() int {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return len(n.electionVotes)
+}
+
+// NextIndex returns a snapshot of the leader's nextIndex map for remote peers.
+// Returns nil if node is not currently leader.
+func (n *Node) NextIndex() map[cluster.NodeID]LogIndex {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.nextIndex == nil {
+		return nil
+	}
+	cp := make(map[cluster.NodeID]LogIndex, len(n.nextIndex))
+	for k, v := range n.nextIndex {
+		cp[k] = v
+	}
+	return cp
+}
+
+// MatchIndex returns a snapshot of the leader's matchIndex map for remote peers.
+// Returns nil if node is not currently leader.
+func (n *Node) MatchIndex() map[cluster.NodeID]LogIndex {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.matchIndex == nil {
+		return nil
+	}
+	cp := make(map[cluster.NodeID]LogIndex, len(n.matchIndex))
+	for k, v := range n.matchIndex {
+		cp[k] = v
+	}
+	return cp
+}
+
 // BecomeCandidate transitions the server from Follower to Candidate.
 //
 // Invariants enforced (P15-S01-M02 / Sections 23 & 33):
@@ -271,6 +331,7 @@ func (n *Node) StartNewElection() error {
 }
 
 // campaignLocked advances the term by 1, persists a self-vote, and publishes RoleCandidate.
+// Initializes volatile election round state (localID counted as self-vote).
 // Caller MUST hold n.mu. Does NOT invoke transitionHook (returned for caller to invoke outside lock).
 func (n *Node) campaignLocked() (oldRole, newRole Role, term Term, shouldHook bool, err error) {
 	currTerm, err := n.storage.Term()
@@ -297,7 +358,51 @@ func (n *Node) campaignLocked() (oldRole, newRole Role, term Term, shouldHook bo
 	n.role = RoleCandidate
 	n.leaderID = cluster.NodeIDNil
 
+	// Volatile election round state (Section 5, 6):
+	// Fresh vote map with self-vote counted
+	n.electionVotes = map[cluster.NodeID]struct{}{
+		n.localID: {},
+	}
+	n.electionRoundTerm = newTerm
+	n.electionRoundGen++
+
 	return oldRole, RoleCandidate, newTerm, true, nil
+}
+
+// becomeLeaderLocked sets role to Leader, initializes volatile leader replication state,
+// invalidates candidate vote counting state, and stops the follower election timer.
+// Caller MUST hold n.mu.
+func (n *Node) becomeLeaderLocked(term Term, lastLogIdx LogIndex) {
+	n.role = RoleLeader
+	n.leaderID = n.localID
+
+	// Initialize leader volatile replication state for each configured remote peer (Section 14)
+	n.nextIndex = make(map[cluster.NodeID]LogIndex, len(n.peers))
+	n.matchIndex = make(map[cluster.NodeID]LogIndex, len(n.peers))
+	for _, peerID := range n.peers {
+		if peerID == n.localID {
+			continue
+		}
+		n.nextIndex[peerID] = lastLogIdx + 1
+		n.matchIndex[peerID] = 0
+	}
+
+	// Invalidate candidate vote-counting state
+	n.electionVotes = nil
+
+	// Leader must not run follower election timer (Section 17 Event D / Section 19)
+	if n.electionTimer != nil {
+		n.electionTimer.Stop()
+	}
+}
+
+// clearLeaderAndElectionStateLocked clears volatile leader replication state and candidate vote tracking.
+// Caller MUST hold n.mu.
+func (n *Node) clearLeaderAndElectionStateLocked() {
+	n.electionVotes = nil
+	n.electionRoundTerm = 0
+	n.nextIndex = nil
+	n.matchIndex = nil
 }
 
 // BecomeLeader transitions the server from Candidate to Leader.
@@ -309,9 +414,11 @@ func (n *Node) campaignLocked() (oldRole, newRole Role, term Term, shouldHook bo
 //   - Does NOT modify log or commit index.
 //   - Sets leaderID to localID.
 //   - Idempotent if already RoleLeader.
+//   - Initializes volatile leader replication state (nextIndex/matchIndex).
 //   - Invokes TransitionHook outside of n.mu.
+//   - Triggers one-time immediate empty AppendEntries heartbeat broadcast outside of n.mu.
 //
-// API Safety Notice (Section 10):
+// API Safety Notice (Section 13):
 // BecomeLeader is strictly an internal role-transition primitive and does NOT assert election
 // safety or quorum proof. Quorum vote verification is the sole responsibility of the
 // election subsystem (P15-S02-M02).
@@ -343,20 +450,23 @@ func (n *Node) BecomeLeader() error {
 		return err
 	}
 
+	lastIdx, lastTerm, err := n.storage.LastIndexAndTerm()
+	if err != nil {
+		n.mu.Unlock()
+		return err
+	}
+
 	oldRole := n.role
-	n.role = RoleLeader
-	n.leaderID = n.localID
+	n.becomeLeaderLocked(currTerm, lastIdx)
 	shouldHook := (n.transitionHook != nil)
 	n.mu.Unlock()
-
-	// Section 17 Event D: Leader must not run follower election timer
-	if n.electionTimer != nil {
-		n.electionTimer.Stop()
-	}
 
 	if shouldHook && n.transitionHook != nil {
 		n.transitionHook(oldRole, RoleLeader, currTerm)
 	}
+
+	// Broadcast one-time immediate empty AppendEntries heartbeats (without holding Node.mu)
+	n.sendImmediateHeartbeats(currTerm, lastIdx, lastTerm)
 
 	return nil
 }
@@ -417,6 +527,7 @@ func (n *Node) BecomeFollower(newTerm Term, leaderID cluster.NodeID) error {
 	oldRole := n.role
 	n.role = RoleFollower
 	n.leaderID = leaderID
+	n.clearLeaderAndElectionStateLocked()
 
 	shouldHook := (oldRole != RoleFollower || newTerm != currTerm)
 	n.mu.Unlock()
@@ -465,6 +576,7 @@ func (n *Node) ObserveHigherTerm(incomingTerm Term) (bool, error) {
 	oldRole := n.role
 	n.role = RoleFollower
 	n.leaderID = cluster.NodeIDNil
+	n.clearLeaderAndElectionStateLocked()
 	n.mu.Unlock()
 
 	if n.transitionHook != nil {
@@ -510,6 +622,7 @@ func (n *Node) StepDownSameTerm(leaderID cluster.NodeID) error {
 	oldRole := n.role
 	n.role = RoleFollower
 	n.leaderID = leaderID
+	n.clearLeaderAndElectionStateLocked()
 	shouldHook := (oldRole != RoleFollower)
 	n.mu.Unlock()
 
@@ -529,10 +642,19 @@ func (n *Node) Close() error {
 		return nil
 	}
 
-	// Cancel election context so election loop terminates
+	n.timerRunning.Store(false)
+
+	// Cancel top-level election context and active loop context
 	if n.electionCancel != nil {
 		n.electionCancel()
 	}
+
+	n.timerLifecycleMu.Lock()
+	if n.loopCancel != nil {
+		n.loopCancel()
+		n.loopCancel = nil
+	}
+	n.timerLifecycleMu.Unlock()
 
 	// Permanently stop election timer
 	if n.electionTimer != nil {
@@ -564,29 +686,44 @@ func (n *Node) StartElectionTimer() error {
 		return errors.ErrRaftStateClosed
 	}
 
-	if n.timerRunning {
+	if n.timerRunning.Load() {
 		return nil // Idempotent (Section 19)
 	}
 
-	n.timerRunning = true
+	loopCtx, cancel := context.WithCancel(n.electionCtx)
+	done := make(chan struct{})
+	n.loopCancel = cancel
+	n.loopDone = done
+	n.timerRunning.Store(true)
 	n.electionTimer.Reset()
 	n.electionLoopWg.Add(1)
-	go n.runElectionLoop(n.electionCtx)
+	go n.runElectionLoop(loopCtx, done)
 
 	return nil
 }
 
 // StopElectionTimer halts the background election loop and timer. Idempotent.
+// Blocks until the election loop goroutine has completely terminated (P15-S02-M02 corrective hardening).
 func (n *Node) StopElectionTimer() {
 	n.timerLifecycleMu.Lock()
 	defer n.timerLifecycleMu.Unlock()
 
-	if !n.timerRunning {
+	if !n.timerRunning.Load() {
 		return
 	}
 
-	n.timerRunning = false
+	n.timerRunning.Store(false)
+	if n.loopCancel != nil {
+		n.loopCancel()
+		n.loopCancel = nil
+	}
 	n.electionTimer.Stop()
+
+	done := n.loopDone
+	n.loopDone = nil
+	if done != nil {
+		<-done
+	}
 }
 
 // ResetElectionTimer resets the election countdown with a freshly randomized duration.
@@ -610,8 +747,9 @@ func (n *Node) ElectionTimer() *ElectionTimer {
 }
 
 // runElectionLoop listens for timer expirations and triggers election rounds.
-func (n *Node) runElectionLoop(ctx context.Context) {
+func (n *Node) runElectionLoop(ctx context.Context, done chan struct{}) {
 	defer n.electionLoopWg.Done()
+	defer close(done)
 
 	for {
 		select {
@@ -622,6 +760,9 @@ func (n *Node) runElectionLoop(ctx context.Context) {
 				return
 			}
 			if n.closed.Load() {
+				return
+			}
+			if !n.timerRunning.Load() {
 				return
 			}
 
@@ -640,6 +781,9 @@ func (n *Node) handleElectionTimeout() {
 	if n.closed.Load() {
 		return
 	}
+	if !n.timerRunning.Load() {
+		return
+	}
 
 	// Section 21: If already Leader, discard stale timeout
 	if n.Role() == RoleLeader {
@@ -650,6 +794,33 @@ func (n *Node) handleElectionTimeout() {
 	if err := n.StartNewElection(); err != nil {
 		return
 	}
+
+	// Section 7: Single-Node N=1 Cluster Quorum Check
+	// If candidate's self-vote immediately satisfies quorum (quorum == 1)
+	n.mu.Lock()
+	if n.role == RoleCandidate && n.quorumSizeLocked() <= len(n.electionVotes) {
+		currTerm, err := n.storage.Term()
+		if err != nil {
+			n.mu.Unlock()
+			return
+		}
+		lastIdx, lastTerm, err := n.storage.LastIndexAndTerm()
+		if err != nil {
+			n.mu.Unlock()
+			return
+		}
+		oldRole := n.role
+		n.becomeLeaderLocked(currTerm, lastIdx)
+		shouldHook := (n.transitionHook != nil)
+		n.mu.Unlock()
+
+		if shouldHook && n.transitionHook != nil {
+			n.transitionHook(oldRole, RoleLeader, currTerm)
+		}
+		n.sendImmediateHeartbeats(currTerm, lastIdx, lastTerm)
+		return
+	}
+	n.mu.Unlock()
 
 	// Section 17 Event C: Candidate starts new election round -> reset timer with fresh timeout
 	n.ResetElectionTimer()
@@ -897,4 +1068,233 @@ func (n *Node) HandleRequestVote(fromPeerID cluster.NodeID, req *transport.Reque
 		Term:        uint64(currTerm),
 		VoteGranted: true,
 	}, nil
+}
+
+// sendImmediateHeartbeats broadcasts a one-time empty AppendEntries frame to each configured remote peer.
+// Invariants enforced (P15-S02-M02 / Section 15):
+//   - Must execute strictly outside of Node.mu (no mutex held during network I/O).
+//   - Uses current leader term and localID as LeaderID.
+//   - Entries is nil (empty heartbeat).
+//   - Includes fresh cryptographic nonce and monotonically increasing sequence ID.
+//   - Never targets self.
+//   - Broadcasts to configured remote peers.
+func (n *Node) sendImmediateHeartbeats(term Term, lastIdx LogIndex, lastTerm Term) {
+	if n.peerSender == nil || len(n.peers) == 0 {
+		return
+	}
+
+	for _, peerID := range n.peers {
+		if peerID == n.localID {
+			continue // Never send to self
+		}
+
+		nonce, err := transport.GenerateNonce()
+		if err != nil {
+			continue
+		}
+
+		seqID := n.peerSender.NextSeqID()
+		req := &transport.AppendEntriesRequest{
+			Term:         uint64(term),
+			LeaderID:     n.localID,
+			PrevLogIndex: uint64(lastIdx),
+			PrevLogTerm:  uint64(lastTerm),
+			LeaderCommit: 0,
+			Nonce:        nonce,
+			Entries:      nil, // Empty heartbeat
+		}
+
+		frame, err := transport.EncodeAppendEntries(req, seqID)
+		if err != nil {
+			continue
+		}
+
+		_ = n.peerSender.Send(n.electionCtx, peerID, frame)
+	}
+}
+
+// HandleRequestVoteResponse processes an incoming RequestVote response from a peer.
+//
+// Invariants enforced (P15-S02-M02 / Sections 8-12, 16-19):
+//  1. Rejects if node is closed.
+//  2. Validates fromPeerID: must be valid (> 0), cannot be self, and must belong to cluster membership.
+//  3. If resp == nil: rejected with ErrNilReceiver.
+//  4. Stale Term: if resp.Term < currentTerm, response is discarded without state mutation.
+//  5. Higher Term: if resp.Term > currentTerm, durably advances to the higher term, clears votedFor,
+//     steps down to RoleFollower, invalidates election state, re-arms election timer, and returns nil.
+//     If durable storage fails, fails closed and returns error.
+//  6. Same Term:
+//     - If role != RoleCandidate or electionRoundTerm != currentTerm: ignored (stale/post-leadership response).
+//     - If resp.VoteGranted == false: ignored.
+//     - Positive votes are deduplicated per peer identity (each peer counts at most once).
+//     - When vote count reaches quorum (floor(N/2) + 1), candidate transitions to RoleLeader exactly once,
+//     initializes leader volatile replication state (nextIndex/matchIndex), invalidates election round state,
+//     stops election timer, invokes transition hook, and broadcasts immediate empty AppendEntries heartbeats.
+//  7. Network I/O and user callbacks execute strictly outside of Node.mu.
+func (n *Node) HandleRequestVoteResponse(fromPeerID cluster.NodeID, resp *transport.RequestVoteResponse) error {
+	if n.closed.Load() {
+		return errors.ErrRaftStateClosed
+	}
+	if resp == nil {
+		return errors.ErrNilReceiver
+	}
+
+	// Validate sender peer ID (Section 9.2)
+	if !fromPeerID.IsValid() {
+		return &errors.InvalidNodeIDError{NodeID: uint64(fromPeerID), Reason: "sender peer ID must be greater than zero"}
+	}
+	if fromPeerID == n.localID {
+		return fmt.Errorf("%w: received vote response from local node ID %d", errors.ErrRaftSelfVoteRPC, n.localID)
+	}
+
+	// Validate cluster membership
+	if n.topology != nil && !n.topology.Contains(fromPeerID) {
+		return &errors.UnknownPeerError{NodeID: uint64(fromPeerID)}
+	}
+	if n.topology == nil && len(n.peers) > 0 {
+		known := false
+		for _, p := range n.peers {
+			if p == fromPeerID {
+				known = true
+				break
+			}
+		}
+		if !known {
+			return &errors.UnknownPeerError{NodeID: uint64(fromPeerID)}
+		}
+	}
+
+	n.mu.Lock()
+	if n.closed.Load() {
+		n.mu.Unlock()
+		return errors.ErrRaftStateClosed
+	}
+
+	currTerm, err := n.storage.Term()
+	if err != nil {
+		n.mu.Unlock()
+		return fmt.Errorf("raft: failed to read current term: %w", err)
+	}
+
+	// Section 9.5: Stale Term (resp.Term < currentTerm) -> ignore without mutating state
+	if resp.Term < uint64(currTerm) {
+		n.mu.Unlock()
+		return nil
+	}
+
+	// Section 9.5: Higher Term (resp.Term > currentTerm) -> durable stepdown to Follower
+	if resp.Term > uint64(currTerm) {
+		newTerm := Term(resp.Term)
+		// Persist higher term and clear vote BEFORE updating volatile role
+		if err := n.storage.SetTerm(newTerm); err != nil {
+			n.mu.Unlock()
+			return fmt.Errorf("raft: failed to persist higher term %d on vote response: %w", resp.Term, err)
+		}
+
+		oldRole := n.role
+		n.role = RoleFollower
+		n.leaderID = cluster.NodeIDNil
+		n.clearLeaderAndElectionStateLocked()
+		n.mu.Unlock()
+
+		if n.transitionHook != nil {
+			n.transitionHook(oldRole, RoleFollower, newTerm)
+		}
+
+		n.ResetElectionTimer()
+		return nil
+	}
+
+	// Section 9.4 & 16: Same Term (resp.Term == currentTerm)
+	// If node is no longer candidate (e.g. already Leader or stepped down), ignore
+	if n.role != RoleCandidate || n.electionRoundTerm != currTerm {
+		n.mu.Unlock()
+		return nil
+	}
+
+	// Section 11: Only positive votes count
+	if !resp.VoteGranted {
+		n.mu.Unlock()
+		return nil
+	}
+
+	// Section 10: Deduplication per peer identity
+	if _, alreadyVoted := n.electionVotes[fromPeerID]; alreadyVoted {
+		n.mu.Unlock()
+		return nil
+	}
+
+	n.electionVotes[fromPeerID] = struct{}{}
+	voteCount := len(n.electionVotes)
+	quorum := n.quorumSizeLocked()
+
+	// Quorum not yet reached
+	if voteCount < quorum {
+		n.mu.Unlock()
+		return nil
+	}
+
+	// Section 12: Quorum reached! Transition Candidate -> Leader
+	oldRole := n.role
+	lastIdx, lastTerm, err := n.storage.LastIndexAndTerm()
+	if err != nil {
+		n.mu.Unlock()
+		return fmt.Errorf("raft: failed to read last index and term on leadership transition: %w", err)
+	}
+
+	n.becomeLeaderLocked(currTerm, lastIdx)
+	shouldHook := (n.transitionHook != nil)
+	n.mu.Unlock()
+
+	if shouldHook && n.transitionHook != nil {
+		n.transitionHook(oldRole, RoleLeader, currTerm)
+	}
+
+	// Section 15: Send one-time immediate empty AppendEntries heartbeats (no Node.mu held)
+	n.sendImmediateHeartbeats(currTerm, lastIdx, lastTerm)
+
+	return nil
+}
+
+// HandlePeerFrame dispatches incoming peer protocol frames to their corresponding Raft handlers.
+// Completes the request-response dispatch path between transport and consensus (Section 22, 23).
+func (n *Node) HandlePeerFrame(fromPeerID cluster.NodeID, frame *transport.Frame) error {
+	if n.closed.Load() {
+		return errors.ErrRaftStateClosed
+	}
+	if frame == nil {
+		return errors.ErrNilReceiver
+	}
+
+	switch transport.PeerMessageType(frame.Header.OpCode) {
+	case transport.PeerOpRequestVote:
+		req, err := transport.DecodeRequestVote(frame)
+		if err != nil {
+			return err
+		}
+
+		resp, err := n.HandleRequestVote(fromPeerID, req)
+		if err != nil {
+			return err
+		}
+
+		if n.peerSender != nil && fromPeerID.IsValid() && fromPeerID != n.localID {
+			seqID := n.peerSender.NextSeqID()
+			respFrame, encErr := transport.EncodeRequestVoteResponse(resp, seqID)
+			if encErr == nil {
+				_ = n.peerSender.Send(n.electionCtx, fromPeerID, respFrame)
+			}
+		}
+		return nil
+
+	case transport.PeerOpRequestVoteResponse:
+		resp, err := transport.DecodeRequestVoteResponse(frame)
+		if err != nil {
+			return err
+		}
+		return n.HandleRequestVoteResponse(fromPeerID, resp)
+
+	default:
+		return nil
+	}
 }

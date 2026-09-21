@@ -153,3 +153,114 @@ func FuzzHandleRequestVote(f *testing.F) {
 		}
 	})
 }
+
+func FuzzHandleRequestVoteResponse(f *testing.F) {
+	// Seed corpus with normal, boundary, and extreme inputs
+	f.Add(uint64(2), uint64(1), true, uint8(0))
+	f.Add(uint64(2), uint64(0), true, uint8(1))
+	f.Add(uint64(3), uint64(10), false, uint8(0))
+	f.Add(uint64(0), uint64(0), false, uint8(2))
+	f.Add(uint64(1), uint64(1), true, uint8(0))
+	f.Add(uint64(99), uint64(1), true, uint8(1))
+	f.Add(^uint64(0), ^uint64(0), true, uint8(0))
+	f.Add(uint64(2), ^uint64(0), false, uint8(0))
+
+	f.Fuzz(func(t *testing.T, fromPeerIDRaw, respTerm uint64, voteGranted bool, initialRoleAction uint8) {
+		dir := t.TempDir()
+		s, err := raft.OpenStorage(dir)
+		if err != nil {
+			return
+		}
+		defer func() { _ = s.Close() }()
+
+		node, err := raft.NewNode(raft.NodeConfig{
+			LocalID: 1,
+			Storage: s,
+			Peers:   []cluster.NodeID{2, 3, 4},
+		})
+		if err != nil {
+			return
+		}
+		defer func() { _ = node.Close() }()
+
+		// Setup initial role
+		switch initialRoleAction % 3 {
+		case 0:
+			// RoleFollower (term 0)
+		case 1:
+			// RoleCandidate (term 1)
+			_ = node.BecomeCandidate()
+		case 2:
+			// RoleLeader (term 1)
+			_ = node.BecomeCandidate()
+			_ = node.BecomeLeader()
+		}
+
+		termBefore, _ := node.Term()
+		roleBefore := node.Role()
+		votesBefore := node.GrantedVotesCount()
+
+		resp := &transport.RequestVoteResponse{
+			Term:        respTerm,
+			VoteGranted: voteGranted,
+		}
+
+		fromPeerID := cluster.NodeID(fromPeerIDRaw)
+		err = node.HandleRequestVoteResponse(fromPeerID, resp)
+
+		// Verification of Core Properties (Section 27):
+		// Property 8: No panic for arbitrary protocol values (verified by reaching here)
+
+		// Property 7: Term never decreases
+		termAfter, _ := node.Term()
+		if termAfter < termBefore {
+			t.Fatalf("term decreased: termBefore=%d, termAfter=%d", termBefore, termAfter)
+		}
+
+		// Property 1: Vote count never exceeds unique remote voters + self (3 + 1 = 4)
+		votesAfter := node.GrantedVotesCount()
+		if votesAfter > 4 {
+			t.Fatalf("vote count %d exceeded maximum possible (4)", votesAfter)
+		}
+
+		// Property 9 & 10: Invalid sender / self sender cannot become a vote
+		if !fromPeerID.IsValid() || fromPeerID == 1 || fromPeerID > 4 {
+			if err == nil {
+				t.Fatalf("expected error for invalid or unknown peer %d", fromPeerID)
+			}
+			if votesAfter > votesBefore {
+				t.Fatalf("votes increased after invalid sender %d", fromPeerID)
+			}
+		}
+
+		// Property 3: Stale term cannot increase vote count
+		if respTerm < uint64(termBefore) && votesAfter > votesBefore {
+			t.Fatalf("votes increased on stale term %d < %d", respTerm, termBefore)
+		}
+
+		// Property 4: Higher term causes stepdown to Follower and clears votes
+		if respTerm > uint64(termBefore) && err == nil {
+			if r := node.Role(); r != raft.RoleFollower {
+				t.Fatalf("node failed to step down on higher term: %s", r)
+			}
+			if votesAfter != 0 {
+				t.Fatalf("votes not cleared on stepdown: %d", votesAfter)
+			}
+		}
+
+		// Property 5: Only Candidate can transition through quorum
+		if roleBefore != raft.RoleCandidate && node.Role() == raft.RoleLeader && roleBefore != raft.RoleLeader {
+			t.Fatalf("non-candidate %s transitioned to leader on vote response", roleBefore)
+		}
+
+		// Property 2: Duplicate peer response cannot increase vote count
+		if err == nil && roleBefore == raft.RoleCandidate && node.Role() == raft.RoleCandidate {
+			votesMid := node.GrantedVotesCount()
+			_ = node.HandleRequestVoteResponse(fromPeerID, resp)
+			votesPostDup := node.GrantedVotesCount()
+			if votesPostDup > votesMid {
+				t.Fatalf("duplicate response increased vote count: %d -> %d", votesMid, votesPostDup)
+			}
+		}
+	})
+}

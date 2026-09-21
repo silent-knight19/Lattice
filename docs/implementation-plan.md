@@ -2421,6 +2421,17 @@ TOTAL: 176 Discrete, Testable Micro-Phases
   * *Invariants*: Candidate must have log at least as up-to-date as voter to receive vote.
 * **P15-S02-M02: Quorum Vote Counting & Leader Transition**
   * *Objective*: Transition to Leader upon receiving $\lfloor N/2 \rfloor + 1$ votes; send immediate heartbeats.
+  * *Implementation Details*:
+    * Quorum calculation: $\lfloor N/2 \rfloor + 1$ over cluster membership ($N$ normalized remote peers + 1 local node).
+    * Volatile election state: `electionVotes` (set of node IDs granting votes), `electionRoundTerm`, and `electionRoundGen` in `Node`. Self-vote initialized to 1.
+    * Deduplication: Positive responses deduplicated per peer ID; duplicate responses cannot increment count.
+    * Higher-term responses: Durably advance term via `storage.SetTerm`, clear vote, step down to Follower, invalidate election state, and re-arm election timer.
+    * Stale-term responses: Discarded without state mutation.
+    * Single-node ($N=1$): Candidate immediately satisfies quorum ($\lfloor 1/2 \rfloor + 1 = 1$); transitions Follower $\to$ Candidate $\to$ Leader without network frames or blocking.
+    * Leader volatile replication state: On transition, `nextIndex[peer] = lastLogIndex + 1` and `matchIndex[peer] = 0` initialized for all remote peers in `peers` (local node excluded).
+    * Immediate heartbeat: Triggers one-time empty `AppendEntries` broadcast (with `Entries: nil`, current term, local LeaderID, fresh nonce, and monotonic seqID) without holding `Node.mu`.
+    * Scope boundary: Immediate heartbeat broadcast concludes M02; recurring $50\text{ms}$ periodic ticker and follower `AppendEntries` processing begin in M03.
+    * Corrective hardening: Fixed `StopElectionTimer()` to cancel election loop context and wait for goroutine termination (`loopCancel`, `loopDone`, `electionLoopWg`), preventing goroutine accumulation across repeated Start/Stop cycles.
 * **P15-S02-M03: Periodic Heartbeat Scheduler (`AppendEntries` Empty)**
   * *Objective*: Transmit heartbeats every $50\text{ms}$ to maintain leadership.
 
