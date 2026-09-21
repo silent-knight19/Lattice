@@ -232,6 +232,28 @@ func (n *Node) GrantedVotesCount() int {
 	return len(n.electionVotes)
 }
 
+// isStillLeader reports whether the node is still Leader in the given term.
+// Used to suppress stale one-time heartbeats after a concurrent stepdown.
+// Checks role under Node.mu and durable term from storage without holding
+// Node.mu across network I/O. Returns false if closed, not leader, storage
+// unreadable, or term changed.
+func (n *Node) isStillLeader(term Term) bool {
+	if n.closed.Load() {
+		return false
+	}
+	n.mu.RLock()
+	isLeader := (n.role == RoleLeader)
+	n.mu.RUnlock()
+	if !isLeader {
+		return false
+	}
+	currTerm, err := n.storage.Term()
+	if err != nil {
+		return false
+	}
+	return currTerm == term
+}
+
 // NextIndex returns a snapshot of the leader's nextIndex map for remote peers.
 // Returns nil if node is not currently leader.
 func (n *Node) NextIndex() map[cluster.NodeID]LogIndex {
@@ -480,6 +502,16 @@ func (n *Node) BecomeLeader() error {
 
 	if shouldHook && n.transitionHook != nil {
 		n.transitionHook(oldRole, RoleLeader, currTerm)
+	}
+
+	// Guard against stale leadership actions: the transition hook or a
+	// concurrent RPC may have stepped down this node before the one-time
+	// heartbeat is emitted. Never hold Node.mu across network I/O; instead
+	// re-validate leadership (role + durable term) before transmitting.
+	// A stale heartbeat that still slips through the residual TOCTOU window
+	// carries the old term and is rejected as stale by followers.
+	if !n.isStillLeader(currTerm) {
+		return nil
 	}
 
 	// Broadcast one-time immediate empty AppendEntries heartbeats (without holding Node.mu)
@@ -853,6 +885,12 @@ func (n *Node) handleElectionTimeout() {
 		if shouldHook && n.transitionHook != nil {
 			n.transitionHook(oldRole, RoleLeader, currTerm)
 		}
+		// Same stale-leadership guard as BecomeLeader: a concurrent
+		// higher-term observation may have invalidated leadership during
+		// the hook. Suppress the one-time heartbeat in that case.
+		if !n.isStillLeader(currTerm) {
+			return
+		}
 		n.sendImmediateHeartbeats(currTerm, lastIdx, lastTerm)
 		n.startHeartbeatScheduler()
 		return
@@ -1124,6 +1162,7 @@ func (n *Node) HandleRequestVote(fromPeerID cluster.NodeID, req *transport.Reque
 //   - Includes fresh cryptographic nonce and monotonically increasing sequence ID per peer.
 //   - Never targets self.
 //   - Tolerates peer send errors without terminating caller.
+//   - Aborts remaining sends if leadership is lost mid-broadcast (stale-leadership guard).
 func (n *Node) sendHeartbeats(ctx context.Context, term Term, lastIdx LogIndex, lastTerm Term) {
 	if n.peerSender == nil || len(n.peers) == 0 {
 		return
@@ -1136,6 +1175,13 @@ func (n *Node) sendHeartbeats(ctx context.Context, term Term, lastIdx LogIndex, 
 
 	for _, peerID := range n.peers {
 		if sendCtx.Err() != nil {
+			return
+		}
+		// Stale-leadership guard: abort broadcast if this node is no longer
+		// Leader in the heartbeat term (concurrent stepdown). Residual
+		// TOCTOU between this check and Send is harmless: any stale frame
+		// carries the old term and is rejected as stale by followers.
+		if !n.isStillLeader(term) {
 			return
 		}
 		if peerID == n.localID {
@@ -1243,6 +1289,14 @@ func (n *Node) stopHeartbeatScheduler() {
 }
 
 // runHeartbeatLoop transmits periodic empty AppendEntries heartbeats at configured cadence (50ms).
+// Stale-scheduler protection: each scheduler session carries the generation
+// captured at start. Any lifecycle transition (stepdown, restart, Close)
+// either clears heartbeatRunning or bumps heartbeatGen, causing stale
+// sessions to exit without transmitting. A final generation + leadership
+// re-check immediately before network I/O narrows the overlap window for
+// rapid Leader -> Follower -> Leader restarts: at most the pre-existing
+// TOCTOU between the final check and Send remains, and any stale frame that
+// slips through carries an old term rejected as stale by followers.
 func (n *Node) runHeartbeatLoop(ctx context.Context, done chan struct{}, gen uint64) {
 	defer func() {
 		n.heartbeatWg.Done()
@@ -1293,6 +1347,21 @@ func (n *Node) runHeartbeatLoop(ctx context.Context, done chan struct{}, gen uin
 		isLeader = (n.role == RoleLeader)
 		n.mu.RUnlock()
 		if !isLeader || n.closed.Load() {
+			return
+		}
+
+		// Final stale-session gate: re-validate generation under the
+		// lifecycle mutex and leadership (role + term) immediately before
+		// transmitting. sendHeartbeats performs a last per-broadcast
+		// isStillLeader check before each peer send.
+		n.heartbeatLifecycleMu.Lock()
+		curGen2 := n.heartbeatGen
+		isRunning2 := n.heartbeatRunning.Load()
+		n.heartbeatLifecycleMu.Unlock()
+		if !isRunning2 || curGen2 != gen || n.closed.Load() {
+			return
+		}
+		if !n.isStillLeader(term) {
 			return
 		}
 
@@ -1414,6 +1483,17 @@ func (n *Node) HandleRequestVoteResponse(fromPeerID cluster.NodeID, resp *transp
 		return nil
 	}
 
+	// Read-before-mutate ordering: fetch leadership initialization state
+	// BEFORE inserting the vote. If the storage read fails, the vote is not
+	// recorded, preserving a valid retry path for the same peer. Inserting
+	// first and then failing would permanently poison this round with a
+	// phantom duplicate entry.
+	lastIdx, lastTerm, err := n.storage.LastIndexAndTerm()
+	if err != nil {
+		n.mu.Unlock()
+		return fmt.Errorf("raft: failed to read last index and term on leadership transition: %w", err)
+	}
+
 	n.electionVotes[fromPeerID] = struct{}{}
 	voteCount := len(n.electionVotes)
 	quorum := n.quorumSizeLocked()
@@ -1426,11 +1506,6 @@ func (n *Node) HandleRequestVoteResponse(fromPeerID cluster.NodeID, resp *transp
 
 	// Section 12: Quorum reached! Transition Candidate -> Leader
 	oldRole := n.role
-	lastIdx, lastTerm, err := n.storage.LastIndexAndTerm()
-	if err != nil {
-		n.mu.Unlock()
-		return fmt.Errorf("raft: failed to read last index and term on leadership transition: %w", err)
-	}
 
 	n.becomeLeaderLocked(currTerm, lastIdx)
 	shouldHook := (n.transitionHook != nil)
@@ -1438,6 +1513,12 @@ func (n *Node) HandleRequestVoteResponse(fromPeerID cluster.NodeID, resp *transp
 
 	if shouldHook && n.transitionHook != nil {
 		n.transitionHook(oldRole, RoleLeader, currTerm)
+	}
+
+	// Stale-leadership guard (see BecomeLeader): suppress the one-time
+	// heartbeat if leadership was invalidated during the hook.
+	if !n.isStillLeader(currTerm) {
+		return nil
 	}
 
 	// Section 15: Send one-time immediate empty AppendEntries heartbeats (no Node.mu held)
@@ -1534,11 +1615,20 @@ func (n *Node) HandlePeerFrame(fromPeerID cluster.NodeID, frame *transport.Frame
 //     and steps down to RoleFollower BEFORE publishing new term. Persistence failure fails closed.
 //  9. Same Term (Section 13, 14, 27, 28): If req.Term == currentTerm, Candidate/Leader steps down to Follower.
 //     Sets leaderID to authenticated sender.
-//  10. Log Matching (Section 15): If PrevLogIndex > 0, checks that local log contains an entry at PrevLogIndex
-//     matching PrevLogTerm. If mismatch, returns Success=false without resetting election timer.
-//  11. Timer Reset (Section 13, 15): If heartbeat is valid and preceding log matches, resets election timer
-//     strictly outside of Node.mu.
-//  12. Response (Section 16): Returns AppendEntriesResponse{Term: currentTerm, Success: true/false, MatchIndex: PrevLogIndex}.
+//  10. Scope Boundary (P15-S03): Non-empty entry replication is NOT implemented yet.
+//     Any request with len(Entries) > 0 returns Success=false without mutating
+//     the log. The sender remains recognized as legitimate leader for liveness
+//     (leaderID recorded, election timer reset), but replication is never
+//     falsely acknowledged.
+//  11. Log Matching (Section 15): If PrevLogIndex > 0, checks that local log contains an entry at PrevLogIndex
+//     matching PrevLogTerm. If mismatch, returns Success=false but STILL resets
+//     the election timer: liveness (valid leader signal) is distinct from log
+//     replication success. A lagging follower must not time out while its
+//     legitimate leader is heartbeating; repair belongs to P15-S03-M02.
+//  12. Timer Reset (Section 13, 15): Any non-stale AppendEntries from the
+//     legitimate current-term leader resets the election timer strictly
+//     outside of Node.mu, regardless of log-match outcome.
+//  13. Response (Section 16): Returns AppendEntriesResponse{Term: currentTerm, Success: true/false, MatchIndex: PrevLogIndex}.
 func (n *Node) HandleAppendEntries(fromPeerID cluster.NodeID, req *transport.AppendEntriesRequest) (*transport.AppendEntriesResponse, error) {
 	if n.closed.Load() {
 		return nil, errors.ErrRaftStateClosed
@@ -1662,6 +1752,20 @@ func (n *Node) HandleAppendEntries(fromPeerID cluster.NodeID, req *transport.App
 		n.stopHeartbeatScheduler()
 	}
 
+	// Scope boundary (P15-S03): full entry replication is not implemented yet.
+	// Never acknowledge un-persisted entries. A non-empty request is a valid
+	// leadership/liveness signal (leaderID already recorded above) but must
+	// not return Success=true. Reset the election timer for liveness and
+	// report replication failure without touching the log.
+	if len(req.Entries) > 0 {
+		n.ResetElectionTimer()
+		return &transport.AppendEntriesResponse{
+			Term:       uint64(currTerm),
+			Success:    false,
+			MatchIndex: 0,
+		}, nil
+	}
+
 	// Section 15: Log Matching Check
 	// Check if follower log contains an entry at PrevLogIndex matching PrevLogTerm
 	logMatches := false
@@ -1678,8 +1782,12 @@ func (n *Node) HandleAppendEntries(fromPeerID cluster.NodeID, req *transport.App
 	}
 
 	if !logMatches {
-		// Section 15: Previous-log check failed. Return Success=false.
-		// Do not reset election timer.
+		// Section 15: Previous-log check failed. Return Success=false BUT
+		// still reset the election timer: an otherwise-valid heartbeat from
+		// the legitimate current-term leader proves liveness even when the
+		// follower's log is lagging. Without this, a healthy-but-lagging
+		// follower would spuriously time out and disrupt the cluster.
+		n.ResetElectionTimer()
 		return &transport.AppendEntriesResponse{
 			Term:       uint64(currTerm),
 			Success:    false,
@@ -1703,9 +1811,12 @@ func (n *Node) HandleAppendEntries(fromPeerID cluster.NodeID, req *transport.App
 //  1. Rejects if node is closed.
 //  2. If resp == nil: ErrNilReceiver.
 //  3. If sender is self or invalid: rejected.
-//  4. If resp.Term > currentTerm: durably steps down to Follower, halts heartbeat scheduler,
+//  4. Sender must belong to configured cluster membership (topology/peers),
+//     consistent with HandleRequestVoteResponse. Unknown senders cannot inject
+//     higher terms or mutate consensus state.
+//  5. If resp.Term > currentTerm: durably steps down to Follower, halts heartbeat scheduler,
 //     and re-arms election timer.
-//  5. No log replication, retry, or nextIndex manipulation (P15-S03 scope boundary).
+//  6. No log replication, retry, or nextIndex manipulation (P15-S03 scope boundary).
 func (n *Node) HandleAppendEntriesResponse(fromPeerID cluster.NodeID, resp *transport.AppendEntriesResponse) error {
 	if n.closed.Load() {
 		return errors.ErrRaftStateClosed
@@ -1718,6 +1829,24 @@ func (n *Node) HandleAppendEntriesResponse(fromPeerID cluster.NodeID, resp *tran
 	}
 	if fromPeerID == n.localID {
 		return fmt.Errorf("%w: received AppendEntries response from self", errors.ErrRaftSelfVoteRPC)
+	}
+
+	// Consistent authenticated-sender membership boundary: unknown peers must
+	// not be able to inject higher terms or otherwise mutate consensus state.
+	if n.topology != nil && !n.topology.Contains(fromPeerID) {
+		return &errors.UnknownPeerError{NodeID: uint64(fromPeerID)}
+	}
+	if n.topology == nil && len(n.peers) > 0 {
+		known := false
+		for _, p := range n.peers {
+			if p == fromPeerID {
+				known = true
+				break
+			}
+		}
+		if !known {
+			return &errors.UnknownPeerError{NodeID: uint64(fromPeerID)}
+		}
 	}
 
 	n.mu.Lock()

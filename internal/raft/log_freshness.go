@@ -7,11 +7,20 @@ import (
 )
 
 // ValidateCandidateLogCoordinates verifies that candidate log index and term respect
-// foundational Raft invariants (e.g. index > 0 requires term > 0).
+// foundational Raft invariants.
+// The only valid zero/sentinel coordinate is (0, 0) for an empty log.
+// Valid non-empty coordinates require index > 0 AND term > 0.
+// Rejects both incoherent combinations:
+//   - index > 0 with term == 0 (impossible: entry exists without term)
+//   - index == 0 with term > 0 (impossible: term claimed without entry)
 func ValidateCandidateLogCoordinates(index, term uint64) error {
 	if index > 0 && term == 0 {
 		return fmt.Errorf("%w: invalid candidate log coordinates (index %d > 0 with term 0)",
 			errors.ErrRaftInvalidLogEntry, index)
+	}
+	if index == 0 && term != 0 {
+		return fmt.Errorf("%w: invalid candidate log coordinates (index 0 with term %d)",
+			errors.ErrRaftInvalidLogEntry, term)
 	}
 	return nil
 }
