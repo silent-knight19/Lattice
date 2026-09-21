@@ -485,6 +485,9 @@ var (
 
 	// ErrRaftVoteClearedInSameTerm indicates an attempt to reset or clear votedFor while remaining in the same term.
 	ErrRaftVoteClearedInSameTerm = stdErrors.New("raft vote cannot be reset or cleared in the same term")
+
+	// ErrRaftEntryTermExceedsCurrentTerm indicates that an appended entry has a term exceeding the local current term.
+	ErrRaftEntryTermExceedsCurrentTerm = stdErrors.New("raft log entry term exceeds current term")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing

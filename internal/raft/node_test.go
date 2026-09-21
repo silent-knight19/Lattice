@@ -142,15 +142,32 @@ func TestNode_FollowerToCandidate(t *testing.T) {
 		t.Fatalf("transitions mismatch: %v", transitions)
 	}
 
-	// Calling BecomeCandidate again starts a new election cycle (Candidate -> Candidate)
-	// Term increments 1 -> 2, self-vote is renewed for term 2
+	// Repeated BecomeCandidate call on Candidate is idempotent (Sections 23 & 52)
+	// Term remains 1, vote remains 3, no duplicate transition hook
 	if err := n.BecomeCandidate(); err != nil {
-		t.Fatalf("BecomeCandidate 2 failed: %v", err)
+		t.Fatalf("BecomeCandidate idempotent re-call failed: %v", err)
+	}
+	term, _ = n.Term()
+	vote, _ = n.VotedFor()
+	if term != 1 || vote != 3 {
+		t.Fatalf("idempotent BecomeCandidate modified state: Term=%d (want 1), VotedFor=%d (want 3)", term, vote)
+	}
+	if len(transitions) != 1 {
+		t.Fatalf("unexpected transition hook on idempotent BecomeCandidate: %v", transitions)
+	}
+
+	// Calling StartNewElection explicitly starts a new election cycle (Candidate -> Candidate)
+	// Term increments 1 -> 2, self-vote is renewed for term 2
+	if err := n.StartNewElection(); err != nil {
+		t.Fatalf("StartNewElection failed: %v", err)
 	}
 	term, _ = n.Term()
 	vote, _ = n.VotedFor()
 	if term != 2 || vote != 3 {
 		t.Fatalf("Term=%d (want 2), VotedFor=%d (want 3)", term, vote)
+	}
+	if len(transitions) != 2 || transitions[1] != "Candidate->Candidate(T2)" {
+		t.Fatalf("transitions mismatch after StartNewElection: %v", transitions)
 	}
 }
 
@@ -348,4 +365,133 @@ func TestNode_ConcurrentTransitionsNoRace(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+func TestNode_RoleTransitionMatrix(t *testing.T) {
+	t.Run("Follower_To_Leader_Rejected", func(t *testing.T) {
+		n, _, cleanup := newTestNode(t, 1)
+		defer cleanup()
+
+		err := n.BecomeLeader()
+		if err == nil || !stdErrors.Is(err, errors.ErrRaftInvalidRoleTransition) {
+			t.Fatalf("expected ErrRaftInvalidRoleTransition for Follower -> Leader, got %v", err)
+		}
+		if n.Role() != raft.RoleFollower {
+			t.Fatalf("role modified on rejected transition: got %s, want %s", n.Role(), raft.RoleFollower)
+		}
+	})
+
+	t.Run("Leader_To_Candidate_Rejected", func(t *testing.T) {
+		n, _, cleanup := newTestNode(t, 1)
+		defer cleanup()
+
+		_ = n.BecomeCandidate()
+		_ = n.BecomeLeader()
+
+		err := n.BecomeCandidate()
+		if err == nil || !stdErrors.Is(err, errors.ErrRaftInvalidRoleTransition) {
+			t.Fatalf("expected ErrRaftInvalidRoleTransition for Leader -> Candidate, got %v", err)
+		}
+		err = n.StartNewElection()
+		if err == nil || !stdErrors.Is(err, errors.ErrRaftInvalidRoleTransition) {
+			t.Fatalf("expected ErrRaftInvalidRoleTransition for Leader -> StartNewElection, got %v", err)
+		}
+		if n.Role() != raft.RoleLeader {
+			t.Fatalf("role modified on rejected transition: got %s, want %s", n.Role(), raft.RoleLeader)
+		}
+	})
+
+	t.Run("Follower_To_Follower_Idempotent", func(t *testing.T) {
+		n, _, cleanup := newTestNode(t, 1)
+		defer cleanup()
+
+		err := n.BecomeFollower(0, cluster.NodeIDNil)
+		if err != nil {
+			t.Fatalf("BecomeFollower same-term failed: %v", err)
+		}
+		if n.Role() != raft.RoleFollower {
+			t.Fatalf("Role = %s, want %s", n.Role(), raft.RoleFollower)
+		}
+	})
+
+	t.Run("Leader_To_Leader_Idempotent", func(t *testing.T) {
+		n, _, cleanup := newTestNode(t, 1)
+		defer cleanup()
+
+		_ = n.BecomeCandidate()
+		_ = n.BecomeLeader()
+
+		err := n.BecomeLeader()
+		if err != nil {
+			t.Fatalf("BecomeLeader idempotent failed: %v", err)
+		}
+		if n.Role() != raft.RoleLeader {
+			t.Fatalf("Role = %s, want %s", n.Role(), raft.RoleLeader)
+		}
+	})
+}
+
+func TestNode_PersistenceFailureSafety(t *testing.T) {
+	// Candidate transition persistence failure (Section 29, 54)
+	t.Run("candidate_persistence_failure", func(t *testing.T) {
+		n, s, cleanup := newTestNode(t, 1)
+		defer cleanup()
+
+		// Inject rename failure when updating state file
+		restore := raft.SetRaftRenameFnForTesting(func(oldpath, newpath string) error {
+			return fmt.Errorf("injected disk failure during state update")
+		})
+
+		err := n.BecomeCandidate()
+		if err == nil {
+			restore()
+			t.Fatalf("expected BecomeCandidate to fail on persistence failure")
+		}
+		restore()
+
+		// Node role MUST remain Follower
+		if r := n.Role(); r != raft.RoleFollower {
+			t.Fatalf("role advanced to %s on persistence failure, expected %s", r, raft.RoleFollower)
+		}
+
+		// Term and vote MUST NOT have falsely advanced in storage
+		hs, err := s.HardState()
+		if err != nil {
+			t.Fatalf("HardState failed: %v", err)
+		}
+		if hs.Term != 0 || hs.VotedFor != cluster.NodeIDNil {
+			t.Fatalf("persistent state mutated on failed candidate transition: %+v", hs)
+		}
+	})
+
+	// Higher-term stepdown persistence failure (Section 54)
+	t.Run("stepdown_persistence_failure", func(t *testing.T) {
+		n, s, cleanup := newTestNode(t, 1)
+		defer cleanup()
+
+		_ = n.BecomeCandidate() // term 1, vote 1
+		_ = n.BecomeLeader()    // leader, term 1, vote 1
+
+		restore := raft.SetRaftRenameFnForTesting(func(oldpath, newpath string) error {
+			return fmt.Errorf("injected disk failure during higher-term stepdown")
+		})
+
+		steppedDown, err := n.ObserveHigherTerm(10)
+		if err == nil || steppedDown {
+			restore()
+			t.Fatalf("expected ObserveHigherTerm to fail on persistence failure, got (%v, %v)", steppedDown, err)
+		}
+		restore()
+
+		// Role remains Leader
+		if r := n.Role(); r != raft.RoleLeader {
+			t.Fatalf("role altered on persistence failure: got %s, want %s", r, raft.RoleLeader)
+		}
+
+		// Term remains 1
+		hs, _ := s.HardState()
+		if hs.Term != 1 {
+			t.Fatalf("term falsely altered on failed stepdown: got %d, want 1", hs.Term)
+		}
+	})
 }

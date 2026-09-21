@@ -1,5 +1,7 @@
 package raft
 
+import "os"
+
 // SetRaftRenameFnForTesting overrides the rename function for fault-injection testing.
 func SetRaftRenameFnForTesting(fn func(oldpath, newpath string) error) func() {
 	orig := raftRenameFn
@@ -15,6 +17,51 @@ func SetRaftSyncDirFnForTesting(fn func(dirPath string) error) func() {
 	raftSyncDirFn = fn
 	return func() {
 		raftSyncDirFn = orig
+	}
+}
+
+// SetRaftOpenFileFnForTesting overrides os.OpenFile for fault-injection testing.
+func SetRaftOpenFileFnForTesting(fn func(name string, flag int, perm os.FileMode) (*os.File, error)) func() {
+	orig := raftOpenFileFn
+	raftOpenFileFn = fn
+	return func() {
+		raftOpenFileFn = orig
+	}
+}
+
+// SetRaftCreateTmpFnForTesting overrides tmp file creation for fault-injection testing.
+func SetRaftCreateTmpFnForTesting(fn func(path string, flag int, perm os.FileMode) (*os.File, error)) func() {
+	orig := raftCreateTmpFn
+	raftCreateTmpFn = fn
+	return func() {
+		raftCreateTmpFn = orig
+	}
+}
+
+// SetRaftWriteTmpFnForTesting overrides tmp file writes for fault-injection testing.
+func SetRaftWriteTmpFnForTesting(fn func(f *os.File, b []byte) (int, error)) func() {
+	orig := raftWriteTmpFn
+	raftWriteTmpFn = fn
+	return func() {
+		raftWriteTmpFn = orig
+	}
+}
+
+// SetRaftSyncTmpFnForTesting overrides tmp file fsync for fault-injection testing.
+func SetRaftSyncTmpFnForTesting(fn func(f *os.File) error) func() {
+	orig := raftSyncTmpFn
+	raftSyncTmpFn = fn
+	return func() {
+		raftSyncTmpFn = orig
+	}
+}
+
+// SetRaftCloseTmpFnForTesting overrides tmp file close for fault-injection testing.
+func SetRaftCloseTmpFnForTesting(fn func(f *os.File) error) func() {
+	orig := raftCloseTmpFn
+	raftCloseTmpFn = fn
+	return func() {
+		raftCloseTmpFn = orig
 	}
 }
 

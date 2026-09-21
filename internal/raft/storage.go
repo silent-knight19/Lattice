@@ -53,8 +53,21 @@ const (
 
 // Pluggable seams for fault-injection testing
 var (
-	raftSyncDirFn = syncDir
-	raftRenameFn  = os.Rename
+	raftSyncDirFn   = syncDir
+	raftRenameFn    = os.Rename
+	raftOpenFileFn  = os.OpenFile
+	raftCreateTmpFn = func(path string, flag int, perm os.FileMode) (*os.File, error) {
+		return os.OpenFile(path, flag, perm)
+	}
+	raftWriteTmpFn = func(f *os.File, b []byte) (int, error) {
+		return f.Write(b)
+	}
+	raftSyncTmpFn = func(f *os.File) error {
+		return fdatasync(f)
+	}
+	raftCloseTmpFn = func(f *os.File) error {
+		return f.Close()
+	}
 )
 
 // syncDir flushes modified directory entries to persistent storage media.
@@ -145,15 +158,32 @@ func OpenStorage(dir string) (*Storage, error) {
 		return nil, fmt.Errorf("raft: failed to recover raft log: %w", err)
 	}
 
+	for _, e := range entries {
+		if e.Term > hs.Term {
+			return nil, fmt.Errorf("%w: recovered entry %d term %d exceeds current term %d",
+				errors.ErrRaftCorruptedState, e.Index, e.Term, hs.Term)
+		}
+	}
+
 	inMemLog, err := NewInMemLogWithEntries(entries)
 	if err != nil {
 		return nil, fmt.Errorf("raft: log contiguity validation failed: %w", err)
 	}
 
 	// 3. Open log file for appending with restrictive 0600 permissions
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_RDWR|os.O_APPEND, RaftFileMode)
+	_, statErr := os.Stat(logPath)
+	isNew := os.IsNotExist(statErr)
+
+	logFile, err := raftOpenFileFn(logPath, os.O_CREATE|os.O_RDWR|os.O_APPEND, RaftFileMode)
 	if err != nil {
 		return nil, fmt.Errorf("raft: failed to open log file %s: %w", logPath, err)
+	}
+
+	if isNew {
+		if err := raftSyncDirFn(cleanDir); err != nil {
+			_ = logFile.Close()
+			return nil, fmt.Errorf("raft: failed to sync directory on initial log creation: %w", err)
+		}
 	}
 
 	// Pin open descriptor against symlink swap
@@ -229,6 +259,11 @@ func (s *Storage) SetHardState(hs HardState) error {
 
 	if s.closed.Load() {
 		return errors.ErrRaftStateClosed
+	}
+
+	// 0. Structural validation
+	if err := hs.Validate(); err != nil {
+		return err
 	}
 
 	// 1. Monotonicity check
@@ -367,8 +402,16 @@ func (s *Storage) Append(entries ...LogEntry) error {
 	}
 
 	lastIdx := s.memLog.LastIndex()
+	currTerm := s.hardState.Term
 
-	// 1. Validate contiguity and payload bounds before any serialization
+	// 1. Validate term relationship, contiguity, and payload bounds before any serialization
+	for _, e := range entries {
+		if e.Term > currTerm {
+			return fmt.Errorf("%w: entry %d term %d exceeds current term %d",
+				errors.ErrRaftEntryTermExceedsCurrentTerm, e.Index, e.Term, currTerm)
+		}
+	}
+
 	if err := CheckContiguity(entries, lastIdx+1); err != nil {
 		return err
 	}
@@ -438,15 +481,15 @@ func (s *Storage) TruncateSuffix(fromIndex LogIndex) error {
 	// Clean up any stale tmp file
 	_ = os.Remove(tmpPath)
 
-	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, RaftFileMode)
+	tmpFile, err := raftCreateTmpFn(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, RaftFileMode)
 	if err != nil {
 		return fmt.Errorf("raft: failed to create log tmp file: %w", err)
 	}
 
-	writeSucceeded := false
+	tmpCleaned := false
 	defer func() {
-		if !writeSucceeded {
-			_ = tmpFile.Close()
+		if !tmpCleaned {
+			_ = raftCloseTmpFn(tmpFile)
 			_ = os.Remove(tmpPath)
 		}
 	}()
@@ -454,45 +497,51 @@ func (s *Storage) TruncateSuffix(fromIndex LogIndex) error {
 	for _, e := range remaining {
 		recBuf := make([]byte, LogRecordHeaderSize+len(e.Data))
 		encodeLogRecord(recBuf, e)
-		if _, err := tmpFile.Write(recBuf); err != nil {
+		if _, err := raftWriteTmpFn(tmpFile, recBuf); err != nil {
 			return fmt.Errorf("raft: failed to write truncated log record: %w", err)
 		}
 	}
 
-	if err := fdatasync(tmpFile); err != nil {
+	if err := raftSyncTmpFn(tmpFile); err != nil {
 		return fmt.Errorf("raft: failed to sync truncated log file: %w", err)
 	}
 
-	if err := tmpFile.Close(); err != nil {
+	if err := raftCloseTmpFn(tmpFile); err != nil {
 		return fmt.Errorf("raft: failed to close truncated log tmp file: %w", err)
 	}
 
 	// At this point, tmpFile is complete and durably synced on disk.
-	// Close existing active logFile descriptor before atomic replacement.
-	if s.logFile != nil {
-		_ = s.logFile.Close()
-		s.logFile = nil
-	}
-
-	// Atomic rename to replace active log file
+	// Atomic rename to replace active log file.
+	// If rename fails, old s.logFile was NEVER touched and remains valid.
 	if err := raftRenameFn(tmpPath, logPath); err != nil {
-		// Terminal failure: mark closed so subsequent operations fail closed
-		s.closed.Store(true)
 		return fmt.Errorf("raft: failed to atomically replace log file: %w", err)
 	}
-	writeSucceeded = true
+	tmpCleaned = true
 
-	// Sync parent directory
+	// Disk state has changed. Any subsequent failure is terminal for this Storage instance.
 	if err := raftSyncDirFn(s.dir); err != nil {
 		s.closed.Store(true)
+		if s.logFile != nil {
+			_ = s.logFile.Close()
+			s.logFile = nil
+		}
 		return fmt.Errorf("raft: failed to sync directory after log truncation: %w", err)
 	}
 
-	// Reopen log file for future appends
-	newLogFile, err := os.OpenFile(logPath, os.O_RDWR|os.O_APPEND, RaftFileMode)
+	// Reopen replacement descriptor
+	newLogFile, err := raftOpenFileFn(logPath, os.O_RDWR|os.O_APPEND, RaftFileMode)
 	if err != nil {
 		s.closed.Store(true)
+		if s.logFile != nil {
+			_ = s.logFile.Close()
+			s.logFile = nil
+		}
 		return fmt.Errorf("raft: failed to reopen log file after truncation: %w", err)
+	}
+
+	// Only then retire old descriptor
+	if s.logFile != nil {
+		_ = s.logFile.Close()
 	}
 	s.logFile = newLogFile
 
@@ -584,12 +633,30 @@ func readStateFile(path string) (HardState, error) {
 	}
 	defer func() { _ = f.Close() }()
 
+	fi, err := f.Stat()
+	if err != nil {
+		return HardState{}, err
+	}
+	if fi.Size() != int64(StateRecordSize) {
+		if fi.Size() < int64(StateRecordSize) {
+			return HardState{}, fmt.Errorf("%w: state file truncated (%d bytes, expected %d)",
+				errors.ErrRaftCorruptedState, fi.Size(), StateRecordSize)
+		}
+		return HardState{}, fmt.Errorf("%w: unexpected trailing bytes in state file (%d bytes, expected %d)",
+			errors.ErrRaftCorruptedState, fi.Size(), StateRecordSize)
+	}
+
 	buf := make([]byte, StateRecordSize)
 	if _, err := io.ReadFull(f, buf); err != nil {
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			return HardState{}, fmt.Errorf("%w: state file truncated", errors.ErrRaftCorruptedState)
 		}
 		return HardState{}, err
+	}
+
+	extra := make([]byte, 1)
+	if n, _ := f.Read(extra); n > 0 {
+		return HardState{}, fmt.Errorf("%w: unexpected trailing bytes in state file", errors.ErrRaftCorruptedState)
 	}
 
 	// Check CRC32
@@ -614,10 +681,15 @@ func readStateFile(path string) (HardState, error) {
 	term := Term(binary.GetUint64(buf[8:16]))
 	votedFor := cluster.NodeID(binary.GetUint64(buf[16:24]))
 
-	return HardState{
+	hs := HardState{
 		Term:     term,
 		VotedFor: votedFor,
-	}, nil
+	}
+	if err := hs.Validate(); err != nil {
+		return HardState{}, err
+	}
+
+	return hs, nil
 }
 
 // encodeLogRecord encodes a LogEntry into dst. Requires len(dst) >= LogRecordHeaderSize + len(e.Data).

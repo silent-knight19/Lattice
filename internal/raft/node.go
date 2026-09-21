@@ -127,16 +127,12 @@ func (n *Node) Storage() *Storage {
 	return n.storage
 }
 
-// BecomeCandidate transitions the server from Follower or Candidate to Candidate for a new election term.
+// BecomeCandidate transitions the server from Follower to Candidate.
 //
-// Invariants enforced:
+// Invariants enforced (P15-S01-M02 / Sections 23 & 33):
 //   - Disallowed from RoleLeader (a leader does not directly become candidate).
-//   - Increments currentTerm by exactly 1.
-//   - Checks for term arithmetic overflow (cannot exceed math.MaxUint64).
-//   - Persists HardState{Term: currentTerm+1, VotedFor: localID} atomically to disk.
-//   - If persistence fails, node remains in its previous role.
-//   - Resets known leaderID to NodeIDNil.
-//   - Updates role to RoleCandidate.
+//   - If already in RoleCandidate, it is an idempotent no-op (preserves existing term and vote).
+//   - From RoleFollower, increments currentTerm by 1, persists self-vote, and transitions to RoleCandidate.
 func (n *Node) BecomeCandidate() error {
 	if n.closed.Load() {
 		return errors.ErrRaftStateClosed
@@ -154,6 +150,46 @@ func (n *Node) BecomeCandidate() error {
 		return fmt.Errorf("%w: leader cannot transition directly to candidate", errors.ErrRaftInvalidRoleTransition)
 	}
 
+	// Idempotent if already candidate
+	if n.role == RoleCandidate {
+		return nil
+	}
+
+	return n.campaignLocked()
+}
+
+// StartNewElection explicitly initiates a new election term from Follower or Candidate.
+// Used by election timer timeouts (Phase 15-S02-M01).
+//
+// Invariants enforced:
+//   - Disallowed from RoleLeader.
+//   - Increments currentTerm by exactly 1.
+//   - Checks for term arithmetic overflow (cannot exceed math.MaxUint64).
+//   - Atomically persists HardState{Term: currentTerm+1, VotedFor: localID}.
+//   - If persistence fails, node remains in its previous role.
+//   - Resets known leaderID to NodeIDNil and sets role to RoleCandidate.
+func (n *Node) StartNewElection() error {
+	if n.closed.Load() {
+		return errors.ErrRaftStateClosed
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.closed.Load() {
+		return errors.ErrRaftStateClosed
+	}
+
+	if n.role == RoleLeader {
+		return fmt.Errorf("%w: leader cannot transition directly to candidate", errors.ErrRaftInvalidRoleTransition)
+	}
+
+	return n.campaignLocked()
+}
+
+// campaignLocked advances the term by 1, persists a self-vote, and publishes RoleCandidate.
+// Caller MUST hold n.mu.
+func (n *Node) campaignLocked() error {
 	currTerm, err := n.storage.Term()
 	if err != nil {
 		return err

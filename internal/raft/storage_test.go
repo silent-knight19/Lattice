@@ -187,13 +187,19 @@ func TestStorage_TruncateSuffixAndReopen(t *testing.T) {
 		t.Fatalf("OpenStorage failed: %v", err)
 	}
 
+	if err := s.SetTerm(2); err != nil {
+		t.Fatalf("SetTerm failed: %v", err)
+	}
+
 	entries := []raft.LogEntry{
 		{Index: 1, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("1")},
 		{Index: 2, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("2")},
 		{Index: 3, Term: 2, Type: transport.PeerEntryNormal, Data: []byte("3")},
 		{Index: 4, Term: 2, Type: transport.PeerEntryNormal, Data: []byte("4")},
 	}
-	_ = s.Append(entries...)
+	if err := s.Append(entries...); err != nil {
+		t.Fatalf("Append failed: %v", err)
+	}
 
 	// Truncate at index 3 (drops 3 and 4)
 	if err := s.TruncateSuffix(3); err != nil {
@@ -203,6 +209,11 @@ func TestStorage_TruncateSuffixAndReopen(t *testing.T) {
 	lastIdx, _ := s.LastIndex()
 	if lastIdx != 2 {
 		t.Fatalf("expected last index 2, got %d", lastIdx)
+	}
+
+	// Advance term to 3 before appending entry with term 3
+	if err := s.SetTerm(3); err != nil {
+		t.Fatalf("SetTerm(3) failed: %v", err)
 	}
 
 	// Append replacement entry at index 3 with higher term
@@ -233,38 +244,269 @@ func TestStorage_TruncateSuffixAndReopen(t *testing.T) {
 	}
 }
 
-func TestStorage_TruncateSuffix_RenameFailureSafe(t *testing.T) {
-	dir := t.TempDir()
+func TestStorage_TruncateSuffix_FaultInjectionBoundaries(t *testing.T) {
+	// 1. Temp creation failure -> storage remains coherent and open
+	t.Run("temp_creation_failure", func(t *testing.T) {
+		dir := t.TempDir()
+		s, err := raft.OpenStorage(dir)
+		if err != nil {
+			t.Fatalf("OpenStorage failed: %v", err)
+		}
+		defer func() { _ = s.Close() }()
 
-	s, err := raft.OpenStorage(dir)
-	if err != nil {
-		t.Fatalf("OpenStorage failed: %v", err)
-	}
-	defer func() { _ = s.Close() }()
+		_ = s.SetTerm(1)
+		_ = s.Append(raft.LogEntry{Index: 1, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("1")},
+			raft.LogEntry{Index: 2, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("2")})
 
-	entries := []raft.LogEntry{
-		{Index: 1, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("1")},
-		{Index: 2, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("2")},
-	}
-	_ = s.Append(entries...)
+		restore := raft.SetRaftCreateTmpFnForTesting(func(path string, flag int, perm os.FileMode) (*os.File, error) {
+			return nil, fmt.Errorf("injected create tmp error")
+		})
+		defer restore()
 
-	// Inject error into rename operation during TruncateSuffix
-	restore := raft.SetRaftRenameFnForTesting(func(oldpath, newpath string) error {
-		return fmt.Errorf("injected rename I/O error")
+		err = s.TruncateSuffix(2)
+		if err == nil {
+			t.Fatalf("expected error from TruncateSuffix on tmp create failure")
+		}
+
+		if s.LogFileDescriptorNilForTesting() {
+			t.Fatalf("logFile descriptor became nil on non-terminal truncate failure")
+		}
+
+		// Storage remains coherent and usable: can append entry 3
+		err = s.Append(raft.LogEntry{Index: 3, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("3")})
+		if err != nil {
+			t.Fatalf("expected Append to succeed after non-terminal truncate failure, got %v", err)
+		}
 	})
-	defer restore()
 
-	err = s.TruncateSuffix(2)
-	if err == nil {
-		t.Fatalf("expected TruncateSuffix to fail when rename fails")
-	}
+	// 2. Temp write failure -> storage remains coherent and open
+	t.Run("temp_write_failure", func(t *testing.T) {
+		dir := t.TempDir()
+		s, err := raft.OpenStorage(dir)
+		if err != nil {
+			t.Fatalf("OpenStorage failed: %v", err)
+		}
+		defer func() { _ = s.Close() }()
 
-	// Because rename failed after closing the active descriptor, Storage must mark itself closed
-	// and reject subsequent appends safely with ErrRaftStateClosed without panicking.
-	err = s.Append(raft.LogEntry{Index: 3, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("3")})
-	if err == nil || !stdErrors.Is(err, errors.ErrRaftStateClosed) {
-		t.Fatalf("expected ErrRaftStateClosed after terminal truncation failure, got %v", err)
-	}
+		_ = s.SetTerm(1)
+		_ = s.Append(raft.LogEntry{Index: 1, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("1")},
+			raft.LogEntry{Index: 2, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("2")})
+
+		restore := raft.SetRaftWriteTmpFnForTesting(func(f *os.File, b []byte) (int, error) {
+			return 0, fmt.Errorf("injected write tmp error")
+		})
+		defer restore()
+
+		err = s.TruncateSuffix(2)
+		if err == nil {
+			t.Fatalf("expected error from TruncateSuffix on tmp write failure")
+		}
+
+		if s.LogFileDescriptorNilForTesting() {
+			t.Fatalf("logFile descriptor became nil on non-terminal truncate failure")
+		}
+
+		err = s.Append(raft.LogEntry{Index: 3, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("3")})
+		if err != nil {
+			t.Fatalf("expected Append to succeed after non-terminal truncate failure, got %v", err)
+		}
+	})
+
+	// 3. Temp sync failure -> storage remains coherent and open
+	t.Run("temp_sync_failure", func(t *testing.T) {
+		dir := t.TempDir()
+		s, err := raft.OpenStorage(dir)
+		if err != nil {
+			t.Fatalf("OpenStorage failed: %v", err)
+		}
+		defer func() { _ = s.Close() }()
+
+		_ = s.SetTerm(1)
+		_ = s.Append(raft.LogEntry{Index: 1, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("1")},
+			raft.LogEntry{Index: 2, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("2")})
+
+		restore := raft.SetRaftSyncTmpFnForTesting(func(f *os.File) error {
+			return fmt.Errorf("injected sync tmp error")
+		})
+		defer restore()
+
+		err = s.TruncateSuffix(2)
+		if err == nil {
+			t.Fatalf("expected error from TruncateSuffix on tmp sync failure")
+		}
+
+		if s.LogFileDescriptorNilForTesting() {
+			t.Fatalf("logFile descriptor became nil on non-terminal truncate failure")
+		}
+
+		err = s.Append(raft.LogEntry{Index: 3, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("3")})
+		if err != nil {
+			t.Fatalf("expected Append to succeed after non-terminal truncate failure, got %v", err)
+		}
+	})
+
+	// 4. Temp close failure -> storage remains coherent and open
+	t.Run("temp_close_failure", func(t *testing.T) {
+		dir := t.TempDir()
+		s, err := raft.OpenStorage(dir)
+		if err != nil {
+			t.Fatalf("OpenStorage failed: %v", err)
+		}
+		defer func() { _ = s.Close() }()
+
+		_ = s.SetTerm(1)
+		_ = s.Append(raft.LogEntry{Index: 1, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("1")},
+			raft.LogEntry{Index: 2, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("2")})
+
+		restore := raft.SetRaftCloseTmpFnForTesting(func(f *os.File) error {
+			_ = f.Close()
+			return fmt.Errorf("injected close tmp error")
+		})
+		defer restore()
+
+		err = s.TruncateSuffix(2)
+		if err == nil {
+			t.Fatalf("expected error from TruncateSuffix on tmp close failure")
+		}
+
+		if s.LogFileDescriptorNilForTesting() {
+			t.Fatalf("logFile descriptor became nil on non-terminal truncate failure")
+		}
+
+		err = s.Append(raft.LogEntry{Index: 3, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("3")})
+		if err != nil {
+			t.Fatalf("expected Append to succeed after non-terminal truncate failure, got %v", err)
+		}
+	})
+
+	// 5. Rename failure -> storage remains coherent and open
+	t.Run("rename_failure", func(t *testing.T) {
+		dir := t.TempDir()
+		s, err := raft.OpenStorage(dir)
+		if err != nil {
+			t.Fatalf("OpenStorage failed: %v", err)
+		}
+		defer func() { _ = s.Close() }()
+
+		_ = s.SetTerm(1)
+		_ = s.Append(raft.LogEntry{Index: 1, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("1")},
+			raft.LogEntry{Index: 2, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("2")})
+
+		restore := raft.SetRaftRenameFnForTesting(func(oldpath, newpath string) error {
+			return fmt.Errorf("injected rename error")
+		})
+		defer restore()
+
+		err = s.TruncateSuffix(2)
+		if err == nil {
+			t.Fatalf("expected error from TruncateSuffix on rename failure")
+		}
+
+		if s.LogFileDescriptorNilForTesting() {
+			t.Fatalf("logFile descriptor became nil on non-terminal truncate failure")
+		}
+
+		err = s.Append(raft.LogEntry{Index: 3, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("3")})
+		if err != nil {
+			t.Fatalf("expected Append to succeed after non-terminal truncate failure, got %v", err)
+		}
+	})
+
+	// 6. Directory sync failure (after rename) -> terminal fail-closed state
+	t.Run("directory_sync_failure_terminal", func(t *testing.T) {
+		dir := t.TempDir()
+		s, err := raft.OpenStorage(dir)
+		if err != nil {
+			t.Fatalf("OpenStorage failed: %v", err)
+		}
+		defer func() { _ = s.Close() }()
+
+		_ = s.SetTerm(1)
+		_ = s.Append(raft.LogEntry{Index: 1, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("1")},
+			raft.LogEntry{Index: 2, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("2")})
+
+		failSync := true
+		restore := raft.SetRaftSyncDirFnForTesting(func(dirPath string) error {
+			if failSync {
+				return fmt.Errorf("injected sync dir error")
+			}
+			return nil
+		})
+		defer restore()
+
+		err = s.TruncateSuffix(2)
+		if err == nil {
+			t.Fatalf("expected error from TruncateSuffix on sync dir failure")
+		}
+
+		// Storage is now terminally failed (disk was replaced, but dir sync failed)
+		err = s.Append(raft.LogEntry{Index: 3, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("3")})
+		if err == nil || !stdErrors.Is(err, errors.ErrRaftStateClosed) {
+			t.Fatalf("expected ErrRaftStateClosed after terminal truncation failure, got %v", err)
+		}
+
+		failSync = false // Stop failing so OpenStorage can reopen
+
+		// Reopen storage: disk state is deterministic (entry 1 recovered)
+		s2, err := raft.OpenStorage(dir)
+		if err != nil {
+			t.Fatalf("recovery OpenStorage failed: %v", err)
+		}
+		defer func() { _ = s2.Close() }()
+
+		lastIdx, _ := s2.LastIndex()
+		if lastIdx != 1 {
+			t.Fatalf("recovered last index = %d, want 1", lastIdx)
+		}
+	})
+
+	// 7. Replacement open failure (after rename) -> terminal fail-closed state
+	t.Run("replacement_open_failure_terminal", func(t *testing.T) {
+		dir := t.TempDir()
+		s, err := raft.OpenStorage(dir)
+		if err != nil {
+			t.Fatalf("OpenStorage failed: %v", err)
+		}
+		defer func() { _ = s.Close() }()
+
+		_ = s.SetTerm(1)
+		_ = s.Append(raft.LogEntry{Index: 1, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("1")},
+			raft.LogEntry{Index: 2, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("2")})
+
+		failReopen := true
+		restore := raft.SetRaftOpenFileFnForTesting(func(name string, flag int, perm os.FileMode) (*os.File, error) {
+			if failReopen && flag&os.O_CREATE == 0 {
+				return nil, fmt.Errorf("injected reopen error")
+			}
+			return os.OpenFile(name, flag, perm)
+		})
+		defer restore()
+
+		err = s.TruncateSuffix(2)
+		if err == nil {
+			t.Fatalf("expected error from TruncateSuffix on replacement open failure")
+		}
+
+		// Storage is now terminally failed
+		err = s.Append(raft.LogEntry{Index: 3, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("3")})
+		if err == nil || !stdErrors.Is(err, errors.ErrRaftStateClosed) {
+			t.Fatalf("expected ErrRaftStateClosed after terminal truncation failure, got %v", err)
+		}
+
+		failReopen = false
+
+		// Reopen storage: disk state is deterministic
+		s2, err := raft.OpenStorage(dir)
+		if err != nil {
+			t.Fatalf("recovery OpenStorage failed: %v", err)
+		}
+		defer func() { _ = s2.Close() }()
+
+		lastIdx, _ := s2.LastIndex()
+		if lastIdx != 1 {
+			t.Fatalf("recovered last index = %d, want 1", lastIdx)
+		}
+	})
 }
 
 func TestStorage_TornWriteAtEOFRecovery(t *testing.T) {
@@ -273,6 +515,9 @@ func TestStorage_TornWriteAtEOFRecovery(t *testing.T) {
 	s, err := raft.OpenStorage(dir)
 	if err != nil {
 		t.Fatalf("OpenStorage failed: %v", err)
+	}
+	if err := s.SetTerm(1); err != nil {
+		t.Fatalf("SetTerm failed: %v", err)
 	}
 
 	entries := []raft.LogEntry{
@@ -307,7 +552,10 @@ func TestStorage_TornWriteAtEOFRecovery(t *testing.T) {
 		t.Fatalf("expected 2 valid entries after torn-write recovery, got %d", lastIdx)
 	}
 
-	// Can safely append entry 3 after recovery
+	// Can safely append entry 3 after recovery (advancing term to 2)
+	if err := s2.SetTerm(2); err != nil {
+		t.Fatalf("SetTerm(2) failed: %v", err)
+	}
 	e3 := raft.LogEntry{Index: 3, Term: 2, Type: transport.PeerEntryNormal, Data: []byte("entry-3")}
 	if err := s2.Append(e3); err != nil {
 		t.Fatalf("Append after torn recovery failed: %v", err)
@@ -320,6 +568,9 @@ func TestStorage_MidLogCorruptionFailsClosed(t *testing.T) {
 	s, err := raft.OpenStorage(dir)
 	if err != nil {
 		t.Fatalf("OpenStorage failed: %v", err)
+	}
+	if err := s.SetTerm(1); err != nil {
+		t.Fatalf("SetTerm failed: %v", err)
 	}
 	_ = s.Append(
 		raft.LogEntry{Index: 1, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("entry-1")},
@@ -441,6 +692,9 @@ func TestStorage_ConcurrencyRace(t *testing.T) {
 		t.Fatalf("OpenStorage failed: %v", err)
 	}
 	defer func() { _ = s.Close() }()
+	if err := s.SetTerm(1); err != nil {
+		t.Fatalf("SetTerm failed: %v", err)
+	}
 
 	var wg sync.WaitGroup
 	const readers = 10
@@ -483,4 +737,198 @@ func TestStorage_ConcurrencyRace(t *testing.T) {
 	if lastIdx != appends {
 		t.Fatalf("expected last index %d, got %d", appends, lastIdx)
 	}
+}
+
+func TestStorage_LogFileCreationDurability(t *testing.T) {
+	dir := t.TempDir()
+
+	var syncedDirs []string
+	restore := raft.SetRaftSyncDirFnForTesting(func(dirPath string) error {
+		syncedDirs = append(syncedDirs, dirPath)
+		return nil
+	})
+	defer restore()
+
+	s, err := raft.OpenStorage(dir)
+	if err != nil {
+		t.Fatalf("OpenStorage failed: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	// Verify that parent directory sync occurred on initial log creation
+	if len(syncedDirs) == 0 {
+		t.Fatalf("expected parent directory sync on initial log creation")
+	}
+
+	// Test failure injection during initial log creation directory sync
+	t.Run("initial_log_dir_sync_failure", func(t *testing.T) {
+		dirFail := t.TempDir()
+		callCount := 0
+		restoreFail := raft.SetRaftSyncDirFnForTesting(func(dirPath string) error {
+			callCount++
+			// Allow raft_state sync (call 1), but fail directory sync on initial raft.log creation (call 2)
+			if callCount > 1 {
+				return fmt.Errorf("injected dir sync error on log creation")
+			}
+			return nil
+		})
+		defer restoreFail()
+
+		_, err = raft.OpenStorage(dirFail)
+		if err == nil {
+			t.Fatalf("expected OpenStorage to fail when directory sync fails during log creation")
+		}
+	})
+}
+
+func TestStorage_LogEntryTermRelationship(t *testing.T) {
+	dir := t.TempDir()
+	s, err := raft.OpenStorage(dir)
+	if err != nil {
+		t.Fatalf("OpenStorage failed: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	// Start at term 1
+	if err := s.SetTerm(1); err != nil {
+		t.Fatalf("SetTerm(1) failed: %v", err)
+	}
+
+	// 1. currentTerm = 1, append entry term 1 -> success
+	e1 := raft.LogEntry{Index: 1, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("e1")}
+	if err := s.Append(e1); err != nil {
+		t.Fatalf("Append term 1 in term 1 failed: %v", err)
+	}
+
+	// 2. currentTerm = 1, append entry term 2 -> reject
+	logPath := filepath.Join(dir, raft.LogFilename)
+	fiBefore, _ := os.Stat(logPath)
+
+	e2Invalid := raft.LogEntry{Index: 2, Term: 2, Type: transport.PeerEntryNormal, Data: []byte("e2")}
+	err = s.Append(e2Invalid)
+	if err == nil || !stdErrors.Is(err, errors.ErrRaftEntryTermExceedsCurrentTerm) {
+		t.Fatalf("expected ErrRaftEntryTermExceedsCurrentTerm, got %v", err)
+	}
+
+	// Verify rejection happened before disk mutation
+	fiAfter, _ := os.Stat(logPath)
+	if fiBefore.Size() != fiAfter.Size() {
+		t.Fatalf("disk was mutated on rejected entry: size before=%d, after=%d", fiBefore.Size(), fiAfter.Size())
+	}
+	lastIdx, _ := s.LastIndex()
+	if lastIdx != 1 {
+		t.Fatalf("lastIndex mutated on rejected entry: got %d, want 1", lastIdx)
+	}
+
+	// Advance term to 2
+	if err := s.SetTerm(2); err != nil {
+		t.Fatalf("SetTerm(2) failed: %v", err)
+	}
+
+	// 3. currentTerm = 2, append entry term 1 -> success
+	e2Valid := raft.LogEntry{Index: 2, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("e2")}
+	if err := s.Append(e2Valid); err != nil {
+		t.Fatalf("Append term 1 in term 2 failed: %v", err)
+	}
+
+	// 4. currentTerm = 2, append entry term 2 -> success
+	e3Valid := raft.LogEntry{Index: 3, Term: 2, Type: transport.PeerEntryNormal, Data: []byte("e3")}
+	if err := s.Append(e3Valid); err != nil {
+		t.Fatalf("Append term 2 in term 2 failed: %v", err)
+	}
+
+	_ = s.Close()
+
+	// Tamper state file: regress term back to 1 while log has entry with term 2
+	// OpenStorage recovery must fail closed with ErrRaftCorruptedState
+	statePath := filepath.Join(dir, raft.StateFilename)
+	data, _ := os.ReadFile(statePath)
+	binary.PutUint64(data[8:16], 1) // Set term to 1
+	crc := binary.Checksum(data[0:raft.StatePayloadSize])
+	binary.PutUint32(data[raft.StatePayloadSize:raft.StateRecordSize], crc)
+	_ = os.WriteFile(statePath, data, 0600)
+
+	_, err = raft.OpenStorage(dir)
+	if err == nil || !stdErrors.Is(err, errors.ErrRaftCorruptedState) {
+		t.Fatalf("expected ErrRaftCorruptedState on recovered entry term > hard state term, got %v", err)
+	}
+}
+
+func TestStorage_StateFileTrailingGarbage(t *testing.T) {
+	// 1. Exact valid size (28 bytes) -> recovers OK
+	t.Run("exact_valid_size", func(t *testing.T) {
+		dir := t.TempDir()
+		s, err := raft.OpenStorage(dir)
+		if err != nil {
+			t.Fatalf("OpenStorage failed: %v", err)
+		}
+		_ = s.SetTerm(3)
+		_ = s.Close()
+
+		s2, err := raft.OpenStorage(dir)
+		if err != nil {
+			t.Fatalf("OpenStorage reopen failed: %v", err)
+		}
+		_ = s2.Close()
+	})
+
+	// 2. Valid record + 1 byte -> fails closed with ErrRaftCorruptedState
+	t.Run("valid_record_plus_one_byte", func(t *testing.T) {
+		dir := t.TempDir()
+		s, err := raft.OpenStorage(dir)
+		if err != nil {
+			t.Fatalf("OpenStorage failed: %v", err)
+		}
+		_ = s.Close()
+
+		statePath := filepath.Join(dir, raft.StateFilename)
+		data, _ := os.ReadFile(statePath)
+		data = append(data, 0x00) // 29 bytes
+		_ = os.WriteFile(statePath, data, 0600)
+
+		_, err = raft.OpenStorage(dir)
+		if err == nil || !stdErrors.Is(err, errors.ErrRaftCorruptedState) {
+			t.Fatalf("expected ErrRaftCorruptedState for state file + 1 byte, got %v", err)
+		}
+	})
+
+	// 3. Valid record + random suffix -> fails closed with ErrRaftCorruptedState
+	t.Run("valid_record_plus_random_suffix", func(t *testing.T) {
+		dir := t.TempDir()
+		s, err := raft.OpenStorage(dir)
+		if err != nil {
+			t.Fatalf("OpenStorage failed: %v", err)
+		}
+		_ = s.Close()
+
+		statePath := filepath.Join(dir, raft.StateFilename)
+		data, _ := os.ReadFile(statePath)
+		data = append(data, []byte("unexpected_trailing_garbage_data!")...)
+		_ = os.WriteFile(statePath, data, 0600)
+
+		_, err = raft.OpenStorage(dir)
+		if err == nil || !stdErrors.Is(err, errors.ErrRaftCorruptedState) {
+			t.Fatalf("expected ErrRaftCorruptedState for state file with suffix, got %v", err)
+		}
+	})
+
+	// 4. Truncated record -> fails closed with ErrRaftCorruptedState
+	t.Run("truncated_record", func(t *testing.T) {
+		dir := t.TempDir()
+		s, err := raft.OpenStorage(dir)
+		if err != nil {
+			t.Fatalf("OpenStorage failed: %v", err)
+		}
+		_ = s.Close()
+
+		statePath := filepath.Join(dir, raft.StateFilename)
+		data, _ := os.ReadFile(statePath)
+		data = data[:15] // Only 15 bytes
+		_ = os.WriteFile(statePath, data, 0600)
+
+		_, err = raft.OpenStorage(dir)
+		if err == nil || !stdErrors.Is(err, errors.ErrRaftCorruptedState) {
+			t.Fatalf("expected ErrRaftCorruptedState for truncated state file, got %v", err)
+		}
+	})
 }

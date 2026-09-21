@@ -87,9 +87,11 @@ func (s HardState) Clone() HardState {
 }
 
 // Validate checks that the HardState contains structurally valid fields.
+// Enforces that VotedFor is either cluster.NodeIDNil (0) or a valid, non-reserved cluster NodeID (> 0).
 func (s HardState) Validate() error {
-	// Term is unsigned (uint64), so cannot be negative.
-	// VotedFor can be NodeIDNil (0) or any valid NodeID (> 0).
+	if s.VotedFor != cluster.NodeIDNil && !s.VotedFor.IsValid() {
+		return fmt.Errorf("%w: invalid votedFor node ID %d", errors.ErrRaftCorruptedState, s.VotedFor)
+	}
 	return nil
 }
 
