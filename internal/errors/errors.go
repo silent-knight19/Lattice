@@ -488,6 +488,18 @@ var (
 
 	// ErrRaftEntryTermExceedsCurrentTerm indicates that an appended entry has a term exceeding the local current term.
 	ErrRaftEntryTermExceedsCurrentTerm = stdErrors.New("raft log entry term exceeds current term")
+
+	// ErrRaftSenderMismatch indicates that a RequestVote message was received from a peer whose ID does not match CandidateID.
+	ErrRaftSenderMismatch = stdErrors.New("raft sender identity does not match declared candidate ID")
+
+	// ErrRaftSelfVoteRPC indicates that a remote RequestVote message had CandidateID or sender equal to local node ID.
+	ErrRaftSelfVoteRPC = stdErrors.New("raft cannot receive or process remote self-vote RPC")
+
+	// ErrRaftElectionAlreadyStarted indicates that the election timer loop is already active on this node.
+	ErrRaftElectionAlreadyStarted = stdErrors.New("raft election timer loop already started")
+
+	// ErrRaftInvalidLogEntry indicates that log coordinates or payload violate fundamental Raft invariants.
+	ErrRaftInvalidLogEntry = stdErrors.New("invalid raft log entry or coordinates")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing

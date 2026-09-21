@@ -495,3 +495,216 @@ func TestNode_PersistenceFailureSafety(t *testing.T) {
 		}
 	})
 }
+
+func TestNode_TransitionHook_ReentrantInspection(t *testing.T) {
+	// Section 6: Regression Test - Reentrant Transition Hook
+	// Hook must be called outside Node.mu so it can safely call Node inspection methods
+	// without deadlocking.
+	dir := t.TempDir()
+	s, err := raft.OpenStorage(dir)
+	if err != nil {
+		t.Fatalf("OpenStorage failed: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	var (
+		hookCalled    int
+		inspectedRole raft.Role
+		inspectedTerm raft.Term
+		inspectedVote cluster.NodeID
+		inspectedLead cluster.NodeID
+		n             *raft.Node
+	)
+
+	n, err = raft.NewNode(raft.NodeConfig{
+		LocalID: 1,
+		Storage: s,
+		TransitionHook: func(oldRole, newRole raft.Role, term raft.Term) {
+			hookCalled++
+			// Re-entrant read calls on Node:
+			inspectedRole = n.Role()
+			inspectedLead = n.LeaderID()
+			inspectedTerm, _ = n.Term()
+			inspectedVote, _ = n.VotedFor()
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewNode failed: %v", err)
+	}
+	defer func() { _ = n.Close() }()
+
+	// 1. Follower -> Candidate
+	if err := n.BecomeCandidate(); err != nil {
+		t.Fatalf("BecomeCandidate failed: %v", err)
+	}
+	if hookCalled != 1 || inspectedRole != raft.RoleCandidate || inspectedTerm != 1 || inspectedVote != 1 || inspectedLead != cluster.NodeIDNil {
+		t.Fatalf("unexpected hook values after BecomeCandidate: called=%d, role=%s, term=%d, vote=%d, lead=%d",
+			hookCalled, inspectedRole, inspectedTerm, inspectedVote, inspectedLead)
+	}
+
+	// 2. Candidate -> Leader
+	if err := n.BecomeLeader(); err != nil {
+		t.Fatalf("BecomeLeader failed: %v", err)
+	}
+	if hookCalled != 2 || inspectedRole != raft.RoleLeader || inspectedTerm != 1 || inspectedVote != 1 || inspectedLead != 1 {
+		t.Fatalf("unexpected hook values after BecomeLeader: called=%d, role=%s, term=%d, vote=%d, lead=%d",
+			hookCalled, inspectedRole, inspectedTerm, inspectedVote, inspectedLead)
+	}
+
+	// 3. Leader -> Follower via ObserveHigherTerm
+	steppedDown, err := n.ObserveHigherTerm(5)
+	if err != nil || !steppedDown {
+		t.Fatalf("ObserveHigherTerm failed: (%v, %v)", steppedDown, err)
+	}
+	if hookCalled != 3 || inspectedRole != raft.RoleFollower || inspectedTerm != 5 || inspectedVote != cluster.NodeIDNil || inspectedLead != cluster.NodeIDNil {
+		t.Fatalf("unexpected hook values after ObserveHigherTerm: called=%d, role=%s, term=%d, vote=%d, lead=%d",
+			hookCalled, inspectedRole, inspectedTerm, inspectedVote, inspectedLead)
+	}
+
+	// 4. Candidate -> Follower via StepDownSameTerm
+	if err := n.StartNewElection(); err != nil {
+		t.Fatalf("StartNewElection failed: %v", err)
+	}
+	if err := n.StepDownSameTerm(2); err != nil {
+		t.Fatalf("StepDownSameTerm failed: %v", err)
+	}
+	if inspectedRole != raft.RoleFollower || inspectedLead != 2 {
+		t.Fatalf("unexpected hook values after StepDownSameTerm: role=%s, lead=%d", inspectedRole, inspectedLead)
+	}
+}
+
+func TestNode_Close_LifecycleAndConcurrency(t *testing.T) {
+	// Section 8: Close tests
+	t.Run("idempotent_and_closed_rejections", func(t *testing.T) {
+		n, _, cleanup := newTestNode(t, 1)
+		defer cleanup()
+
+		if err := n.Close(); err != nil {
+			t.Fatalf("initial Close failed: %v", err)
+		}
+		// Close() again must be safe and idempotent
+		if err := n.Close(); err != nil {
+			t.Fatalf("second Close failed: %v", err)
+		}
+
+		// Mutations after Close must return ErrRaftStateClosed
+		if err := n.BecomeCandidate(); !stdErrors.Is(err, errors.ErrRaftStateClosed) {
+			t.Fatalf("expected ErrRaftStateClosed, got %v", err)
+		}
+		if err := n.StartNewElection(); !stdErrors.Is(err, errors.ErrRaftStateClosed) {
+			t.Fatalf("expected ErrRaftStateClosed, got %v", err)
+		}
+		if err := n.BecomeLeader(); !stdErrors.Is(err, errors.ErrRaftStateClosed) {
+			t.Fatalf("expected ErrRaftStateClosed, got %v", err)
+		}
+		if err := n.BecomeFollower(10, cluster.NodeIDNil); !stdErrors.Is(err, errors.ErrRaftStateClosed) {
+			t.Fatalf("expected ErrRaftStateClosed, got %v", err)
+		}
+		if _, err := n.ObserveHigherTerm(10); !stdErrors.Is(err, errors.ErrRaftStateClosed) {
+			t.Fatalf("expected ErrRaftStateClosed, got %v", err)
+		}
+		if err := n.StepDownSameTerm(2); !stdErrors.Is(err, errors.ErrRaftStateClosed) {
+			t.Fatalf("expected ErrRaftStateClosed, got %v", err)
+		}
+	})
+
+	t.Run("concurrent_close_and_transitions", func(t *testing.T) {
+		// Run concurrent transitions while invoking Close
+		n, _, cleanup := newTestNode(t, 1)
+		defer cleanup()
+
+		var wg sync.WaitGroup
+		const numWorkers = 8
+
+		startCh := make(chan struct{})
+
+		for i := 0; i < numWorkers; i++ {
+			wg.Add(1)
+			go func(workerID int) {
+				defer wg.Done()
+				<-startCh
+				for j := 0; j < 50; j++ {
+					switch j % 4 {
+					case 0:
+						_ = n.BecomeCandidate()
+					case 1:
+						_ = n.BecomeLeader()
+					case 2:
+						_, _ = n.ObserveHigherTerm(raft.Term(j + 1))
+					case 3:
+						_ = n.StepDownSameTerm(2)
+					}
+				}
+			}(i)
+		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-startCh
+			_ = n.Close()
+		}()
+
+		close(startCh)
+		wg.Wait()
+
+		// Final state must be closed
+		if err := n.BecomeCandidate(); !stdErrors.Is(err, errors.ErrRaftStateClosed) {
+			t.Fatalf("expected ErrRaftStateClosed after Close, got %v", err)
+		}
+	})
+}
+
+func TestNode_LeaderIdentity_Boundary(t *testing.T) {
+	// Section 9: Fix C - Leader identity boundary tests
+	n, _, cleanup := newTestNode(t, 1)
+	defer cleanup()
+
+	// 1. Self ID rejected as external leader in BecomeFollower
+	err := n.BecomeFollower(1, 1)
+	if err == nil || !stdErrors.Is(err, errors.ErrRaftInvalidRoleTransition) {
+		t.Fatalf("expected ErrRaftInvalidRoleTransition when setting leader to self, got %v", err)
+	}
+
+	// 2. Self ID rejected as external leader in StepDownSameTerm
+	err = n.StepDownSameTerm(1)
+	if err == nil || !stdErrors.Is(err, errors.ErrRaftInvalidRoleTransition) {
+		t.Fatalf("expected ErrRaftInvalidRoleTransition when setting leader to self in StepDownSameTerm, got %v", err)
+	}
+
+	// 3. NodeIDNil is allowed (unknown leader) in StepDownSameTerm
+	err = n.StepDownSameTerm(cluster.NodeIDNil)
+	if err != nil {
+		t.Fatalf("StepDownSameTerm(NodeIDNil) failed: %v", err)
+	}
+	if n.LeaderID() != cluster.NodeIDNil {
+		t.Fatalf("expected LeaderID to be NodeIDNil, got %d", n.LeaderID())
+	}
+
+	// 4. NodeIDNil is allowed in BecomeFollower
+	err = n.BecomeFollower(1, cluster.NodeIDNil)
+	if err != nil {
+		t.Fatalf("BecomeFollower(1, NodeIDNil) failed: %v", err)
+	}
+	if n.LeaderID() != cluster.NodeIDNil {
+		t.Fatalf("expected LeaderID to be NodeIDNil, got %d", n.LeaderID())
+	}
+
+	// 5. Valid peer ID is allowed in StepDownSameTerm
+	err = n.StepDownSameTerm(2)
+	if err != nil {
+		t.Fatalf("StepDownSameTerm(2) failed: %v", err)
+	}
+	if n.LeaderID() != 2 {
+		t.Fatalf("expected LeaderID to be 2, got %d", n.LeaderID())
+	}
+
+	// 6. Valid peer ID is allowed in BecomeFollower
+	err = n.BecomeFollower(2, 3)
+	if err != nil {
+		t.Fatalf("BecomeFollower(2, 3) failed: %v", err)
+	}
+	if n.LeaderID() != 3 {
+		t.Fatalf("expected LeaderID to be 3, got %d", n.LeaderID())
+	}
+}

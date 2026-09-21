@@ -7,6 +7,7 @@ import (
 
 	"github.com/silent-knight19/lattice/internal/cluster"
 	"github.com/silent-knight19/lattice/internal/raft"
+	"github.com/silent-knight19/lattice/internal/transport"
 )
 
 func FuzzRecoverStorage(f *testing.F) {
@@ -102,6 +103,52 @@ func FuzzRoleTransitions(f *testing.F) {
 			r := node.Role()
 			if !r.Valid() {
 				t.Fatalf("invalid role observed: %v", r)
+			}
+		}
+	})
+}
+
+func FuzzHandleRequestVote(f *testing.F) {
+	// Section 61: Fuzz RequestVote decision function with extreme inputs (0, MaxUint64, malformed)
+	f.Add(uint64(2), uint64(2), uint64(1), uint64(0), uint64(0), uint64(100))
+	f.Add(uint64(2), uint64(3), uint64(5), uint64(10), uint64(2), uint64(200))
+	f.Add(uint64(0), uint64(0), uint64(0), uint64(0), uint64(0), uint64(0))
+	f.Add(uint64(1), uint64(1), uint64(1<<63), uint64(1<<63), uint64(1<<63), uint64(300))
+	f.Add(uint64(2), uint64(2), ^uint64(0), ^uint64(0), ^uint64(0), ^uint64(0))
+	f.Add(uint64(2), uint64(2), uint64(1), uint64(100), uint64(0), uint64(400)) // invalid coordinates (index > 0, term 0)
+
+	f.Fuzz(func(t *testing.T, fromPeerIDRaw, candIDRaw, term, lastLogIndex, lastLogTerm, nonce uint64) {
+		dir := t.TempDir()
+		s, err := raft.OpenStorage(dir)
+		if err != nil {
+			return
+		}
+		defer func() { _ = s.Close() }()
+
+		node, err := raft.NewNode(raft.NodeConfig{
+			LocalID: 1,
+			Storage: s,
+			Peers:   []cluster.NodeID{2, 3},
+		})
+		if err != nil {
+			return
+		}
+		defer func() { _ = node.Close() }()
+
+		req := &transport.RequestVoteRequest{
+			Term:         term,
+			CandidateID:  cluster.NodeID(candIDRaw),
+			LastLogIndex: lastLogIndex,
+			LastLogTerm:  lastLogTerm,
+			Nonce:        nonce,
+		}
+
+		// HandleRequestVote must safely evaluate or reject without panicking
+		resp, err := node.HandleRequestVote(cluster.NodeID(fromPeerIDRaw), req)
+		if err == nil && resp != nil {
+			// Invariant: if vote is granted, response term must be >= request term
+			if resp.VoteGranted && resp.Term < term {
+				t.Fatalf("response term %d < request term %d on granted vote", resp.Term, term)
 			}
 		}
 	})
