@@ -81,6 +81,12 @@ type Node struct {
 	heartbeatDone        chan struct{}
 	heartbeatWg          sync.WaitGroup
 	heartbeatGen         uint64
+
+	// Proposal serialization (P15-S03-M01): serializes concurrent Propose
+	// calls so each accepted proposal receives a distinct contiguous index.
+	// Always acquired before Node.mu (brief RLock); never held across
+	// network I/O. Stepdown/Close paths never acquire it, so no inversion.
+	proposeMu sync.Mutex
 }
 
 // NodeConfig provides initialization parameters for a Raft Node.
