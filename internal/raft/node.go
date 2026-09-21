@@ -6,11 +6,15 @@ import (
 	"math"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/silent-knight19/lattice/internal/cluster"
 	"github.com/silent-knight19/lattice/internal/errors"
 	"github.com/silent-knight19/lattice/internal/transport"
 )
+
+// DefaultHeartbeatInterval is the standard heartbeat cadence specified by Raft (50ms).
+const DefaultHeartbeatInterval = 50 * time.Millisecond
 
 // TransitionHook is an optional callback invoked synchronously when a role transition completes.
 // Passed previous role, new role, and new term.
@@ -38,11 +42,8 @@ type PeerSender interface {
 //  7. Same-term stepdown (StepDownSameTerm) returns Candidate or Leader to Follower without
 //     modifying term or vote.
 //  8. If persistence fails during a transition, the transition fails closed and the node remains
-//     in its prior coherent role and state.
-//  9. Election timer is dynamically randomized per round ([150ms, 300ms]), generation-tracked,
-//     and stopped when RoleLeader is active.
-//
-// 10. Outbound RequestVote broadcasts are transmitted to remote peers without holding the Node mutex.
+//     in its current valid state.
+//  9. Role transitions are verifiable and non-blocking under the race detector.
 type Node struct {
 	mu             sync.RWMutex
 	localID        cluster.NodeID
@@ -71,17 +72,27 @@ type Node struct {
 	electionRoundGen  uint64                      // Monotonically increasing round identifier
 	nextIndex         map[cluster.NodeID]LogIndex // Leader tracking: next log index to send to each remote peer
 	matchIndex        map[cluster.NodeID]LogIndex // Leader tracking: highest log index known replicated on each remote peer
+
+	// Periodic heartbeat scheduler (P15-S02-M03)
+	heartbeatInterval    time.Duration
+	heartbeatLifecycleMu sync.Mutex
+	heartbeatRunning     atomic.Bool
+	heartbeatCancel      context.CancelFunc
+	heartbeatDone        chan struct{}
+	heartbeatWg          sync.WaitGroup
+	heartbeatGen         uint64
 }
 
 // NodeConfig provides initialization parameters for a Raft Node.
 type NodeConfig struct {
-	LocalID          cluster.NodeID
-	Storage          *Storage
-	TransitionHook   TransitionHook
-	Topology         *cluster.Topology
-	Peers            []cluster.NodeID
-	PeerSender       PeerSender
-	DurationProvider DurationProvider
+	LocalID           cluster.NodeID
+	Storage           *Storage
+	TransitionHook    TransitionHook
+	Topology          *cluster.Topology
+	Peers             []cluster.NodeID
+	PeerSender        PeerSender
+	DurationProvider  DurationProvider
+	HeartbeatInterval time.Duration
 }
 
 // NewNode initializes a Raft node.
@@ -131,19 +142,25 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		}
 	}
 
+	hbInterval := cfg.HeartbeatInterval
+	if hbInterval <= 0 {
+		hbInterval = DefaultHeartbeatInterval
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	n := &Node{
-		localID:        cfg.LocalID,
-		storage:        cfg.Storage,
-		role:           RoleFollower,
-		leaderID:       cluster.NodeIDNil,
-		transitionHook: cfg.TransitionHook,
-		topology:       cfg.Topology,
-		peers:          remotePeers,
-		peerSender:     cfg.PeerSender,
-		electionTimer:  NewElectionTimer(cfg.DurationProvider),
-		electionCtx:    ctx,
-		electionCancel: cancel,
+		localID:           cfg.LocalID,
+		storage:           cfg.Storage,
+		role:              RoleFollower,
+		leaderID:          cluster.NodeIDNil,
+		transitionHook:    cfg.TransitionHook,
+		topology:          cfg.Topology,
+		peers:             remotePeers,
+		peerSender:        cfg.PeerSender,
+		electionTimer:     NewElectionTimer(cfg.DurationProvider),
+		electionCtx:       ctx,
+		electionCancel:    cancel,
+		heartbeatInterval: hbInterval,
 	}
 
 	return n, nil
@@ -468,6 +485,9 @@ func (n *Node) BecomeLeader() error {
 	// Broadcast one-time immediate empty AppendEntries heartbeats (without holding Node.mu)
 	n.sendImmediateHeartbeats(currTerm, lastIdx, lastTerm)
 
+	// Start recurring periodic heartbeat scheduler (P15-S02-M03)
+	n.startHeartbeatScheduler()
+
 	return nil
 }
 
@@ -536,6 +556,10 @@ func (n *Node) BecomeFollower(newTerm Term, leaderID cluster.NodeID) error {
 		n.transitionHook(oldRole, RoleFollower, newTerm)
 	}
 
+	if oldRole == RoleLeader {
+		n.stopHeartbeatScheduler()
+	}
+
 	n.ResetElectionTimer()
 
 	return nil
@@ -581,6 +605,10 @@ func (n *Node) ObserveHigherTerm(incomingTerm Term) (bool, error) {
 
 	if n.transitionHook != nil {
 		n.transitionHook(oldRole, RoleFollower, incomingTerm)
+	}
+
+	if oldRole == RoleLeader {
+		n.stopHeartbeatScheduler()
 	}
 
 	n.ResetElectionTimer()
@@ -630,6 +658,10 @@ func (n *Node) StepDownSameTerm(leaderID cluster.NodeID) error {
 		n.transitionHook(oldRole, RoleFollower, currTerm)
 	}
 
+	if oldRole == RoleLeader {
+		n.stopHeartbeatScheduler()
+	}
+
 	n.ResetElectionTimer()
 
 	return nil
@@ -663,6 +695,10 @@ func (n *Node) Close() error {
 
 	// Wait for election loop goroutine to exit
 	n.electionLoopWg.Wait()
+
+	// Stop periodic heartbeat scheduler and wait for goroutine termination (P15-S02-M03)
+	n.stopHeartbeatScheduler()
+	n.heartbeatWg.Wait()
 
 	// Synchronize with any active state transition so Close cannot return while
 	// an in-flight transition is mutating Node state (Section 7).
@@ -818,6 +854,7 @@ func (n *Node) handleElectionTimeout() {
 			n.transitionHook(oldRole, RoleLeader, currTerm)
 		}
 		n.sendImmediateHeartbeats(currTerm, lastIdx, lastTerm)
+		n.startHeartbeatScheduler()
 		return
 	}
 	n.mu.Unlock()
@@ -982,7 +1019,13 @@ func (n *Node) HandleRequestVote(fromPeerID cluster.NodeID, req *transport.Reque
 		oldRole            = n.role
 		termTransitioned   = false
 		stepDownTargetTerm Term
+		steppedDownLeader  = false
 	)
+	defer func() {
+		if steppedDownLeader {
+			n.stopHeartbeatScheduler()
+		}
+	}()
 
 	// Section 30, 40: Higher Term
 	if req.Term > uint64(currTerm) {
@@ -997,6 +1040,9 @@ func (n *Node) HandleRequestVote(fromPeerID cluster.NodeID, req *transport.Reque
 		n.leaderID = cluster.NodeIDNil
 		currTerm = stepDownTargetTerm
 		termTransitioned = true
+		if oldRole == RoleLeader {
+			steppedDownLeader = true
+		}
 	}
 
 	// Read vote status in the current term
@@ -1070,20 +1116,28 @@ func (n *Node) HandleRequestVote(fromPeerID cluster.NodeID, req *transport.Reque
 	}, nil
 }
 
-// sendImmediateHeartbeats broadcasts a one-time empty AppendEntries frame to each configured remote peer.
-// Invariants enforced (P15-S02-M02 / Section 15):
+// sendHeartbeats broadcasts an empty AppendEntries frame to each configured remote peer.
+// Invariants enforced (P15-S02-M03 / Sections 3, 9, 10, 11):
 //   - Must execute strictly outside of Node.mu (no mutex held during network I/O).
-//   - Uses current leader term and localID as LeaderID.
+//   - Uses specified term and localID as LeaderID.
 //   - Entries is nil (empty heartbeat).
-//   - Includes fresh cryptographic nonce and monotonically increasing sequence ID.
+//   - Includes fresh cryptographic nonce and monotonically increasing sequence ID per peer.
 //   - Never targets self.
-//   - Broadcasts to configured remote peers.
-func (n *Node) sendImmediateHeartbeats(term Term, lastIdx LogIndex, lastTerm Term) {
+//   - Tolerates peer send errors without terminating caller.
+func (n *Node) sendHeartbeats(ctx context.Context, term Term, lastIdx LogIndex, lastTerm Term) {
 	if n.peerSender == nil || len(n.peers) == 0 {
 		return
 	}
 
+	sendCtx := ctx
+	if sendCtx == nil {
+		sendCtx = n.electionCtx
+	}
+
 	for _, peerID := range n.peers {
+		if sendCtx.Err() != nil {
+			return
+		}
 		if peerID == n.localID {
 			continue // Never send to self
 		}
@@ -1109,7 +1163,140 @@ func (n *Node) sendImmediateHeartbeats(term Term, lastIdx LogIndex, lastTerm Ter
 			continue
 		}
 
-		_ = n.peerSender.Send(n.electionCtx, peerID, frame)
+		_ = n.peerSender.Send(sendCtx, peerID, frame)
+	}
+}
+
+// sendImmediateHeartbeats broadcasts a one-time empty AppendEntries frame to each configured remote peer.
+// Invariants enforced (P15-S02-M02 / Section 15):
+//   - Executes immediately upon leadership acquisition at T=0.
+//   - Reuses sendHeartbeats under the election context.
+func (n *Node) sendImmediateHeartbeats(term Term, lastIdx LogIndex, lastTerm Term) {
+	n.sendHeartbeats(n.electionCtx, term, lastIdx, lastTerm)
+}
+
+// HeartbeatRunning returns true if the periodic heartbeat scheduler is currently running.
+func (n *Node) HeartbeatRunning() bool {
+	return n.heartbeatRunning.Load()
+}
+
+// startHeartbeatScheduler starts the periodic heartbeat scheduler if node is leader.
+// Idempotent: at most one active heartbeat scheduler goroutine may run per Node.
+func (n *Node) startHeartbeatScheduler() {
+	if n.closed.Load() {
+		return
+	}
+
+	n.heartbeatLifecycleMu.Lock()
+	defer n.heartbeatLifecycleMu.Unlock()
+
+	if n.closed.Load() {
+		return
+	}
+
+	n.mu.RLock()
+	isLeader := (n.role == RoleLeader)
+	n.mu.RUnlock()
+	if !isLeader {
+		return
+	}
+
+	if n.heartbeatRunning.Load() {
+		return // Idempotent: at most one active scheduler
+	}
+
+	n.heartbeatGen++
+	gen := n.heartbeatGen
+
+	ctx, cancel := context.WithCancel(n.electionCtx)
+	done := make(chan struct{})
+	n.heartbeatCancel = cancel
+	n.heartbeatDone = done
+	n.heartbeatRunning.Store(true)
+	n.heartbeatWg.Add(1)
+
+	go n.runHeartbeatLoop(ctx, done, gen)
+}
+
+// stopHeartbeatScheduler halts the periodic heartbeat scheduler. Idempotent.
+// Blocks until the active scheduler goroutine terminates cleanly.
+// MUST NOT be called while holding Node.mu.
+func (n *Node) stopHeartbeatScheduler() {
+	n.heartbeatLifecycleMu.Lock()
+	if !n.heartbeatRunning.Load() {
+		n.heartbeatLifecycleMu.Unlock()
+		return
+	}
+
+	n.heartbeatRunning.Store(false)
+	if n.heartbeatCancel != nil {
+		n.heartbeatCancel()
+		n.heartbeatCancel = nil
+	}
+	done := n.heartbeatDone
+	n.heartbeatDone = nil
+	n.heartbeatLifecycleMu.Unlock()
+
+	if done != nil {
+		<-done
+	}
+}
+
+// runHeartbeatLoop transmits periodic empty AppendEntries heartbeats at configured cadence (50ms).
+func (n *Node) runHeartbeatLoop(ctx context.Context, done chan struct{}, gen uint64) {
+	defer func() {
+		n.heartbeatWg.Done()
+		close(done)
+	}()
+
+	ticker := time.NewTicker(n.heartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		if ctx.Err() != nil || n.closed.Load() || !n.heartbeatRunning.Load() {
+			return
+		}
+
+		n.heartbeatLifecycleMu.Lock()
+		curGen := n.heartbeatGen
+		isRunning := n.heartbeatRunning.Load()
+		n.heartbeatLifecycleMu.Unlock()
+		if !isRunning || curGen != gen || n.closed.Load() {
+			return
+		}
+
+		n.mu.RLock()
+		isLeader := (n.role == RoleLeader)
+		n.mu.RUnlock()
+		if !isLeader || n.closed.Load() {
+			return
+		}
+
+		term, err := n.Term()
+		if err != nil || n.closed.Load() {
+			return
+		}
+
+		lastIdx, lastTerm, err := n.storage.LastIndexAndTerm()
+		if err != nil || n.closed.Load() {
+			return
+		}
+
+		// Double-check leadership and lifecycle state before network I/O
+		n.mu.RLock()
+		isLeader = (n.role == RoleLeader)
+		n.mu.RUnlock()
+		if !isLeader || n.closed.Load() {
+			return
+		}
+
+		n.sendHeartbeats(ctx, term, lastIdx, lastTerm)
 	}
 }
 
@@ -1200,6 +1387,9 @@ func (n *Node) HandleRequestVoteResponse(fromPeerID cluster.NodeID, resp *transp
 		if n.transitionHook != nil {
 			n.transitionHook(oldRole, RoleFollower, newTerm)
 		}
+		if oldRole == RoleLeader {
+			n.stopHeartbeatScheduler()
+		}
 
 		n.ResetElectionTimer()
 		return nil
@@ -1253,6 +1443,9 @@ func (n *Node) HandleRequestVoteResponse(fromPeerID cluster.NodeID, resp *transp
 	// Section 15: Send one-time immediate empty AppendEntries heartbeats (no Node.mu held)
 	n.sendImmediateHeartbeats(currTerm, lastIdx, lastTerm)
 
+	// Start recurring periodic heartbeat scheduler (P15-S02-M03)
+	n.startHeartbeatScheduler()
+
 	return nil
 }
 
@@ -1294,7 +1487,273 @@ func (n *Node) HandlePeerFrame(fromPeerID cluster.NodeID, frame *transport.Frame
 		}
 		return n.HandleRequestVoteResponse(fromPeerID, resp)
 
+	case transport.PeerOpAppendEntries:
+		req, err := transport.DecodeAppendEntries(frame)
+		if err != nil {
+			return err
+		}
+
+		resp, err := n.HandleAppendEntries(fromPeerID, req)
+		if err != nil {
+			return err
+		}
+
+		if n.peerSender != nil && fromPeerID.IsValid() && fromPeerID != n.localID {
+			seqID := n.peerSender.NextSeqID()
+			respFrame, encErr := transport.EncodeAppendEntriesResponse(resp, seqID)
+			if encErr == nil {
+				_ = n.peerSender.Send(n.electionCtx, fromPeerID, respFrame)
+			}
+		}
+		return nil
+
+	case transport.PeerOpAppendEntriesResponse:
+		resp, err := transport.DecodeAppendEntriesResponse(frame)
+		if err != nil {
+			return err
+		}
+		return n.HandleAppendEntriesResponse(fromPeerID, resp)
+
 	default:
 		return nil
 	}
+}
+
+// HandleAppendEntries processes an incoming AppendEntries RPC from a peer.
+//
+// Invariants enforced (P15-S02-M03 / Sections 8, 9, 10, 13, 14, 15, 16):
+//  1. Rejects if node is closed.
+//  2. If req == nil: ErrNilReceiver.
+//  3. Identity Binding (Section 8): fromPeerID must match req.LeaderID.
+//  4. Self Rejection (Section 8): remote requests from or for self are rejected.
+//  5. Topology Boundary (Section 8): unknown peers are rejected fail-closed.
+//  6. Invariant check: PrevLogIndex > 0 with PrevLogTerm == 0 is rejected.
+//  7. Stale Term (Section 13, 24): If req.Term < currentTerm, returns Success=false, Term=currentTerm.
+//     No election timer reset, no leaderID change, no role change.
+//  8. Higher Term (Section 13, 25, 26): If req.Term > currentTerm, durably persists new term, clears vote,
+//     and steps down to RoleFollower BEFORE publishing new term. Persistence failure fails closed.
+//  9. Same Term (Section 13, 14, 27, 28): If req.Term == currentTerm, Candidate/Leader steps down to Follower.
+//     Sets leaderID to authenticated sender.
+//  10. Log Matching (Section 15): If PrevLogIndex > 0, checks that local log contains an entry at PrevLogIndex
+//     matching PrevLogTerm. If mismatch, returns Success=false without resetting election timer.
+//  11. Timer Reset (Section 13, 15): If heartbeat is valid and preceding log matches, resets election timer
+//     strictly outside of Node.mu.
+//  12. Response (Section 16): Returns AppendEntriesResponse{Term: currentTerm, Success: true/false, MatchIndex: PrevLogIndex}.
+func (n *Node) HandleAppendEntries(fromPeerID cluster.NodeID, req *transport.AppendEntriesRequest) (*transport.AppendEntriesResponse, error) {
+	if n.closed.Load() {
+		return nil, errors.ErrRaftStateClosed
+	}
+	if req == nil {
+		return nil, errors.ErrNilReceiver
+	}
+
+	// Validate sender peer ID
+	if !fromPeerID.IsValid() {
+		return nil, &errors.InvalidNodeIDError{NodeID: uint64(fromPeerID), Reason: "sender peer ID must be greater than zero"}
+	}
+	if !req.LeaderID.IsValid() {
+		return nil, &errors.InvalidNodeIDError{NodeID: uint64(req.LeaderID), Reason: "leader ID in AppendEntries must be greater than zero"}
+	}
+
+	// Section 8: Transport Identity Binding
+	if fromPeerID != req.LeaderID {
+		return nil, fmt.Errorf("%w: sender peer ID %d does not match leader ID %d",
+			errors.ErrRaftSenderMismatch, fromPeerID, req.LeaderID)
+	}
+
+	// Section 8: Self Request Rejection
+	if fromPeerID == n.localID || req.LeaderID == n.localID {
+		return nil, fmt.Errorf("%w: received remote AppendEntries for local node ID %d",
+			errors.ErrRaftSelfVoteRPC, n.localID)
+	}
+
+	// Section 8: Unknown Peer Rejection
+	if n.topology != nil && !n.topology.Contains(fromPeerID) {
+		return nil, &errors.UnknownPeerError{NodeID: uint64(fromPeerID)}
+	}
+	if n.topology == nil && len(n.peers) > 0 {
+		known := false
+		for _, p := range n.peers {
+			if p == fromPeerID {
+				known = true
+				break
+			}
+		}
+		if !known {
+			return nil, &errors.UnknownPeerError{NodeID: uint64(fromPeerID)}
+		}
+	}
+
+	// Invariant validation: check log coordinates
+	if err := ValidateCandidateLogCoordinates(req.PrevLogIndex, req.PrevLogTerm); err != nil {
+		return nil, err
+	}
+
+	n.mu.Lock()
+	if n.closed.Load() {
+		n.mu.Unlock()
+		return nil, errors.ErrRaftStateClosed
+	}
+
+	currTerm, err := n.storage.Term()
+	if err != nil {
+		n.mu.Unlock()
+		return nil, fmt.Errorf("raft: failed to read current term: %w", err)
+	}
+
+	// Section 13, 24: Stale Term (req.Term < currentTerm) -> reject fail-closed
+	// No timer reset, no leaderID change, no role change
+	if Term(req.Term) < currTerm {
+		n.mu.Unlock()
+		return &transport.AppendEntriesResponse{
+			Term:       uint64(currTerm),
+			Success:    false,
+			MatchIndex: 0,
+		}, nil
+	}
+
+	oldRole := n.role
+	termAdvanced := false
+	var steppedDownLeader bool
+
+	// Section 13, 25: Higher Term (req.Term > currentTerm)
+	if Term(req.Term) > currTerm {
+		newTerm := Term(req.Term)
+		// Durably persist higher term and clear vote BEFORE publishing volatile state
+		if err := n.storage.SetTerm(newTerm); err != nil {
+			n.mu.Unlock()
+			return nil, fmt.Errorf("raft: failed to persist higher term %d on AppendEntries: %w", req.Term, err)
+		}
+		currTerm = newTerm
+		termAdvanced = true
+		n.role = RoleFollower
+		n.leaderID = fromPeerID
+		n.clearLeaderAndElectionStateLocked()
+		if oldRole == RoleLeader {
+			steppedDownLeader = true
+		}
+	} else {
+		// Section 13, 14, 27, 28: Same Term (req.Term == currentTerm)
+		if n.role == RoleCandidate {
+			// Candidate steps down to Follower; preserve currentTerm and durable vote
+			n.role = RoleFollower
+			n.leaderID = fromPeerID
+			n.clearLeaderAndElectionStateLocked()
+		} else if n.role == RoleLeader {
+			// Dual leader discovery in same term: step down to Follower
+			n.role = RoleFollower
+			n.leaderID = fromPeerID
+			n.clearLeaderAndElectionStateLocked()
+			steppedDownLeader = true
+		} else {
+			// Already RoleFollower: record leaderID
+			n.leaderID = fromPeerID
+		}
+	}
+
+	roleChanged := (oldRole != n.role)
+	n.mu.Unlock()
+
+	// Post-mutex notifications & lifecycle adjustments
+	if (roleChanged || termAdvanced) && n.transitionHook != nil {
+		n.transitionHook(oldRole, RoleFollower, currTerm)
+	}
+	if steppedDownLeader {
+		n.stopHeartbeatScheduler()
+	}
+
+	// Section 15: Log Matching Check
+	// Check if follower log contains an entry at PrevLogIndex matching PrevLogTerm
+	logMatches := false
+	if req.PrevLogIndex == 0 {
+		logMatches = true
+	} else {
+		lastIdx, _, err := n.storage.LastIndexAndTerm()
+		if err == nil && LogIndex(req.PrevLogIndex) <= lastIdx {
+			termAtPrev, err := n.storage.TermOf(LogIndex(req.PrevLogIndex))
+			if err == nil && termAtPrev == Term(req.PrevLogTerm) {
+				logMatches = true
+			}
+		}
+	}
+
+	if !logMatches {
+		// Section 15: Previous-log check failed. Return Success=false.
+		// Do not reset election timer.
+		return &transport.AppendEntriesResponse{
+			Term:       uint64(currTerm),
+			Success:    false,
+			MatchIndex: 0,
+		}, nil
+	}
+
+	// Section 13, 15: Preceding log matched (and term is valid current or higher).
+	// Reset election timer!
+	n.ResetElectionTimer()
+
+	return &transport.AppendEntriesResponse{
+		Term:       uint64(currTerm),
+		Success:    true,
+		MatchIndex: req.PrevLogIndex,
+	}, nil
+}
+
+// HandleAppendEntriesResponse processes an incoming AppendEntries response from a peer.
+// Invariants enforced (P15-S02-M03 / Section 17):
+//  1. Rejects if node is closed.
+//  2. If resp == nil: ErrNilReceiver.
+//  3. If sender is self or invalid: rejected.
+//  4. If resp.Term > currentTerm: durably steps down to Follower, halts heartbeat scheduler,
+//     and re-arms election timer.
+//  5. No log replication, retry, or nextIndex manipulation (P15-S03 scope boundary).
+func (n *Node) HandleAppendEntriesResponse(fromPeerID cluster.NodeID, resp *transport.AppendEntriesResponse) error {
+	if n.closed.Load() {
+		return errors.ErrRaftStateClosed
+	}
+	if resp == nil {
+		return errors.ErrNilReceiver
+	}
+	if !fromPeerID.IsValid() {
+		return &errors.InvalidNodeIDError{NodeID: uint64(fromPeerID), Reason: "sender peer ID must be greater than zero"}
+	}
+	if fromPeerID == n.localID {
+		return fmt.Errorf("%w: received AppendEntries response from self", errors.ErrRaftSelfVoteRPC)
+	}
+
+	n.mu.Lock()
+	if n.closed.Load() {
+		n.mu.Unlock()
+		return errors.ErrRaftStateClosed
+	}
+
+	currTerm, err := n.storage.Term()
+	if err != nil {
+		n.mu.Unlock()
+		return err
+	}
+
+	if Term(resp.Term) > currTerm {
+		newTerm := Term(resp.Term)
+		if err := n.storage.SetTerm(newTerm); err != nil {
+			n.mu.Unlock()
+			return fmt.Errorf("raft: failed to persist higher term %d on append entries response: %w", resp.Term, err)
+		}
+		oldRole := n.role
+		n.role = RoleFollower
+		n.leaderID = cluster.NodeIDNil
+		n.clearLeaderAndElectionStateLocked()
+		n.mu.Unlock()
+
+		if n.transitionHook != nil {
+			n.transitionHook(oldRole, RoleFollower, newTerm)
+		}
+		if oldRole == RoleLeader {
+			n.stopHeartbeatScheduler()
+		}
+		n.ResetElectionTimer()
+		return nil
+	}
+
+	n.mu.Unlock()
+	return nil
 }

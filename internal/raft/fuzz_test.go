@@ -264,3 +264,148 @@ func FuzzHandleRequestVoteResponse(f *testing.F) {
 		}
 	})
 }
+
+func FuzzHandleAppendEntries(f *testing.F) {
+	// Seed 1: Valid empty heartbeat from peer 2
+	f.Add(uint64(2), uint64(2), uint64(1), uint64(0), uint64(0), uint64(0), uint64(100), byte(0), byte(0))
+
+	// Seed 2: Stale heartbeat
+	f.Add(uint64(2), uint64(2), uint64(0), uint64(0), uint64(0), uint64(0), uint64(101), byte(1), byte(0))
+
+	// Seed 3: Higher term heartbeat
+	f.Add(uint64(2), uint64(2), uint64(10), uint64(0), uint64(0), uint64(0), uint64(102), byte(2), byte(0))
+
+	// Seed 4: Mismatched leader and sender ID
+	f.Add(uint64(2), uint64(3), uint64(2), uint64(0), uint64(0), uint64(0), uint64(103), byte(0), byte(0))
+
+	// Seed 5: Self sender / leader
+	f.Add(uint64(1), uint64(1), uint64(2), uint64(0), uint64(0), uint64(0), uint64(104), byte(0), byte(0))
+
+	// Seed 6: Unknown peer
+	f.Add(uint64(99), uint64(99), uint64(2), uint64(0), uint64(0), uint64(0), uint64(105), byte(0), byte(0))
+
+	// Seed 7: Non-empty entries entry count byte
+	f.Add(uint64(2), uint64(2), uint64(2), uint64(1), uint64(1), uint64(0), uint64(106), byte(1), byte(1))
+
+	f.Fuzz(func(t *testing.T, fromPeerIDRaw, leaderIDRaw, reqTerm, prevLogIndex, prevLogTerm, leaderCommit, nonce uint64, initialRoleAction byte, hasEntries byte) {
+		dir := t.TempDir()
+		s, err := raft.OpenStorage(dir)
+		if err != nil {
+			return
+		}
+		defer func() { _ = s.Close() }()
+
+		node, err := raft.NewNode(raft.NodeConfig{
+			LocalID: 1,
+			Storage: s,
+			Peers:   []cluster.NodeID{2, 3, 4},
+		})
+		if err != nil {
+			return
+		}
+		defer func() { _ = node.Close() }()
+
+		// Setup initial role
+		switch initialRoleAction % 3 {
+		case 0:
+			// Follower (term 1)
+			_ = s.SetTerm(1)
+		case 1:
+			// Candidate (term 2)
+			_ = s.SetTerm(1)
+			_ = node.BecomeCandidate()
+		case 2:
+			// Leader (term 2)
+			_ = s.SetTerm(1)
+			_ = node.BecomeCandidate()
+			_ = node.BecomeLeader()
+		}
+
+		termBefore, _ := node.Term()
+		roleBefore := node.Role()
+		leaderBefore := node.LeaderID()
+		lastIdxBefore, _, _ := s.LastIndexAndTerm()
+
+		var entries []transport.PeerLogEntry
+		if hasEntries%2 != 0 {
+			entries = []transport.PeerLogEntry{
+				{Term: reqTerm, Type: transport.PeerEntryNormal, Data: []byte("test")},
+			}
+		}
+
+		req := &transport.AppendEntriesRequest{
+			Term:         reqTerm,
+			LeaderID:     cluster.NodeID(leaderIDRaw),
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			LeaderCommit: leaderCommit,
+			Nonce:        nonce,
+			Entries:      entries,
+		}
+
+		fromPeerID := cluster.NodeID(fromPeerIDRaw)
+		resp, err := node.HandleAppendEntries(fromPeerID, req)
+
+		// Property 1: No panic (verified by reaching here)
+
+		// Property 2: Term never decreases
+		termAfter, _ := node.Term()
+		if termAfter < termBefore {
+			t.Fatalf("term decreased: termBefore=%d, termAfter=%d", termBefore, termAfter)
+		}
+
+		// Property 3: Invalid sender / unknown peer / self / mismatch cannot become leader
+		if !fromPeerID.IsValid() || fromPeerID == 1 || fromPeerID > 4 || fromPeerID != req.LeaderID {
+			if err == nil {
+				t.Fatalf("expected error for invalid/unknown sender %d (leaderID %d)", fromPeerID, req.LeaderID)
+			}
+			if node.LeaderID() != leaderBefore {
+				t.Fatalf("invalid sender %d caused leaderID to change: before=%d, after=%d", fromPeerID, leaderBefore, node.LeaderID())
+			}
+		}
+
+		// Property 4: Stale term cannot change leaderID
+		if reqTerm < uint64(termBefore) {
+			if resp != nil && resp.Success {
+				t.Fatalf("stale heartbeat succeeded: reqTerm=%d, termBefore=%d", reqTerm, termBefore)
+			}
+			if node.LeaderID() != leaderBefore {
+				t.Fatalf("stale heartbeat changed leaderID: before=%d, after=%d", leaderBefore, node.LeaderID())
+			}
+		}
+
+		// Property 5: Higher term never leaves node in Leader/Candidate
+		if reqTerm > uint64(termBefore) && err == nil {
+			if r := node.Role(); r != raft.RoleFollower {
+				t.Fatalf("node failed to step down on higher term: %s", r)
+			}
+			if node.HeartbeatRunning() {
+				t.Fatalf("heartbeat scheduler still running after higher term stepdown")
+			}
+		}
+
+		// Property 6: Same-term valid heartbeat causes Candidate -> Follower
+		if reqTerm == uint64(termBefore) && roleBefore == raft.RoleCandidate && err == nil && resp != nil && resp.Success {
+			if node.Role() != raft.RoleFollower {
+				t.Fatalf("candidate failed to step down on same-term valid heartbeat: %s", node.Role())
+			}
+		}
+
+		// Property 7 & 8: Heartbeat handling never appends log entries or mutates log
+		lastIdxAfter, _, _ := s.LastIndexAndTerm()
+		if lastIdxAfter != lastIdxBefore {
+			t.Fatalf("log index changed during heartbeat handling: before=%d, after=%d", lastIdxBefore, lastIdxAfter)
+		}
+
+		// Property 9: Repeated valid heartbeat is idempotent
+		if err == nil && resp != nil && resp.Success {
+			resp2, err2 := node.HandleAppendEntries(fromPeerID, req)
+			if err2 != nil || resp2 == nil || !resp2.Success {
+				t.Fatalf("repeated valid heartbeat failed: resp2=%+v, err2=%v", resp2, err2)
+			}
+			if node.Role() != raft.RoleFollower {
+				t.Fatalf("role changed after repeated heartbeat: %s", node.Role())
+			}
+		}
+	})
+}

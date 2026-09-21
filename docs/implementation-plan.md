@@ -2434,6 +2434,20 @@ TOTAL: 176 Discrete, Testable Micro-Phases
     * Corrective hardening: Fixed `StopElectionTimer()` to cancel election loop context and wait for goroutine termination (`loopCancel`, `loopDone`, `electionLoopWg`), preventing goroutine accumulation across repeated Start/Stop cycles.
 * **P15-S02-M03: Periodic Heartbeat Scheduler (`AppendEntries` Empty)**
   * *Objective*: Transmit heartbeats every $50\text{ms}$ to maintain leadership.
+  * *Implementation Details*:
+    * Periodic Scheduler: Leader runs a background loop with a $50\text{ms}$ ticker (`time.NewTicker(heartbeatInterval)`) transmitting empty `AppendEntries` heartbeats (`Entries: nil`) to all configured remote peers.
+    * Single Scheduler Invariant: At most one heartbeat scheduler goroutine per Node, guarded by `heartbeatLifecycleMu` and atomic `heartbeatRunning`. Generation counter `heartbeatGen` invalidates delayed ticks from prior terms.
+    * Leader-Only Activation: Starts on Candidate $\to$ Leader transitions (manual `BecomeLeader`, quorum response in `HandleRequestVoteResponse`, or single-node $N=1$ timeout). Does not double-send at $T=0$; immediate M02 broadcast fires at $T=0$, ticker fires periodic beats at $T \approx 50\text{ms}, 100\text{ms}, \dots$.
+    * Shutdown & Stepdown: Stops immediately on leader stepdown (`BecomeFollower`, `ObserveHigherTerm`, `StepDownSameTerm`, higher-term RPC handlers) and on `Node.Close()`. Synchronously waits for scheduler termination (`<-heartbeatDone`), preventing lingering goroutines or post-stepdown sends.
+    * Concurrency & Network I/O: `Node.mu` is never held during network I/O (`peerSender.Send`) or ticker waits. Each heartbeat uses a fresh cryptographic nonce and monotonically increasing sequence ID; self-send is strictly prevented.
+    * Heartbeat Receive Path: `HandleAppendEntries` processes incoming frames dispatched from `HandlePeerFrame`:
+      * Sender Authentication: Authenticated `fromPeerID` must match `req.LeaderID`; self and unknown peers rejected fail-closed.
+      * Stale Term (`req.Term < currentTerm`): Rejected with `Success=false, Term=currentTerm`; no role, leaderID, or timer modification.
+      * Higher Term (`req.Term > currentTerm`): Durably advances term via `storage.SetTerm`, clears `votedFor`, steps down to Follower, halts heartbeat scheduler if previously Leader, records `leaderID`, and resets election timer if preceding log matches. Persistence failure fails closed.
+      * Same Term (`req.Term == currentTerm`): Candidate/Leader steps down to Follower; preserves term and durable vote; records `leaderID`.
+      * Preceding Log Verification: Checks if `PrevLogIndex == 0` or local log entry at `PrevLogIndex` matches `PrevLogTerm`. If mismatched, returns `Success=false` and does not reset election timer.
+      * Election Timer Reset: On valid heartbeat with matching preceding log, `ResetElectionTimer()` is invoked outside `Node.mu`.
+    * Scope Boundary: Log entry replication, batching, client proposals, `nextIndex` decrement, `matchIndex` advancement, and `commitIndex` calculation are explicitly deferred to P15-S03.
 
 ### Sub-Phase 15.3: Log Replication & Quorum Commit
 * **P15-S03-M01: Proposal Ingestion & Log Append**
