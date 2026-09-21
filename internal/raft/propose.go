@@ -24,10 +24,12 @@ import (
 //     in-memory state. Success is reported only after durable persistence.
 //     On append failure an error is returned and no success is claimed;
 //     Storage guarantees all-or-nothing (no phantom in-memory entry).
-//   - Scope boundary: success means "durably appended locally", NOT committed,
-//     applied, or replicated. No commitIndex is advanced (none exists yet),
-//     no state machine is touched, and no AppendEntries replication is
-//     triggered; those belong to P15-S03-M02/M03 and Phase 16.
+//   - Scope boundary: success means "durably appended locally", NOT applied
+//     or replicated. Quorum commitment may advance as a result (immediately
+//     for N=1 clusters via the post-append refresh below, or via follower
+//     responses for larger clusters), but no state machine is touched and no
+//     AppendEntries replication is triggered here; those belong to P15-S03-M03
+//     (replication rounds) and Phase 16 (application).
 //
 // Concurrency & linearization:
 //   - Concurrent Propose calls are serialized by proposeMu so each accepted
@@ -118,6 +120,12 @@ func (n *Node) Propose(data []byte) (LogEntry, error) {
 	if err := n.storage.Append(entry); err != nil {
 		return LogEntry{}, err
 	}
+
+	// Post-append quorum refresh: N=1 clusters commit the new current-term
+	// entry immediately (leader alone is quorum); larger clusters evaluate
+	// harmlessly (no follower progress yet) and commit via later responses.
+	// No-op unless still leader. Never holds Node.mu across I/O.
+	n.refreshCommitIndex()
 
 	return entry.Clone(), nil
 }

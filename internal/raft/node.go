@@ -73,6 +73,13 @@ type Node struct {
 	nextIndex         map[cluster.NodeID]LogIndex // Leader tracking: next log index to send to each remote peer
 	matchIndex        map[cluster.NodeID]LogIndex // Leader tracking: highest log index known replicated on each remote peer
 
+	// Volatile commit state (P15-S03-M03): highest log index known committed
+	// (contiguous prefix 1..commitIndex). Never decreases; never exceeds the
+	// local LastIndex; advanced only by the leader quorum rule. Survives role
+	// transitions (a committed prefix stays committed). Followers do not
+	// maintain commit state in M03 (no application yet).
+	commitIndex LogIndex
+
 	// Periodic heartbeat scheduler (P15-S02-M03)
 	heartbeatInterval    time.Duration
 	heartbeatLifecycleMu sync.Mutex
@@ -238,6 +245,77 @@ func (n *Node) GrantedVotesCount() int {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	return len(n.electionVotes)
+}
+
+// CommitIndex returns the highest log index known committed (volatile state,
+// P15-S03-M03). The committed prefix is always the contiguous range
+// 1..commitIndex; 0 means nothing is committed yet. Stops at commitment:
+// entries are never applied to a state machine here (Phase 16 owns that).
+func (n *Node) CommitIndex() LogIndex {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.commitIndex
+}
+
+// advanceCommitIndexLocked applies the Raft leader commitment rule for
+// currTerm: the largest N > commitIndex such that a quorum of replication
+// positions (leader LastIndex plus follower matchIndex) covers N and
+// log[N].term == currTerm. The leader counts itself exactly when its own log
+// contains N (the scan never exceeds LastIndex). Older-term entries are never
+// a direct basis for advancement; they commit implicitly once a newer
+// current-term entry commits over them. commitIndex never decreases.
+// Caller MUST hold n.mu. Performs only in-memory storage reads (no I/O).
+func (n *Node) advanceCommitIndexLocked(currTerm Term) {
+	if n.role != RoleLeader {
+		return
+	}
+	lastIdx, _, err := n.storage.LastIndexAndTerm()
+	if err != nil || lastIdx <= n.commitIndex {
+		return
+	}
+	quorum := n.quorumSizeLocked()
+	for idx := lastIdx; idx > n.commitIndex; idx-- {
+		t, err := n.storage.TermOf(idx)
+		if err != nil {
+			return
+		}
+		if t != currTerm {
+			continue
+		}
+		count := 1 // Leader itself replicates every index it holds.
+		for _, peerID := range n.peers {
+			if peerID == n.localID {
+				continue
+			}
+			if n.matchIndex[peerID] >= idx {
+				count++
+				if count >= quorum {
+					break
+				}
+			}
+		}
+		if count >= quorum {
+			n.commitIndex = idx
+			return
+		}
+	}
+}
+
+// refreshCommitIndex re-evaluates quorum commitment for the current leader
+// session (used after local appends, where no follower response arrives —
+// notably N=1 clusters, which commit immediately). No-op unless still leader.
+// Never holds Node.mu across I/O.
+func (n *Node) refreshCommitIndex() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.closed.Load() || n.role != RoleLeader {
+		return
+	}
+	currTerm, err := n.storage.Term()
+	if err != nil {
+		return
+	}
+	n.advanceCommitIndexLocked(currTerm)
 }
 
 // isStillLeader reports whether the node is still Leader in the given term.
@@ -418,6 +496,8 @@ func (n *Node) campaignLocked() (oldRole, newRole Role, term Term, shouldHook bo
 
 // becomeLeaderLocked sets role to Leader, initializes volatile leader replication state,
 // invalidates candidate vote counting state, and stops the follower election timer.
+// commitIndex is intentionally preserved: a committed prefix stays committed
+// across leader sessions; only the current-term quorum rule may advance it.
 // Caller MUST hold n.mu.
 func (n *Node) becomeLeaderLocked(term Term, lastLogIdx LogIndex) {
 	n.role = RoleLeader
@@ -444,6 +524,8 @@ func (n *Node) becomeLeaderLocked(term Term, lastLogIdx LogIndex) {
 }
 
 // clearLeaderAndElectionStateLocked clears volatile leader replication state and candidate vote tracking.
+// commitIndex is intentionally NOT cleared: commitment is monotonic and a
+// committed prefix remains committed after stepdown.
 // Caller MUST hold n.mu.
 func (n *Node) clearLeaderAndElectionStateLocked() {
 	n.electionVotes = nil
@@ -1171,6 +1253,8 @@ func (n *Node) HandleRequestVote(fromPeerID cluster.NodeID, req *transport.Reque
 //   - Never targets self.
 //   - Tolerates peer send errors without terminating caller.
 //   - Aborts remaining sends if leadership is lost mid-broadcast (stale-leadership guard).
+//   - LeaderCommit carries the current commit index (followers ignore it in
+//     M03; it becomes meaningful in Phase 16).
 func (n *Node) sendHeartbeats(ctx context.Context, term Term, lastIdx LogIndex, lastTerm Term) {
 	if n.peerSender == nil || len(n.peers) == 0 {
 		return
@@ -1180,6 +1264,8 @@ func (n *Node) sendHeartbeats(ctx context.Context, term Term, lastIdx LogIndex, 
 	if sendCtx == nil {
 		sendCtx = n.electionCtx
 	}
+
+	leaderCommit := uint64(n.CommitIndex())
 
 	for _, peerID := range n.peers {
 		if sendCtx.Err() != nil {
@@ -1207,7 +1293,7 @@ func (n *Node) sendHeartbeats(ctx context.Context, term Term, lastIdx LogIndex, 
 			LeaderID:     n.localID,
 			PrevLogIndex: uint64(lastIdx),
 			PrevLogTerm:  uint64(lastTerm),
-			LeaderCommit: 0,
+			LeaderCommit: leaderCommit,
 			Nonce:        nonce,
 			Entries:      nil, // Empty heartbeat
 		}
@@ -1227,6 +1313,156 @@ func (n *Node) sendHeartbeats(ctx context.Context, term Term, lastIdx LogIndex, 
 //   - Reuses sendHeartbeats under the election context.
 func (n *Node) sendImmediateHeartbeats(term Term, lastIdx LogIndex, lastTerm Term) {
 	n.sendHeartbeats(n.electionCtx, term, lastIdx, lastTerm)
+}
+
+// replicateToFollowers transmits the periodic replication round (P15-S03-M03):
+// for each configured remote peer, sends the pending log suffix starting at
+// nextIndex[peer], or an empty heartbeat when the follower is caught up
+// (nextIndex > LastIndex). Follower responses drive matchIndex/nextIndex and
+// quorum commitment via HandleAppendEntriesResponse; this function only sends.
+//
+// Invariants (inherited from sendHeartbeats plus replication scope):
+//   - Executes strictly outside of Node.mu and lifecycle mutexes (no mutex
+//     held during network I/O or storage reads beyond their own locks).
+//   - Per-peer leadership/lifecycle abort via isStillLeader(term).
+//   - PrevLog coordinates are coherent by construction: (0,0) sentinel or a
+//     stored term at prevIndex. Suffix reads come from durable storage
+//     clones; payloads/terms are never synthesized or altered.
+//   - Suffix length is capped at transport.MaxPeerEntries per round; an
+//     unencodable suffix degrades to an empty heartbeat for that peer this
+//     round (liveness preserved, entries retried next round).
+//   - Never targets self or unknown peers (peers list is fixed at startup).
+func (n *Node) replicateToFollowers(ctx context.Context, term Term) {
+	if n.peerSender == nil || len(n.peers) == 0 {
+		return
+	}
+
+	sendCtx := ctx
+	if sendCtx == nil {
+		sendCtx = n.electionCtx
+	}
+
+	leaderCommit := uint64(n.CommitIndex())
+
+	for _, peerID := range n.peers {
+		if sendCtx.Err() != nil {
+			return
+		}
+		if !n.isStillLeader(term) {
+			return
+		}
+		if peerID == n.localID {
+			continue // Never send to self
+		}
+
+		n.mu.RLock()
+		isLeader := (n.role == RoleLeader)
+		nextIdx, ok := n.nextIndex[peerID]
+		n.mu.RUnlock()
+		if !isLeader || n.closed.Load() {
+			return
+		}
+		if !ok {
+			continue // Unknown peer snapshot: skip this round.
+		}
+
+		n.sendReplicationTo(sendCtx, term, peerID, nextIdx, leaderCommit)
+	}
+}
+
+// sendReplicationTo sends one peer's replication round: pending suffix or
+// empty heartbeat. No Node.mu or lifecycle mutex held; storage provides its
+// own locking. Failures for one peer never affect others.
+func (n *Node) sendReplicationTo(sendCtx context.Context, term Term, peerID cluster.NodeID, nextIdx LogIndex, leaderCommit uint64) {
+	lastIdx, _, err := n.storage.LastIndexAndTerm()
+	if err != nil || n.closed.Load() {
+		return
+	}
+
+	// Caught up (or follower ahead): empty heartbeat anchored at our tail.
+	if nextIdx > lastIdx {
+		var prevTerm Term
+		if lastIdx > 0 {
+			prevTerm, err = n.storage.TermOf(lastIdx)
+			if err != nil {
+				return
+			}
+		}
+		n.sendHeartbeatTo(sendCtx, term, peerID, lastIdx, prevTerm, leaderCommit)
+		return
+	}
+
+	// Pending suffix: prev = nextIdx-1 with its stored term.
+	var prevTerm Term
+	if nextIdx > 1 {
+		prevTerm, err = n.storage.TermOf(nextIdx - 1)
+		if err != nil {
+			return
+		}
+	}
+	end := lastIdx + 1
+	if count := end - nextIdx; count > LogIndex(transport.MaxPeerEntries) {
+		end = nextIdx + LogIndex(transport.MaxPeerEntries)
+	}
+	stored, err := n.storage.Entries(nextIdx, end)
+	if err != nil {
+		return
+	}
+	wire := make([]transport.PeerLogEntry, len(stored))
+	for i, e := range stored {
+		wire[i] = transport.PeerLogEntry{Term: uint64(e.Term), Type: e.Type, Data: e.Data}
+	}
+
+	nonce, err := transport.GenerateNonce()
+	if err != nil {
+		return
+	}
+	req := &transport.AppendEntriesRequest{
+		Term:         uint64(term),
+		LeaderID:     n.localID,
+		PrevLogIndex: uint64(nextIdx - 1),
+		PrevLogTerm:  uint64(prevTerm),
+		LeaderCommit: leaderCommit,
+		Nonce:        nonce,
+		Entries:      wire,
+	}
+	frame, err := transport.EncodeAppendEntries(req, n.peerSender.NextSeqID())
+	if err != nil {
+		// Unencodable suffix (frame limits): degrade to an empty heartbeat
+		// anchored at our tail so liveness is preserved this round.
+		var tailTerm Term
+		if lastIdx > 0 {
+			if tailTerm, err = n.storage.TermOf(lastIdx); err != nil {
+				return
+			}
+		}
+		n.sendHeartbeatTo(sendCtx, term, peerID, lastIdx, tailTerm, leaderCommit)
+		return
+	}
+	_ = n.peerSender.Send(sendCtx, peerID, frame)
+}
+
+// sendHeartbeatTo transmits a single empty AppendEntries heartbeat.
+// No Node.mu or lifecycle mutex held.
+func (n *Node) sendHeartbeatTo(sendCtx context.Context, term Term, peerID cluster.NodeID, lastIdx LogIndex, lastTerm Term, leaderCommit uint64) {
+	nonce, err := transport.GenerateNonce()
+	if err != nil {
+		return
+	}
+	req := &transport.AppendEntriesRequest{
+		Term:         uint64(term),
+		LeaderID:     n.localID,
+		PrevLogIndex: uint64(lastIdx),
+		PrevLogTerm:  uint64(lastTerm),
+		LeaderCommit: leaderCommit,
+		Nonce:        nonce,
+		Entries:      nil,
+	}
+	frame, err := transport.EncodeAppendEntries(req, n.peerSender.NextSeqID())
+	if err != nil {
+		return
+	}
+	_ = n.peerSender.Send(sendCtx, peerID, frame)
 }
 
 // HeartbeatRunning returns true if the periodic heartbeat scheduler is currently running.
@@ -1296,7 +1532,9 @@ func (n *Node) stopHeartbeatScheduler() {
 	}
 }
 
-// runHeartbeatLoop transmits periodic empty AppendEntries heartbeats at configured cadence (50ms).
+// runHeartbeatLoop transmits the periodic replication round at configured cadence (50ms):
+// pending log suffix per follower via nextIndex, empty AppendEntries heartbeat
+// when caught up (P15-S02-M03 heartbeat, P15-S03-M03 replication).
 // Stale-scheduler protection: each scheduler session carries the generation
 // captured at start. Any lifecycle transition (stepdown, restart, Close)
 // either clears heartbeatRunning or bumps heartbeatGen, causing stale
@@ -1345,11 +1583,6 @@ func (n *Node) runHeartbeatLoop(ctx context.Context, done chan struct{}, gen uin
 			return
 		}
 
-		lastIdx, lastTerm, err := n.storage.LastIndexAndTerm()
-		if err != nil || n.closed.Load() {
-			return
-		}
-
 		// Double-check leadership and lifecycle state before network I/O
 		n.mu.RLock()
 		isLeader = (n.role == RoleLeader)
@@ -1360,8 +1593,8 @@ func (n *Node) runHeartbeatLoop(ctx context.Context, done chan struct{}, gen uin
 
 		// Final stale-session gate: re-validate generation under the
 		// lifecycle mutex and leadership (role + term) immediately before
-		// transmitting. sendHeartbeats performs a last per-broadcast
-		// isStillLeader check before each peer send.
+		// transmitting. replicateToFollowers performs a last per-peer
+		// isStillLeader check before each send.
 		n.heartbeatLifecycleMu.Lock()
 		curGen2 := n.heartbeatGen
 		isRunning2 := n.heartbeatRunning.Load()
@@ -1373,7 +1606,9 @@ func (n *Node) runHeartbeatLoop(ctx context.Context, done chan struct{}, gen uin
 			return
 		}
 
-		n.sendHeartbeats(ctx, term, lastIdx, lastTerm)
+		// Periodic replication round: pending suffix per follower based on
+		// nextIndex, empty heartbeat when caught up (P15-S03-M03).
+		n.replicateToFollowers(ctx, term)
 	}
 }
 
@@ -1966,7 +2201,7 @@ func (n *Node) replicateEntries(prevLogIndex uint64, prevLogTerm uint64, entries
 }
 
 // HandleAppendEntriesResponse processes an incoming AppendEntries response from a peer.
-// Invariants enforced (P15-S02-M03 / Section 17):
+// Invariants enforced (P15-S02-M03 / Section 17, extended P15-S03-M03):
 //  1. Rejects if node is closed.
 //  2. If resp == nil: ErrNilReceiver.
 //  3. If sender is self or invalid: rejected.
@@ -1974,8 +2209,18 @@ func (n *Node) replicateEntries(prevLogIndex uint64, prevLogTerm uint64, entries
 //     consistent with HandleRequestVoteResponse. Unknown senders cannot inject
 //     higher terms or mutate consensus state.
 //  5. If resp.Term > currentTerm: durably steps down to Follower, halts heartbeat scheduler,
-//     and re-arms election timer.
-//  6. No log replication, retry, or nextIndex manipulation (P15-S03 scope boundary).
+//     and re-arms election timer. Commitment state is preserved (monotonic).
+//  6. Stale responses (resp.Term < currentTerm) and responses received while
+//     not Leader are ignored without mutating replication or commit state.
+//     Role + term jointly identify the leader session: a stepdown always
+//     leaves RoleLeader (same-term stepdown) or advances the term, so an old
+//     session's delayed response can never satisfy both checks at once.
+//  7. Same-term leader responses update follower progress monotonically:
+//     Success advances matchIndex (never regresses) and nextIndex, then
+//     re-evaluates quorum commitment under the current-term rule; failure
+//     steps nextIndex back toward matchIndex+1 without touching matchIndex
+//     or commitIndex.
+//  8. No state-machine application, no client acknowledgement (Phase 16 scope).
 func (n *Node) HandleAppendEntriesResponse(fromPeerID cluster.NodeID, resp *transport.AppendEntriesResponse) error {
 	if n.closed.Load() {
 		return errors.ErrRaftStateClosed
@@ -2040,6 +2285,45 @@ func (n *Node) HandleAppendEntriesResponse(fromPeerID cluster.NodeID, resp *tran
 		}
 		n.ResetElectionTimer()
 		return nil
+	}
+
+	// Stale response term: ignore without mutating replication/commit state.
+	if Term(resp.Term) < currTerm {
+		n.mu.Unlock()
+		return nil
+	}
+
+	// Same term: only the current leader tracks replication progress.
+	// Candidates and followers ignore follower responses (a candidate must
+	// never advance commit state from another session's traffic).
+	if n.role != RoleLeader {
+		n.mu.Unlock()
+		return nil
+	}
+	if n.matchIndex == nil || n.nextIndex == nil {
+		n.mu.Unlock()
+		return nil
+	}
+
+	if resp.Success {
+		// Monotonic progress: a delayed lower response must not regress an
+		// already-established position; duplicates are harmless no-ops.
+		if match := LogIndex(resp.MatchIndex); match > n.matchIndex[fromPeerID] {
+			n.matchIndex[fromPeerID] = match
+		}
+		if m := n.matchIndex[fromPeerID]; m < math.MaxUint64 && m+1 > n.nextIndex[fromPeerID] {
+			n.nextIndex[fromPeerID] = m + 1
+		}
+		n.advanceCommitIndexLocked(currTerm)
+	} else {
+		// Log mismatch: step nextIndex back by one (floor 1) so the next
+		// replication attempt uses an earlier PrevLog and converges. This
+		// applies even right after a success: the failure refers to an older
+		// request than the established position. matchIndex and commitIndex
+		// are untouched by failures; a later success restores nextIndex.
+		if next := n.nextIndex[fromPeerID]; next > 1 {
+			n.nextIndex[fromPeerID] = next - 1
+		}
 	}
 
 	n.mu.Unlock()
