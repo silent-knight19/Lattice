@@ -326,6 +326,14 @@ func FuzzHandleAppendEntries(f *testing.F) {
 		leaderBefore := node.LeaderID()
 		lastIdxBefore, _, _ := s.LastIndexAndTerm()
 
+		// Snapshot full log contents for rejection immutability checks.
+		var logBefore []raft.LogEntry
+		for idx := raft.LogIndex(1); idx <= lastIdxBefore; idx++ {
+			if e, eerr := s.Entry(idx); eerr == nil {
+				logBefore = append(logBefore, e)
+			}
+		}
+
 		var entries []transport.PeerLogEntry
 		if hasEntries%2 != 0 {
 			entries = []transport.PeerLogEntry{
@@ -391,10 +399,44 @@ func FuzzHandleAppendEntries(f *testing.F) {
 			}
 		}
 
-		// Property 7 & 8: Heartbeat handling never appends log entries or mutates log
+		// Property 7 & 8 (M02): rejected requests must not mutate the log at
+		// all; accepted requests must leave a structurally valid contiguous
+		// log; empty accepted heartbeats must not mutate the log.
 		lastIdxAfter, _, _ := s.LastIndexAndTerm()
-		if lastIdxAfter != lastIdxBefore {
-			t.Fatalf("log index changed during heartbeat handling: before=%d, after=%d", lastIdxBefore, lastIdxAfter)
+		accepted := err == nil && resp != nil && resp.Success
+		if !accepted {
+			if lastIdxAfter != lastIdxBefore {
+				t.Fatalf("rejected request mutated log length: before=%d, after=%d", lastIdxBefore, lastIdxAfter)
+			}
+			// Full-content check: no entry may differ after rejection.
+			for i, want := range logBefore {
+				got, aerr := s.Entry(raft.LogIndex(i + 1))
+				if aerr != nil {
+					t.Fatalf("rejected request removed entry %d: %v", i+1, aerr)
+				}
+				if got.Term != want.Term || got.Type != want.Type || string(got.Data) != string(want.Data) {
+					t.Fatalf("rejected request mutated entry %d: before=%+v after=%+v", i+1, want, got)
+				}
+			}
+		} else {
+			// Accepted: log must be contiguous 1..lastIdxAfter with valid
+			// entries, and MatchIndex must equal PrevLogIndex+len(entries).
+			if resp.MatchIndex != prevLogIndex+uint64(len(entries)) {
+				t.Fatalf("MatchIndex %d != PrevLogIndex %d + %d entries",
+					resp.MatchIndex, prevLogIndex, len(entries))
+			}
+			for idx := raft.LogIndex(1); idx <= lastIdxAfter; idx++ {
+				e, eerr := s.Entry(idx)
+				if eerr != nil {
+					t.Fatalf("accepted log has gap at index %d: %v", idx, eerr)
+				}
+				if e.Index != idx || e.Term == 0 {
+					t.Fatalf("accepted log has invalid entry at %d: %+v", idx, e)
+				}
+			}
+			if len(entries) == 0 && lastIdxAfter != lastIdxBefore {
+				t.Fatalf("empty heartbeat mutated log: before=%d, after=%d", lastIdxBefore, lastIdxAfter)
+			}
 		}
 
 		// Property 9: Repeated valid heartbeat is idempotent

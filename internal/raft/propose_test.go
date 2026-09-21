@@ -385,8 +385,10 @@ func TestPropose_RacingStepdownNoCorruption(t *testing.T) {
 	}
 }
 
-// M01 must not change follower replication semantics: non-empty AppendEntries
-// is still rejected (no premature replication via the heartbeat path).
+// M01/M02 boundary (evolved in P15-S03-M02): a follower receiving valid
+// non-empty entries from its legitimate leader now durably replicates them
+// (no longer rejected). Leader-local Propose and follower replication compose:
+// the leader's entry can travel via AppendEntries and persist on the follower.
 func TestPropose_NonEmptyAppendEntriesStillRejected(t *testing.T) {
 	n, s := newProposeNode(t, 1, []cluster.NodeID{2})
 	if err := s.SetTerm(3); err != nil {
@@ -395,11 +397,12 @@ func TestPropose_NonEmptyAppendEntriesStillRejected(t *testing.T) {
 	mustLead(t, n)
 
 	// A leader proposal exists locally...
-	if _, err := n.Propose([]byte("local")); err != nil {
+	prop, err := n.Propose([]byte("local"))
+	if err != nil {
 		t.Fatalf("Propose failed: %v", err)
 	}
 
-	// ...but a follower receiving non-empty entries must still reject.
+	// ...and the follower durably replicates the leader's entry.
 	followerDir := t.TempDir()
 	fs, err := raft.OpenStorage(followerDir)
 	if err != nil {
@@ -424,14 +427,21 @@ func TestPropose_NonEmptyAppendEntriesStillRejected(t *testing.T) {
 		PrevLogTerm:  0,
 		Nonce:        31337,
 		Entries: []transport.PeerLogEntry{
-			{Term: uint64(leaderTerm), Type: transport.PeerEntryNormal, Data: []byte("replicated")},
+			{Term: uint64(prop.Term), Type: transport.PeerEntryNormal, Data: []byte("local")},
 		},
 	}
 	resp, err := fn.HandleAppendEntries(1, req)
 	if err != nil {
 		t.Fatalf("HandleAppendEntries failed: %v", err)
 	}
-	if resp.Success {
-		t.Fatalf("non-empty AppendEntries must still be rejected in M01")
+	if !resp.Success {
+		t.Fatalf("valid follower replication must succeed after M02")
+	}
+	stored, err := fs.Entry(1)
+	if err != nil {
+		t.Fatalf("replicated entry missing on follower: %v", err)
+	}
+	if string(stored.Data) != "local" || stored.Term != prop.Term {
+		t.Fatalf("follower entry mismatch: %+v", stored)
 	}
 }

@@ -208,7 +208,10 @@ func TestAudit_LaggingFollower_TimerResetOnLogMismatch(t *testing.T) {
 	}
 }
 
-// Non-empty AppendEntries must never be falsely acknowledged before P15-S03.
+// Non-empty AppendEntries boundary (evolved in P15-S03-M02): valid entries
+// from the legitimate leader must now be durably replicated and genuinely
+// acknowledged, while malformed or mismatching requests must still fail
+// without false success or partial mutation.
 func TestAudit_NonEmptyAppendEntries_NeverAcked(t *testing.T) {
 	n, s := newAuditNode(t, 1, []cluster.NodeID{2}, nil, nil)
 	if err := s.SetTerm(1); err != nil {
@@ -228,22 +231,49 @@ func TestAudit_NonEmptyAppendEntries_NeverAcked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HandleAppendEntries failed: %v", err)
 	}
-	if resp.Success {
-		t.Fatalf("non-empty AppendEntries must not return Success=true before replication exists")
+	// M02: valid non-empty replication is genuinely persisted and acked.
+	if !resp.Success {
+		t.Fatalf("valid non-empty AppendEntries must succeed after M02")
 	}
-	if resp.MatchIndex != 0 {
-		t.Fatalf("expected MatchIndex 0, got %d", resp.MatchIndex)
+	if resp.MatchIndex != 1 {
+		t.Fatalf("expected MatchIndex 1, got %d", resp.MatchIndex)
+	}
+	stored, err := s.Entry(1)
+	if err != nil {
+		t.Fatalf("replicated entry missing: %v", err)
+	}
+	if string(stored.Data) != "cmd" || stored.Term != 1 {
+		t.Fatalf("replicated entry mismatch: %+v", stored)
+	}
+	// Liveness must still hold: sender recognized as leader.
+	if n.LeaderID() != 2 {
+		t.Fatalf("expected LeaderID=2, got %d", n.LeaderID())
+	}
+
+	// Malformed non-empty requests must still fail without false success.
+	bad := &transport.AppendEntriesRequest{
+		Term:         1,
+		LeaderID:     2,
+		PrevLogIndex: 5, // beyond follower log
+		PrevLogTerm:  1,
+		Nonce:        1000,
+		Entries: []transport.PeerLogEntry{
+			{Term: 1, Type: transport.PeerEntryNormal, Data: []byte("bad")},
+		},
+	}
+	badResp, err := n.HandleAppendEntries(2, bad)
+	if err != nil {
+		t.Fatalf("mismatching HandleAppendEntries failed: %v", err)
+	}
+	if badResp.Success {
+		t.Fatalf("mismatching non-empty AppendEntries must not succeed")
 	}
 	lastIdx, _, err := s.LastIndexAndTerm()
 	if err != nil {
 		t.Fatalf("LastIndexAndTerm failed: %v", err)
 	}
-	if lastIdx != 0 {
-		t.Fatalf("heartbeat handling mutated the log: lastIdx=%d", lastIdx)
-	}
-	// Liveness must still hold: sender recognized as leader.
-	if n.LeaderID() != 2 {
-		t.Fatalf("expected LeaderID=2, got %d", n.LeaderID())
+	if lastIdx != 1 {
+		t.Fatalf("mismatching request mutated the log: lastIdx=%d", lastIdx)
 	}
 }
 

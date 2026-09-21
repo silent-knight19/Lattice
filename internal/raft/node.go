@@ -82,8 +82,10 @@ type Node struct {
 	heartbeatWg          sync.WaitGroup
 	heartbeatGen         uint64
 
-	// Proposal serialization (P15-S03-M01): serializes concurrent Propose
-	// calls so each accepted proposal receives a distinct contiguous index.
+	// Proposal/replication serialization (P15-S03-M01/M02): serializes
+	// concurrent Propose calls and follower log-replication mutations so each
+	// accepted proposal receives a distinct contiguous index and suffix
+	// replacement cannot interleave with index allocation.
 	// Always acquired before Node.mu (brief RLock); never held across
 	// network I/O. Stepdown/Close paths never acquire it, so no inversion.
 	proposeMu sync.Mutex
@@ -1621,20 +1623,22 @@ func (n *Node) HandlePeerFrame(fromPeerID cluster.NodeID, frame *transport.Frame
 //     and steps down to RoleFollower BEFORE publishing new term. Persistence failure fails closed.
 //  9. Same Term (Section 13, 14, 27, 28): If req.Term == currentTerm, Candidate/Leader steps down to Follower.
 //     Sets leaderID to authenticated sender.
-//  10. Scope Boundary (P15-S03): Non-empty entry replication is NOT implemented yet.
-//     Any request with len(Entries) > 0 returns Success=false without mutating
-//     the log. The sender remains recognized as legitimate leader for liveness
-//     (leaderID recorded, election timer reset), but replication is never
-//     falsely acknowledged.
-//  11. Log Matching (Section 15): If PrevLogIndex > 0, checks that local log contains an entry at PrevLogIndex
-//     matching PrevLogTerm. If mismatch, returns Success=false but STILL resets
-//     the election timer: liveness (valid leader signal) is distinct from log
-//     replication success. A lagging follower must not time out while its
-//     legitimate leader is heartbeating; repair belongs to P15-S03-M02.
+//  10. Log Matching (Section 15, P15-S03-M02): If PrevLogIndex > 0, checks that
+//     local log contains an entry at PrevLogIndex matching PrevLogTerm. If
+//     mismatch, returns Success=false but STILL resets the election timer:
+//     liveness (valid leader signal) is distinct from log replication success.
+//     A lagging follower must not time out while its legitimate leader is
+//     heartbeating.
+//  11. Follower Replication (P15-S03-M02): For non-empty requests with matching
+//     PrevLog, incoming entries are validated, conflicting suffixes truncated,
+//     and new entries durably appended before reporting Success=true with
+//     MatchIndex = PrevLogIndex + len(Entries). See replicateEntries.
 //  12. Timer Reset (Section 13, 15): Any non-stale AppendEntries from the
 //     legitimate current-term leader resets the election timer strictly
 //     outside of Node.mu, regardless of log-match outcome.
-//  13. Response (Section 16): Returns AppendEntriesResponse{Term: currentTerm, Success: true/false, MatchIndex: PrevLogIndex}.
+//  13. Response (Section 16): Returns AppendEntriesResponse{Term: currentTerm,
+//     Success: true/false, MatchIndex: last replicated index (or PrevLogIndex
+//     for empty heartbeats, 0 on failure)}.
 func (n *Node) HandleAppendEntries(fromPeerID cluster.NodeID, req *transport.AppendEntriesRequest) (*transport.AppendEntriesResponse, error) {
 	if n.closed.Load() {
 		return nil, errors.ErrRaftStateClosed
@@ -1758,41 +1762,42 @@ func (n *Node) HandleAppendEntries(fromPeerID cluster.NodeID, req *transport.App
 		n.stopHeartbeatScheduler()
 	}
 
-	// Scope boundary (P15-S03): full entry replication is not implemented yet.
-	// Never acknowledge un-persisted entries. A non-empty request is a valid
-	// leadership/liveness signal (leaderID already recorded above) but must
-	// not return Success=true. Reset the election timer for liveness and
-	// report replication failure without touching the log.
-	if len(req.Entries) > 0 {
-		n.ResetElectionTimer()
-		return &transport.AppendEntriesResponse{
-			Term:       uint64(currTerm),
-			Success:    false,
-			MatchIndex: 0,
-		}, nil
-	}
-
-	// Section 15: Log Matching Check
-	// Check if follower log contains an entry at PrevLogIndex matching PrevLogTerm
-	logMatches := false
-	if req.PrevLogIndex == 0 {
-		logMatches = true
-	} else {
-		lastIdx, _, err := n.storage.LastIndexAndTerm()
-		if err == nil && LogIndex(req.PrevLogIndex) <= lastIdx {
-			termAtPrev, err := n.storage.TermOf(LogIndex(req.PrevLogIndex))
-			if err == nil && termAtPrev == Term(req.PrevLogTerm) {
-				logMatches = true
-			}
+	// Empty heartbeat path (no log mutation, no proposal serialization):
+	// PrevLog match determines success; the election timer resets on any
+	// non-stale leader signal regardless of match outcome.
+	if len(req.Entries) == 0 {
+		if !n.prevLogMatches(req.PrevLogIndex, req.PrevLogTerm) {
+			// Section 15: Previous-log check failed. Return Success=false BUT
+			// still reset the election timer: an otherwise-valid heartbeat from
+			// the legitimate current-term leader proves liveness even when the
+			// follower's log is lagging. Without this, a healthy-but-lagging
+			// follower would spuriously time out and disrupt the cluster.
+			n.ResetElectionTimer()
+			return &transport.AppendEntriesResponse{
+				Term:       uint64(currTerm),
+				Success:    false,
+				MatchIndex: 0,
+			}, nil
 		}
+
+		// Section 13, 15: Preceding log matched (and term is valid current or higher).
+		// Reset election timer! No storage writes for heartbeats.
+		n.ResetElectionTimer()
+
+		return &transport.AppendEntriesResponse{
+			Term:       uint64(currTerm),
+			Success:    true,
+			MatchIndex: req.PrevLogIndex,
+		}, nil
 	}
 
-	if !logMatches {
-		// Section 15: Previous-log check failed. Return Success=false BUT
-		// still reset the election timer: an otherwise-valid heartbeat from
-		// the legitimate current-term leader proves liveness even when the
-		// follower's log is lagging. Without this, a healthy-but-lagging
-		// follower would spuriously time out and disrupt the cluster.
+	// Non-empty replication path (P15-S03-M02): validate entries purely first
+	// (no shared state), then serialize against concurrent Propose/replication
+	// writers via proposeMu for conflict detection and durable mutation.
+	entries, ok := convertPeerEntries(req)
+	if !ok {
+		// Malformed entries from an otherwise-legitimate leader: replication
+		// rejected (no mutation), liveness preserved via timer reset.
 		n.ResetElectionTimer()
 		return &transport.AppendEntriesResponse{
 			Term:       uint64(currTerm),
@@ -1801,15 +1806,163 @@ func (n *Node) HandleAppendEntries(fromPeerID cluster.NodeID, req *transport.App
 		}, nil
 	}
 
-	// Section 13, 15: Preceding log matched (and term is valid current or higher).
-	// Reset election timer!
+	matchIdx, ok := n.replicateEntries(req.PrevLogIndex, req.PrevLogTerm, entries)
+	// Liveness holds for every non-stale legitimate-leader signal, including
+	// mismatches and replication outcomes.
 	n.ResetElectionTimer()
-
+	if !ok {
+		return &transport.AppendEntriesResponse{
+			Term:       uint64(currTerm),
+			Success:    false,
+			MatchIndex: 0,
+		}, nil
+	}
 	return &transport.AppendEntriesResponse{
 		Term:       uint64(currTerm),
 		Success:    true,
-		MatchIndex: req.PrevLogIndex,
+		MatchIndex: uint64(matchIdx),
 	}, nil
+}
+
+// prevLogMatches reports whether the local log contains an entry at prevIndex
+// with term prevTerm. The (0,0) sentinel always matches an empty prefix.
+// Pure storage reads; no Node.mu held.
+func (n *Node) prevLogMatches(prevIndex uint64, prevTerm uint64) bool {
+	if prevIndex == 0 {
+		return true
+	}
+	lastIdx, _, err := n.storage.LastIndexAndTerm()
+	if err != nil || LogIndex(prevIndex) > lastIdx {
+		return false
+	}
+	termAtPrev, err := n.storage.TermOf(LogIndex(prevIndex))
+	return err == nil && termAtPrev == Term(prevTerm)
+}
+
+// convertPeerEntries translates wire entries into Raft log entries with
+// positional indexes (first entry = PrevLogIndex+1; the wire carries no
+// per-entry index, so contiguity holds by construction) and validates every
+// entry against Raft structural invariants. Pure computation, no shared state.
+// Returns ok=false for arithmetic overflow, zero entry terms, entries from a
+// term beyond the leader's stated term, or any LogEntry.Validate failure
+// (bad type, oversize data). Callers must not mutate the log on ok=false.
+func convertPeerEntries(req *transport.AppendEntriesRequest) ([]LogEntry, bool) {
+	if uint64(len(req.Entries)) > math.MaxUint64-req.PrevLogIndex {
+		return nil, false
+	}
+	entries := make([]LogEntry, len(req.Entries))
+	for i, pe := range req.Entries {
+		if pe.Term == 0 || pe.Term > req.Term {
+			return nil, false
+		}
+		e := LogEntry{
+			Index: LogIndex(req.PrevLogIndex) + LogIndex(i) + 1,
+			Term:  Term(pe.Term),
+			Type:  pe.Type,
+			Data:  pe.Data,
+		}
+		if err := e.Validate(); err != nil {
+			return nil, false
+		}
+		entries[i] = e
+	}
+	return entries, true
+}
+
+// replicateEntries incorporates validated leader entries into the local log.
+//
+// Preconditions (checked by caller): req already passed identity/term handling
+// (node is Follower, leaderID recorded) and entries are structurally valid
+// with positional indexes from prevLogIndex+1.
+//
+// Behavior:
+//   - PrevLog re-checked against fresh storage state: on mismatch, returns
+//     ok=false without mutating anything.
+//   - Walk entries against the local log: matching terms are kept as-is
+//     (never rewritten); the first term conflict truncates the local suffix
+//     at the conflicting index; entries beyond the local tail are appended.
+//     A follower tail extending beyond the leader suffix is preserved (no
+//     truncation merely because the request ends earlier).
+//   - Success (ok=true) is returned only after the resulting state is
+//     durably persisted. Truncate-then-append crash windows are benign: an
+//     interrupted replacement leaves a valid durable prefix that the leader's
+//     retry re-matches, so no false acknowledgement is possible.
+//   - On any storage failure returns ok=false with no success claim; the log
+//     remains structurally valid (Storage guarantees all-or-nothing per op).
+//
+// Locking: serialized via proposeMu (shared with Propose) so concurrent
+// proposals and replications cannot interleave index allocation with suffix
+// replacement. Node.mu is never held here (no role state is mutated); Storage
+// provides its own locking. Lock order: proposeMu -> Storage.mu, consistent
+// with Propose. MatchIndex returned is prevLogIndex + len(entries).
+func (n *Node) replicateEntries(prevLogIndex uint64, prevLogTerm uint64, entries []LogEntry) (LogIndex, bool) {
+	n.proposeMu.Lock()
+	defer n.proposeMu.Unlock()
+
+	if n.closed.Load() {
+		return 0, false
+	}
+
+	// Fresh PrevLog verification: the caller checked this before
+	// serialization, but a concurrent writer may have replaced the suffix
+	// since. Mismatch here means no mutation and a retryable rejection.
+	if prevLogIndex == 0 {
+		if prevLogTerm != 0 {
+			return 0, false
+		}
+	} else {
+		lastIdx, _, err := n.storage.LastIndexAndTerm()
+		if err != nil || LogIndex(prevLogIndex) > lastIdx {
+			return 0, false
+		}
+		termAtPrev, err := n.storage.TermOf(LogIndex(prevLogIndex))
+		if err != nil || termAtPrev != Term(prevLogTerm) {
+			return 0, false
+		}
+	}
+
+	lastIdx, _, err := n.storage.LastIndexAndTerm()
+	if err != nil {
+		return 0, false
+	}
+
+	// Walk entries against the local log.
+	appendFrom := len(entries)
+	for i, e := range entries {
+		if e.Index > lastIdx {
+			appendFrom = i
+			break
+		}
+		localTerm, err := n.storage.TermOf(e.Index)
+		if err != nil {
+			return 0, false
+		}
+		if localTerm != e.Term {
+			// Conflict: truncate the divergent suffix, then append this
+			// entry and everything after it.
+			if err := n.storage.TruncateSuffix(e.Index); err != nil {
+				return 0, false
+			}
+			appendFrom = i
+			lastIdx = e.Index - 1
+			break
+		}
+	}
+
+	if appendFrom == len(entries) {
+		// Every supplied entry already matches (duplicate or prefix
+		// delivery, possibly with extra local tail beyond — preserved).
+		// No storage writes needed.
+		return LogIndex(prevLogIndex) + LogIndex(len(entries)), true
+	}
+
+	// Durably persist the new suffix. Storage.Append re-validates contiguity
+	// (entries[appendFrom].Index == lastIdx+1 by construction above) and
+	// syncs before mutating memory; on failure the log is untouched.
+	if err := n.storage.Append(entries[appendFrom:]...); err != nil {
+		return 0, false
+	}
+	return LogIndex(prevLogIndex) + LogIndex(len(entries)), true
 }
 
 // HandleAppendEntriesResponse processes an incoming AppendEntries response from a peer.
