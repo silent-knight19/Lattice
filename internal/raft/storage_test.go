@@ -85,6 +85,26 @@ func TestStorage_TermMonotonicityAndVoteSafety(t *testing.T) {
 		t.Fatalf("expected ErrRaftTermRegressed, got %v", err)
 	}
 
+	// Calling SetTerm(1) with current term 1 must NOT clear the existing vote for node 2
+	if err := s.SetTerm(1); err != nil {
+		t.Fatalf("SetTerm(1) same-term failed: %v", err)
+	}
+	vote, _ = s.VotedFor()
+	if vote != 2 {
+		t.Fatalf("SetTerm(1) cleared vote in same term! got %d, want 2", vote)
+	}
+	// Attempting to vote for candidate 3 after SetTerm(1) must still be rejected
+	err = s.SetVote(3)
+	if err == nil || !stdErrors.Is(err, errors.ErrRaftDuplicateVote) {
+		t.Fatalf("expected ErrRaftDuplicateVote after SetTerm(1), got %v", err)
+	}
+
+	// Calling SetHardState in same term with votedFor=NodeIDNil must fail closed
+	err = s.SetHardState(raft.HardState{Term: 1, VotedFor: cluster.NodeIDNil})
+	if err == nil || !stdErrors.Is(err, errors.ErrRaftVoteClearedInSameTerm) {
+		t.Fatalf("expected ErrRaftVoteClearedInSameTerm, got %v", err)
+	}
+
 	// Advance term to 2 clears vote automatically
 	if err := s.SetTerm(2); err != nil {
 		t.Fatalf("SetTerm(2) failed: %v", err)
@@ -210,6 +230,40 @@ func TestStorage_TruncateSuffixAndReopen(t *testing.T) {
 	rec3, _ := s2.Entry(3)
 	if !bytes.Equal(rec3.Data, []byte("new-3")) {
 		t.Fatalf("expected new-3, got %s", string(rec3.Data))
+	}
+}
+
+func TestStorage_TruncateSuffix_RenameFailureSafe(t *testing.T) {
+	dir := t.TempDir()
+
+	s, err := raft.OpenStorage(dir)
+	if err != nil {
+		t.Fatalf("OpenStorage failed: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	entries := []raft.LogEntry{
+		{Index: 1, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("1")},
+		{Index: 2, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("2")},
+	}
+	_ = s.Append(entries...)
+
+	// Inject error into rename operation during TruncateSuffix
+	restore := raft.SetRaftRenameFnForTesting(func(oldpath, newpath string) error {
+		return fmt.Errorf("injected rename I/O error")
+	})
+	defer restore()
+
+	err = s.TruncateSuffix(2)
+	if err == nil {
+		t.Fatalf("expected TruncateSuffix to fail when rename fails")
+	}
+
+	// Because rename failed after closing the active descriptor, Storage must mark itself closed
+	// and reject subsequent appends safely with ErrRaftStateClosed without panicking.
+	err = s.Append(raft.LogEntry{Index: 3, Term: 1, Type: transport.PeerEntryNormal, Data: []byte("3")})
+	if err == nil || !stdErrors.Is(err, errors.ErrRaftStateClosed) {
+		t.Fatalf("expected ErrRaftStateClosed after terminal truncation failure, got %v", err)
 	}
 }
 

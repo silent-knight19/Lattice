@@ -54,6 +54,7 @@ const (
 // Pluggable seams for fault-injection testing
 var (
 	raftSyncDirFn = syncDir
+	raftRenameFn  = os.Rename
 )
 
 // syncDir flushes modified directory entries to persistent storage media.
@@ -236,11 +237,19 @@ func (s *Storage) SetHardState(hs HardState) error {
 			errors.ErrRaftTermRegressed, hs.Term, s.hardState.Term)
 	}
 
-	// 2. Vote uniqueness check: if same term, cannot vote for a different node
+	// 2. Same-term vote rules:
+	//    - Cannot vote for a different node in the same term (vote uniqueness).
+	//    - Cannot clear or reset an already cast vote in the same term.
 	if hs.Term == s.hardState.Term {
-		if s.hardState.VotedFor != cluster.NodeIDNil && hs.VotedFor != cluster.NodeIDNil && hs.VotedFor != s.hardState.VotedFor {
-			return fmt.Errorf("%w: already voted for node %d in term %d, cannot vote for %d",
-				errors.ErrRaftDuplicateVote, s.hardState.VotedFor, hs.Term, hs.VotedFor)
+		if s.hardState.VotedFor != cluster.NodeIDNil {
+			if hs.VotedFor == cluster.NodeIDNil {
+				return fmt.Errorf("%w: cannot clear vote for node %d in term %d",
+					errors.ErrRaftVoteClearedInSameTerm, s.hardState.VotedFor, hs.Term)
+			}
+			if hs.VotedFor != s.hardState.VotedFor {
+				return fmt.Errorf("%w: already voted for node %d in term %d, cannot vote for %d",
+					errors.ErrRaftDuplicateVote, s.hardState.VotedFor, hs.Term, hs.VotedFor)
+			}
 		}
 	}
 
@@ -253,9 +262,23 @@ func (s *Storage) SetHardState(hs HardState) error {
 	return nil
 }
 
-// SetTerm atomically advances the current term and clears votedFor.
+// SetTerm advances the current term and clears votedFor if newTerm > currentTerm.
+// If newTerm == currentTerm, it is a no-op and preserves any existing vote.
 // Returns ErrRaftTermRegressed if newTerm < currentTerm.
 func (s *Storage) SetTerm(newTerm Term) error {
+	s.mu.RLock()
+	currTerm := s.hardState.Term
+	s.mu.RUnlock()
+
+	if newTerm < currTerm {
+		return fmt.Errorf("%w: attempted term %d < current term %d",
+			errors.ErrRaftTermRegressed, newTerm, currTerm)
+	}
+	if newTerm == currTerm {
+		// Same term: preserve existing vote and avoid unnecessary disk write
+		return nil
+	}
+
 	return s.SetHardState(HardState{
 		Term:     newTerm,
 		VotedFor: cluster.NodeIDNil,
@@ -339,6 +362,10 @@ func (s *Storage) Append(entries ...LogEntry) error {
 		return errors.ErrRaftStateClosed
 	}
 
+	if s.logFile == nil {
+		return fmt.Errorf("%w: log file descriptor is nil", errors.ErrRaftStateClosed)
+	}
+
 	lastIdx := s.memLog.LastIndex()
 
 	// 1. Validate contiguity and payload bounds before any serialization
@@ -375,10 +402,10 @@ func (s *Storage) Append(entries ...LogEntry) error {
 //
 // Operational lifecycle:
 //   - If fromIndex > LastIndex(), no-op.
-//   - Rewrites remaining entries [1, fromIndex) to `raft.log.tmp`, fsyncs, atomically swaps
-//     via os.Rename, and syncs parent directory.
-//   - Reopens pinned `raft.log` descriptor in append mode.
-//   - Truncates in-memory log suffix.
+//   - Staged in `raft.log.tmp`, fsynced, and only upon success is the active descriptor closed
+//     and swapped with os.Rename.
+//   - If atomic rename or subsequent reopen fails, the storage enters a terminal fail-closed state.
+//   - If staging or syncing the temp file fails, the original active logFile remains completely untouched.
 func (s *Storage) TruncateSuffix(fromIndex LogIndex) error {
 	if s.closed.Load() {
 		return errors.ErrRaftStateClosed
@@ -403,12 +430,6 @@ func (s *Storage) TruncateSuffix(fromIndex LogIndex) error {
 		if err != nil {
 			return err
 		}
-	}
-
-	// Close existing log file descriptor before replacing
-	if s.logFile != nil {
-		_ = s.logFile.Close()
-		s.logFile = nil
 	}
 
 	tmpPath := filepath.Join(s.dir, LogTempFilename)
@@ -446,20 +467,31 @@ func (s *Storage) TruncateSuffix(fromIndex LogIndex) error {
 		return fmt.Errorf("raft: failed to close truncated log tmp file: %w", err)
 	}
 
+	// At this point, tmpFile is complete and durably synced on disk.
+	// Close existing active logFile descriptor before atomic replacement.
+	if s.logFile != nil {
+		_ = s.logFile.Close()
+		s.logFile = nil
+	}
+
 	// Atomic rename to replace active log file
-	if err := os.Rename(tmpPath, logPath); err != nil {
+	if err := raftRenameFn(tmpPath, logPath); err != nil {
+		// Terminal failure: mark closed so subsequent operations fail closed
+		s.closed.Store(true)
 		return fmt.Errorf("raft: failed to atomically replace log file: %w", err)
 	}
 	writeSucceeded = true
 
 	// Sync parent directory
 	if err := raftSyncDirFn(s.dir); err != nil {
+		s.closed.Store(true)
 		return fmt.Errorf("raft: failed to sync directory after log truncation: %w", err)
 	}
 
 	// Reopen log file for future appends
 	newLogFile, err := os.OpenFile(logPath, os.O_RDWR|os.O_APPEND, RaftFileMode)
 	if err != nil {
+		s.closed.Store(true)
 		return fmt.Errorf("raft: failed to reopen log file after truncation: %w", err)
 	}
 	s.logFile = newLogFile
@@ -536,7 +568,7 @@ func writeStateFile(dir string, hs HardState) error {
 		return err
 	}
 
-	if err := os.Rename(tmpPath, finalPath); err != nil {
+	if err := raftRenameFn(tmpPath, finalPath); err != nil {
 		return err
 	}
 	writeOk = true

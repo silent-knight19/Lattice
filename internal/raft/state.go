@@ -92,3 +92,37 @@ func (s HardState) Validate() error {
 	// VotedFor can be NodeIDNil (0) or any valid NodeID (> 0).
 	return nil
 }
+
+// Role represents the volatile consensus server role in Raft (Follower, Candidate, Leader).
+// At any given instant, exactly one role is active on a node.
+type Role uint8
+
+const (
+	// RoleFollower indicates the node is a passive replica receiving heartbeats and log entries.
+	RoleFollower Role = iota
+
+	// RoleCandidate indicates the node has transitioned to candidate and is soliciting votes.
+	RoleCandidate
+
+	// RoleLeader indicates the node has won election and coordinates log replication and heartbeats.
+	RoleLeader
+)
+
+// String returns the canonical human-readable name of the Raft server role.
+func (r Role) String() string {
+	switch r {
+	case RoleFollower:
+		return "Follower"
+	case RoleCandidate:
+		return "Candidate"
+	case RoleLeader:
+		return "Leader"
+	default:
+		return fmt.Sprintf("Role(%d)", r)
+	}
+}
+
+// Valid reports whether the role is one of Follower, Candidate, or Leader.
+func (r Role) Valid() bool {
+	return r <= RoleLeader
+}

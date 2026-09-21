@@ -476,6 +476,15 @@ var (
 
 	// ErrRaftEntryTooLarge indicates that a log entry data payload exceeds the maximum allowed limit.
 	ErrRaftEntryTooLarge = stdErrors.New("raft log entry payload exceeds maximum allowed size")
+
+	// ErrRaftInvalidRoleTransition indicates that an attempted Raft role change violates the valid state transition matrix.
+	ErrRaftInvalidRoleTransition = stdErrors.New("invalid raft role state transition")
+
+	// ErrRaftTermOverflow indicates that incrementing the term would exceed uint64 representation.
+	ErrRaftTermOverflow = stdErrors.New("raft term arithmetic overflow")
+
+	// ErrRaftVoteClearedInSameTerm indicates an attempt to reset or clear votedFor while remaining in the same term.
+	ErrRaftVoteClearedInSameTerm = stdErrors.New("raft vote cannot be reset or cleared in the same term")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/silent-knight19/lattice/internal/cluster"
 	"github.com/silent-knight19/lattice/internal/raft"
 )
 
@@ -48,6 +49,60 @@ func FuzzRecoverStorage(f *testing.F) {
 		s2, err := raft.OpenStorage(dir)
 		if err == nil && s2 != nil {
 			_ = s2.Close()
+		}
+	})
+}
+
+func FuzzRoleTransitions(f *testing.F) {
+	// Seed sequences of operations: 0=BecomeCandidate, 1=BecomeLeader, 2=StepDownSameTerm, 3=ObserveHigherTerm
+	f.Add(uint64(1), []byte{0, 1, 2, 3})
+	f.Add(uint64(5), []byte{0, 0, 1, 0, 3})
+	f.Add(uint64(10), []byte{3, 2, 1, 0})
+
+	f.Fuzz(func(t *testing.T, localIDRaw uint64, ops []byte) {
+		if localIDRaw == 0 {
+			return
+		}
+		if len(ops) > 20 { // Bound iteration length
+			return
+		}
+
+		dir := t.TempDir()
+		s, err := raft.OpenStorage(dir)
+		if err != nil {
+			return
+		}
+		defer func() { _ = s.Close() }()
+
+		node, err := raft.NewNode(raft.NodeConfig{
+			LocalID: cluster.NodeID(localIDRaw),
+			Storage: s,
+		})
+		if err != nil {
+			return
+		}
+		defer func() { _ = node.Close() }()
+
+		for _, op := range ops {
+			switch op % 4 {
+			case 0:
+				_ = node.BecomeCandidate()
+			case 1:
+				_ = node.BecomeLeader()
+			case 2:
+				_ = node.StepDownSameTerm(cluster.NodeID(1))
+			case 3:
+				term, err := node.Term()
+				if err == nil {
+					_, _ = node.ObserveHigherTerm(term + 1)
+				}
+			}
+
+			// Invariant verification: role must always be valid
+			r := node.Role()
+			if !r.Valid() {
+				t.Fatalf("invalid role observed: %v", r)
+			}
 		}
 	})
 }
