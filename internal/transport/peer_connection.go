@@ -354,6 +354,59 @@ func (s *peerSupervisor) run(ctx context.Context, wg *sync.WaitGroup) {
 			s.mu.Unlock()
 			return
 		}
+		if s.state == PeerStateConnected && s.conn != nil {
+			doneCh := s.connDoneCh
+			curGen := s.generation
+			s.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				s.disconnect(curGen, ctx.Err())
+				s.mu.Lock()
+				s.state = PeerStateClosing
+				s.mu.Unlock()
+				s.readerWg.Wait()
+				return
+			case <-doneCh:
+				s.mu.Lock()
+				if s.state == PeerStateClosing || ctx.Err() != nil {
+					s.state = PeerStateClosing
+					s.mu.Unlock()
+					return
+				}
+				if s.state == PeerStateConnected && s.conn != nil {
+					s.mu.Unlock()
+					continue
+				}
+				s.mu.Unlock()
+
+				s.readerWg.Wait()
+
+				s.mu.Lock()
+				if s.state == PeerStateClosing || ctx.Err() != nil {
+					s.state = PeerStateClosing
+					s.mu.Unlock()
+					return
+				}
+				if s.state == PeerStateConnected && s.conn != nil {
+					s.mu.Unlock()
+					continue
+				}
+				s.failures++
+				failures := s.failures
+				s.mu.Unlock()
+
+				delay := s.calculateBackoff(failures)
+				select {
+				case <-ctx.Done():
+					s.mu.Lock()
+					s.state = PeerStateClosing
+					s.mu.Unlock()
+					return
+				case <-time.After(delay):
+					continue
+				}
+			}
+		}
 		s.state = PeerStateConnecting
 		s.mu.Unlock()
 
@@ -398,6 +451,11 @@ func (s *peerSupervisor) run(ctx context.Context, wg *sync.WaitGroup) {
 			_ = conn.Close()
 			return
 		}
+		if s.state == PeerStateConnected && s.conn != nil {
+			s.mu.Unlock()
+			_ = conn.Close()
+			continue
+		}
 
 		// Configure TCP keep-alive
 		configureKeepAlive(conn, s.cfg.KeepAlivePeriod)
@@ -427,12 +485,29 @@ func (s *peerSupervisor) run(ctx context.Context, wg *sync.WaitGroup) {
 			s.readerWg.Wait()
 			return
 		case <-doneCh:
-			s.readerWg.Wait()
 			s.mu.Lock()
 			if s.state == PeerStateClosing || ctx.Err() != nil {
 				s.state = PeerStateClosing
 				s.mu.Unlock()
 				return
+			}
+			if s.state == PeerStateConnected && s.conn != nil {
+				s.mu.Unlock()
+				continue
+			}
+			s.mu.Unlock()
+
+			s.readerWg.Wait()
+
+			s.mu.Lock()
+			if s.state == PeerStateClosing || ctx.Err() != nil {
+				s.state = PeerStateClosing
+				s.mu.Unlock()
+				return
+			}
+			if s.state == PeerStateConnected && s.conn != nil {
+				s.mu.Unlock()
+				continue
 			}
 			s.failures++
 			failures := s.failures
@@ -450,6 +525,69 @@ func (s *peerSupervisor) run(ctx context.Context, wg *sync.WaitGroup) {
 			}
 		}
 	}
+}
+
+// adoptInboundConnection installs an accepted inbound TCP connection into the supervisor,
+// replacing any stale connection, and starts a reader loop.
+// Returns true if connection was adopted, false if rejected.
+func (s *peerSupervisor) adoptInboundConnection(ctx context.Context, conn net.Conn, firstFrame *Frame, localID cluster.NodeID) bool {
+	s.mu.Lock()
+	if s.state == PeerStateClosing || ctx.Err() != nil {
+		s.mu.Unlock()
+		_ = conn.Close()
+		return false
+	}
+
+	// If already connected with a live connection:
+	// Tie-break: if localID < s.peerID, our local outbound connection is authoritative. Reject incoming.
+	// Otherwise (localID > s.peerID), remote peer's connection is authoritative. Replace local connection.
+	if s.state == PeerStateConnected && s.conn != nil {
+		if localID < s.peerID {
+			s.mu.Unlock()
+			_ = conn.Close()
+			return false
+		}
+	}
+
+	oldConn := s.conn
+	s.conn = nil
+	if s.connDoneCh != nil {
+		select {
+		case <-s.connDoneCh:
+		default:
+			close(s.connDoneCh)
+		}
+	}
+	if oldConn != nil {
+		_ = oldConn.Close()
+	}
+
+	configureKeepAlive(conn, s.cfg.KeepAlivePeriod)
+
+	s.generation++
+	curGen := s.generation
+	s.conn = conn
+	s.state = PeerStateConnected
+	s.failures = 0
+	doneCh := make(chan struct{})
+	s.connDoneCh = doneCh
+	s.replayFilter.ResetSequence()
+	s.mu.Unlock()
+
+	// Launch reader loop for subsequent frames on conn
+	s.readerWg.Add(1)
+	go s.runReader(ctx, curGen, conn)
+
+	// Process firstFrame if provided
+	if firstFrame != nil {
+		if err := s.replayFilter.CheckAndRecord(firstFrame); err == nil {
+			if s.cfg.OnFrameReceived != nil {
+				s.cfg.OnFrameReceived(s.peerID, firstFrame)
+			}
+		}
+	}
+
+	return true
 }
 
 // runReader continuously consumes framed messages from conn using DecodeFrame.
@@ -510,6 +648,8 @@ type PeerConnectionManager struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	listener net.Listener
 }
 
 // NewPeerConnectionManager constructs a new PeerConnectionManager.
@@ -626,6 +766,161 @@ func (m *PeerConnectionManager) Start() error {
 	}
 
 	return nil
+}
+
+// StartListener binds a TCP listener on addr (or topology.LocalAddress() if addr is empty)
+// and begins accepting incoming peer connections in the background.
+func (m *PeerConnectionManager) StartListener(addr string) error {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+
+	if m.closed.Load() {
+		return errors.ErrManagerClosed
+	}
+
+	if addr == "" {
+		if m.topology != nil {
+			addr = m.topology.LocalAddress()
+		}
+	}
+	if addr == "" {
+		return nil
+	}
+
+	if !m.cfg.InsecureTransport && !isLoopbackAddress(addr) {
+		return fmt.Errorf("%w: peer listener address %q is non-loopback; plaintext transport forbidden without mTLS or InsecureTransport=true",
+			errors.ErrInsecureTransport, addr)
+	}
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+
+	m.listener = ln
+	m.wg.Add(1)
+	go m.acceptLoop(ln)
+
+	return nil
+}
+
+// ServeListener accepts incoming connections from an existing listener.
+func (m *PeerConnectionManager) ServeListener(ln net.Listener) error {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+
+	if m.closed.Load() {
+		return errors.ErrManagerClosed
+	}
+	if ln == nil {
+		return errors.ErrNilReceiver
+	}
+
+	m.listener = ln
+	m.wg.Add(1)
+	go m.acceptLoop(ln)
+
+	return nil
+}
+
+// ListenerAddr returns the network address the peer listener is bound to,
+// or nil if no listener is currently running.
+func (m *PeerConnectionManager) ListenerAddr() net.Addr {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	if m.listener != nil {
+		return m.listener.Addr()
+	}
+	return nil
+}
+
+func (m *PeerConnectionManager) acceptLoop(ln net.Listener) {
+	defer m.wg.Done()
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if m.closed.Load() {
+				return
+			}
+			// Transient accept error
+			select {
+			case <-m.ctx.Done():
+				return
+			case <-time.After(10 * time.Millisecond):
+				continue
+			}
+		}
+
+		m.wg.Add(1)
+		go m.handleInboundConn(conn)
+	}
+}
+
+func (m *PeerConnectionManager) handleInboundConn(conn net.Conn) {
+	defer m.wg.Done()
+
+	// Deadline for first request frame to defend against Slowloris
+	if ds, ok := conn.(deadlineSetter); ok {
+		_ = ds.SetReadDeadline(time.Now().Add(m.cfg.DialTimeout))
+	}
+
+	frame, err := DecodeFrame(conn)
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
+
+	// Reset read deadline after first frame read
+	if ds, ok := conn.(deadlineSetter); ok {
+		_ = ds.SetReadDeadline(time.Time{})
+	}
+
+	// Validate opcode
+	op := PeerMessageType(frame.Header.OpCode)
+	if !op.Valid() {
+		_ = conn.Close()
+		return
+	}
+	if frame.Header.Flags != FlagNone {
+		_ = conn.Close()
+		return
+	}
+
+	var fromPeerID cluster.NodeID
+	switch op {
+	case PeerOpAppendEntries:
+		req, err := DecodeAppendEntries(frame)
+		if err != nil {
+			_ = conn.Close()
+			return
+		}
+		fromPeerID = cluster.NodeID(req.LeaderID)
+	case PeerOpRequestVote:
+		req, err := DecodeRequestVote(frame)
+		if err != nil {
+			_ = conn.Close()
+			return
+		}
+		fromPeerID = cluster.NodeID(req.CandidateID)
+	default:
+		_ = conn.Close()
+		return
+	}
+
+	if !fromPeerID.IsValid() || m.topology.IsSelf(fromPeerID) {
+		_ = conn.Close()
+		return
+	}
+
+	sup, ok := m.supervisors[fromPeerID]
+	if !ok {
+		_ = conn.Close()
+		return
+	}
+
+	// Hand over connection to supervisor
+	sup.adoptInboundConnection(m.ctx, conn, frame, m.topology.LocalID())
 }
 
 // Send serializes and transmits a protocol frame to target peerID.
@@ -752,6 +1047,12 @@ func (m *PeerConnectionManager) Close() error {
 	// Cancel root context to interrupt all pending dials and backoff sleeps
 	if m.cancel != nil {
 		m.cancel()
+	}
+
+	// Close listener if active
+	if m.listener != nil {
+		_ = m.listener.Close()
+		m.listener = nil
 	}
 
 	// Close all currently active sockets immediately to unblock blocked readers/writers

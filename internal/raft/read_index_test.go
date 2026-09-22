@@ -629,3 +629,39 @@ func TestReadIndex_ConcurrentReads(t *testing.T) {
 		t.Fatalf("concurrent reader failed: %v", err)
 	}
 }
+
+// TestReadIndex_SuccessFalseDoesNotConfirmQuorum proves that an AppendEntries response
+// bearing the matching nonce but Success == false does NOT count as a quorum acknowledgement (Section 5).
+func TestReadIndex_SuccessFalseDoesNotConfirmQuorum(t *testing.T) {
+	var n *raft.Node
+	// Mock sender returns matching nonce but Success: false (e.g. follower log rejection)
+	sender := newMockReadSender(func(ctx context.Context, peerID cluster.NodeID, req *transport.AppendEntriesRequest) {
+		go func() {
+			_ = n.HandleAppendEntriesResponse(peerID, &transport.AppendEntriesResponse{
+				Term:       req.Term,
+				Success:    false, // Negative ack: log rejected
+				MatchIndex: 0,
+				Nonce:      req.Nonce, // Matching nonce
+			})
+		}()
+	})
+
+	n, _ = newTestReadNode(t, 1, []cluster.NodeID{2, 3}, sender)
+	leadReadNode(t, n)
+
+	// ReadIndex must fail to confirm quorum and time out
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	_, err := n.ReadIndex(ctx)
+	if err == nil {
+		t.Fatal("expected ReadIndex to fail when follower returns Success=false, but got nil error")
+	}
+	if !stdErrors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected DeadlineExceeded, got: %v", err)
+	}
+
+	if n.ActiveReadRoundsCount() != 0 {
+		t.Fatalf("expected 0 active read rounds after timeout, got %d", n.ActiveReadRoundsCount())
+	}
+}

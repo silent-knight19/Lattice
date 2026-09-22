@@ -2560,9 +2560,12 @@ func (n *Node) HandleAppendEntriesResponse(fromPeerID cluster.NodeID, resp *tran
 	// ReadIndex quorum heartbeat verification (P17-S01-M01):
 	// If this response carries a non-zero nonce matching an active read round,
 	// record the peer's current-term acknowledgement.
+	// Hard requirement (Section 5): resp.Success must be true.
+	// A follower that rejects the probe (e.g. log mismatch) has not positively
+	// confirmed the leader's read authority.
 	if resp.Nonce != 0 && len(n.readRounds) > 0 {
 		if round, ok := n.readRounds[resp.Nonce]; ok {
-			if Term(resp.Term) == round.term && n.leaderEpoch == round.epoch {
+			if resp.Success && Term(resp.Term) == round.term && n.leaderEpoch == round.epoch {
 				if round.acks == nil {
 					round.acks = make(map[cluster.NodeID]struct{})
 				}
@@ -2669,7 +2672,22 @@ func (n *Node) sendReadHeartbeats(ctx context.Context, term Term, nonce uint64) 
 	}
 
 	leaderCommit := uint64(n.CommitIndex())
-	lastIdx, lastTerm, _ := n.storage.LastIndexAndTerm()
+	lastIdx, lastTerm, err := n.storage.LastIndexAndTerm()
+	if err != nil {
+		// Storage failure during probe preparation must abort the round fail-closed
+		n.mu.Lock()
+		if round, ok := n.readRounds[nonce]; ok {
+			round.err = fmt.Errorf("raft: failed to read storage coordinates for read heartbeats: %w", err)
+			select {
+			case <-round.done:
+			default:
+				close(round.done)
+			}
+			delete(n.readRounds, nonce)
+		}
+		n.mu.Unlock()
+		return
+	}
 
 	for _, peerID := range n.peers {
 		if sendCtx.Err() != nil {

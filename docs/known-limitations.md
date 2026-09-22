@@ -1389,24 +1389,27 @@ This document tracks all **genuine architectural and operational limitations** o
   The ReadIndex primitive (`Node.ReadIndex(ctx context.Context) (ReadIndexResult, error)` in `internal/raft/node.go`) establishes the safe Raft-side read position and confirms active current-term leadership across a majority of the cluster before returning, with the following deliberate boundaries:
   1. *Raft-Side Primitive Only (No State Machine Barrier in M01)*:
      `Node.ReadIndex` establishes that the node is the legitimate leader with confirmed current-term majority authority and returns the safe committed position (`ReadIndexResult{Index: commitIndex, Term: term}`). It does **not** wait for `lastApplied >= ReadIndex`, nor does it perform state-machine read dispatch or alter client `GET` request handling. State-machine read barriers and client-facing linearizable GET execution belong exclusively to P17-S01-M02.
-  2. *Strict Quorum Semantics*:
+  2. *Production Transport Integration & Nonce Round-Trip*:
+     In multi-node cluster mode, the Lattice daemon constructs `PeerConnectionManager` as the production `raft.PeerSender`, binding inbound TCP frame dispatch (`PeerOpAppendEntries`, `PeerOpAppendEntriesResponse`, `PeerOpRequestVote`, `PeerOpRequestVoteResponse`) directly to `raftNode.HandlePeerFrame`. Heartbeat probes and nonces survive the full wire path: `AppendEntriesRequest.Nonce` -> framed TCP -> follower `HandleAppendEntries` -> `AppendEntriesResponse.Nonce` -> framed TCP -> leader `HandleAppendEntriesResponse`.
+  3. *Strict Quorum Semantics & Success=true Enforcement*:
      Quorum is evaluated using the cluster's canonical rule: $\text{quorumSize} = \lfloor N/2 \rfloor + 1$.
      - In single-node clusters ($N=1$), the leader alone constitutes a majority ($\text{quorumSize}=1$) and returns immediately without network I/O or waiting.
      - In multi-node clusters ($N > 1$), the leader broadcasts empty `AppendEntries` heartbeat probes bearing a round-unique 64-bit cryptographic nonce to all remote peers and awaits current-term confirmation from a majority ($1 + \text{acks} \ge \text{quorumSize}$).
-  3. *Stale-Response & Round Correlation Defense*:
-     Followers echo `req.Nonce` in `AppendEntriesResponse` (extended backwards-compatibly to 25 bytes on the wire when `Nonce != 0`). Responses are matched in $O(1)$ against active read rounds. Responses with mismatched nonces, legacy zero nonces, older terms, or older leadership epochs are strictly ignored and cannot advance quorum confirmation.
-  4. *Continuous Leadership & Epoch Verification*:
+     - Only responses with `resp.Success == true` count toward quorum. Responses where `resp.Success == false` (e.g. follower log mismatch) are strictly disqualified from quorum advancement.
+  4. *Stale-Response & Round Correlation Defense*:
+     Followers echo `req.Nonce` in `AppendEntriesResponse` (extended backwards-compatibly to 25 bytes on the wire when `Nonce != 0`). Responses are matched in $O(1)$ against active read rounds. Responses with mismatched nonces, legacy zero nonces, older terms, `Success=false`, or older leadership epochs are strictly ignored and cannot advance quorum confirmation.
+  5. *Continuous Leadership & Epoch Verification*:
      The linearization point captures `commitIndex` atomically with verified `role == RoleLeader`, continuous `currTerm`, and unchanged `leaderEpoch`. Any concurrent stepdown, higher-term observation, or node closure aborts all pending read rounds fail-closed with `ErrRaftInvalidRoleTransition` or `ErrRaftStateClosed`.
-  5. *Context Error Preservation*:
+  6. *Context Error Preservation*:
      Context cancellation or timeout during quorum wait immediately unregisters the active round and returns pure context errors (`context.Canceled` or `context.DeadlineExceeded`), preventing spurious not-leader redirects.
 * **Why It Exists**:
-  Prevents stale reads under asymmetric network partitions (where an isolated former leader might otherwise serve reads with obsolete data) by requiring explicit, fresh proof of leadership from a majority.
+  Prevents stale reads under asymmetric network partitions (where an isolated former leader might otherwise serve reads with obsolete data) by requiring explicit, fresh proof of leadership from a majority over the production TCP transport.
 * **Impact**:
-  The Raft consensus layer now provides a verifiable, race-free `ReadIndex` primitive ready for consumption by the P17-S01-M02 state-machine read barrier.
+  The Raft consensus layer now provides a verifiable, race-free `ReadIndex` primitive integrated with the real multi-node transport and ready for consumption by the P17-S01-M02 state-machine read barrier.
 * **Dimensional Impact**:
-  * Correctness: **Optimal** (Atomic linearization point, round-unique nonces, leadership epoch fencing, zero TOCTOU windows).
+  * Correctness: **Optimal** (Atomic linearization point, round-unique nonces, leadership epoch fencing, Success=true enforcement, zero TOCTOU windows).
   * Security: **Audited & Hardened** (Fail-closed on stepdown, unknown peers rejected, bounded memory with automatic round deregistration).
-  * Performance: **Low overhead** (Single round of heartbeat probes; single-node clusters execute with zero network delay).
+  * Performance: **Low overhead** (Single round of heartbeat probes; single-node clusters execute with zero network delay; connection reuse over PeerConnectionManager).
 
 ---
 

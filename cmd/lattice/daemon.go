@@ -127,6 +127,7 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 	var (
 		raftStorage *raft.Storage
 		raftNode    *raft.Node
+		peerMgr     *transport.PeerConnectionManager
 	)
 
 	// In cluster mode: wire persistent Raft storage, Node, ProposalRouter, and apply loop
@@ -154,14 +155,35 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 			return ExitStartupError
 		}
 
+		peerCfg := transport.DefaultPeerConnectionConfig()
+		peerCfg.InsecureTransport = cfg.InsecureTransport
+		peerCfg.OnFrameReceived = func(peerID cluster.NodeID, frame *transport.Frame) {
+			if raftNode != nil {
+				_ = raftNode.HandlePeerFrame(peerID, frame)
+			}
+		}
+
+		peerMgr, err = transport.NewPeerConnectionManager(cfg.Topology, peerCfg)
+		if err != nil {
+			_ = raftStorage.Close()
+			if pprofSrv != nil {
+				_ = pprofSrv.Shutdown(context.Background())
+			}
+			_ = eng.Close()
+			fmt.Fprintf(stderr, "lattice: failed to initialize peer connection manager: %v\n", err)
+			return ExitStartupError
+		}
+
 		raftCfg := raft.NodeConfig{
 			LocalID:      cluster.NodeID(cfg.NodeID),
 			Storage:      raftStorage,
 			Topology:     cfg.Topology,
 			StateMachine: eng,
+			PeerSender:   peerMgr,
 		}
 		raftNode, err = raft.NewNode(raftCfg)
 		if err != nil {
+			_ = peerMgr.Close()
 			_ = raftStorage.Close()
 			if pprofSrv != nil {
 				_ = pprofSrv.Shutdown(context.Background())
@@ -174,6 +196,34 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 		router := raft.NewProposalRouter(raftNode, cfg.Topology)
 		srvCfg.ProposalRouter = router
 
+		// Start peer listener if cluster topology has local address and remote peers exist
+		if cfg.Topology != nil && cfg.Topology.LocalAddress() != "" && cfg.Topology.Size() > 1 {
+			if err := peerMgr.StartListener(cfg.Topology.LocalAddress()); err != nil {
+				_ = raftNode.Close()
+				_ = peerMgr.Close()
+				_ = raftStorage.Close()
+				if pprofSrv != nil {
+					_ = pprofSrv.Shutdown(context.Background())
+				}
+				_ = eng.Close()
+				fmt.Fprintf(stderr, "lattice: failed to start peer listener on %s: %v\n", cfg.Topology.LocalAddress(), err)
+				return ExitStartupError
+			}
+		}
+
+		// Start peer connection supervisor loops
+		if err := peerMgr.Start(); err != nil {
+			_ = raftNode.Close()
+			_ = peerMgr.Close()
+			_ = raftStorage.Close()
+			if pprofSrv != nil {
+				_ = pprofSrv.Shutdown(context.Background())
+			}
+			_ = eng.Close()
+			fmt.Fprintf(stderr, "lattice: failed to start peer connection manager: %v\n", err)
+			return ExitStartupError
+		}
+
 		// Start election services
 		if cfg.Topology != nil && cfg.Topology.Size() == 1 {
 			// In single-node cluster (N=1), candidate self-vote satisfies quorum immediately
@@ -183,6 +233,7 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 		}
 		if err := raftNode.StartElectionTimer(); err != nil {
 			_ = raftNode.Close()
+			_ = peerMgr.Close()
 			_ = raftStorage.Close()
 			if pprofSrv != nil {
 				_ = pprofSrv.Shutdown(context.Background())
@@ -195,6 +246,9 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 
 	srv, err := transport.NewServer(srvCfg, eng)
 	if err != nil {
+		if peerMgr != nil {
+			_ = peerMgr.Close()
+		}
 		if raftNode != nil {
 			_ = raftNode.Close()
 		}
@@ -211,6 +265,9 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 
 	// Step 4: Bind Listener and Start Accept Loop
 	if err := srv.Listen(cfg.Address); err != nil {
+		if peerMgr != nil {
+			_ = peerMgr.Close()
+		}
 		if raftNode != nil {
 			_ = raftNode.Close()
 		}
@@ -229,6 +286,9 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 	select {
 	case <-ctx.Done():
 		_ = srv.Close()
+		if peerMgr != nil {
+			_ = peerMgr.Close()
+		}
 		if raftNode != nil {
 			_ = raftNode.Close()
 		}
@@ -243,6 +303,9 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 	case sig := <-sigCh:
 		fmt.Fprintf(stdout, "lattice: received signal %s during startup, shutting down...\n", sig)
 		_ = srv.Close()
+		if peerMgr != nil {
+			_ = peerMgr.Close()
+		}
 		if raftNode != nil {
 			_ = raftNode.Close()
 		}
@@ -261,6 +324,9 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 	if pprofSrv != nil {
 		if err := pprofSrv.Start(); err != nil {
 			_ = srv.Close()
+			if peerMgr != nil {
+				_ = peerMgr.Close()
+			}
 			if raftNode != nil {
 				_ = raftNode.Close()
 			}
@@ -317,6 +383,10 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 
 	if srvErr := srv.Shutdown(shutCtx); srvErr != nil {
 		fmt.Fprintf(stderr, "lattice: warning: server network shutdown error: %v\n", srvErr)
+	}
+
+	if peerMgr != nil {
+		_ = peerMgr.Close()
 	}
 
 	if raftNode != nil {
