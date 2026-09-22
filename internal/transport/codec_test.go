@@ -480,6 +480,13 @@ func TestCodec_ResponseRoundTrip(t *testing.T) {
 			seqID:   109,
 			message: "server is shutting down",
 		},
+		{
+			name:    "Not leader redirect error",
+			opCode:  transport.OpPut,
+			status:  transport.StatusNotLeader,
+			seqID:   110,
+			message: "not leader: leader is node 2 at 127.0.0.1:9002",
+		},
 	}
 
 	for _, tc := range testCases {
@@ -620,4 +627,72 @@ func TestEncodeResponse_MaxPayloadLengthExceeded(t *testing.T) {
 	if !stdErrors.As(err, &frameErr) {
 		t.Fatalf("expected *errors.FrameTooLargeError, got: %T (%v)", err, err)
 	}
+}
+
+func TestFormatAndParseRedirectMessage(t *testing.T) {
+	tests := []struct {
+		name       string
+		id         uint64
+		addr       string
+		wantParsed bool
+	}{
+		{"standard endpoint", 1, "127.0.0.1:9099", true},
+		{"node 2 loopback", 2, "127.0.0.1:9002", true},
+		{"high node ID", 255, "10.0.0.1:9099", true},
+		{"ipv6 endpoint", 3, "[::1]:9099", true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := transport.FormatRedirectMessage(tc.id, tc.addr)
+			parsedID, parsedAddr, ok := transport.ParseRedirectMessage(msg)
+			if ok != tc.wantParsed {
+				t.Fatalf("ParseRedirectMessage(%q) ok = %v, want %v", msg, ok, tc.wantParsed)
+			}
+			if parsedID != tc.id {
+				t.Errorf("parsedID = %d, want %d", parsedID, tc.id)
+			}
+			if parsedAddr != tc.addr {
+				t.Errorf("parsedAddr = %q, want %q", parsedAddr, tc.addr)
+			}
+		})
+	}
+
+	invalidMessages := []string{
+		"",
+		"random error",
+		"not leader:",
+		"not leader: leader is node",
+		"not leader: leader is node abc at 127.0.0.1:9099",
+		"not leader: leader is node 0 at 127.0.0.1:9099",
+		"not leader: leader is node 1 at ",
+		"not leader: leader is unknown, retry later",
+	}
+	for _, inv := range invalidMessages {
+		if _, _, ok := transport.ParseRedirectMessage(inv); ok {
+			t.Errorf("ParseRedirectMessage(%q) unexpectedly returned ok=true", inv)
+		}
+	}
+}
+
+func FuzzParseRedirectMessage(f *testing.F) {
+	f.Add("not leader: leader is node 1 at 127.0.0.1:9099")
+	f.Add("not leader: leader is unknown, retry later")
+	f.Add("not leader: node is candidate, retry later")
+	f.Add("")
+	f.Add("not leader: leader is node ")
+	f.Add("not leader: leader is node 999999999999999999999999999999 at x")
+
+	f.Fuzz(func(t *testing.T, msg string) {
+		// Must not panic on arbitrary inputs
+		id, addr, ok := transport.ParseRedirectMessage(msg)
+		if ok {
+			if id == 0 {
+				t.Fatalf("parsed id is 0 for message %q", msg)
+			}
+			if len(addr) == 0 {
+				t.Fatalf("parsed addr is empty for message %q", msg)
+			}
+		}
+	})
 }

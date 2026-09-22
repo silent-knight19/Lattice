@@ -1309,5 +1309,36 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 77. Phase 16 Client Proposal Routing & Follower Redirection Scope & Model Boundaries (P16-S01-M02)
+* **Limitation & Architectural Boundaries**:
+  The client proposal router (`internal/transport/server.go`, `internal/raft/router.go`) bridges the external TCP client data-plane write path (`OpPut`, `OpDelete`) to the Raft consensus subsystem, enforcing consensus-first mutation and follower redirection with the following boundaries:
+  1. *Proposal Acceptance vs. Quorum Commit vs. State Machine Apply*:
+     `Node.Propose()` durably appends the canonical client mutation command to the leader's local Raft log and returns `StatusOK`.
+     **Critical Distinction**: In P16-S01-M02, proposal acceptance guarantees that the entry is durably persisted to the active leader's local log. It does *not* block waiting for quorum replication across peer nodes, nor does it block waiting for the P16-S01-M01 apply loop to execute the command against the local LSM engine. In a single-node cluster ($N=1$), `refreshCommitIndex()` commits the entry immediately on append, waking the apply loop. In multi-node clusters ($N > 1$), asynchronous peer replication drives commit advancement and subsequent application. Synchronous quorum commit waiting and linearizable read verification (`ReadIndex`) belong to Phase 17.
+  2. *Follower Redirection via Trusted Topology*:
+     Non-leader nodes (followers and candidates) strictly intercept client write requests and return `StatusNotLeader` (0x06).
+     Followers never mutate their local LSM engine directly and never propose log entries locally.
+     If a leader is known, the redirection response includes the leader's NodeID and network address resolved strictly from the immutable `cluster.Topology`.
+     The system never relies on client-provided addresses or unverified network endpoints, eliminating SSRF and open-redirect vectors.
+  3. *Candidate & Unknown Leader Handling*:
+     If a node is in the `Candidate` role, or is a `Follower` with no known leader (`LeaderIDNil` = 0), or if the known leader has no configured address in the topology, the router returns `StatusNotLeader` with an informative message indicating election in progress or unknown leader. Clients are expected to apply exponential backoff and retry.
+  4. *Preserved Standalone / Local Engine Mode*:
+     For single-process deployments and standalone tests operating without Raft consensus, `transport.Server` maintains backward compatibility: when `ProposalRouter` is nil, client writes are dispatched directly to `Engine.Put` and `Engine.Delete`. Consensus mode vs. standalone mode is strictly explicit via `ServerConfig.ProposalRouter` / `Server.SetProposalRouter`.
+  5. *Retry and Deduplication Semantics*:
+     Lattice does not implement a client duplicate-request filtering table in M02. If a client transmits a proposal, receives a network timeout, and retransmits, multiple identical entries may be appended to the Raft log.
+     Because Lattice `Put` (key-value overwrite) and `Delete` (tombstone) are naturally idempotent operations in the LSM state machine, sequential replay of duplicate writes produces deterministic, identical final state. Non-idempotent operations (such as atomic counters or list appends) will require a dedicated request deduplication table in future phases.
+  6. *Client Sequence ID Preservation*:
+     Every client response strictly preserves the client's request `SeqID` across all outcomes: leader success, follower redirect, unknown leader, validation errors, and internal proposal failures. Raft log indexes and terms are strictly decoupled from client sequence IDs.
+* **Why It Exists**:
+  Prevents client writes from bypassing consensus on replicated nodes while maintaining decoupled transport and Raft abstractions, zero import cycles, and 100% wire-protocol compatibility.
+* **Impact**:
+  Replicated nodes cannot suffer state divergence caused by direct local engine writes. Followers reliably guide clients to the current leader.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Consensus-first write invariant strictly enforced; direct engine bypass eliminated; zero races during leadership transitions).
+  * Performance: **Minimal overhead** (Local append and async replication; zero network hop on leader writes).
+  * Scalability: **Single-group leader write bottleneck** (As documented in Limitation 1).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*
 

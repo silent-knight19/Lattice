@@ -2464,10 +2464,10 @@ TOTAL: 176 Discrete, Testable Micro-Phases
 * **Major Objective**: Connect Raft committed log stream to local LSM storage engine state machine.
 * **Dependencies**: Phase 10, Phase 15.
 
-* **P16-S01-M01: State Machine Apply Loop**
+* **P16-S01-M01: State Machine Apply Loop** (complete)
   * *Objective*: Consume committed Raft entries sequentially and apply them to local LSM engine.
-* **P16-S01-M02: Client Proposal Routing & Follower Redirection**
-  * *Objective*: Follower nodes intercept client write requests and return redirect response with Leader address.
+* **P16-S01-M02: Client Proposal Routing & Follower Redirection** (complete)
+  * *Objective*: Follower nodes intercept client write requests and return redirect response with Leader address. Leader nodes ingest external mutations via Raft proposal path. Preserves non-replicated engine mode when unconfigured.
 
 ---
 

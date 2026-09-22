@@ -23,6 +23,14 @@ type Engine interface {
 	Delete(ctx context.Context, key []byte) error
 }
 
+// ProposalRouter defines the interface for routing client write mutations in replicated mode (P16-S01-M02).
+type ProposalRouter interface {
+	// RouteWrite handles client write requests (OpPut, OpDelete) in a Raft cluster.
+	// If the current node is the leader, the mutation is proposed to consensus.
+	// If the current node is a follower/non-leader, leader redirection is returned.
+	RouteWrite(ctx context.Context, req *Request) (*Response, error)
+}
+
 // ServerConfig configures the TCP transport server.
 type ServerConfig struct {
 	// Address is the TCP address to bind and listen on (default: "127.0.0.1:9099").
@@ -52,6 +60,10 @@ type ServerConfig struct {
 
 	// ShutdownTimeout is the maximum duration to wait for active connections to drain during Close (default: 5s).
 	ShutdownTimeout time.Duration
+
+	// ProposalRouter routes client write mutations to the consensus subsystem in replicated mode (P16-S01-M02).
+	// When nil (default), Server operates in standalone local engine mode.
+	ProposalRouter ProposalRouter
 }
 
 // DefaultServerConfig returns a production-hardened ServerConfig with safe default timeouts and limits.
@@ -99,6 +111,9 @@ type Server struct {
 	shutdownDone chan struct{}
 	wg           sync.WaitGroup
 	activeConns  atomic.Int64
+
+	routerMu sync.RWMutex
+	router   ProposalRouter
 }
 
 // NewServer constructs a new transport Server. It validates the configuration and verifies that eng is non-nil.
@@ -139,10 +154,32 @@ func NewServer(cfg ServerConfig, eng Engine) (*Server, error) {
 	return &Server{
 		cfg:          cfg,
 		engine:       eng,
+		router:       cfg.ProposalRouter,
 		conns:        make(map[net.Conn]struct{}),
 		shutdownCh:   make(chan struct{}),
 		shutdownDone: make(chan struct{}),
 	}, nil
+}
+
+// SetProposalRouter configures the authoritative consensus proposal router for replicated writes (P16-S01-M02).
+// When non-nil, PUT and DELETE requests are routed through consensus; when nil, server operates in local engine mode.
+func (s *Server) SetProposalRouter(r ProposalRouter) {
+	if s == nil {
+		return
+	}
+	s.routerMu.Lock()
+	defer s.routerMu.Unlock()
+	s.router = r
+}
+
+// ProposalRouter returns the currently configured proposal router, or nil if operating in local engine mode.
+func (s *Server) ProposalRouter() ProposalRouter {
+	if s == nil {
+		return nil
+	}
+	s.routerMu.RLock()
+	defer s.routerMu.RUnlock()
+	return s.router
 }
 
 // Listen binds on addr and starts the accept loop in a background goroutine.
@@ -443,8 +480,19 @@ func (s *Server) dispatch(req *Request) *Response {
 	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.RequestTimeout)
 	defer cancel()
 
+	router := s.ProposalRouter()
+
 	switch req.OpCode {
 	case OpPut:
+		if router != nil {
+			r, err := router.RouteWrite(ctx, req)
+			if err != nil {
+				resp.Status = StatusError
+				resp.Message = "internal routing error"
+				return resp
+			}
+			return r
+		}
 		err := s.engine.Put(ctx, req.Key, req.Value)
 		s.mapEngineError(err, resp)
 
@@ -463,6 +511,15 @@ func (s *Server) dispatch(req *Request) *Response {
 		}
 
 	case OpDelete:
+		if router != nil {
+			r, err := router.RouteWrite(ctx, req)
+			if err != nil {
+				resp.Status = StatusError
+				resp.Message = "internal routing error"
+				return resp
+			}
+			return r
+		}
 		err := s.engine.Delete(ctx, req.Key)
 		s.mapEngineError(err, resp)
 

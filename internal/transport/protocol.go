@@ -2,6 +2,8 @@ package transport
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/silent-knight19/lattice/internal/binary"
 )
@@ -110,11 +112,14 @@ const (
 
 	// StatusServerClosed indicates that the database engine is shutting down or closed (0x05).
 	StatusServerClosed StatusCode = 0x05
+
+	// StatusNotLeader indicates that the node is not the Raft leader and cannot process client writes (0x06).
+	StatusNotLeader StatusCode = 0x06
 )
 
 // Valid reports whether the status code is a recognized StatusCode.
 func (sc StatusCode) Valid() bool {
-	return sc <= StatusServerClosed
+	return sc <= StatusNotLeader
 }
 
 // String returns the human-readable string representation of the status code.
@@ -132,6 +137,8 @@ func (sc StatusCode) String() string {
 		return "STATUS_THROTTLED"
 	case StatusServerClosed:
 		return "STATUS_SERVER_CLOSED"
+	case StatusNotLeader:
+		return "STATUS_NOT_LEADER"
 	default:
 		return fmt.Sprintf("STATUS_UNKNOWN(0x%02x)", byte(sc))
 	}
@@ -216,10 +223,42 @@ type Request struct {
 
 // Response is the strongly-typed representation of an outgoing operation result.
 type Response struct {
-	OpCode  OpCode
-	Status  StatusCode
-	SeqID   uint64
-	Value   []byte // returned value for OpGet when Status == StatusOk
-	Exists  bool   // boolean result for OpExists when Status == StatusOk
-	Message string // human-readable diagnostic message when Status != StatusOk
+	OpCode     OpCode
+	Status     StatusCode
+	SeqID      uint64
+	Value      []byte // returned value for OpGet when Status == StatusOk
+	Exists     bool   // boolean result for OpExists when Status == StatusOk
+	Message    string // human-readable diagnostic message when Status != StatusOk
+	LeaderID   uint64 // resolved leader node ID if Status == StatusNotLeader and known
+	LeaderAddr string // resolved leader endpoint if Status == StatusNotLeader and known
+}
+
+const redirectPrefix = "not leader: leader is node "
+
+// FormatRedirectMessage formats a canonical human-readable redirect message for StatusNotLeader.
+func FormatRedirectMessage(leaderID uint64, addr string) string {
+	return fmt.Sprintf("not leader: leader is node %d at %s", leaderID, addr)
+}
+
+// ParseRedirectMessage parses a canonical redirect message, returning (leaderID, addr, ok).
+// Expects format produced by FormatRedirectMessage: "not leader: leader is node <id> at <addr>".
+func ParseRedirectMessage(msg string) (uint64, string, bool) {
+	if !strings.HasPrefix(msg, redirectPrefix) {
+		return 0, "", false
+	}
+	rest := msg[len(redirectPrefix):]
+	atIdx := strings.Index(rest, " at ")
+	if atIdx <= 0 {
+		return 0, "", false
+	}
+	idStr := rest[:atIdx]
+	addr := strings.TrimSpace(rest[atIdx+4:])
+	if len(addr) == 0 {
+		return 0, "", false
+	}
+	id, err := strconv.ParseUint(idStr, 10, 64)
+	if err != nil || id == 0 {
+		return 0, "", false
+	}
+	return id, addr, true
 }

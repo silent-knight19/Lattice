@@ -342,6 +342,12 @@ func DecodeResponse(f *Frame) (*Response, error) {
 	} else {
 		// Non-OK status: payload is human-readable diagnostic error message
 		resp.Message = string(f.Payload)
+		if status == StatusNotLeader {
+			if id, addr, ok := ParseRedirectMessage(resp.Message); ok {
+				resp.LeaderID = id
+				resp.LeaderAddr = addr
+			}
+		}
 	}
 
 	return resp, nil
@@ -353,7 +359,7 @@ func DecodeResponse(f *Frame) (*Response, error) {
 //   - Sets Magic = 0x4C415454 and SeqID matching the client's request.
 //   - Encodes Status into the Flags/Status byte (byte 5) of the 18-byte header.
 //   - Success: encodes Value (for GET) or Exists byte (for EXISTS).
-//   - Failure: encodes Message string into payload.
+//   - Failure / Redirect: encodes Message string into payload.
 func EncodeResponse(resp *Response) (*Frame, error) {
 	if resp == nil {
 		return nil, errors.ErrNilReceiver
@@ -390,6 +396,9 @@ func EncodeResponse(resp *Response) (*Frame, error) {
 			payload = nil
 		}
 	} else {
+		if resp.Status == StatusNotLeader && len(resp.Message) == 0 && resp.LeaderAddr != "" {
+			resp.Message = FormatRedirectMessage(resp.LeaderID, resp.LeaderAddr)
+		}
 		payload = []byte(resp.Message)
 	}
 
