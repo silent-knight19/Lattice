@@ -1290,4 +1290,24 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 76. Phase 16 State Machine Apply Loop Scope & Model Boundaries (P16-S01-M01)
+* **Limitation & Architectural Boundaries**:
+  The state machine apply loop (`internal/raft/apply.go`, `internal/raft/command.go`) establishes sequential, deterministic application of committed Raft entries to the local LSM storage engine (`internal/engine`), with the following deliberate boundaries:
+  1. *Volatile `lastApplied` & Restart Replay*: `lastApplied` is an in-memory monotonic watermark owned exclusively by the apply loop. It is not persisted to disk in M01. On restart, application progress resets to 0 (or restored point), and committed entries are replayed sequentially. For current CRUD primitives (`Put` with overwrite, `Delete`), re-application is naturally idempotent. Non-idempotent primitives (e.g. increments, list appends) are non-goals for this micro-phase and will require deduplication mechanisms in later phases.
+  2. *Strict Failure Halt (No Skip)*: If an entry fails state-machine application (e.g., corrupted command payload, disk exhaustion, closed engine), the apply loop halts immediately and sets `n.ApplyError()`. `lastApplied` does not advance. The loop never skips failed entry $N$ to process $N+1$. Recovery requires operator intervention or node restart with a corrected engine state.
+  3. *Consensus Coordinates vs. LSM Sequence Numbers*: Raft `LogIndex` is a consensus coordinate; LSM `SeqNum` is an internal engine MVCC tag. They are never conflated. Raft consensus no-ops (`PeerEntryNoop`) advance `lastApplied` to maintain Raft log alignment but produce zero LSM mutations.
+  4. *Client Proposal Routing Deferred*: P16-S01-M01 implements only the background apply loop. Client request interception, leader proposal forwarding, and follower redirection belong to P16-S01-M02.
+  5. *Linearizable Reads Deferred*: Reading state machine data directly without consensus verification does not guarantee linearizability; lease-based or consensus-verified reads (`ReadIndex`) belong to Phase 17.
+* **Why It Exists**:
+  Preserves clear separation of concerns between consensus commitment and local state machine durability without prematurely introducing distributed client routing or snapshotting.
+* **Impact**:
+  Replication and state machine apply are fully decoupled from client wire protocol changes.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Strict contiguous index order $N, N+1, \dots$; invariant $0 \le \text{lastApplied} \le \text{commitIndex} \le \text{lastLogIndex}$ enforced; halted on error).
+  * Performance: **Streaming batch processing** (bounded `DefaultApplyBatchSize` chunks avoid unbounded memory allocation during commit catchup).
+  * Scalability: **None** (Single-group consensus).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*
+

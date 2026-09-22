@@ -76,9 +76,22 @@ type Node struct {
 	// Volatile commit state (P15-S03-M03): highest log index known committed
 	// (contiguous prefix 1..commitIndex). Never decreases; never exceeds the
 	// local LastIndex; advanced only by the leader quorum rule. Survives role
-	// transitions (a committed prefix stays committed). Followers do not
-	// maintain commit state in M03 (no application yet).
+	// transitions (a committed prefix stays committed).
 	commitIndex LogIndex
+
+	// State machine apply loop state (P16-S01-M01)
+	stateMachine     StateMachine
+	lastApplied      LogIndex
+	applyBatchSize   int
+	applyLifecycleMu sync.Mutex
+	applyRunning     atomic.Bool
+	applyNotifyCh    chan struct{}
+	applyStopCh      chan struct{}
+	applyWg          sync.WaitGroup
+	applyErrMu       sync.RWMutex
+	applyErr         error
+	applyCtx         context.Context
+	applyCancel      context.CancelFunc
 
 	// Periodic heartbeat scheduler (P15-S02-M03)
 	heartbeatInterval    time.Duration
@@ -108,6 +121,8 @@ type NodeConfig struct {
 	PeerSender        PeerSender
 	DurationProvider  DurationProvider
 	HeartbeatInterval time.Duration
+	StateMachine      StateMachine // Phase 16: optional StateMachine for applying committed entries
+	ApplyBatchSize    int          // Phase 16: max entries to fetch/apply per batch (default 64)
 }
 
 // NewNode initializes a Raft node.
@@ -178,6 +193,13 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		heartbeatInterval: hbInterval,
 	}
 
+	if cfg.StateMachine != nil {
+		if err := n.StartApplyLoop(cfg.StateMachine, cfg.ApplyBatchSize); err != nil {
+			_ = n.Close()
+			return nil, err
+		}
+	}
+
 	return n, nil
 }
 
@@ -188,11 +210,17 @@ func osErrInvalid() error {
 
 // LocalID returns the local node ID.
 func (n *Node) LocalID() cluster.NodeID {
+	if n == nil {
+		return cluster.NodeIDNil
+	}
 	return n.localID
 }
 
 // Role returns the currently active server role.
 func (n *Node) Role() Role {
+	if n == nil {
+		return RoleFollower
+	}
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	return n.role
@@ -200,6 +228,9 @@ func (n *Node) Role() Role {
 
 // Term returns the current term from storage.
 func (n *Node) Term() (Term, error) {
+	if n == nil {
+		return 0, errors.ErrNilReceiver
+	}
 	if n.closed.Load() {
 		return 0, errors.ErrRaftStateClosed
 	}
@@ -208,6 +239,9 @@ func (n *Node) Term() (Term, error) {
 
 // VotedFor returns candidate voted for in current term.
 func (n *Node) VotedFor() (cluster.NodeID, error) {
+	if n == nil {
+		return cluster.NodeIDNil, errors.ErrNilReceiver
+	}
 	if n.closed.Load() {
 		return cluster.NodeIDNil, errors.ErrRaftStateClosed
 	}
@@ -216,6 +250,9 @@ func (n *Node) VotedFor() (cluster.NodeID, error) {
 
 // LeaderID returns the currently known leader node ID, or NodeIDNil if unknown.
 func (n *Node) LeaderID() cluster.NodeID {
+	if n == nil {
+		return cluster.NodeIDNil
+	}
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	return n.leaderID
@@ -223,18 +260,27 @@ func (n *Node) LeaderID() cluster.NodeID {
 
 // Storage returns the underlying persistent storage instance.
 func (n *Node) Storage() *Storage {
+	if n == nil {
+		return nil
+	}
 	return n.storage
 }
 
 // QuorumSize returns the majority quorum size based on configured cluster membership.
 // For N cluster members: quorum = floor(N/2) + 1.
 func (n *Node) QuorumSize() int {
+	if n == nil {
+		return 0
+	}
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	return n.quorumSizeLocked()
 }
 
 func (n *Node) quorumSizeLocked() int {
+	if n == nil {
+		return 0
+	}
 	clusterSize := len(n.peers) + 1
 	return (clusterSize / 2) + 1
 }
@@ -242,6 +288,9 @@ func (n *Node) quorumSizeLocked() int {
 // GrantedVotesCount returns the number of granted votes recorded in the current election round.
 // Returns 0 if not currently candidate or round is invalid.
 func (n *Node) GrantedVotesCount() int {
+	if n == nil {
+		return 0
+	}
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	return len(n.electionVotes)
@@ -249,9 +298,11 @@ func (n *Node) GrantedVotesCount() int {
 
 // CommitIndex returns the highest log index known committed (volatile state,
 // P15-S03-M03). The committed prefix is always the contiguous range
-// 1..commitIndex; 0 means nothing is committed yet. Stops at commitment:
-// entries are never applied to a state machine here (Phase 16 owns that).
+// 1..commitIndex; 0 means nothing is committed yet.
 func (n *Node) CommitIndex() LogIndex {
+	if n == nil {
+		return 0
+	}
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	return n.commitIndex
@@ -296,6 +347,7 @@ func (n *Node) advanceCommitIndexLocked(currTerm Term) {
 		}
 		if count >= quorum {
 			n.commitIndex = idx
+			n.signalApplyLocked()
 			return
 		}
 	}
@@ -862,6 +914,9 @@ func (n *Node) Close() error {
 	// Stop periodic heartbeat scheduler and wait for goroutine termination (P15-S02-M03)
 	n.stopHeartbeatScheduler()
 	n.heartbeatWg.Wait()
+
+	// Stop state machine apply loop and wait for worker termination (P16-S01-M01)
+	n.stopApplyLoop()
 
 	// Synchronize with any active state transition so Close cannot return while
 	// an in-flight transition is mutating Node state (Section 7).
@@ -2111,6 +2166,21 @@ func (n *Node) HandleAppendEntries(fromPeerID cluster.NodeID, req *transport.App
 		// Reset election timer! No storage writes for heartbeats.
 		n.ResetElectionTimer()
 
+		// Follower commit advancement (P16-S01-M01): advance commitIndex up to
+		// min(LeaderCommit, PrevLogIndex). Preceding log was verified identical to leader.
+		if req.LeaderCommit > 0 {
+			n.mu.Lock()
+			targetCommit := LogIndex(req.LeaderCommit)
+			if targetCommit > LogIndex(req.PrevLogIndex) {
+				targetCommit = LogIndex(req.PrevLogIndex)
+			}
+			if targetCommit > n.commitIndex {
+				n.commitIndex = targetCommit
+				n.signalApplyLocked()
+			}
+			n.mu.Unlock()
+		}
+
 		return &transport.AppendEntriesResponse{
 			Term:       uint64(currTerm),
 			Success:    true,
@@ -2144,6 +2214,22 @@ func (n *Node) HandleAppendEntries(fromPeerID cluster.NodeID, req *transport.App
 			MatchIndex: 0,
 		}, nil
 	}
+
+	// Follower commit advancement (P16-S01-M01): advance commitIndex up to
+	// min(LeaderCommit, matchIdx). Replicated entries are durable on disk.
+	if req.LeaderCommit > 0 {
+		n.mu.Lock()
+		targetCommit := LogIndex(req.LeaderCommit)
+		if targetCommit > matchIdx {
+			targetCommit = matchIdx
+		}
+		if targetCommit > n.commitIndex {
+			n.commitIndex = targetCommit
+			n.signalApplyLocked()
+		}
+		n.mu.Unlock()
+	}
+
 	return &transport.AppendEntriesResponse{
 		Term:       uint64(currTerm),
 		Success:    true,

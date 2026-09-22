@@ -505,6 +505,12 @@ var (
 
 	// ErrRaftInvalidLogEntry indicates that log coordinates or payload violate fundamental Raft invariants.
 	ErrRaftInvalidLogEntry = stdErrors.New("invalid raft log entry or coordinates")
+
+	// ErrRaftApplyLoopAlreadyStarted indicates that the state machine apply loop is already active on this node.
+	ErrRaftApplyLoopAlreadyStarted = stdErrors.New("raft state machine apply loop already started")
+
+	// ErrRaftApplyFailed indicates that the state machine returned an error while applying a committed entry.
+	ErrRaftApplyFailed = stdErrors.New("raft state machine apply failed")
 )
 
 // KeyOutOfOrderError provides structured context when a key violates strictly increasing
