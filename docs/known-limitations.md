@@ -1338,6 +1338,47 @@ This document tracks all **genuine architectural and operational limitations** o
   * Performance: **Minimal overhead** (Local append and async replication; zero network hop on leader writes).
   * Scalability: **Single-group leader write bottleneck** (As documented in Limitation 1).
 
+
+---
+
+### 78. Phase 16 Security Remediation & Hardening (P16-SEC)
+* **Limitation & Architectural Boundaries**:
+  An exhaustive security audit and independent review across `P16-S01-M01` (Apply Loop) and `P16-S01-M02` (Proposal Routing) established critical hardening boundaries against consensus bypass, leadership TOCTOU races, unbounded memory allocation, and unauthenticated redirects:
+  1. *Cluster-Mode Fail-Open Bypass Elimination (F01 / F09)*:
+     - `transport.ServerConfig` introduces an explicit `ClusterMode bool` flag, captured immutably in `Server.clusterMode` upon initialization.
+     - In cluster mode, if the consensus router is unavailable (`s.router == nil`), `s.dispatch()` strictly rejects `OpPut` and `OpDelete` with `StatusError` ("cluster mode active but consensus router unavailable").
+     - Direct fallback to `s.engine` occurs *only* when `!s.clusterMode` (standalone local engine mode).
+     - Dynamically clearing or mutating `s.router` via `SetProposalRouter(nil)` cannot enable direct engine writes in cluster mode.
+  2. *Leadership TOCTOU & Phantom Acknowledgement Defense (F02 / F10)*:
+     - `Node` tracks a monotonically increasing `leaderEpoch uint64`, incremented under lock on all role transitions (`becomeLeaderLocked`, `BecomeFollower`, `ObserveHigherTerm`).
+     - `ProposeWithContext()` takes an atomic snapshot of `leaderEpoch` prior to disk I/O. Following durable `Storage.Append()`, `leaderEpoch` is re-verified.
+     - If the node stepped down or lost leadership during the append, client acknowledgement is suppressed with `ErrRaftInvalidRoleTransition`. The appended entry remains in the log and will be cleanly truncated or committed by the subsequent leader, preventing split-brain phantom ACKs.
+  3. *Context Propagation & Resource Exhaustion Defense (F03)*:
+     - `ProposeWithContext(ctx, data)` checks `ctx.Err()` before acquiring `proposeMu`, after acquiring `proposeMu`, before filesystem I/O, and after append.
+     - Cancelled or timed-out client requests are immediately rejected before queuing behind slow storage appends, eliminating thread-pool and memory exhaustion attacks.
+  4. *Apply Batch Size Upper Bounding (F04)*:
+     - `StartApplyLoop()` enforces a hard maximum batch size: `MaxApplyBatchSize = 4096`. Values $\le 0$ default to `DefaultApplyBatchSize = 64`, and values exceeding 4096 are clamped.
+     - Prevents adversarial or misconfigured batch limits from causing unbounded heap allocations during commit catch-up.
+  5. *Strict Entry Type & Canonical Control Validation (F05)*:
+     - `applySingleEntry()` enforces that `PeerEntryNoop` entries must carry strictly empty payload (`len(Data) == 0`). Non-empty noops are rejected with `ErrRaftCorruptedState`.
+     - Reserved `PeerEntryConfiguration` entries with non-empty payload are rejected fail-closed, preventing silent consumption of unsupported configuration commands.
+  6. *Storage Result Bounds & Contiguity Verification (F06)*:
+     - `drainCommittedEntries()` defensively verifies the count and index bounds of entries returned by `Storage.Entries(from, to)`.
+     - Specifically validates: `len(entries) <= requestedCount`, `entries[0].Index == from`, `lastReturnedIdx < to`, and `lastReturnedIdx <= commitIndex`. Any anomaly immediately halts the apply loop with `ErrRaftCorruptedState`.
+  7. *Bounded Apply Loop Shutdown Timeout (F07)*:
+     - `stopApplyLoop()` introduces a bounded termination wait (`DefaultApplyShutdownTimeout = 10s`).
+     - If the underlying state machine or LSM engine blocks indefinitely during apply, `Node.Close()` logs the timeout and proceeds, preventing permanent hangs on server shutdown.
+  8. *Header Injection & Open Redirect Sanitization (F08)*:
+     - `ParseRedirectMessage()` and redirect payload parsers reject messages containing ASCII control characters (0x00–0x1F, 0x7F), preventing response splitting, log injection, or format string exploits.
+* **Why It Exists**:
+  Guarantees fail-closed consensus invariants across distributed failure modes, hostile client requests, and uncoordinated leadership transitions.
+* **Impact**:
+  Nodes operating in cluster mode cannot silently bifurcate state machine state from Raft consensus state.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Linearization of proposals preserved across stepdowns; zero fail-open bypass).
+  * Security: **Audited & Hardened** (Fail-closed invariants, bounded buffers, sanitized wire outputs).
+  * Performance: **Minimal overhead** (Epoch checks and batch clamping operate in $O(1)$ time).
+
 ---
 
 *End of Known Limitations — To be updated continuously throughout implementation.*

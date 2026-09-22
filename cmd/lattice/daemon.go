@@ -121,6 +121,14 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 	srvCfg.Address = cfg.Address
 	srvCfg.InsecureTransport = cfg.InsecureTransport
 
+	// P16-SEC-F01: When cluster topology is configured, enable cluster mode on the transport
+	// server. This ensures that client PUT/DELETE mutations are NEVER dispatched directly to
+	// the local Engine, even if the ProposalRouter is not yet wired (or is temporarily nil).
+	// Writes are rejected fail-closed until a valid ProposalRouter is configured.
+	if cfg.IsClusterEnabled() {
+		srvCfg.ClusterMode = true
+	}
+
 	srv, err := transport.NewServer(srvCfg, eng)
 	if err != nil {
 		if pprofSrv != nil {

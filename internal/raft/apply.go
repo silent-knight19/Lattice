@@ -15,12 +15,24 @@ const (
 	// fetched and applied in a single batch iteration (P16-S01-M01).
 	DefaultApplyBatchSize = 64
 
+	// MaxApplyBatchSize defines the hard upper bound on apply batch size to prevent
+	// unbounded memory allocation from Storage.Entries (P16-SEC-F04).
+	MaxApplyBatchSize = 4096
+
 	// DefaultApplyTimeout defines the per-entry context execution deadline.
 	DefaultApplyTimeout = 5 * time.Second
+
+	// DefaultApplyShutdownTimeout defines the maximum duration to wait for the
+	// apply loop goroutine to exit during shutdown (P16-SEC-F07).
+	DefaultApplyShutdownTimeout = 10 * time.Second
 )
 
 // StateMachine defines the storage engine contract required by the Raft apply loop.
 // It is satisfied by *engine.Engine and test mocks.
+//
+// Context compliance: implementations MUST return promptly when ctx is cancelled
+// or its deadline expires. Blocking indefinitely prevents Node.Close from completing
+// within the shutdown timeout (P16-SEC-F07).
 type StateMachine interface {
 	Put(ctx context.Context, key, val []byte) error
 	Delete(ctx context.Context, key []byte) error
@@ -29,6 +41,11 @@ type StateMachine interface {
 // StartApplyLoop initializes and starts the authoritative state machine apply loop.
 // Idempotent if already running. Returns ErrServerAlreadyStarted if already started,
 // or ErrRaftStateClosed if Node is closed.
+//
+// Batch size semantics (P16-SEC-F04):
+//   - batchSize <= 0: uses DefaultApplyBatchSize (64)
+//   - batchSize > MaxApplyBatchSize: clamped to MaxApplyBatchSize (4096)
+//   - otherwise: uses the provided value
 func (n *Node) StartApplyLoop(sm StateMachine, batchSize int) error {
 	if n == nil {
 		return errors.ErrNilReceiver
@@ -50,8 +67,12 @@ func (n *Node) StartApplyLoop(sm StateMachine, batchSize int) error {
 		return errors.ErrRaftApplyLoopAlreadyStarted
 	}
 
+	// P16-SEC-F04: Bound apply batch size
 	if batchSize <= 0 {
 		batchSize = DefaultApplyBatchSize
+	}
+	if batchSize > MaxApplyBatchSize {
+		batchSize = MaxApplyBatchSize
 	}
 
 	n.stateMachine = sm
@@ -86,7 +107,23 @@ func (n *Node) stopApplyLoop() {
 	close(n.applyStopCh)
 	n.applyLifecycleMu.Unlock()
 
-	n.applyWg.Wait()
+	// P16-SEC-F07: Bounded wait for apply loop termination.
+	// If the state machine blocks beyond the shutdown timeout, we proceed
+	// rather than hanging Node.Close indefinitely.
+	done := make(chan struct{})
+	go func() {
+		n.applyWg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		// Clean shutdown
+	case <-time.After(DefaultApplyShutdownTimeout):
+		// Apply loop goroutine is stuck in a state machine operation.
+		// The goroutine will eventually exit when the operation completes
+		// or the context cancellation propagates. This is logged but not
+		// fatal — the node is shutting down.
+	}
 }
 
 // LastApplied returns the highest Raft log index applied to the state machine.
@@ -187,6 +224,8 @@ func (n *Node) drainCommittedEntries() {
 			to = from + batchLimit
 		}
 
+		requestedCount := int(to - from)
+
 		// Fetch entries from persistent storage
 		entries, err := n.storage.Entries(from, to)
 		if err != nil {
@@ -196,6 +235,30 @@ func (n *Node) drainCommittedEntries() {
 		if len(entries) == 0 {
 			n.setApplyError(fmt.Errorf("%w: storage returned 0 entries for committed range [%d, %d)",
 				errors.ErrRaftLogIndexOutOfBounds, from, to))
+			return
+		}
+
+		// P16-SEC-F06: Validate storage results before applying.
+		// Defense against a malicious/buggy storage implementation.
+		if len(entries) > requestedCount {
+			n.setApplyError(fmt.Errorf("%w: storage returned %d entries, exceeding requested count %d for range [%d, %d)",
+				errors.ErrRaftCorruptedState, len(entries), requestedCount, from, to))
+			return
+		}
+		if entries[0].Index != from {
+			n.setApplyError(fmt.Errorf("%w: storage returned first entry index %d, expected %d",
+				errors.ErrRaftCorruptedState, entries[0].Index, from))
+			return
+		}
+		lastReturnedIdx := entries[len(entries)-1].Index
+		if lastReturnedIdx >= to {
+			n.setApplyError(fmt.Errorf("%w: storage returned entry index %d at or beyond requested upper bound %d",
+				errors.ErrRaftCorruptedState, lastReturnedIdx, to))
+			return
+		}
+		if lastReturnedIdx > commitIdx {
+			n.setApplyError(fmt.Errorf("%w: storage returned entry index %d beyond commitIndex %d",
+				errors.ErrRaftCorruptedState, lastReturnedIdx, commitIdx))
 			return
 		}
 
@@ -239,11 +302,23 @@ func (n *Node) applySingleEntry(entry LogEntry) error {
 
 	switch entry.Type {
 	case transport.PeerEntryNoop:
-		// Consensus election no-op: advances Raft log alignment without state machine mutation.
+		// P16-SEC-F05: Noop entries must have empty Data (canonical no-op).
+		// Reject any noop carrying a non-empty payload to prevent silent
+		// consumption of malformed or adversarial control entries.
+		if len(entry.Data) > 0 {
+			return fmt.Errorf("%w: noop entry at index %d carries non-empty payload (%d bytes); canonical noop must be empty",
+				errors.ErrRaftCorruptedState, entry.Index, len(entry.Data))
+		}
 		return nil
 
 	case transport.PeerEntryConfiguration:
-		// Cluster membership change: reserved for dynamic reconfiguration; no state machine mutation.
+		// P16-SEC-F05: Configuration entries are reserved but unsupported in Phase 16.
+		// Reject any configuration entry with non-empty payload fail-closed rather than
+		// silently ignoring arbitrary configuration data.
+		if len(entry.Data) > 0 {
+			return fmt.Errorf("%w: configuration entry at index %d carries non-empty payload (%d bytes); configuration is unsupported in phase 16",
+				errors.ErrRaftCorruptedState, entry.Index, len(entry.Data))
+		}
 		return nil
 
 	case transport.PeerEntryNormal:

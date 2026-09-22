@@ -64,6 +64,12 @@ type ServerConfig struct {
 	// ProposalRouter routes client write mutations to the consensus subsystem in replicated mode (P16-S01-M02).
 	// When nil (default), Server operates in standalone local engine mode.
 	ProposalRouter ProposalRouter
+
+	// ClusterMode indicates that this server is part of a Raft cluster (P16-SEC-F01).
+	// When true, all client write mutations (PUT, DELETE) MUST go through the ProposalRouter.
+	// If ProposalRouter is nil while ClusterMode is true, writes are rejected fail-closed
+	// rather than falling through to direct Engine mutations.
+	ClusterMode bool
 }
 
 // DefaultServerConfig returns a production-hardened ServerConfig with safe default timeouts and limits.
@@ -112,8 +118,9 @@ type Server struct {
 	wg           sync.WaitGroup
 	activeConns  atomic.Int64
 
-	routerMu sync.RWMutex
-	router   ProposalRouter
+	routerMu    sync.RWMutex
+	router      ProposalRouter
+	clusterMode bool // immutable after construction (P16-SEC-F01)
 }
 
 // NewServer constructs a new transport Server. It validates the configuration and verifies that eng is non-nil.
@@ -155,6 +162,7 @@ func NewServer(cfg ServerConfig, eng Engine) (*Server, error) {
 		cfg:          cfg,
 		engine:       eng,
 		router:       cfg.ProposalRouter,
+		clusterMode:  cfg.ClusterMode,
 		conns:        make(map[net.Conn]struct{}),
 		shutdownCh:   make(chan struct{}),
 		shutdownDone: make(chan struct{}),
@@ -162,7 +170,9 @@ func NewServer(cfg ServerConfig, eng Engine) (*Server, error) {
 }
 
 // SetProposalRouter configures the authoritative consensus proposal router for replicated writes (P16-S01-M02).
-// When non-nil, PUT and DELETE requests are routed through consensus; when nil, server operates in local engine mode.
+// When non-nil, PUT and DELETE requests are routed through consensus.
+// In cluster mode, setting the router to nil does NOT re-enable direct Engine writes;
+// writes remain fail-closed until a valid router is provided (P16-SEC-F09).
 func (s *Server) SetProposalRouter(r ProposalRouter) {
 	if s == nil {
 		return
@@ -180,6 +190,15 @@ func (s *Server) ProposalRouter() ProposalRouter {
 	s.routerMu.RLock()
 	defer s.routerMu.RUnlock()
 	return s.router
+}
+
+// IsClusterMode reports whether the server was constructed in cluster mode (P16-SEC-F01).
+// Cluster mode is immutable after construction.
+func (s *Server) IsClusterMode() bool {
+	if s == nil {
+		return false
+	}
+	return s.clusterMode
 }
 
 // Listen binds on addr and starts the accept loop in a background goroutine.
@@ -493,6 +512,12 @@ func (s *Server) dispatch(req *Request) *Response {
 			}
 			return r
 		}
+		// P16-SEC-F01: In cluster mode, NEVER fall through to direct Engine writes.
+		if s.clusterMode {
+			resp.Status = StatusError
+			resp.Message = "cluster mode active but consensus router unavailable"
+			return resp
+		}
 		err := s.engine.Put(ctx, req.Key, req.Value)
 		s.mapEngineError(err, resp)
 
@@ -519,6 +544,12 @@ func (s *Server) dispatch(req *Request) *Response {
 				return resp
 			}
 			return r
+		}
+		// P16-SEC-F01: In cluster mode, NEVER fall through to direct Engine writes.
+		if s.clusterMode {
+			resp.Status = StatusError
+			resp.Message = "cluster mode active but consensus router unavailable"
+			return resp
 		}
 		err := s.engine.Delete(ctx, req.Key)
 		s.mapEngineError(err, resp)
@@ -635,4 +666,9 @@ func (s *Server) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout)
 	defer cancel()
 	return s.Shutdown(ctx)
+}
+
+// TestDispatch exposes dispatch for testing internal request routing without opening network connections.
+func (s *Server) TestDispatch(req *Request) *Response {
+	return s.dispatch(req)
 }

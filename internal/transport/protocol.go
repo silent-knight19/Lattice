@@ -236,13 +236,31 @@ type Response struct {
 const redirectPrefix = "not leader: leader is node "
 
 // FormatRedirectMessage formats a canonical human-readable redirect message for StatusNotLeader.
+// The address must not contain control characters (P16-SEC-F08).
 func FormatRedirectMessage(leaderID uint64, addr string) string {
 	return fmt.Sprintf("not leader: leader is node %d at %s", leaderID, addr)
 }
 
+// containsControlChars reports whether s contains any ASCII control characters
+// (bytes 0x00-0x1F or 0x7F). Used to prevent log-injection and framing attacks (P16-SEC-F08).
+func containsControlChars(s string) bool {
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b < 0x20 || b == 0x7F {
+			return true
+		}
+	}
+	return false
+}
+
 // ParseRedirectMessage parses a canonical redirect message, returning (leaderID, addr, ok).
 // Expects format produced by FormatRedirectMessage: "not leader: leader is node <id> at <addr>".
+// Rejects messages containing control characters (P16-SEC-F08).
 func ParseRedirectMessage(msg string) (uint64, string, bool) {
+	// P16-SEC-F08: Reject messages with control characters to prevent log injection.
+	if containsControlChars(msg) {
+		return 0, "", false
+	}
 	if !strings.HasPrefix(msg, redirectPrefix) {
 		return 0, "", false
 	}
@@ -254,6 +272,10 @@ func ParseRedirectMessage(msg string) (uint64, string, bool) {
 	idStr := rest[:atIdx]
 	addr := strings.TrimSpace(rest[atIdx+4:])
 	if len(addr) == 0 {
+		return 0, "", false
+	}
+	// P16-SEC-F08: Reject addresses containing control characters.
+	if containsControlChars(addr) {
 		return 0, "", false
 	}
 	id, err := strconv.ParseUint(idStr, 10, 64)

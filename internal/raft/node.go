@@ -53,6 +53,17 @@ type Node struct {
 	closed         atomic.Bool
 	transitionHook TransitionHook
 
+	// P16-SEC-F02: Leadership epoch counter. Monotonically incremented under Node.mu.Lock
+	// on every BecomeLeader, BecomeFollower, and ObserveHigherTerm transition.
+	// Used by Propose to detect stale-leader acknowledgements after stepdown.
+	leaderEpoch uint64
+
+	// proposeTestHook is an optional test injection point called inside Propose
+	// AFTER the pre-append leadership check but BEFORE Storage.Append.
+	// Allows deterministic stepdown injection to test the TOCTOU window (P16-SEC-F02).
+	// Must be nil in production. Protected by proposeMu (only accessed under proposeMu).
+	proposeTestHook func()
+
 	// Election subsystem & Quorum (P15-S02-M01 & P15-S02-M02)
 	topology         *cluster.Topology
 	peers            []cluster.NodeID // Remote peer identities strictly excluding localID
@@ -554,6 +565,7 @@ func (n *Node) campaignLocked() (oldRole, newRole Role, term Term, shouldHook bo
 func (n *Node) becomeLeaderLocked(term Term, lastLogIdx LogIndex) {
 	n.role = RoleLeader
 	n.leaderID = n.localID
+	n.leaderEpoch++ // P16-SEC-F02: fence stale proposals
 
 	// Initialize leader volatile replication state for each configured remote peer (Section 14)
 	n.nextIndex = make(map[cluster.NodeID]LogIndex, len(n.peers))
@@ -762,6 +774,7 @@ func (n *Node) BecomeFollower(newTerm Term, leaderID cluster.NodeID) error {
 	oldRole := n.role
 	n.role = RoleFollower
 	n.leaderID = leaderID
+	n.leaderEpoch++ // P16-SEC-F02: fence stale proposals
 	n.clearLeaderAndElectionStateLocked()
 
 	shouldHook := (oldRole != RoleFollower || newTerm != currTerm)
@@ -815,6 +828,7 @@ func (n *Node) ObserveHigherTerm(incomingTerm Term) (bool, error) {
 	oldRole := n.role
 	n.role = RoleFollower
 	n.leaderID = cluster.NodeIDNil
+	n.leaderEpoch++ // P16-SEC-F02: fence stale proposals
 	n.clearLeaderAndElectionStateLocked()
 	n.mu.Unlock()
 

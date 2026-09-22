@@ -171,8 +171,8 @@ func (n *Node) routeWriteWithTopology(ctx context.Context, req *transport.Reques
 		return resp, nil
 	}
 
-	// Submit proposal to leader's durable Raft log
-	_, err = n.Propose(cmdBytes)
+	// Submit proposal to leader's durable Raft log (P16-SEC-F03: context-aware)
+	_, err = n.ProposeWithContext(ctx, cmdBytes)
 	if err == nil {
 		// Proposal accepted and durably persisted in leader's local Raft log (P16-S01-M02)
 		resp.Status = transport.StatusOk

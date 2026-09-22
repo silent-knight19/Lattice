@@ -2468,6 +2468,8 @@ TOTAL: 176 Discrete, Testable Micro-Phases
   * *Objective*: Consume committed Raft entries sequentially and apply them to local LSM engine.
 * **P16-S01-M02: Client Proposal Routing & Follower Redirection** (complete)
   * *Objective*: Follower nodes intercept client write requests and return redirect response with Leader address. Leader nodes ingest external mutations via Raft proposal path. Preserves non-replicated engine mode when unconfigured.
+* **P16-SEC: Phase 16 Security Remediation & Hardening** (complete)
+  * *Objective*: Remediate fail-open bypass (F01/F09), leadership TOCTOU race via leaderEpoch (F02/F10), context propagation (F03), apply batch bounds (F04), entry type validation (F05), storage bounds verification (F06), bounded apply shutdown (F07), and redirect control-character sanitization (F08).
 
 ---
 
