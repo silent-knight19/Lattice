@@ -543,6 +543,9 @@ func (n *Node) campaignLocked() (oldRole, newRole Role, term Term, shouldHook bo
 	}
 
 	oldRole = n.role
+	if oldRole == RoleLeader {
+		n.leaderEpoch++ // Fence stale proposals if campaigning from leader
+	}
 	n.role = RoleCandidate
 	n.leaderID = cluster.NodeIDNil
 
@@ -877,6 +880,9 @@ func (n *Node) StepDownSameTerm(leaderID cluster.NodeID) error {
 	}
 
 	oldRole := n.role
+	if oldRole == RoleLeader {
+		n.leaderEpoch++ // Fence stale proposals on same-term stepdown
+	}
 	n.role = RoleFollower
 	n.leaderID = leaderID
 	n.clearLeaderAndElectionStateLocked()
@@ -935,7 +941,10 @@ func (n *Node) Close() error {
 	// Synchronize with any active state transition so Close cannot return while
 	// an in-flight transition is mutating Node state (Section 7).
 	n.mu.Lock()
-	defer n.mu.Unlock()
+	if n.role == RoleLeader {
+		n.leaderEpoch++ // Fence stale proposals on node shutdown
+	}
+	n.mu.Unlock()
 
 	return nil
 }
@@ -1281,13 +1290,14 @@ func (n *Node) HandleRequestVote(fromPeerID cluster.NodeID, req *transport.Reque
 			return nil, fmt.Errorf("raft: failed to persist higher term %d on RequestVote: %w", req.Term, err)
 		}
 
+		if oldRole == RoleLeader {
+			n.leaderEpoch++ // Fence stale proposals on higher-term vote request
+			steppedDownLeader = true
+		}
 		n.role = RoleFollower
 		n.leaderID = cluster.NodeIDNil
 		currTerm = stepDownTargetTerm
 		termTransitioned = true
-		if oldRole == RoleLeader {
-			steppedDownLeader = true
-		}
 	}
 
 	// Read vote status in the current term
@@ -1844,6 +1854,9 @@ func (n *Node) HandleRequestVoteResponse(fromPeerID cluster.NodeID, resp *transp
 		}
 
 		oldRole := n.role
+		if oldRole == RoleLeader {
+			n.leaderEpoch++ // Fence stale proposals on higher-term vote response
+		}
 		n.role = RoleFollower
 		n.leaderID = cluster.NodeIDNil
 		n.clearLeaderAndElectionStateLocked()
@@ -2120,14 +2133,15 @@ func (n *Node) HandleAppendEntries(fromPeerID cluster.NodeID, req *transport.App
 			n.mu.Unlock()
 			return nil, fmt.Errorf("raft: failed to persist higher term %d on AppendEntries: %w", req.Term, err)
 		}
+		if oldRole == RoleLeader {
+			n.leaderEpoch++ // Fence stale proposals on higher-term append entries
+			steppedDownLeader = true
+		}
 		currTerm = newTerm
 		termAdvanced = true
 		n.role = RoleFollower
 		n.leaderID = fromPeerID
 		n.clearLeaderAndElectionStateLocked()
-		if oldRole == RoleLeader {
-			steppedDownLeader = true
-		}
 	} else {
 		// Section 13, 14, 27, 28: Same Term (req.Term == currentTerm)
 		if n.role == RoleCandidate {
@@ -2137,6 +2151,7 @@ func (n *Node) HandleAppendEntries(fromPeerID cluster.NodeID, req *transport.App
 			n.clearLeaderAndElectionStateLocked()
 		} else if n.role == RoleLeader {
 			// Dual leader discovery in same term: step down to Follower
+			n.leaderEpoch++ // Fence stale proposals on same-term leader discovery
 			n.role = RoleFollower
 			n.leaderID = fromPeerID
 			n.clearLeaderAndElectionStateLocked()
@@ -2467,6 +2482,9 @@ func (n *Node) HandleAppendEntriesResponse(fromPeerID cluster.NodeID, resp *tran
 			return fmt.Errorf("raft: failed to persist higher term %d on append entries response: %w", resp.Term, err)
 		}
 		oldRole := n.role
+		if oldRole == RoleLeader {
+			n.leaderEpoch++ // Fence stale proposals on higher-term append entries response
+		}
 		n.role = RoleFollower
 		n.leaderID = cluster.NodeIDNil
 		n.clearLeaderAndElectionStateLocked()

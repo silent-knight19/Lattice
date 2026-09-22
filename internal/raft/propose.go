@@ -66,11 +66,12 @@ func (n *Node) ProposeWithContext(ctx context.Context, data []byte) (LogEntry, e
 		return LogEntry{}, errors.ErrRaftStateClosed
 	}
 
-	// P16-SEC-F03: Check context before acquiring the proposal mutex.
+	// P16-SEC-F03 / GAP-B: Check context before acquiring the proposal mutex.
 	// This prevents a cancelled request from queuing behind blocked proposals.
+	// Returns pure context error without ErrRaftInvalidRoleTransition so the router
+	// correctly returns StatusThrottled rather than a misleading StatusNotLeader redirect.
 	if ctx.Err() != nil {
-		return LogEntry{}, fmt.Errorf("%w: context cancelled before proposal admission",
-			errors.ErrRaftInvalidRoleTransition)
+		return LogEntry{}, fmt.Errorf("raft: proposal context cancelled before admission: %w", ctx.Err())
 	}
 
 	n.proposeMu.Lock()
@@ -80,10 +81,9 @@ func (n *Node) ProposeWithContext(ctx context.Context, data []byte) (LogEntry, e
 		return LogEntry{}, errors.ErrRaftStateClosed
 	}
 
-	// P16-SEC-F03: Check context after acquiring the mutex (may have blocked).
+	// P16-SEC-F03 / GAP-B: Check context after acquiring the mutex (may have blocked).
 	if ctx.Err() != nil {
-		return LogEntry{}, fmt.Errorf("%w: context cancelled during proposal admission",
-			errors.ErrRaftInvalidRoleTransition)
+		return LogEntry{}, fmt.Errorf("raft: proposal context cancelled during admission: %w", ctx.Err())
 	}
 
 	// Single atomic snapshot of leadership, term, log tail, and leaderEpoch under one
@@ -147,10 +147,9 @@ func (n *Node) ProposeWithContext(ctx context.Context, data []byte) (LogEntry, e
 		n.proposeTestHook()
 	}
 
-	// P16-SEC-F03: Final context check before slow I/O.
+	// P16-SEC-F03 / GAP-B: Final context check before slow I/O.
 	if ctx.Err() != nil {
-		return LogEntry{}, fmt.Errorf("%w: context cancelled before storage append",
-			errors.ErrRaftInvalidRoleTransition)
+		return LogEntry{}, fmt.Errorf("raft: proposal context cancelled before storage append: %w", ctx.Err())
 	}
 
 	// Durable append WITHOUT holding Node.mu (slow filesystem I/O).
@@ -171,12 +170,11 @@ func (n *Node) ProposeWithContext(ctx context.Context, data []byte) (LogEntry, e
 			errors.ErrRaftInvalidRoleTransition, epochBefore, epochAfter)
 	}
 
-	// P16-SEC-F03: Post-append context check. If the context expired during fdatasync,
+	// P16-SEC-F03 / GAP-B: Post-append context check. If the context expired during fdatasync,
 	// the entry IS durably appended. We report the cancellation rather than a false success.
 	// This is a known ambiguity documented in known-limitations.
 	if ctx.Err() != nil {
-		return LogEntry{}, fmt.Errorf("%w: context cancelled after storage append; entry may be durably committed",
-			errors.ErrRaftInvalidRoleTransition)
+		return LogEntry{}, fmt.Errorf("raft: proposal context cancelled after storage append; entry may be durably committed: %w", ctx.Err())
 	}
 
 	// Post-append quorum refresh: N=1 clusters commit the new current-term

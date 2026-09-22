@@ -756,6 +756,278 @@ func TestSecurity_Invariant_LastAppliedNeverExceedsCommitIndex(t *testing.T) {
 }
 
 // =============================================================================
+// GAP A: Complete Leadership Epoch Fencing Tests
+// =============================================================================
+
+func TestSecurity_GAP_A_HandleAppendEntriesForcesStepdownFencing(t *testing.T) {
+	sm := &secMockStateMachine{}
+	n, cleanup := securityTestNode(t, sm, DefaultApplyBatchSize)
+	defer cleanup()
+
+	topo, err := cluster.NewTopology(1, "127.0.0.1:9098", []cluster.PeerConfig{
+		{ID: 2, Address: "127.0.0.1:9099"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.SetTopology(topo)
+
+	epochBefore := n.leaderEpoch
+
+	// Install test hook: pause proposal, then inject HandleAppendEntries with higher term
+	stepdownDone := make(chan struct{})
+	n.proposeTestHook = func() {
+		req := &transport.AppendEntriesRequest{
+			Term:         uint64(n.storage.mustTerm() + 1),
+			LeaderID:     2,
+			PrevLogIndex: 0,
+			PrevLogTerm:  0,
+		}
+		resp, err := n.HandleAppendEntries(2, req)
+		if err != nil {
+			t.Logf("HandleAppendEntries error: %v", err)
+		} else if !resp.Success {
+			t.Logf("HandleAppendEntries reported false")
+		}
+		close(stepdownDone)
+	}
+
+	_, err = n.Propose([]byte("fenced-by-append-entries"))
+	if err == nil {
+		t.Fatal("Propose must FAIL when HandleAppendEntries forces stepdown during append")
+	}
+	<-stepdownDone
+
+	// Epoch must have advanced
+	n.mu.RLock()
+	epochAfter := n.leaderEpoch
+	role := n.role
+	n.mu.RUnlock()
+
+	if epochAfter <= epochBefore {
+		t.Fatalf("leaderEpoch did not increment on HandleAppendEntries stepdown: before=%d, after=%d",
+			epochBefore, epochAfter)
+	}
+	if role != RoleFollower {
+		t.Fatalf("expected node to be RoleFollower, got %s", role)
+	}
+	t.Logf("Propose correctly failed with: %v", err)
+}
+
+func TestSecurity_GAP_A_StepDownSameTermFencing(t *testing.T) {
+	sm := &secMockStateMachine{}
+	n, cleanup := securityTestNode(t, sm, DefaultApplyBatchSize)
+	defer cleanup()
+
+	topo, err := cluster.NewTopology(1, "127.0.0.1:9098", []cluster.PeerConfig{
+		{ID: 2, Address: "127.0.0.1:9099"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.SetTopology(topo)
+
+	epochBefore := n.leaderEpoch
+
+	n.proposeTestHook = func() {
+		if err := n.StepDownSameTerm(2); err != nil {
+			t.Logf("StepDownSameTerm error: %v", err)
+		}
+	}
+
+	_, err = n.Propose([]byte("fenced-by-same-term-stepdown"))
+	if err == nil {
+		t.Fatal("Propose must FAIL when StepDownSameTerm occurs during append")
+	}
+
+	n.mu.RLock()
+	epochAfter := n.leaderEpoch
+	n.mu.RUnlock()
+
+	if epochAfter <= epochBefore {
+		t.Fatalf("leaderEpoch did not increment on StepDownSameTerm: before=%d, after=%d",
+			epochBefore, epochAfter)
+	}
+}
+
+func TestSecurity_GAP_A_RequestVoteHigherTermFencing(t *testing.T) {
+	sm := &secMockStateMachine{}
+	n, cleanup := securityTestNode(t, sm, DefaultApplyBatchSize)
+	defer cleanup()
+
+	topo, err := cluster.NewTopology(1, "127.0.0.1:9098", []cluster.PeerConfig{
+		{ID: 2, Address: "127.0.0.1:9099"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.SetTopology(topo)
+
+	epochBefore := n.leaderEpoch
+
+	n.proposeTestHook = func() {
+		req := &transport.RequestVoteRequest{
+			Term:         uint64(n.storage.mustTerm() + 1),
+			CandidateID:  2,
+			LastLogIndex: 10,
+			LastLogTerm:  uint64(n.storage.mustTerm() + 1),
+		}
+		_, _ = n.HandleRequestVote(2, req)
+	}
+
+	_, err = n.Propose([]byte("fenced-by-request-vote"))
+	if err == nil {
+		t.Fatal("Propose must FAIL when HandleRequestVote with higher term occurs during append")
+	}
+
+	n.mu.RLock()
+	epochAfter := n.leaderEpoch
+	n.mu.RUnlock()
+
+	if epochAfter <= epochBefore {
+		t.Fatalf("leaderEpoch did not increment on HandleRequestVote higher term: before=%d, after=%d",
+			epochBefore, epochAfter)
+	}
+}
+
+// =============================================================================
+// GAP B: Context Cancellation vs Leadership Loss Tests
+// =============================================================================
+
+func TestSecurity_GAP_B_ContextCancellationReturnsStatusThrottledNotRedirect(t *testing.T) {
+	sm := &secMockStateMachine{}
+	n, cleanup := securityTestNode(t, sm, DefaultApplyBatchSize)
+	defer cleanup()
+
+	router := NewProposalRouter(n, n.Topology())
+
+	// 1. PUT with cancelled context
+	ctxCancel, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	putReq := &transport.Request{
+		OpCode: transport.OpPut,
+		Key:    []byte("key_cancel"),
+		Value:  []byte("val_cancel"),
+		SeqID:  1,
+	}
+
+	resp, err := router.RouteWrite(ctxCancel, putReq)
+	if err != nil {
+		t.Fatalf("RouteWrite should not return error: %v", err)
+	}
+	if resp.Status != transport.StatusThrottled {
+		t.Fatalf("expected StatusThrottled (0x04) for cancelled context, got %v: %s",
+			resp.Status, resp.Message)
+	}
+	if resp.Status == transport.StatusNotLeader {
+		t.Fatal("CRITICAL: router falsely returned StatusNotLeader redirect on cancelled context!")
+	}
+
+	// 2. DELETE with cancelled context
+	delReq := &transport.Request{
+		OpCode: transport.OpDelete,
+		Key:    []byte("key_cancel"),
+		SeqID:  2,
+	}
+
+	respDel, err := router.RouteWrite(ctxCancel, delReq)
+	if err != nil {
+		t.Fatalf("RouteWrite should not return error: %v", err)
+	}
+	if respDel.Status != transport.StatusThrottled {
+		t.Fatalf("expected StatusThrottled for DELETE with cancelled context, got %v", respDel.Status)
+	}
+
+	// 3. PUT with expired deadline context
+	ctxExpired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-1*time.Second))
+	defer cancelExpired()
+
+	respExp, err := router.RouteWrite(ctxExpired, putReq)
+	if err != nil {
+		t.Fatalf("RouteWrite should not return error: %v", err)
+	}
+	if respExp.Status != transport.StatusThrottled {
+		t.Fatalf("expected StatusThrottled for expired context, got %v: %s", respExp.Status, respExp.Message)
+	}
+}
+
+func TestSecurity_GAP_B_ContextExpiresDuringAppendReturnsThrottled(t *testing.T) {
+	sm := &secMockStateMachine{}
+	n, cleanup := securityTestNode(t, sm, DefaultApplyBatchSize)
+	defer cleanup()
+
+	router := NewProposalRouter(n, n.Topology())
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// In test hook (before append), cancel the context
+	n.proposeTestHook = func() {
+		cancel()
+	}
+
+	putReq := &transport.Request{
+		OpCode: transport.OpPut,
+		Key:    []byte("key_during_append"),
+		Value:  []byte("val_during_append"),
+		SeqID:  10,
+	}
+
+	resp, err := router.RouteWrite(ctx, putReq)
+	if err != nil {
+		t.Fatalf("RouteWrite returned unexpected error: %v", err)
+	}
+	if resp.Status != transport.StatusThrottled {
+		t.Fatalf("expected StatusThrottled when context expires during append, got %v: %s",
+			resp.Status, resp.Message)
+	}
+	if resp.Status == transport.StatusNotLeader {
+		t.Fatal("CRITICAL: router falsely returned StatusNotLeader redirect on context expiration during append!")
+	}
+}
+
+func TestSecurity_GAP_B_ActualStepdownReturnsNotLeaderRedirect(t *testing.T) {
+	sm := &secMockStateMachine{}
+	n, cleanup := securityTestNode(t, sm, DefaultApplyBatchSize)
+	defer cleanup()
+
+	// Update topology to include peer 2 so redirect can find leader address
+	peer2Addr := "127.0.0.1:9099"
+	topo, err := cluster.NewTopology(1, "127.0.0.1:9098", []cluster.PeerConfig{
+		{ID: 2, Address: peer2Addr},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.SetTopology(topo)
+	router := NewProposalRouter(n, topo)
+
+	// Step down to follower with leader=2
+	if err := n.BecomeFollower(n.storage.mustTerm()+1, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	putReq := &transport.Request{
+		OpCode: transport.OpPut,
+		Key:    []byte("key_stepdown"),
+		Value:  []byte("val_stepdown"),
+		SeqID:  20,
+	}
+
+	ctx := context.Background()
+	resp, err := router.RouteWrite(ctx, putReq)
+	if err != nil {
+		t.Fatalf("RouteWrite returned unexpected error: %v", err)
+	}
+	if resp.Status != transport.StatusNotLeader {
+		t.Fatalf("expected StatusNotLeader for actual stepdown, got %v: %s", resp.Status, resp.Message)
+	}
+	if resp.LeaderID != 2 || resp.LeaderAddr != peer2Addr {
+		t.Fatalf("unexpected redirect: leaderID=%d, leaderAddr=%s", resp.LeaderID, resp.LeaderAddr)
+	}
+}
+
+// =============================================================================
 // Helper types for testing
 // =============================================================================
 

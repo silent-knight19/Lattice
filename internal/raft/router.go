@@ -185,14 +185,18 @@ func (n *Node) routeWriteWithTopology(ctx context.Context, req *transport.Reques
 		resp.Message = "server is closed"
 		return resp, nil
 	}
+
+	// GAP B: Context cancellation or deadline expiration must be reported as StatusThrottled.
+	// It MUST NOT be misclassified as leadership loss and must NEVER generate a leader redirect.
+	if ctx.Err() != nil || stdErrors.Is(err, context.Canceled) || stdErrors.Is(err, context.DeadlineExceeded) {
+		resp.Status = transport.StatusThrottled
+		resp.Message = "request context cancelled or timed out under proposal write"
+		return resp, nil
+	}
+
 	if stdErrors.Is(err, errors.ErrRaftInvalidRoleTransition) {
 		// Leadership was lost concurrently during proposal; fall back to follower redirect
 		return n.routeNonLeader(req, top)
-	}
-	if ctx.Err() != nil {
-		resp.Status = transport.StatusThrottled
-		resp.Message = "request timed out under proposal write"
-		return resp, nil
 	}
 
 	// Sanitize general proposal error

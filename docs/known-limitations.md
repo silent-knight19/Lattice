@@ -1349,13 +1349,14 @@ This document tracks all **genuine architectural and operational limitations** o
      - In cluster mode, if the consensus router is unavailable (`s.router == nil`), `s.dispatch()` strictly rejects `OpPut` and `OpDelete` with `StatusError` ("cluster mode active but consensus router unavailable").
      - Direct fallback to `s.engine` occurs *only* when `!s.clusterMode` (standalone local engine mode).
      - Dynamically clearing or mutating `s.router` via `SetProposalRouter(nil)` cannot enable direct engine writes in cluster mode.
-  2. *Leadership TOCTOU & Phantom Acknowledgement Defense (F02 / F10)*:
-     - `Node` tracks a monotonically increasing `leaderEpoch uint64`, incremented under lock on all role transitions (`becomeLeaderLocked`, `BecomeFollower`, `ObserveHigherTerm`).
-     - `ProposeWithContext()` takes an atomic snapshot of `leaderEpoch` prior to disk I/O. Following durable `Storage.Append()`, `leaderEpoch` is re-verified.
-     - If the node stepped down or lost leadership during the append, client acknowledgement is suppressed with `ErrRaftInvalidRoleTransition`. The appended entry remains in the log and will be cleanly truncated or committed by the subsequent leader, preventing split-brain phantom ACKs.
-  3. *Context Propagation & Resource Exhaustion Defense (F03)*:
-     - `ProposeWithContext(ctx, data)` checks `ctx.Err()` before acquiring `proposeMu`, after acquiring `proposeMu`, before filesystem I/O, and after append.
-     - Cancelled or timed-out client requests are immediately rejected before queuing behind slow storage appends, eliminating thread-pool and memory exhaustion attacks.
+  2. *Leadership TOCTOU & Phantom Acknowledgement Defense (F02 / F10 / GAP A)*:
+     - `Node` tracks a monotonically increasing `leaderEpoch uint64`, incremented under lock on all role transitions and stepdowns (`becomeLeaderLocked`, `campaignLocked`, `BecomeFollower`, `ObserveHigherTerm`, `StepDownSameTerm`, `HandleRequestVote`, `HandleRequestVoteResponse`, `HandleAppendEntries`, `HandleAppendEntriesResponse`, `Close`).
+     - `ProposeWithContext()` takes an atomic snapshot of `leaderEpoch` prior to disk I/O. Following durable `Storage.Append()`, `leaderEpoch` is re-verified under lock.
+     - If the node stepped down or lost leadership during the append via any vector (higher-term heartbeat, same-term dual leader discovery, vote request/response), client acknowledgement is suppressed with `ErrRaftInvalidRoleTransition`. The appended entry remains in the log and will be cleanly truncated or committed by the subsequent leader, preventing split-brain phantom ACKs.
+  3. *Context Disambiguation & Post-Append Ambiguity (F03 / GAP B)*:
+     - Pure client context cancellation or deadline expiration is strictly decoupled from leadership loss (`ErrRaftInvalidRoleTransition`).
+     - Context expiration before admission, during mutex acquisition, or before append returns pure `ctx.Err()`, causing `RouteWrite()` to return `StatusThrottled` (0x04) without triggering a misleading `StatusNotLeader` redirect.
+     - *Intentional Semantic Ambiguity*: If context expires after durable `Storage.Append()`, the entry is durably written to the local log, but client acknowledgement returns `StatusThrottled`. The distinction between `durably appended locally`, `quorum committed`, and `applied to state machine` is strictly preserved.
   4. *Apply Batch Size Upper Bounding (F04)*:
      - `StartApplyLoop()` enforces a hard maximum batch size: `MaxApplyBatchSize = 4096`. Values $\le 0$ default to `DefaultApplyBatchSize = 64`, and values exceeding 4096 are clamped.
      - Prevents adversarial or misconfigured batch limits from causing unbounded heap allocations during commit catch-up.
@@ -1370,13 +1371,17 @@ This document tracks all **genuine architectural and operational limitations** o
      - If the underlying state machine or LSM engine blocks indefinitely during apply, `Node.Close()` logs the timeout and proceeds, preventing permanent hangs on server shutdown.
   8. *Header Injection & Open Redirect Sanitization (F08)*:
      - `ParseRedirectMessage()` and redirect payload parsers reject messages containing ASCII control characters (0x00–0x1F, 0x7F), preventing response splitting, log injection, or format string exploits.
+  9. *Production Daemon End-to-End Wiring (GAP C)*:
+     - `cmd/lattice/daemon.go` wires `raft.Storage`, `raft.Node`, `raft.ProposalRouter`, and `StartApplyLoop` into the production server lifecycle.
+     - Standalone mode continues to mutate `engine.Engine` directly when cluster flags are absent.
+     - Cluster mode initializes Raft consensus, routes client writes exclusively through `ProposalRouter`, and halts fail-closed if consensus components are absent.
 * **Why It Exists**:
-  Guarantees fail-closed consensus invariants across distributed failure modes, hostile client requests, and uncoordinated leadership transitions.
+  Guarantees fail-closed consensus invariants across distributed failure modes, hostile client requests, uncoordinated leadership transitions, and daemon lifecycles.
 * **Impact**:
   Nodes operating in cluster mode cannot silently bifurcate state machine state from Raft consensus state.
 * **Dimensional Impact**:
-  * Correctness: **Optimal** (Linearization of proposals preserved across stepdowns; zero fail-open bypass).
-  * Security: **Audited & Hardened** (Fail-closed invariants, bounded buffers, sanitized wire outputs).
+  * Correctness: **Optimal** (Linearization of proposals preserved across stepdowns; zero fail-open bypass; complete epoch fencing).
+  * Security: **Audited & Hardened** (Fail-closed invariants, bounded buffers, sanitized wire outputs, context disambiguation).
   * Performance: **Minimal overhead** (Epoch checks and batch clamping operate in $O(1)$ time).
 
 ---

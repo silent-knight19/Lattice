@@ -6,9 +6,12 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
+	"github.com/silent-knight19/lattice/internal/cluster"
 	"github.com/silent-knight19/lattice/internal/engine"
+	"github.com/silent-knight19/lattice/internal/raft"
 	"github.com/silent-knight19/lattice/internal/transport"
 )
 
@@ -116,21 +119,88 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 		}
 	}
 
-	// Step 3: Initialize Transport Server
+	// Step 3: Initialize Transport Server & Raft Subsystem (GAP C)
 	srvCfg := transport.DefaultServerConfig()
 	srvCfg.Address = cfg.Address
 	srvCfg.InsecureTransport = cfg.InsecureTransport
 
-	// P16-SEC-F01: When cluster topology is configured, enable cluster mode on the transport
-	// server. This ensures that client PUT/DELETE mutations are NEVER dispatched directly to
-	// the local Engine, even if the ProposalRouter is not yet wired (or is temporarily nil).
-	// Writes are rejected fail-closed until a valid ProposalRouter is configured.
+	var (
+		raftStorage *raft.Storage
+		raftNode    *raft.Node
+	)
+
+	// In cluster mode: wire persistent Raft storage, Node, ProposalRouter, and apply loop
 	if cfg.IsClusterEnabled() {
 		srvCfg.ClusterMode = true
+
+		raftDir := filepath.Join(cfg.DataDir, "raft")
+		if err := os.MkdirAll(raftDir, 0750); err != nil {
+			if pprofSrv != nil {
+				_ = pprofSrv.Shutdown(context.Background())
+			}
+			_ = eng.Close()
+			fmt.Fprintf(stderr, "lattice: failed to create raft storage directory at %s: %v\n", raftDir, err)
+			return ExitStartupError
+		}
+
+		var err error
+		raftStorage, err = raft.OpenStorage(raftDir)
+		if err != nil {
+			if pprofSrv != nil {
+				_ = pprofSrv.Shutdown(context.Background())
+			}
+			_ = eng.Close()
+			fmt.Fprintf(stderr, "lattice: failed to open raft storage at %s: %v\n", raftDir, err)
+			return ExitStartupError
+		}
+
+		raftCfg := raft.NodeConfig{
+			LocalID:      cluster.NodeID(cfg.NodeID),
+			Storage:      raftStorage,
+			Topology:     cfg.Topology,
+			StateMachine: eng,
+		}
+		raftNode, err = raft.NewNode(raftCfg)
+		if err != nil {
+			_ = raftStorage.Close()
+			if pprofSrv != nil {
+				_ = pprofSrv.Shutdown(context.Background())
+			}
+			_ = eng.Close()
+			fmt.Fprintf(stderr, "lattice: failed to initialize raft node: %v\n", err)
+			return ExitStartupError
+		}
+
+		router := raft.NewProposalRouter(raftNode, cfg.Topology)
+		srvCfg.ProposalRouter = router
+
+		// Start election services
+		if cfg.Topology != nil && cfg.Topology.Size() == 1 {
+			// In single-node cluster (N=1), candidate self-vote satisfies quorum immediately
+			if err := raftNode.BecomeCandidate(); err == nil {
+				_ = raftNode.BecomeLeader()
+			}
+		}
+		if err := raftNode.StartElectionTimer(); err != nil {
+			_ = raftNode.Close()
+			_ = raftStorage.Close()
+			if pprofSrv != nil {
+				_ = pprofSrv.Shutdown(context.Background())
+			}
+			_ = eng.Close()
+			fmt.Fprintf(stderr, "lattice: failed to start election timer: %v\n", err)
+			return ExitStartupError
+		}
 	}
 
 	srv, err := transport.NewServer(srvCfg, eng)
 	if err != nil {
+		if raftNode != nil {
+			_ = raftNode.Close()
+		}
+		if raftStorage != nil {
+			_ = raftStorage.Close()
+		}
 		if pprofSrv != nil {
 			_ = pprofSrv.Shutdown(context.Background())
 		}
@@ -141,6 +211,12 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 
 	// Step 4: Bind Listener and Start Accept Loop
 	if err := srv.Listen(cfg.Address); err != nil {
+		if raftNode != nil {
+			_ = raftNode.Close()
+		}
+		if raftStorage != nil {
+			_ = raftStorage.Close()
+		}
 		if pprofSrv != nil {
 			_ = pprofSrv.Shutdown(context.Background())
 		}
@@ -153,6 +229,12 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 	select {
 	case <-ctx.Done():
 		_ = srv.Close()
+		if raftNode != nil {
+			_ = raftNode.Close()
+		}
+		if raftStorage != nil {
+			_ = raftStorage.Close()
+		}
 		if pprofSrv != nil {
 			_ = pprofSrv.Shutdown(context.Background())
 		}
@@ -161,6 +243,12 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 	case sig := <-sigCh:
 		fmt.Fprintf(stdout, "lattice: received signal %s during startup, shutting down...\n", sig)
 		_ = srv.Close()
+		if raftNode != nil {
+			_ = raftNode.Close()
+		}
+		if raftStorage != nil {
+			_ = raftStorage.Close()
+		}
 		if pprofSrv != nil {
 			_ = pprofSrv.Shutdown(context.Background())
 		}
@@ -173,6 +261,12 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 	if pprofSrv != nil {
 		if err := pprofSrv.Start(); err != nil {
 			_ = srv.Close()
+			if raftNode != nil {
+				_ = raftNode.Close()
+			}
+			if raftStorage != nil {
+				_ = raftStorage.Close()
+			}
 			_ = pprofSrv.Shutdown(context.Background())
 			_ = eng.Close()
 			fmt.Fprintf(stderr, "lattice: failed to start pprof server: %v\n", err)
@@ -215,13 +309,24 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 	}()
 
 	// Step 8: Ordered Graceful Shutdown
-	// Invariant: Halt network ingestion and drain data clients BEFORE pprof diagnostics,
-	// and close storage engine LAST.
+	// Invariant: Halt network ingestion and drain data clients BEFORE Raft/pprof/storage,
+	// stop Raft node and apply loop, close Raft persistent storage,
+	// drain pprof diagnostics, and close storage engine LAST.
 	shutCtx, cancel := context.WithTimeout(context.Background(), srvCfg.ShutdownTimeout)
 	defer cancel()
 
 	if srvErr := srv.Shutdown(shutCtx); srvErr != nil {
 		fmt.Fprintf(stderr, "lattice: warning: server network shutdown error: %v\n", srvErr)
+	}
+
+	if raftNode != nil {
+		_ = raftNode.Close()
+	}
+
+	if raftStorage != nil {
+		if rErr := raftStorage.Close(); rErr != nil {
+			fmt.Fprintf(stderr, "lattice: warning: raft storage close error: %v\n", rErr)
+		}
 	}
 
 	if pprofSrv != nil {
