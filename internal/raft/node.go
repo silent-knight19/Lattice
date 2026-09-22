@@ -27,6 +27,36 @@ type PeerSender interface {
 	Send(ctx context.Context, peerID cluster.NodeID, frame *transport.Frame) error
 }
 
+// ReadIndexResult represents the committed log position and leadership evidence
+// established by a successful ReadIndex leader quorum verification round (P17-S01-M01).
+type ReadIndexResult struct {
+	Index LogIndex
+	Term  Term
+}
+
+// readQuorumRound tracks in-flight leader quorum verification state for ReadIndex (P17-S01-M01).
+// All field mutations are guarded by Node.mu.
+type readQuorumRound struct {
+	nonce      uint64
+	term       Term
+	epoch      uint64
+	readIndex  LogIndex
+	quorumSize int
+	acks       map[cluster.NodeID]struct{}
+	done       chan struct{}
+	err        error
+	waiters    int
+}
+
+func (r *readQuorumRound) isDone() bool {
+	select {
+	case <-r.done:
+		return true
+	default:
+		return false
+	}
+}
+
 // Node represents the core Raft consensus state machine governing role transitions
 // (Follower <-> Candidate <-> Leader) and integrating with persistent storage.
 //
@@ -63,6 +93,10 @@ type Node struct {
 	// Allows deterministic stepdown injection to test the TOCTOU window (P16-SEC-F02).
 	// Must be nil in production. Protected by proposeMu (only accessed under proposeMu).
 	proposeTestHook func()
+
+	// ReadIndex leadership quorum verification state (P17-S01-M01)
+	readRounds        map[uint64]*readQuorumRound
+	readIndexTestHook func()
 
 	// Election subsystem & Quorum (P15-S02-M01 & P15-S02-M02)
 	topology         *cluster.Topology
@@ -202,6 +236,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		electionCtx:       ctx,
 		electionCancel:    cancel,
 		heartbeatInterval: hbInterval,
+		readRounds:        make(map[uint64]*readQuorumRound),
 	}
 
 	if cfg.StateMachine != nil {
@@ -599,6 +634,7 @@ func (n *Node) clearLeaderAndElectionStateLocked() {
 	n.electionRoundTerm = 0
 	n.nextIndex = nil
 	n.matchIndex = nil
+	n.abortReadRoundsLocked(errors.ErrRaftInvalidRoleTransition)
 }
 
 // appendLeaderNoOpLocked durably appends the new leader's current-term no-op
@@ -944,6 +980,7 @@ func (n *Node) Close() error {
 	if n.role == RoleLeader {
 		n.leaderEpoch++ // Fence stale proposals on node shutdown
 	}
+	n.abortReadRoundsLocked(errors.ErrRaftStateClosed)
 	n.mu.Unlock()
 
 	return nil
@@ -2118,6 +2155,7 @@ func (n *Node) HandleAppendEntries(fromPeerID cluster.NodeID, req *transport.App
 			Term:       uint64(currTerm),
 			Success:    false,
 			MatchIndex: 0,
+			Nonce:      req.Nonce,
 		}, nil
 	}
 
@@ -2188,6 +2226,7 @@ func (n *Node) HandleAppendEntries(fromPeerID cluster.NodeID, req *transport.App
 				Term:       uint64(currTerm),
 				Success:    false,
 				MatchIndex: 0,
+				Nonce:      req.Nonce,
 			}, nil
 		}
 
@@ -2214,6 +2253,7 @@ func (n *Node) HandleAppendEntries(fromPeerID cluster.NodeID, req *transport.App
 			Term:       uint64(currTerm),
 			Success:    true,
 			MatchIndex: req.PrevLogIndex,
+			Nonce:      req.Nonce,
 		}, nil
 	}
 
@@ -2229,6 +2269,7 @@ func (n *Node) HandleAppendEntries(fromPeerID cluster.NodeID, req *transport.App
 			Term:       uint64(currTerm),
 			Success:    false,
 			MatchIndex: 0,
+			Nonce:      req.Nonce,
 		}, nil
 	}
 
@@ -2241,6 +2282,7 @@ func (n *Node) HandleAppendEntries(fromPeerID cluster.NodeID, req *transport.App
 			Term:       uint64(currTerm),
 			Success:    false,
 			MatchIndex: 0,
+			Nonce:      req.Nonce,
 		}, nil
 	}
 
@@ -2263,6 +2305,7 @@ func (n *Node) HandleAppendEntries(fromPeerID cluster.NodeID, req *transport.App
 		Term:       uint64(currTerm),
 		Success:    true,
 		MatchIndex: uint64(matchIdx),
+		Nonce:      req.Nonce,
 	}, nil
 }
 
@@ -2513,6 +2556,30 @@ func (n *Node) HandleAppendEntriesResponse(fromPeerID cluster.NodeID, resp *tran
 		n.mu.Unlock()
 		return nil
 	}
+
+	// ReadIndex quorum heartbeat verification (P17-S01-M01):
+	// If this response carries a non-zero nonce matching an active read round,
+	// record the peer's current-term acknowledgement.
+	if resp.Nonce != 0 && len(n.readRounds) > 0 {
+		if round, ok := n.readRounds[resp.Nonce]; ok {
+			if Term(resp.Term) == round.term && n.leaderEpoch == round.epoch {
+				if round.acks == nil {
+					round.acks = make(map[cluster.NodeID]struct{})
+				}
+				round.acks[fromPeerID] = struct{}{}
+				// Leader itself counts as 1. Quorum satisfied when 1 + len(round.acks) >= round.quorumSize.
+				if 1+len(round.acks) >= round.quorumSize {
+					select {
+					case <-round.done:
+					default:
+						close(round.done)
+					}
+					delete(n.readRounds, resp.Nonce)
+				}
+			}
+		}
+	}
+
 	if n.matchIndex == nil || n.nextIndex == nil {
 		n.mu.Unlock()
 		return nil
@@ -2555,3 +2622,250 @@ func (n *Node) HandleAppendEntriesResponse(fromPeerID cluster.NodeID, resp *tran
 	n.mu.Unlock()
 	return nil
 }
+
+// abortReadRoundsLocked aborts all active in-flight read quorum rounds with the specified error.
+// Caller MUST hold n.mu.
+func (n *Node) abortReadRoundsLocked(err error) {
+	for nonce, round := range n.readRounds {
+		round.err = err
+		select {
+		case <-round.done:
+		default:
+			close(round.done)
+		}
+		delete(n.readRounds, nonce)
+	}
+}
+
+// generateReadRoundNonceLocked mints a non-zero cryptographic nonce that does not collide
+// with any currently active read round.
+// Caller MUST hold n.mu.
+func (n *Node) generateReadRoundNonceLocked() (uint64, error) {
+	for {
+		nonce, err := transport.GenerateNonce()
+		if err != nil {
+			return 0, err
+		}
+		if nonce == 0 {
+			continue
+		}
+		if _, exists := n.readRounds[nonce]; !exists {
+			return nonce, nil
+		}
+	}
+}
+
+// sendReadHeartbeats broadcasts empty AppendEntries probe frames bearing the specified
+// round nonce to all configured remote peers.
+// Must execute strictly outside of Node.mu (no mutex held during network I/O).
+func (n *Node) sendReadHeartbeats(ctx context.Context, term Term, nonce uint64) {
+	if n.peerSender == nil || len(n.peers) == 0 {
+		return
+	}
+
+	sendCtx := ctx
+	if sendCtx == nil {
+		sendCtx = n.electionCtx
+	}
+
+	leaderCommit := uint64(n.CommitIndex())
+	lastIdx, lastTerm, _ := n.storage.LastIndexAndTerm()
+
+	for _, peerID := range n.peers {
+		if sendCtx.Err() != nil {
+			return
+		}
+		// Stale-leadership guard: abort broadcast if this node is no longer
+		// Leader in the heartbeat term (concurrent stepdown).
+		if !n.isStillLeader(term) {
+			return
+		}
+		if peerID == n.localID {
+			continue // Never send to self
+		}
+
+		seqID := n.peerSender.NextSeqID()
+		req := &transport.AppendEntriesRequest{
+			Term:         uint64(term),
+			LeaderID:     n.localID,
+			PrevLogIndex: uint64(lastIdx),
+			PrevLogTerm:  uint64(lastTerm),
+			LeaderCommit: leaderCommit,
+			Nonce:        nonce,
+			Entries:      nil, // Empty heartbeat probe
+		}
+
+		frame, err := transport.EncodeAppendEntries(req, seqID)
+		if err != nil {
+			continue
+		}
+
+		_ = n.peerSender.Send(sendCtx, peerID, frame)
+	}
+}
+
+// ReadIndex implements the Raft ReadIndex leader quorum verification protocol (P17-S01-M01).
+// It establishes that this node is currently the legitimate leader with confirmation
+// from a current-term majority before returning the safe committed position (ReadIndex).
+//
+// Invariants enforced (P17-S01-M01):
+//  1. Context & cancellation: Checks ctx before start, during wait, and returns pure
+//     context errors (preserving errors.Is for context.Canceled and context.DeadlineExceeded).
+//  2. Leader-only: Only RoleLeader can execute ReadIndex; followers, candidates, and closed
+//     nodes return ErrRaftInvalidRoleTransition or ErrRaftStateClosed.
+//  3. Single-node cluster (N=1): The leader alone satisfies majority quorum (quorumSize=1)
+//     and immediately returns (commitIndex, currentTerm) without network I/O.
+//  4. Multi-node cluster (N>1): Broadcasts empty AppendEntries heartbeat probes with a unique
+//     cryptographic round nonce and waits for current-term majority confirmation.
+//  5. Stale-response defense: Responses from older terms, older rounds, older leadership epochs,
+//     or unknown peers are strictly ignored and cannot confirm quorum.
+//  6. Leadership safety: Any stepdown, higher-term observation, or epoch change invalidates
+//     in-flight rounds and returns ErrRaftInvalidRoleTransition.
+//  7. State-machine boundary: This primitive ONLY verifies leadership and establishes the
+//     safe read index. It does NOT wait for lastApplied or perform state-machine reads (M02).
+func (n *Node) ReadIndex(ctx context.Context) (ReadIndexResult, error) {
+	if n.closed.Load() {
+		return ReadIndexResult{}, errors.ErrRaftStateClosed
+	}
+
+	if ctx.Err() != nil {
+		return ReadIndexResult{}, fmt.Errorf("raft: read index context cancelled before start: %w", ctx.Err())
+	}
+
+	n.mu.Lock()
+	if n.closed.Load() {
+		n.mu.Unlock()
+		return ReadIndexResult{}, errors.ErrRaftStateClosed
+	}
+	if n.role != RoleLeader {
+		role := n.role
+		n.mu.Unlock()
+		return ReadIndexResult{}, fmt.Errorf("%w: only the leader can verify read index (current role %s)",
+			errors.ErrRaftInvalidRoleTransition, role)
+	}
+
+	currTerm, err := n.storage.Term()
+	if err != nil {
+		n.mu.Unlock()
+		return ReadIndexResult{}, fmt.Errorf("raft: failed to read current term: %w", err)
+	}
+
+	readCommitIndex := n.commitIndex
+	epoch := n.leaderEpoch
+	quorum := n.quorumSizeLocked()
+
+	// Single-node cluster (N=1): leader alone constitutes a majority.
+	if quorum <= 1 {
+		n.mu.Unlock()
+		return ReadIndexResult{
+			Index: readCommitIndex,
+			Term:  currTerm,
+		}, nil
+	}
+
+	// Multi-node cluster (N>1): mint unique nonce and register active read round.
+	nonce, err := n.generateReadRoundNonceLocked()
+	if err != nil {
+		n.mu.Unlock()
+		return ReadIndexResult{}, fmt.Errorf("raft: failed to generate read round nonce: %w", err)
+	}
+
+	round := &readQuorumRound{
+		nonce:      nonce,
+		term:       currTerm,
+		epoch:      epoch,
+		readIndex:  readCommitIndex,
+		quorumSize: quorum,
+		acks:       make(map[cluster.NodeID]struct{}),
+		done:       make(chan struct{}),
+	}
+	if n.readRounds == nil {
+		n.readRounds = make(map[uint64]*readQuorumRound)
+	}
+	n.readRounds[nonce] = round
+	n.mu.Unlock()
+
+	// Transmit heartbeat probes outside of Node.mu
+	n.sendReadHeartbeats(ctx, currTerm, nonce)
+
+	// Test hook injection point (deterministic stepdown / race testing)
+	if n.readIndexTestHook != nil {
+		n.readIndexTestHook()
+	}
+
+	// Wait for quorum confirmation, cancellation, or round abort
+	select {
+	case <-ctx.Done():
+		n.mu.Lock()
+		delete(n.readRounds, nonce)
+		n.mu.Unlock()
+		return ReadIndexResult{}, fmt.Errorf("raft: read index context cancelled during quorum wait: %w", ctx.Err())
+	case <-round.done:
+	}
+
+	// Context cancellation check takes priority over round result
+	if ctx.Err() != nil {
+		n.mu.Lock()
+		delete(n.readRounds, nonce)
+		n.mu.Unlock()
+		return ReadIndexResult{}, fmt.Errorf("raft: read index context cancelled during quorum wait: %w", ctx.Err())
+	}
+
+	// Post-wait validation under Node.mu: re-verify continuous leadership, epoch, and term
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.closed.Load() {
+		return ReadIndexResult{}, errors.ErrRaftStateClosed
+	}
+
+	currTermAfter, err := n.storage.Term()
+	if err != nil {
+		return ReadIndexResult{}, fmt.Errorf("raft: failed to read term after quorum wait: %w", err)
+	}
+
+	if n.role != RoleLeader || n.leaderEpoch != round.epoch || currTermAfter != round.term {
+		return ReadIndexResult{}, fmt.Errorf("%w: leadership lost during read index confirmation (current role %s)",
+			errors.ErrRaftInvalidRoleTransition, n.role)
+	}
+
+	if round.err != nil {
+		return ReadIndexResult{}, round.err
+	}
+
+	if 1+len(round.acks) < round.quorumSize {
+		return ReadIndexResult{}, fmt.Errorf("%w: quorum not confirmed for read index",
+			errors.ErrRaftInvalidRoleTransition)
+	}
+
+	// Linearization point: Return commitIndex observed under Node.mu atomically
+	// with verified leadership, epoch, and term. If commitIndex advanced during
+	// the heartbeat round (e.g. from the heartbeat responses confirming the election no-op),
+	// using max(round.readIndex, n.commitIndex) captures the latest committed position.
+	finalCommitIndex := n.commitIndex
+	if round.readIndex > finalCommitIndex {
+		finalCommitIndex = round.readIndex
+	}
+
+	return ReadIndexResult{
+		Index: finalCommitIndex,
+		Term:  currTermAfter,
+	}, nil
+}
+
+// SetReadIndexTestHook sets an optional hook called during ReadIndex after sending
+// read-confirmation heartbeats but before waiting for quorum confirmation.
+// Used exclusively by tests to inject deterministic races (e.g. stepdown).
+func (n *Node) SetReadIndexTestHook(fn func()) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.readIndexTestHook = fn
+}
+
+// ActiveReadRoundsCount returns the number of active read quorum rounds currently registered.
+func (n *Node) ActiveReadRoundsCount() int {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return len(n.readRounds)
+}
+

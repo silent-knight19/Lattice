@@ -72,9 +72,13 @@ const (
 	// Layout: Term (8B) | LeaderID (8B) | PrevLogIndex (8B) | PrevLogTerm (8B) | LeaderCommit (8B) | Nonce (8B) | EntryCount (4B).
 	AppendEntriesRequestHeaderSize = 52
 
-	// AppendEntriesResponseSize is the fixed size in bytes of an AppendEntries response payload (17 bytes).
+	// AppendEntriesResponseSize is the fixed size in bytes of an AppendEntries response payload without nonce (17 bytes).
 	// Layout: Term (8B) | Success (1B: 0x00=false, 0x01=true) | MatchIndex (8B).
 	AppendEntriesResponseSize = 17
+
+	// AppendEntriesResponseSizeWithNonce is the size in bytes of an AppendEntries response payload with nonce correlation (25 bytes).
+	// Layout: Term (8B) | Success (1B: 0x00=false, 0x01=true) | MatchIndex (8B) | Nonce (8B).
+	AppendEntriesResponseSizeWithNonce = 25
 
 	// PeerLogEntryHeaderSize is the fixed size in bytes of each log entry header within AppendEntries (13 bytes).
 	// Layout: Term (8B) | Type (1B) | DataLen (4B) | Data (DataLen B).
@@ -184,15 +188,17 @@ type AppendEntriesRequest struct {
 
 // AppendEntriesResponse represents a Raft AppendEntries RPC response on the wire.
 //
-// Wire Layout (17 bytes fixed):
+// Wire Layout (17 bytes legacy, 25 bytes with Nonce):
 //
 //	Offset  0..7  : Term (8B uint64 Big-Endian)
 //	Offset  8     : Success (1B uint8: 0x00=false, 0x01=true)
 //	Offset  9..16 : MatchIndex (8B uint64 Big-Endian)
+//	Offset 17..24 : Nonce (8B uint64 Big-Endian, optional for backwards compatibility)
 type AppendEntriesResponse struct {
 	Term       uint64
 	Success    bool
 	MatchIndex uint64
+	Nonce      uint64
 }
 
 // EncodeRequestVote serializes a RequestVoteRequest into a protocol Frame.
@@ -505,12 +511,17 @@ func DecodeAppendEntries(f *Frame) (*AppendEntriesRequest, error) {
 //   - Encodes Term (8B Big-Endian).
 //   - Encodes Success strictly as 0x00 or 0x01.
 //   - Encodes MatchIndex (8B Big-Endian).
+//   - Encodes Nonce (8B Big-Endian) if non-zero (25B payload), else emits legacy 17B payload.
 //   - Sets OpCode to PeerOpAppendEntriesResponse (0x84).
 func EncodeAppendEntriesResponse(resp *AppendEntriesResponse, seqID uint64) (*Frame, error) {
 	if resp == nil {
 		return nil, errors.ErrNilReceiver
 	}
-	payload := make([]byte, AppendEntriesResponseSize)
+	size := AppendEntriesResponseSize
+	if resp.Nonce != 0 {
+		size = AppendEntriesResponseSizeWithNonce
+	}
+	payload := make([]byte, size)
 	binary.PutUint64(payload[0:8], resp.Term)
 	if resp.Success {
 		payload[8] = 0x01
@@ -518,6 +529,9 @@ func EncodeAppendEntriesResponse(resp *AppendEntriesResponse, seqID uint64) (*Fr
 		payload[8] = 0x00
 	}
 	binary.PutUint64(payload[9:17], resp.MatchIndex)
+	if resp.Nonce != 0 {
+		binary.PutUint64(payload[17:25], resp.Nonce)
+	}
 
 	return &Frame{
 		Header: Header{
@@ -525,7 +539,7 @@ func EncodeAppendEntriesResponse(resp *AppendEntriesResponse, seqID uint64) (*Fr
 			OpCode:        OpCode(PeerOpAppendEntriesResponse),
 			Status:        StatusOk,
 			SeqID:         seqID,
-			PayloadLength: AppendEntriesResponseSize,
+			PayloadLength: uint32(size),
 		},
 		Payload: payload,
 	}, nil
@@ -535,7 +549,7 @@ func EncodeAppendEntriesResponse(resp *AppendEntriesResponse, seqID uint64) (*Fr
 //
 // Invariants:
 //   - OpCode must equal PeerOpAppendEntriesResponse (0x84).
-//   - Payload length must be exactly AppendEntriesResponseSize (17B).
+//   - Payload length must be exactly AppendEntriesResponseSize (17B) or AppendEntriesResponseSizeWithNonce (25B).
 //   - Success wire byte must be strictly 0x00 or 0x01.
 func DecodeAppendEntriesResponse(f *Frame) (*AppendEntriesResponse, error) {
 	if f == nil {
@@ -549,19 +563,24 @@ func DecodeAppendEntriesResponse(f *Frame) (*AppendEntriesResponse, error) {
 			Reason: fmt.Sprintf("unsupported peer response status/flags: 0x%02x", f.Header.Status),
 		}
 	}
-	if len(f.Payload) != AppendEntriesResponseSize {
+	if len(f.Payload) != AppendEntriesResponseSize && len(f.Payload) != AppendEntriesResponseSizeWithNonce {
 		return nil, &errors.InvalidPeerPayloadError{
-			Reason: fmt.Sprintf("AppendEntriesResponse payload size %d does not match expected %d", len(f.Payload), AppendEntriesResponseSize),
+			Reason: fmt.Sprintf("AppendEntriesResponse payload size %d does not match expected %d or %d", len(f.Payload), AppendEntriesResponseSize, AppendEntriesResponseSizeWithNonce),
 		}
 	}
 	b := f.Payload[8]
 	if b > 1 {
 		return nil, &errors.InvalidPeerBooleanError{Field: "Success", Value: b}
 	}
+	var nonce uint64
+	if len(f.Payload) == AppendEntriesResponseSizeWithNonce {
+		nonce = binary.GetUint64(f.Payload[17:25])
+	}
 	return &AppendEntriesResponse{
 		Term:       binary.GetUint64(f.Payload[0:8]),
 		Success:    b == 1,
 		MatchIndex: binary.GetUint64(f.Payload[9:17]),
+		Nonce:      nonce,
 	}, nil
 }
 

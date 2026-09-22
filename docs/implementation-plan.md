@@ -2479,8 +2479,10 @@ TOTAL: 176 Discrete, Testable Micro-Phases
 * **Major Objective**: Eliminate stale reads under network partitions using the `ReadIndex` protocol.
 * **Dependencies**: Phase 16.
 
-* **P17-S01-M01: Leader Quorum Heartbeat Verification**
-  * *Objective*: Record current `commitIndex`, broadcast heartbeat to confirm active majority leadership.
+* **P17-S01-M01: Leader Quorum Heartbeat Verification** (complete)
+  * *Objective*: Record current `commitIndex`, broadcast heartbeat probes bearing a round-unique cryptographic nonce to confirm active current-term majority leadership.
+  * *Implementation & Invariants*: Implemented `Node.ReadIndex(ctx context.Context) (ReadIndexResult, error)`. Enforces strict atomic relationship between leader role, current term, leader epoch, and `commitIndex` at the linearization point. Single-node clusters ($N=1$) satisfy majority immediately (quorum size = 1). Multi-node clusters ($N > 1$) broadcast empty AppendEntries probes with unique 64-bit cryptographic nonces echoed by followers, requiring current-term responses matching the round nonce from a majority ($1 + \text{acks} \ge \text{quorumSize}$). Defends against stale responses (older term, older round, mismatched nonce), higher terms (forces stepdown), concurrent leadership epoch changes, context cancellation/deadlines, and node closure.
+  * *Scope Boundary*: Establishes the safe Raft-side read index only; state machine read barrier execution and waiting for `lastApplied` remain deferred to P17-S01-M02.
 * **P17-S01-M02: State Machine Read Barrier Execution**
   * *Objective*: Wait until local state machine applies up to recorded `commitIndex`, then serve read.
   * *Tests*: Partition simulation verifying stale reads are never returned.

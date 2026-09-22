@@ -337,7 +337,8 @@ func TestAppendEntriesResponse_RoundTrip(t *testing.T) {
 	}{
 		{name: "success_response", resp: AppendEntriesResponse{Term: 5, Success: true, MatchIndex: 120}},
 		{name: "rejected_response", resp: AppendEntriesResponse{Term: 6, Success: false, MatchIndex: 80}},
-		{name: "max_boundaries", resp: AppendEntriesResponse{Term: math.MaxUint64, Success: true, MatchIndex: math.MaxUint64}},
+		{name: "with_nonce_response", resp: AppendEntriesResponse{Term: 7, Success: true, MatchIndex: 150, Nonce: 0xAABBCCDDEEFF0011}},
+		{name: "max_boundaries", resp: AppendEntriesResponse{Term: math.MaxUint64, Success: true, MatchIndex: math.MaxUint64, Nonce: math.MaxUint64}},
 		{name: "zero_boundaries", resp: AppendEntriesResponse{Term: 0, Success: false, MatchIndex: 0}},
 	}
 
