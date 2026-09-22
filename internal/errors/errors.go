@@ -166,6 +166,11 @@ var (
 	// ErrNilReceiver indicates that a method was invoked on a nil pointer receiver.
 	ErrNilReceiver = stdErrors.New("nil receiver pointer")
 
+	// ErrNotInitialized indicates that a method was invoked on a zero-value object
+	// that requires constructor initialization (e.g. NewSkipList, OpenWriter,
+	// NewWriteQueue). It distinguishes "never constructed" from "closed after use".
+	ErrNotInitialized = stdErrors.New("object used before initialization: constructor required")
+
 	// ErrKeyOutOfOrder indicates that an entry was added out of strictly increasing canonical order.
 	ErrKeyOutOfOrder = stdErrors.New("key out of order: keys must be added in strictly increasing canonical order")
 

@@ -116,12 +116,21 @@ func OpenReader(path string) (*WALReader, error) {
 
 // OpenSegmentReader opens an existing WAL segment file under dbPath using its 12-digit segment ID.
 // The segment path is constructed as <db_path>/wal/wal_<000000000001>.log.
+// AUDIT-F-007: id 0 is rejected because no valid segment file can exist
+// under that ID (ParseSegmentID strictly requires ID >= 1).
 func OpenSegmentReader(dbPath string, id uint64) (*WALReader, error) {
+	if id == 0 {
+		return nil, fmt.Errorf("wal: segment ID must be strictly positive: %w", os.ErrInvalid)
+	}
 	return OpenReader(SegmentPath(dbPath, id))
 }
 
 // Path returns the canonical filesystem path of the WAL segment being read.
+// Returns "" if the reader is nil.
 func (r *WALReader) Path() string {
+	if r == nil {
+		return ""
+	}
 	return r.path
 }
 
@@ -134,13 +143,21 @@ func (r *WALReader) Path() string {
 //   - If Next() returns an error (io.EOF, truncation, or corruption), Offset() remains unchanged,
 //     pointing precisely to the start of the unconsumed record.
 func (r *WALReader) Offset() int64 {
+	if r == nil {
+		return 0
+	}
 	return r.offset
 }
 
 // Close closes the underlying file descriptor and marks the reader as closed.
 // Subsequent calls to Next() return errors.ErrReaderClosed.
 // Close is idempotent; subsequent calls return nil.
+// AUDIT-F-003: nil-receiver safe, returning errors.ErrReaderClosed instead of
+// panicking, so `r, _ := OpenReader(bad); r.Next()` fails visibly.
 func (r *WALReader) Close() error {
+	if r == nil {
+		return errors.ErrReaderClosed
+	}
 	if r.closed {
 		return nil
 	}
@@ -167,6 +184,9 @@ func (r *WALReader) Close() error {
 //   - On checksum corruption: returns (Record{}, *errors.ChecksumMismatchError); Offset() is NOT advanced.
 //   - On structural invalidity: returns (Record{}, err); Offset() is NOT advanced.
 func (r *WALReader) Next() (Record, error) {
+	if r == nil {
+		return Record{}, errors.ErrReaderClosed
+	}
 	if r.closed {
 		return Record{}, errors.ErrReaderClosed
 	}

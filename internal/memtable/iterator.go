@@ -44,9 +44,10 @@ type Iterator struct {
 // The iterator starts unpositioned (Valid() == false).
 // Callers may either advance using Next() (which moves to the first element)
 // or position explicitly using Seek() or SeekToFirst().
-// Returns nil if s is nil.
+// Returns nil if s is nil or is a zero value that was never constructed
+// via NewSkipList* (AUDIT-F-005).
 func (s *SkipList) NewIterator() *Iterator {
-	if s == nil {
+	if !s.usable() {
 		return nil
 	}
 	s.activeIterators.Add(1)
@@ -81,7 +82,7 @@ func (it *Iterator) Next() bool {
 	it.mu.Lock()
 	defer it.mu.Unlock()
 
-	if it.closed || it.sl == nil {
+	if it.closed || it.sl == nil || it.sl.head == nil {
 		it.state = stateExhausted
 		it.curr = nil
 		return false
@@ -182,6 +183,11 @@ func (it *Iterator) Seek(userKey []byte) error {
 		it.state = stateExhausted
 		return errors.ErrIteratorClosed
 	}
+	if it.sl.head == nil {
+		it.curr = nil
+		it.state = stateExhausted
+		return errors.ErrNotInitialized
+	}
 	if err := binary.ValidateKey(userKey); err != nil {
 		it.curr = nil
 		it.state = stateExhausted
@@ -225,7 +231,7 @@ func (it *Iterator) SeekToFirst() {
 	it.mu.Lock()
 	defer it.mu.Unlock()
 
-	if it.closed || it.sl == nil {
+	if it.closed || it.sl == nil || it.sl.head == nil {
 		it.curr = nil
 		it.state = stateExhausted
 		return
@@ -254,6 +260,11 @@ func (it *Iterator) SeekInternalKey(target binary.InternalKey) error {
 		it.curr = nil
 		it.state = stateExhausted
 		return errors.ErrIteratorClosed
+	}
+	if it.sl.head == nil {
+		it.curr = nil
+		it.state = stateExhausted
+		return errors.ErrNotInitialized
 	}
 	if err := binary.ValidateKey(target.UserKey); err != nil {
 		it.curr = nil

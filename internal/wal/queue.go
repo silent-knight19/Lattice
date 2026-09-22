@@ -74,6 +74,11 @@ func NewWriteQueue(capacity int) (*WriteQueue, error) {
 //   - errors.ErrTaskAlreadyEnqueued if task was already enqueued.
 //   - errors.ErrQueueClosed if the queue is closed before or while waiting.
 func (q *WriteQueue) Enqueue(task *WriteTask) error {
+	// AUDIT re-audit: nil-queue safe. Check before touching task state so a
+	// rejected enqueue leaves the task reusable.
+	if q == nil {
+		return errors.ErrQueueClosed
+	}
 	if task == nil || task.done == nil {
 		return errors.ErrNilTask
 	}
@@ -113,6 +118,9 @@ func (q *WriteQueue) Enqueue(task *WriteTask) error {
 // TryEnqueue attempts to add task to the queue without blocking.
 // If the queue is full, it returns errors.ErrQueueFull immediately.
 func (q *WriteQueue) TryEnqueue(task *WriteTask) error {
+	if q == nil {
+		return errors.ErrQueueClosed
+	}
 	if task == nil || task.done == nil {
 		return errors.ErrNilTask
 	}
@@ -155,6 +163,9 @@ func (q *WriteQueue) TryEnqueue(task *WriteTask) error {
 // If the queue is closed, Dequeue drains all remaining queued tasks before
 // returning (nil, errors.ErrQueueClosed).
 func (q *WriteQueue) Dequeue() (*WriteTask, error) {
+	if q == nil {
+		return nil, errors.ErrQueueClosed
+	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -183,6 +194,9 @@ func (q *WriteQueue) Dequeue() (*WriteTask, error) {
 // If the queue is empty, it returns (nil, errors.ErrQueueEmpty).
 // If the queue is closed and empty, it returns (nil, errors.ErrQueueClosed).
 func (q *WriteQueue) TryDequeue() (*WriteTask, error) {
+	if q == nil {
+		return nil, errors.ErrQueueClosed
+	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -226,6 +240,9 @@ func (q *WriteQueue) TryDequeue() (*WriteTask, error) {
 //     If closed but has remaining tasks, drains available tasks up to batch limits.
 //   - Producer Wakeup: Wakes all waiting producers via notFull.Broadcast() after freeing slots.
 func (q *WriteQueue) DequeueBatch(maxTasks int, maxBytes int64) ([]*WriteTask, error) {
+	if q == nil {
+		return nil, errors.ErrQueueClosed
+	}
 	if maxTasks <= 0 || maxTasks > MaxBatchTasks {
 		maxTasks = MaxBatchTasks
 	}
@@ -255,6 +272,9 @@ func (q *WriteQueue) DequeueBatch(maxTasks int, maxBytes int64) ([]*WriteTask, e
 // If the queue is empty, it returns (nil, errors.ErrQueueEmpty).
 // If the queue is closed and empty, it returns (nil, errors.ErrQueueClosed).
 func (q *WriteQueue) TryDequeueBatch(maxTasks int, maxBytes int64) ([]*WriteTask, error) {
+	if q == nil {
+		return nil, errors.ErrQueueClosed
+	}
 	if maxTasks <= 0 || maxTasks > MaxBatchTasks {
 		maxTasks = MaxBatchTasks
 	}
@@ -332,6 +352,9 @@ func (q *WriteQueue) drainBatchLocked(maxTasks int, maxBytes int64) []*WriteTask
 // Any tasks currently in the queue can still be dequeued by consumers until empty.
 // Calling Close on an already closed queue returns nil.
 func (q *WriteQueue) Close() error {
+	if q == nil {
+		return nil
+	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -353,6 +376,9 @@ func (q *WriteQueue) Close() error {
 // with the provided err, ensuring no task waiters are left hanging.
 // If err is nil, errors.ErrQueueClosed is used.
 func (q *WriteQueue) CloseWithError(err error) error {
+	if q == nil {
+		return nil
+	}
 	if err == nil {
 		err = errors.ErrQueueClosed
 	}
@@ -385,6 +411,9 @@ func (q *WriteQueue) CloseWithError(err error) error {
 
 // Len returns the current number of tasks waiting in the queue.
 func (q *WriteQueue) Len() int {
+	if q == nil {
+		return 0
+	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return q.count
@@ -392,6 +421,9 @@ func (q *WriteQueue) Len() int {
 
 // Cap returns the maximum capacity of the queue.
 func (q *WriteQueue) Cap() int {
+	if q == nil {
+		return 0
+	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return q.capacity
@@ -399,6 +431,9 @@ func (q *WriteQueue) Cap() int {
 
 // IsClosed reports whether the queue has been closed.
 func (q *WriteQueue) IsClosed() bool {
+	if q == nil {
+		return true
+	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return q.closed

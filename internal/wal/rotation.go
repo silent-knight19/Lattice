@@ -303,6 +303,9 @@ func Open(dbPath string, opts Options) (*RotatingWriter, error) {
 // ActiveSegmentID returns the numeric ID of the currently active segment file.
 // Returns 0 if no segment is currently active (e.g. after a failed rotation or after close).
 func (rw *RotatingWriter) ActiveSegmentID() uint64 {
+	if rw == nil {
+		return 0
+	}
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 	if rw.active == nil || rw.closed {
@@ -314,6 +317,9 @@ func (rw *RotatingWriter) ActiveSegmentID() uint64 {
 // ActiveSegmentSize returns the current physical byte length of the active segment file.
 // Returns 0 if no segment is currently active.
 func (rw *RotatingWriter) ActiveSegmentSize() int64 {
+	if rw == nil {
+		return 0
+	}
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 	if rw.active == nil || rw.closed {
@@ -325,6 +331,9 @@ func (rw *RotatingWriter) ActiveSegmentSize() int64 {
 // ActivePath returns the filesystem path of the currently active segment file.
 // Returns empty string if no segment is currently active.
 func (rw *RotatingWriter) ActivePath() string {
+	if rw == nil {
+		return ""
+	}
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 	if rw.active == nil || rw.closed {
@@ -333,16 +342,45 @@ func (rw *RotatingWriter) ActivePath() string {
 	return rw.active.Path()
 }
 
+// ActiveSegment exposes read-only inspection of the active WAL segment.
+// It deliberately omits Append/AppendSync/Close: all mutation and lifecycle
+// operations must go through RotatingWriter so rotation accounting
+// (activeLen), segment sequencing, and close semantics stay consistent
+// (AUDIT-F-006). Appending or closing through an aliased raw writer bypassed
+// rotation thresholds and could corrupt writer lifecycle state.
+type ActiveSegment interface {
+	// Path returns the filesystem path of the active segment file.
+	Path() string
+	// Size returns the current physical byte length of the segment file.
+	Size() (int64, error)
+	// Sync executes a durability barrier on the active segment.
+	Sync() error
+	// IsPoisoned reports whether the active segment writer is poisoned.
+	IsPoisoned() bool
+}
+
 // DBPath returns the database root directory path containing the WAL directory.
+// Returns "" if the writer is nil.
 func (rw *RotatingWriter) DBPath() string {
+	if rw == nil {
+		return ""
+	}
 	return rw.dbPath
 }
 
-// ActiveWriter returns the underlying *WALWriter for the active segment.
+// ActiveWriter returns a read-only handle for the active segment.
 // Returns nil if no segment is active.
-func (rw *RotatingWriter) ActiveWriter() *WALWriter {
+// AUDIT-F-006: the returned handle cannot mutate or close the segment; use
+// Append/AppendSync/Rotate/Close on the RotatingWriter itself.
+func (rw *RotatingWriter) ActiveWriter() ActiveSegment {
+	if rw == nil {
+		return nil
+	}
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
+	if rw.active == nil || rw.closed {
+		return nil
+	}
 	return rw.active
 }
 
@@ -359,6 +397,9 @@ func (rw *RotatingWriter) ActiveWriter() *WALWriter {
 //   - On success, updates active segment size by the physical wire length.
 //   - Does NOT guarantee durability of the new record until Sync() is called.
 func (rw *RotatingWriter) Append(rec Record) error {
+	if rw == nil {
+		return errors.ErrWriterClosed
+	}
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 
@@ -379,6 +420,9 @@ func (rw *RotatingWriter) Append(rec Record) error {
 //   - If no segment is active, returns an error.
 //   - Thread-safe under concurrent callers.
 func (rw *RotatingWriter) Sync() error {
+	if rw == nil {
+		return errors.ErrWriterClosed
+	}
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 
@@ -440,6 +484,9 @@ func (rw *RotatingWriter) appendLocked(rec Record) error {
 //   - On success, updates active segment size by the physical wire length and executes Sync().
 //   - On failure, queries file stat to maintain accurate size tracking and returns error.
 func (rw *RotatingWriter) AppendSync(rec Record) error {
+	if rw == nil {
+		return errors.ErrWriterClosed
+	}
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 
@@ -465,6 +512,9 @@ func (rw *RotatingWriter) AppendSync(rec Record) error {
 //  3. Transitions active writer handle to segment N+1.
 //  4. If creation of N+1 fails, active writer is set to nil and error is returned.
 func (rw *RotatingWriter) Rotate() error {
+	if rw == nil {
+		return errors.ErrWriterClosed
+	}
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 
@@ -554,6 +604,9 @@ func (rw *RotatingWriter) rotateLocked() error {
 // and closes the underlying descriptor. Subsequent operations return errors.ErrWriterClosed.
 // Close is idempotent; subsequent calls return nil.
 func (rw *RotatingWriter) Close() error {
+	if rw == nil {
+		return errors.ErrWriterClosed
+	}
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 
@@ -573,5 +626,8 @@ func (rw *RotatingWriter) Close() error {
 // Segments returns all segment IDs discovered under the database WAL directory,
 // sorted in strictly ascending numeric order.
 func (rw *RotatingWriter) Segments() ([]uint64, error) {
+	if rw == nil {
+		return nil, errors.ErrWriterClosed
+	}
 	return ListSegments(rw.dbPath)
 }

@@ -170,7 +170,13 @@ func OpenWriter(path string) (*WALWriter, error) {
 
 // OpenSegmentWriter opens or creates a WAL segment file under dbPath using its 12-digit segment ID.
 // The segment path is constructed as <db_path>/wal/wal_<000000000001>.log.
+// AUDIT-F-007: id 0 is rejected because SegmentName(0) produces a filename
+// that ParseSegmentID/ListSegments/recovery treat as invalid, which would
+// create a recovery-invisible file and silently lose the data written to it.
 func OpenSegmentWriter(dbPath string, id uint64) (*WALWriter, error) {
+	if id == 0 {
+		return nil, fmt.Errorf("wal: segment ID must be strictly positive: %w", os.ErrInvalid)
+	}
 	return OpenWriter(SegmentPath(dbPath, id))
 }
 
@@ -272,12 +278,20 @@ func CreateWriter(path string) (*WALWriter, error) {
 // CreateSegmentWriter creates a new WAL segment file under dbPath using its 12-digit segment ID.
 // The segment path is constructed as <db_path>/wal/wal_<000000000001>.log.
 // Fails with os.ErrExist if the segment file already exists.
+// AUDIT-F-007: id 0 is rejected (see OpenSegmentWriter).
 func CreateSegmentWriter(dbPath string, id uint64) (*WALWriter, error) {
+	if id == 0 {
+		return nil, fmt.Errorf("wal: segment ID must be strictly positive: %w", os.ErrInvalid)
+	}
 	return CreateWriter(SegmentPath(dbPath, id))
 }
 
 // Path returns the canonical filesystem path of the active WAL segment file.
+// Returns "" if the writer is nil.
 func (w *WALWriter) Path() string {
+	if w == nil {
+		return ""
+	}
 	return w.path
 }
 
@@ -302,7 +316,14 @@ func (w *WALWriter) checkPoisonLocked() error {
 }
 
 // IsPoisoned reports whether the writer has entered the poisoned state due to a write or sync failure.
+// Returns false if the writer is nil.
+// AUDIT-F-003: nil-receiver safe; all mutating/query methods below likewise
+// return explicit errors instead of panicking, and zero-value writers
+// (file == nil, never constructed) report errors.ErrNotInitialized.
 func (w *WALWriter) IsPoisoned() bool {
+	if w == nil {
+		return false
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.poisoned
@@ -310,9 +331,15 @@ func (w *WALWriter) IsPoisoned() bool {
 
 // Size returns the current physical byte length of the segment file.
 func (w *WALWriter) Size() (int64, error) {
+	if w == nil {
+		return 0, errors.ErrWriterClosed
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.file == nil {
+		return 0, errors.ErrNotInitialized
+	}
 	if w.closed {
 		return 0, errors.ErrWriterClosed
 	}
@@ -331,9 +358,15 @@ func (w *WALWriter) Size() (int64, error) {
 // Subsequent operations on the writer will return errors.ErrWriterClosed.
 // Close is idempotent; subsequent calls return nil.
 func (w *WALWriter) Close() error {
+	if w == nil {
+		return errors.ErrWriterClosed
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.file == nil {
+		return errors.ErrNotInitialized
+	}
 	if w.closed {
 		return nil
 	}
@@ -378,9 +411,15 @@ func (w *WALWriter) Close() error {
 //   - Caller's rec.Key and rec.Value slices are never mutated.
 //   - Concurrent invocations are serialized by an internal mutex to prevent record interleaving.
 func (w *WALWriter) Append(rec Record) error {
+	if w == nil {
+		return errors.ErrWriterClosed
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.file == nil {
+		return errors.ErrNotInitialized
+	}
 	if w.closed {
 		return errors.ErrWriterClosed
 	}
@@ -401,9 +440,15 @@ func (w *WALWriter) Append(rec Record) error {
 //   - Returns nil if fdatasync succeeds.
 //   - Thread-safe under concurrent callers.
 func (w *WALWriter) Sync() error {
+	if w == nil {
+		return errors.ErrWriterClosed
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.file == nil {
+		return errors.ErrNotInitialized
+	}
 	if w.closed {
 		return errors.ErrWriterClosed
 	}
@@ -471,9 +516,15 @@ func (w *WALWriter) syncLocked() error {
 //   - Caller's rec.Key and rec.Value slices are never mutated.
 //   - Concurrent invocations are serialized by an internal mutex to prevent record interleaving.
 func (w *WALWriter) AppendSync(rec Record) error {
+	if w == nil {
+		return errors.ErrWriterClosed
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.file == nil {
+		return errors.ErrNotInitialized
+	}
 	if w.closed {
 		return errors.ErrWriterClosed
 	}
@@ -490,6 +541,9 @@ func (w *WALWriter) AppendSync(rec Record) error {
 
 // setSyncFnForTesting injects a custom synchronization function for fault injection tests.
 func (w *WALWriter) setSyncFnForTesting(fn func(f *os.File) error) {
+	if w == nil {
+		return
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.syncFn = fn
@@ -497,6 +551,9 @@ func (w *WALWriter) setSyncFnForTesting(fn func(f *os.File) error) {
 
 // setWriteFnForTesting injects a custom write function for fault injection tests.
 func (w *WALWriter) setWriteFnForTesting(fn func(f *os.File, p []byte) (int, error)) {
+	if w == nil {
+		return
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.writeFn = fn

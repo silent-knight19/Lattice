@@ -217,6 +217,7 @@ func TestSentinelNegativeComparisons(t *testing.T) {
 		errors.ErrMemTableFrozen,
 		errors.ErrIteratorClosed,
 		errors.ErrNilReceiver,
+		errors.ErrNotInitialized,
 		errors.ErrKeyOutOfOrder,
 		errors.ErrBlockFinished,
 		errors.ErrInvalidRestartInterval,

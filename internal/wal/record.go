@@ -7,6 +7,7 @@ import (
 	"hash/crc32"
 	"io"
 	"math"
+	"os"
 
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
@@ -390,6 +391,11 @@ func EncodeRecord(record Record) ([]byte, error) {
 //     Callers that need to preserve stream position across decode failures must buffer the input
 //     or record file offsets before calling DecodeRecord.
 func DecodeRecord(r io.Reader) (Record, error) {
+	// AUDIT-F-004: a nil reader previously panicked inside io.ReadFull with a
+	// nil-pointer dereference. Fail visibly instead.
+	if r == nil {
+		return Record{}, fmt.Errorf("wal: decode record from nil reader: %w", os.ErrInvalid)
+	}
 	var headerBuf [HeaderSize]byte
 	n, err := io.ReadFull(r, headerBuf[:])
 	if err != nil {

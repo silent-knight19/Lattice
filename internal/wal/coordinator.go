@@ -24,7 +24,13 @@ type ReplaySink interface {
 type ReplayFunc func(rec Record) error
 
 // Apply calls f(rec).
+// A nil ReplayFunc is a no-op returning nil, consistent with the
+// validation-only mode of passing a nil ReplaySink to RecoverWAL
+// (AUDIT re-audit: nil func values would otherwise panic on call).
 func (f ReplayFunc) Apply(rec Record) error {
+	if f == nil {
+		return nil
+	}
 	return f(rec)
 }
 

@@ -75,6 +75,14 @@ func NewSkipListWithGenerator(rnd *HeightGenerator) *SkipList {
 	return sl
 }
 
+// usable reports whether the SkipList was constructed via NewSkipList* and is
+// safe for operation. The zero value (&SkipList{} / var s SkipList) has nil
+// head/rnd and must be rejected with errors.ErrNotInitialized instead of
+// panicking on first use (AUDIT-F-005).
+func (s *SkipList) usable() bool {
+	return s != nil && s.head != nil && s.rnd != nil
+}
+
 // Height returns the current active maximum tower height among inserted nodes (1 <= height <= MaxHeight).
 func (s *SkipList) Height() int {
 	if s == nil {
@@ -169,6 +177,9 @@ func (s *SkipList) Freeze() bool {
 	if s == nil {
 		return false
 	}
+	if s.head == nil {
+		return false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -225,6 +236,9 @@ func (s *SkipList) Insert(key binary.InternalKey, value []byte) error {
 func (s *SkipList) insertInternal(key binary.InternalKey, value []byte, forcedHeight int) error {
 	if s == nil {
 		return errors.ErrNilReceiver
+	}
+	if !s.usable() {
+		return errors.ErrNotInitialized
 	}
 	// 0. Fast-path check for frozen state before any validation or allocation
 	if s.frozen.Load() {
@@ -376,6 +390,9 @@ func (s *SkipList) Search(userKey []byte) ([]byte, error) {
 	if s == nil {
 		return nil, errors.ErrNilReceiver
 	}
+	if !s.usable() {
+		return nil, errors.ErrNotInitialized
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.SearchConcurrent(userKey)
@@ -408,6 +425,9 @@ func (s *SkipList) SearchConcurrent(userKey []byte) ([]byte, error) {
 	if s == nil {
 		return nil, errors.ErrNilReceiver
 	}
+	if !s.usable() {
+		return nil, errors.ErrNotInitialized
+	}
 	if err := binary.ValidateKey(userKey); err != nil {
 		return nil, err
 	}
@@ -422,8 +442,12 @@ func (s *SkipList) SearchConcurrent(userKey []byte) ([]byte, error) {
 // searchNodeConcurrent locates the first node whose UserKey matches userKey using lock-free atomic traversal.
 // Because keys with the same UserKey sort descending by SeqNum, the first matching
 // node encountered is guaranteed to be the newest revision.
-// Returns nil if no node with UserKey exists in the SkipList.
+// Returns nil if no node with UserKey exists in the SkipList, or if the list
+// is nil/uninitialized.
 func (s *SkipList) searchNodeConcurrent(userKey []byte) *skipListNode {
+	if !s.usable() {
+		return nil
+	}
 	curr := s.head
 
 	// Atomically load current active height and clamp to valid range

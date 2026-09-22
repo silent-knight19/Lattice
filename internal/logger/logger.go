@@ -385,9 +385,28 @@ func scrubString(s string) string {
 
 // scrubValue recursively traverses nested maps, slices, structs, and custom Stringers
 // to ensure no secrets or sensitive keys are logged at any depth (SEC-005, VULN-004).
+//
+// Recursion bound (AUDIT-F-001): traversal depth is capped at maxScrubDepth.
+// Cyclic data structures (e.g. a struct whose pointer field loops back to an
+// ancestor) would otherwise recurse without bound and exhaust the goroutine
+// stack with a fatal, unrecoverable "stack overflow". Beyond the depth limit
+// the subtree is replaced with RedactedPlaceholder (fail closed: redact rather
+// than expose or crash).
 func scrubValue(v any, redactedMap map[string]struct{}) any {
+	return scrubValueDepth(v, redactedMap, 0)
+}
+
+// maxScrubDepth caps recursive descent in scrubValue/scrubGroupAttrs.
+// Legitimate log payloads nest only a few levels deep; the bound exists solely
+// to terminate cyclic or adversarially deep structures before stack exhaustion.
+const maxScrubDepth = 32
+
+func scrubValueDepth(v any, redactedMap map[string]struct{}, depth int) any {
 	if v == nil {
 		return nil
+	}
+	if depth > maxScrubDepth {
+		return RedactedPlaceholder
 	}
 
 	// Precedence 1: Evaluate custom Redactable implementations directly
@@ -414,7 +433,7 @@ func scrubValue(v any, redactedMap map[string]struct{}) any {
 			if isSensitiveKey(k, redactedMap) {
 				scrubbed[k] = RedactedPlaceholder
 			} else {
-				scrubbed[k] = scrubValue(val, redactedMap)
+				scrubbed[k] = scrubValueDepth(val, redactedMap, depth+1)
 			}
 		}
 		return scrubbed
@@ -444,7 +463,7 @@ func scrubValue(v any, redactedMap map[string]struct{}) any {
 		if val.IsNil() {
 			return nil
 		}
-		return scrubValue(val.Elem().Interface(), redactedMap)
+		return scrubValueDepth(val.Elem().Interface(), redactedMap, depth+1)
 
 	case reflect.Map:
 		if val.IsNil() {
@@ -456,7 +475,7 @@ func scrubValue(v any, redactedMap map[string]struct{}) any {
 			if isSensitiveKey(kStr, redactedMap) {
 				scrubbed[kStr] = RedactedPlaceholder
 			} else {
-				scrubbed[kStr] = scrubValue(val.MapIndex(key).Interface(), redactedMap)
+				scrubbed[kStr] = scrubValueDepth(val.MapIndex(key).Interface(), redactedMap, depth+1)
 			}
 		}
 		return scrubbed
@@ -471,7 +490,7 @@ func scrubValue(v any, redactedMap map[string]struct{}) any {
 		n := val.Len()
 		scrubbed := make([]any, n)
 		for i := 0; i < n; i++ {
-			scrubbed[i] = scrubValue(val.Index(i).Interface(), redactedMap)
+			scrubbed[i] = scrubValueDepth(val.Index(i).Interface(), redactedMap, depth+1)
 		}
 		return scrubbed
 
@@ -501,7 +520,7 @@ func scrubValue(v any, redactedMap map[string]struct{}) any {
 			if isSensitiveKey(fieldName, redactedMap) {
 				scrubbed[fieldName] = RedactedPlaceholder
 			} else {
-				scrubbed[fieldName] = scrubValue(val.Field(i).Interface(), redactedMap)
+				scrubbed[fieldName] = scrubValueDepth(val.Field(i).Interface(), redactedMap, depth+1)
 			}
 		}
 		return scrubbed
@@ -512,7 +531,13 @@ func scrubValue(v any, redactedMap map[string]struct{}) any {
 
 // scrubGroupAttrs recursively scrubs attributes within a slog.Group,
 // redacting sensitive keys at any nesting depth and preserving GroupValue hierarchy.
+// Group nesting depth is capped at maxScrubDepth (see AUDIT-F-001); deeper
+// groups are replaced with RedactedPlaceholder to fail closed.
 func scrubGroupAttrs(attrs []slog.Attr, redactedMap map[string]struct{}) []slog.Attr {
+	return scrubGroupAttrsDepth(attrs, redactedMap, 0)
+}
+
+func scrubGroupAttrsDepth(attrs []slog.Attr, redactedMap map[string]struct{}, depth int) []slog.Attr {
 	scrubbedAttrs := make([]slog.Attr, len(attrs))
 	for i, attr := range attrs {
 		if attr.Key == "" {
@@ -522,12 +547,16 @@ func scrubGroupAttrs(attrs []slog.Attr, redactedMap map[string]struct{}) []slog.
 		if isSensitiveKey(attr.Key, redactedMap) {
 			scrubbedAttrs[i] = slog.String(attr.Key, RedactedPlaceholder)
 		} else if attr.Value.Kind() == slog.KindGroup {
-			scrubbedAttrs[i] = slog.Attr{
-				Key:   attr.Key,
-				Value: slog.GroupValue(scrubGroupAttrs(attr.Value.Group(), redactedMap)...),
+			if depth >= maxScrubDepth {
+				scrubbedAttrs[i] = slog.String(attr.Key, RedactedPlaceholder)
+			} else {
+				scrubbedAttrs[i] = slog.Attr{
+					Key:   attr.Key,
+					Value: slog.GroupValue(scrubGroupAttrsDepth(attr.Value.Group(), redactedMap, depth+1)...),
+				}
 			}
 		} else {
-			scrubbedAttrs[i] = slog.Any(attr.Key, scrubValue(attr.Value.Any(), redactedMap))
+			scrubbedAttrs[i] = slog.Any(attr.Key, scrubValueDepth(attr.Value.Any(), redactedMap, depth+1))
 		}
 	}
 	return scrubbedAttrs
@@ -555,7 +584,17 @@ func makeReplaceAttr(customRedacted []string) func(groups []string, a slog.Attr)
 		}
 	}
 
-	return func(groups []string, a slog.Attr) slog.Attr {
+	return func(groups []string, a slog.Attr) (out slog.Attr) {
+		// AUDIT-F-001: scrubbing invokes caller-controlled code (fmt.Stringer,
+		// Redactable, map/slice reflection). A panicking implementation must not
+		// propagate out of the logging call and crash the process; fail closed
+		// by redacting the offending attribute.
+		defer func() {
+			if recover() != nil {
+				out = slog.String(a.Key, RedactedPlaceholder)
+			}
+		}()
+
 		if a.Key == "" {
 			return a
 		}

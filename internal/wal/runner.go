@@ -128,6 +128,9 @@ func NewGroupCommitRunner(queue *WriteQueue, writer BatchWriter, opts RunnerOpti
 //   - Returns errors.ErrRunnerClosed if the runner has been stopped.
 //   - Exactly one runner goroutine executes at any time.
 func (r *GroupCommitRunner) Start() error {
+	if r == nil {
+		return errors.ErrRunnerClosed
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -150,6 +153,9 @@ func (r *GroupCommitRunner) Start() error {
 // queued tasks to completion, and waits for the runner loop to exit cleanly.
 // Stop is idempotent; repeated calls return nil.
 func (r *GroupCommitRunner) Stop() error {
+	if r == nil {
+		return errors.ErrRunnerClosed
+	}
 	r.mu.Lock()
 	if r.stopped {
 		r.mu.Unlock()
@@ -157,6 +163,12 @@ func (r *GroupCommitRunner) Stop() error {
 	}
 	if !r.running {
 		r.stopped = true
+		// AUDIT-F-002 follow-up: the loop never started, so nothing will ever
+		// drain the queue. Fail pending tasks fast with ErrRunnerClosed so
+		// Wait/WaitContext callers cannot block forever.
+		if r.queue != nil {
+			_ = r.queue.CloseWithError(errors.ErrRunnerClosed)
+		}
 		r.mu.Unlock()
 		return nil
 	}
@@ -179,29 +191,46 @@ func (r *GroupCommitRunner) Close() error {
 
 // IsRunning reports whether the runner is currently executing.
 func (r *GroupCommitRunner) IsRunning() bool {
+	if r == nil {
+		return false
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.running && !r.stopped
 }
 
-// SyncCount returns the total number of physical durability synchronization barriers
-// executed by this runner.
+// SyncCount returns the total number of successful physical durability
+// synchronization barriers executed by this runner.
+// AUDIT-F-008: failed barriers are not counted, so the counter reflects
+// durability events observers can rely on rather than attempts.
 func (r *GroupCommitRunner) SyncCount() int64 {
+	if r == nil {
+		return 0
+	}
 	return atomic.LoadInt64(&r.syncsCount)
 }
 
 // BatchesExecuted returns the total number of batches executed by this runner.
 func (r *GroupCommitRunner) BatchesExecuted() int64 {
+	if r == nil {
+		return 0
+	}
 	return atomic.LoadInt64(&r.batchesCount)
 }
 
 // TasksExecuted returns the total number of write tasks completed by this runner.
 func (r *GroupCommitRunner) TasksExecuted() int64 {
+	if r == nil {
+		return 0
+	}
 	return atomic.LoadInt64(&r.tasksCount)
 }
 
 // BytesWritten returns the total physical wire bytes appended by this runner.
 func (r *GroupCommitRunner) BytesWritten() int64 {
+	if r == nil {
+		return 0
+	}
 	return atomic.LoadInt64(&r.bytesCount)
 }
 
@@ -265,10 +294,28 @@ func (r *GroupCommitRunner) drainRemaining() {
 //  3. Executes exactly ONE durability barrier (Sync).
 //  4. If Sync fails, fails all tasks in the batch.
 //  5. If Sync succeeds, completes every task with nil.
+//
+// Panic safety (AUDIT-F-002): a panic from the underlying BatchWriter (or any
+// defect in batch serialization) must never orphan the in-flight batch. The
+// deferred recover completes every task in the batch with the panic error so
+// no caller blocks in Wait()/WaitContext() forever, then re-panics so the
+// run-loop interceptor observes the failure and fails the queue closed.
 func (r *GroupCommitRunner) executeBatch(batch []*WriteTask) {
 	if len(batch) == 0 {
 		return
 	}
+
+	defer func() {
+		if p := recover(); p != nil {
+			panicErr := fmt.Errorf("wal: group commit batch panicked: %v", p)
+			for _, task := range batch {
+				if task != nil {
+					_ = task.Complete(panicErr)
+				}
+			}
+			panic(p)
+		}
+	}()
 
 	var batchBytes int64
 	var appendErr error
@@ -295,7 +342,6 @@ func (r *GroupCommitRunner) executeBatch(batch []*WriteTask) {
 
 	// Step 2: Durability synchronization barrier
 	syncErr := r.writer.Sync()
-	atomic.AddInt64(&r.syncsCount, 1)
 
 	// Failure Case C: Sync barrier failed
 	if syncErr != nil {
@@ -305,6 +351,7 @@ func (r *GroupCommitRunner) executeBatch(batch []*WriteTask) {
 		}
 		return
 	}
+	atomic.AddInt64(&r.syncsCount, 1)
 
 	// Success: Durability established on non-volatile storage
 	for _, task := range batch {

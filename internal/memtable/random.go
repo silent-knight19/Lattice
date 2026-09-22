@@ -40,7 +40,11 @@ func NewPCG32(initState, initSeq uint64) *PCG32 {
 }
 
 // Uint32 returns a pseudo-random 32-bit unsigned integer in [0, 2^32-1].
+// A nil receiver deterministically returns 0 instead of panicking (AUDIT-F-005).
 func (p *PCG32) Uint32() uint32 {
+	if p == nil {
+		return 0
+	}
 	oldState := p.state
 	p.state = oldState*6364136223846793005 + p.inc
 	xorshifted := uint32(((oldState >> 18) ^ oldState) >> 27)
@@ -107,9 +111,15 @@ func initialEntropySeed() uint64 {
 //     of user keys and values.
 //   - P03-S01-INV-05: Always terminates deterministically.
 func (g *HeightGenerator) RandomHeight() int {
+	if g == nil {
+		return MinHeight
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
+	if g.src == nil {
+		return MinHeight
+	}
 	height := MinHeight
 	for height < MaxHeight && (g.src.Uint32()&3 == 0) {
 		height++
