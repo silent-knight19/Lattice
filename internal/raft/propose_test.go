@@ -62,8 +62,9 @@ func TestPropose_LeaderAcceptsProposal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Propose failed: %v", err)
 	}
-	if e.Index != 1 {
-		t.Fatalf("expected index 1, got %d", e.Index)
+	// Index 1 holds the election no-op; the first proposal follows it.
+	if e.Index != 2 {
+		t.Fatalf("expected index 2, got %d", e.Index)
 	}
 	if e.Term != term {
 		t.Fatalf("expected term %d, got %d", term, e.Term)
@@ -75,10 +76,19 @@ func TestPropose_LeaderAcceptsProposal(t *testing.T) {
 		t.Fatalf("payload not preserved: got %q", e.Data)
 	}
 
-	// Durably present in storage.
-	stored, err := s.Entry(1)
+	// The no-op itself is durable at index 1.
+	noop, err := s.Entry(1)
 	if err != nil {
 		t.Fatalf("storage Entry(1) failed: %v", err)
+	}
+	if noop.Type != transport.PeerEntryNoop || noop.Term != term {
+		t.Fatalf("expected election no-op at index 1, got %+v", noop)
+	}
+
+	// Durably present in storage.
+	stored, err := s.Entry(2)
+	if err != nil {
+		t.Fatalf("storage Entry(2) failed: %v", err)
 	}
 	if stored.Term != term || string(stored.Data) != string(payload) {
 		t.Fatalf("stored entry mismatch: %+v", stored)
@@ -150,8 +160,10 @@ func TestPropose_ClosedNodeRejects(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LastIndexAndTerm failed: %v", err)
 	}
-	if lastIdx != 0 {
-		t.Fatalf("closed-node log mutated: lastIdx=%d", lastIdx)
+	// Only the election no-op (index 1) may exist; the rejected proposal
+	// must not have appended anything.
+	if lastIdx != 1 {
+		t.Fatalf("closed-node proposal mutated log: lastIdx=%d", lastIdx)
 	}
 }
 
@@ -166,8 +178,9 @@ func TestPropose_SequentialContiguousIndexes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Propose %d failed: %v", i, err)
 		}
-		if e.Index != raft.LogIndex(i) {
-			t.Fatalf("proposal %d: expected index %d, got %d", i, i, e.Index)
+		// Index 1 is the election no-op; proposals follow contiguously.
+		if e.Index != raft.LogIndex(i+1) {
+			t.Fatalf("proposal %d: expected index %d, got %d", i, i+1, e.Index)
 		}
 		curTerm, _ := n.Term()
 		if e.Term != curTerm {
@@ -212,7 +225,8 @@ func TestPropose_ConcurrentDistinctIndexes(t *testing.T) {
 	if len(seen) != count {
 		t.Fatalf("expected %d distinct indexes, got %d", count, len(seen))
 	}
-	for idx := raft.LogIndex(1); idx <= raft.LogIndex(count); idx++ {
+	// Index 1 is the election no-op; proposals occupy 2..count+1.
+	for idx := raft.LogIndex(2); idx <= raft.LogIndex(count+1); idx++ {
 		data, ok := seen[idx]
 		if !ok {
 			t.Fatalf("missing index %d (gap in allocation)", idx)
@@ -255,7 +269,7 @@ func TestPropose_PersistenceFailureFailClosed(t *testing.T) {
 
 // Test 8 — entry uses the current (advanced) term, not a stale one.
 func TestPropose_UsesCurrentTermAfterReelection(t *testing.T) {
-	n, _ := newProposeNode(t, 1, []cluster.NodeID{2})
+	n, s := newProposeNode(t, 1, []cluster.NodeID{2})
 	term1 := mustLead(t, n)
 	e1, err := n.Propose([]byte("first"))
 	if err != nil {
@@ -281,8 +295,16 @@ func TestPropose_UsesCurrentTermAfterReelection(t *testing.T) {
 	if e2.Term != term2 {
 		t.Fatalf("expected new term %d, got %d", term2, e2.Term)
 	}
-	if e2.Index != e1.Index+1 {
-		t.Fatalf("expected contiguous index %d, got %d", e1.Index+1, e2.Index)
+	// A fresh no-op separates the terms: e1 < noop < e2, still contiguous.
+	if e2.Index != e1.Index+2 {
+		t.Fatalf("expected contiguous index %d, got %d", e1.Index+2, e2.Index)
+	}
+	mid, err := s.Entry(e1.Index + 1)
+	if err != nil {
+		t.Fatalf("Entry failed: %v", err)
+	}
+	if mid.Type != transport.PeerEntryNoop || mid.Term != term2 {
+		t.Fatalf("expected term-%d no-op between proposals, got %+v", term2, mid)
 	}
 }
 

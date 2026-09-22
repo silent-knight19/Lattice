@@ -10,6 +10,87 @@ import (
 	"github.com/silent-knight19/lattice/internal/transport"
 )
 
+func FuzzHandleAppendEntriesResponse(f *testing.F) {
+	// Seed corpus: normal, stale, higher-term, unknown-peer, max values.
+	f.Add(uint64(2), uint64(1), uint64(1), uint64(0))
+	f.Add(uint64(2), uint64(0), uint64(1), uint64(0))
+	f.Add(uint64(3), uint64(10), uint64(0), uint64(0))
+	f.Add(uint64(99), uint64(50), uint64(1), uint64(5))
+	f.Add(uint64(2), ^uint64(0), uint64(1), ^uint64(0))
+	f.Add(uint64(0), uint64(1), uint64(0), uint64(0))
+
+	f.Fuzz(func(t *testing.T, fromPeerIDRaw, respTerm, successRaw, matchIndex uint64) {
+		success := successRaw%2 != 0
+		dir := t.TempDir()
+		s, err := raft.OpenStorage(dir)
+		if err != nil {
+			return
+		}
+		defer func() { _ = s.Close() }()
+
+		node, err := raft.NewNode(raft.NodeConfig{
+			LocalID: 1,
+			Storage: s,
+			Peers:   []cluster.NodeID{2, 3, 4},
+		})
+		if err != nil {
+			return
+		}
+		defer func() { _ = node.Close() }()
+
+		// Elect a leader with one log entry so progress/commit have meaning.
+		_ = node.BecomeCandidate()
+		_ = node.BecomeLeader()
+		termBefore, _ := node.Term()
+		commitBefore := node.CommitIndex()
+
+		resp := &transport.AppendEntriesResponse{
+			Term:       respTerm,
+			Success:    success,
+			MatchIndex: matchIndex,
+		}
+		_ = node.HandleAppendEntriesResponse(cluster.NodeID(fromPeerIDRaw), resp)
+
+		termAfter, _ := node.Term()
+		commitAfter := node.CommitIndex()
+		lastIdx, _, _ := s.LastIndexAndTerm()
+
+		// Property 1: no panic (reaching here).
+		// Property 2: term never decreases.
+		if termAfter < termBefore {
+			t.Fatalf("term decreased: %d -> %d", termBefore, termAfter)
+		}
+		// Property 3: commit never decreases (volatile field is monotonic).
+		if commitAfter < commitBefore {
+			t.Fatalf("commit decreased: %d -> %d", commitBefore, commitAfter)
+		}
+		// Property 4: commit never exceeds the leader's durable log.
+		if commitAfter > lastIdx {
+			t.Fatalf("commit %d exceeds LastIndex %d", commitAfter, lastIdx)
+		}
+		// Property 5: recorded match never exceeds the leader's log
+		// (inflated progress is ignored, never stored). nextIndex keeps its
+		// floor while leader replication state exists (nil after stepdown).
+		stillLeader := node.Role() == raft.RoleLeader
+		for _, p := range []cluster.NodeID{2, 3, 4} {
+			if m := node.MatchIndex()[p]; m > lastIdx {
+				t.Fatalf("matchIndex[%d] = %d exceeds LastIndex %d", p, m, lastIdx)
+			}
+			if stillLeader {
+				if nx := node.NextIndex()[p]; nx < 1 {
+					t.Fatalf("nextIndex[%d] = %d below floor 1", p, nx)
+				}
+			}
+		}
+		// Property 6: unknown senders cannot advance commit.
+		if fromPeerIDRaw == 0 || fromPeerIDRaw == 1 || fromPeerIDRaw > 4 {
+			if commitAfter != commitBefore {
+				t.Fatalf("invalid sender %d changed commit %d -> %d", fromPeerIDRaw, commitBefore, commitAfter)
+			}
+		}
+	})
+}
+
 func FuzzRecoverStorage(f *testing.F) {
 	// Seed 1: Empty state
 	f.Add([]byte{})

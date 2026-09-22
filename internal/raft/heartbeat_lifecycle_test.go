@@ -498,3 +498,141 @@ func TestNode_Heartbeat_SchedulerConcurrency(t *testing.T) {
 	stop.Store(true)
 	wg.Wait()
 }
+
+// -----------------------------------------------------------------------------
+// Section 20.G: Sequential Restart Sends Only Current-Term Frames
+// -----------------------------------------------------------------------------
+
+// A synchronous Leader -> Follower -> Leader restart fully terminates the old
+// scheduler before the new one starts (stop blocks until done): every frame
+// transmitted after the restart must carry the new term.
+func TestNode_Heartbeat_SequentialRestartNoStaleFrames(t *testing.T) {
+	sender := newMockHeartbeatSender()
+	node, s := newTestHeartbeatNode(t, 1, []cluster.NodeID{2}, sender, nil)
+
+	if err := s.SetTerm(1); err != nil {
+		t.Fatalf("SetTerm failed: %v", err)
+	}
+	if err := node.BecomeCandidate(); err != nil {
+		t.Fatalf("BecomeCandidate failed: %v", err)
+	}
+	if err := node.BecomeLeader(); err != nil {
+		t.Fatalf("BecomeLeader failed: %v", err)
+	}
+	time.Sleep(70 * time.Millisecond)
+
+	term1, _ := node.Term()
+	if err := node.BecomeFollower(term1+1, cluster.NodeIDNil); err != nil {
+		t.Fatalf("BecomeFollower failed: %v", err)
+	}
+	// Synchronous stop: no old-session frame may arrive after this point.
+	mark := len(sender.GetSent(2))
+
+	if err := node.BecomeCandidate(); err != nil {
+		t.Fatalf("BecomeCandidate failed: %v", err)
+	}
+	if err := node.BecomeLeader(); err != nil {
+		t.Fatalf("BecomeLeader failed: %v", err)
+	}
+	term2, _ := node.Term()
+	if term2 <= term1 {
+		t.Fatalf("expected term advance, got %d -> %d", term1, term2)
+	}
+	time.Sleep(120 * time.Millisecond)
+
+	for i, frame := range sender.GetSent(2)[mark:] {
+		req, err := transport.DecodeAppendEntries(frame)
+		if err != nil {
+			t.Fatalf("frame %d decode failed: %v", i, err)
+		}
+		if req.Term != uint64(term2) {
+			t.Fatalf("post-restart frame %d carries stale term %d (want %d)", i, req.Term, term2)
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Section 20.H: Concurrent Restart Hammering Converges to One Session
+// -----------------------------------------------------------------------------
+
+// Rapid concurrent Leader <-> Follower flapping must never deadlock, panic,
+// leak schedulers, or leave the node without a functioning scheduler once it
+// settles as Leader. The settled session transmits only its own term.
+func TestNode_Heartbeat_ConcurrentRestartConverges(t *testing.T) {
+	sender := newMockHeartbeatSender()
+	node, _ := newTestHeartbeatNode(t, 1, []cluster.NodeID{2}, sender, nil)
+
+	baseGoroutines := runtime.NumGoroutine()
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for !stop.Load() {
+			term, err := node.Term()
+			if err != nil {
+				return
+			}
+			_ = node.BecomeFollower(term+1, cluster.NodeIDNil)
+			_ = node.BecomeCandidate()
+			_ = node.BecomeLeader()
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		var term uint64 = 100000
+		for !stop.Load() {
+			term++
+			_, _ = node.ObserveHigherTerm(raft.Term(term))
+		}
+	}()
+
+	time.Sleep(250 * time.Millisecond)
+	stop.Store(true)
+	wg.Wait()
+
+	// Settle deterministically as Leader in a fresh term.
+	curTerm, err := node.Term()
+	if err != nil {
+		t.Fatalf("Term failed: %v", err)
+	}
+	if err := node.BecomeFollower(curTerm+1, cluster.NodeIDNil); err != nil {
+		t.Fatalf("settle BecomeFollower failed: %v", err)
+	}
+	if err := node.BecomeCandidate(); err != nil {
+		t.Fatalf("settle BecomeCandidate failed: %v", err)
+	}
+	if err := node.BecomeLeader(); err != nil {
+		t.Fatalf("settle BecomeLeader failed: %v", err)
+	}
+	finalTerm, _ := node.Term()
+	mark := len(sender.GetSent(2))
+	time.Sleep(150 * time.Millisecond)
+
+	if !node.HeartbeatRunning() {
+		t.Fatalf("settled leader must run exactly one scheduler")
+	}
+	foundCurrent := false
+	for i, frame := range sender.GetSent(2)[mark:] {
+		req, err := transport.DecodeAppendEntries(frame)
+		if err != nil {
+			t.Fatalf("frame %d decode failed: %v", i, err)
+		}
+		if req.Term > uint64(finalTerm) {
+			t.Fatalf("frame %d carries impossible future term %d", i, req.Term)
+		}
+		if req.Term == uint64(finalTerm) {
+			foundCurrent = true
+		}
+	}
+	if !foundCurrent {
+		t.Fatalf("settled session transmitted no current-term frames")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if after := runtime.NumGoroutine(); after-baseGoroutines > 8 {
+		t.Fatalf("possible scheduler leak: base=%d after=%d", baseGoroutines, after)
+	}
+}

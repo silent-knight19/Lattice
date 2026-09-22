@@ -298,19 +298,29 @@ func TestNode_ThreeNodeQuorumElection_HappyPath(t *testing.T) {
 	}
 
 	// Verify leader volatile replication state (Section 26.Q):
-	// nextIndex = lastLogIndex + 1 = 2 + 1 = 3
+	// no-op appended at index 3, so nextIndex = 3 + 1 = 4
 	// matchIndex = 0
 	nextIdx := n.NextIndex()
 	matchIdx := n.MatchIndex()
-	if len(nextIdx) != 2 || nextIdx[2] != 3 || nextIdx[3] != 3 {
+	if len(nextIdx) != 2 || nextIdx[2] != 4 || nextIdx[3] != 4 {
 		t.Fatalf("unexpected nextIndex: %+v", nextIdx)
 	}
 	if len(matchIdx) != 2 || matchIdx[2] != 0 || matchIdx[3] != 0 {
 		t.Fatalf("unexpected matchIndex: %+v", matchIdx)
 	}
 
+	// Verify the election no-op is durable at index 3 in term 2.
+	noop, err := s.Entry(3)
+	if err != nil {
+		t.Fatalf("no-op Entry(3) failed: %v", err)
+	}
+	if noop.Term != 2 || noop.Type != transport.PeerEntryNoop {
+		t.Fatalf("unexpected no-op entry: %+v", noop)
+	}
+
 	// Verify immediate heartbeat broadcast (Section 26.R):
-	// Exactly one empty AppendEntries frame sent to each peer (2 and 3)
+	// Exactly one empty AppendEntries frame sent to each peer (2 and 3),
+	// anchored at the no-op (PrevLog 3/2).
 	frames2 := sender.GetSent(2)
 	frames3 := sender.GetSent(3)
 	if len(frames2) != 1 || len(frames3) != 1 {
@@ -321,7 +331,7 @@ func TestNode_ThreeNodeQuorumElection_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodeAppendEntries peer 2 failed: %v", err)
 	}
-	if ae2.Term != 2 || ae2.LeaderID != 1 || ae2.PrevLogIndex != 2 || ae2.PrevLogTerm != 1 || len(ae2.Entries) != 0 {
+	if ae2.Term != 2 || ae2.LeaderID != 1 || ae2.PrevLogIndex != 3 || ae2.PrevLogTerm != 2 || len(ae2.Entries) != 0 {
 		t.Fatalf("unexpected AppendEntries payload: %+v", ae2)
 	}
 	if ae2.Nonce == 0 {

@@ -534,16 +534,46 @@ func (n *Node) clearLeaderAndElectionStateLocked() {
 	n.matchIndex = nil
 }
 
+// appendLeaderNoOpLocked durably appends the new leader's current-term no-op
+// entry (transport.PeerEntryNoop, empty payload) at lastIdx+1 and returns the
+// new last index. Every leadership acquisition mints exactly one such entry
+// so quorum commitment can progress without waiting for client traffic: an
+// inherited old-term prefix becomes committable once the no-op replicates,
+// and N=1 clusters commit it immediately via the post-promotion refresh.
+//
+// Failure atomicity: called BEFORE becomeLeaderLocked while holding n.mu, so
+// a persistence failure leaves the node Candidate (never a partially-promoted
+// Leader); the next election timeout retries naturally. Disk I/O under
+// Node.mu here is deliberate and precedented (campaignLocked persists
+// HardState under mu for the same reason): leadership publication must be
+// atomic with its durable prerequisites. No network I/O, no user callbacks.
+// Caller MUST hold n.mu.
+func (n *Node) appendLeaderNoOpLocked(currTerm Term, lastIdx LogIndex) (LogIndex, error) {
+	if n.closed.Load() {
+		return 0, errors.ErrRaftStateClosed
+	}
+	noOp := LogEntry{Index: lastIdx + 1, Term: currTerm, Type: transport.PeerEntryNoop}
+	if err := noOp.Validate(); err != nil {
+		return 0, err
+	}
+	if err := n.storage.Append(noOp); err != nil {
+		return 0, fmt.Errorf("raft: failed to append leader no-op entry: %w", err)
+	}
+	return noOp.Index, nil
+}
+
 // BecomeLeader transitions the server from Candidate to Leader.
 //
 // Invariants enforced:
 //   - Legal ONLY from RoleCandidate (Follower cannot directly become Leader).
 //   - Does NOT increment term.
 //   - Does NOT clear vote.
-//   - Does NOT modify log or commit index.
+//   - Durably appends exactly one current-term no-op entry before publishing
+//     leadership; promotion fails closed (stays Candidate) if persistence fails.
 //   - Sets leaderID to localID.
-//   - Idempotent if already RoleLeader.
-//   - Initializes volatile leader replication state (nextIndex/matchIndex).
+//   - Idempotent if already RoleLeader (no duplicate no-op).
+//   - Initializes volatile leader replication state (nextIndex/matchIndex)
+//     over the post-no-op log.
 //   - Invokes TransitionHook outside of n.mu.
 //   - Triggers one-time immediate empty AppendEntries heartbeat broadcast outside of n.mu.
 //
@@ -579,14 +609,19 @@ func (n *Node) BecomeLeader() error {
 		return err
 	}
 
-	lastIdx, lastTerm, err := n.storage.LastIndexAndTerm()
+	lastIdx, _, err := n.storage.LastIndexAndTerm()
 	if err != nil {
 		n.mu.Unlock()
 		return err
 	}
 
 	oldRole := n.role
-	n.becomeLeaderLocked(currTerm, lastIdx)
+	newLastIdx, err := n.appendLeaderNoOpLocked(currTerm, lastIdx)
+	if err != nil {
+		n.mu.Unlock()
+		return err
+	}
+	n.becomeLeaderLocked(currTerm, newLastIdx)
 	shouldHook := (n.transitionHook != nil)
 	n.mu.Unlock()
 
@@ -604,8 +639,14 @@ func (n *Node) BecomeLeader() error {
 		return nil
 	}
 
+	// New-term commitment can already cover the just-appended no-op (notably
+	// N=1, where the leader alone is quorum) before the first heartbeat.
+	n.refreshCommitIndex()
+
 	// Broadcast one-time immediate empty AppendEntries heartbeats (without holding Node.mu)
-	n.sendImmediateHeartbeats(currTerm, lastIdx, lastTerm)
+	// anchored at the no-op: followers learn the leader's log head and pull
+	// the suffix through the periodic replication rounds.
+	n.sendImmediateHeartbeats(currTerm, newLastIdx, currTerm)
 
 	// Start recurring periodic heartbeat scheduler (P15-S02-M03)
 	n.startHeartbeatScheduler()
@@ -962,13 +1003,18 @@ func (n *Node) handleElectionTimeout() {
 			n.mu.Unlock()
 			return
 		}
-		lastIdx, lastTerm, err := n.storage.LastIndexAndTerm()
+		lastIdx, _, err := n.storage.LastIndexAndTerm()
 		if err != nil {
 			n.mu.Unlock()
 			return
 		}
 		oldRole := n.role
-		n.becomeLeaderLocked(currTerm, lastIdx)
+		newLastIdx, err := n.appendLeaderNoOpLocked(currTerm, lastIdx)
+		if err != nil {
+			n.mu.Unlock()
+			return
+		}
+		n.becomeLeaderLocked(currTerm, newLastIdx)
 		shouldHook := (n.transitionHook != nil)
 		n.mu.Unlock()
 
@@ -981,7 +1027,9 @@ func (n *Node) handleElectionTimeout() {
 		if !n.isStillLeader(currTerm) {
 			return
 		}
-		n.sendImmediateHeartbeats(currTerm, lastIdx, lastTerm)
+		// N=1 commits the no-op immediately (leader alone is quorum).
+		n.refreshCommitIndex()
+		n.sendImmediateHeartbeats(currTerm, newLastIdx, currTerm)
 		n.startHeartbeatScheduler()
 		return
 	}
@@ -1328,9 +1376,10 @@ func (n *Node) sendImmediateHeartbeats(term Term, lastIdx LogIndex, lastTerm Ter
 //   - PrevLog coordinates are coherent by construction: (0,0) sentinel or a
 //     stored term at prevIndex. Suffix reads come from durable storage
 //     clones; payloads/terms are never synthesized or altered.
-//   - Suffix length is capped at transport.MaxPeerEntries per round; an
-//     unencodable suffix degrades to an empty heartbeat for that peer this
-//     round (liveness preserved, entries retried next round).
+//   - Suffix length is size-aware batched (≤MaxPeerEntries and ≤MaxPayloadLength
+//     encoded bytes, ≥1 entry per round): every round makes progress and memory
+//     stays bounded by one frame. An unencodable round degrades to an empty
+//     heartbeat for that peer (liveness preserved, entries retried next round).
 //   - Never targets self or unknown peers (peers list is fixed at startup).
 func (n *Node) replicateToFollowers(ctx context.Context, term Term) {
 	if n.peerSender == nil || len(n.peers) == 0 {
@@ -1392,7 +1441,8 @@ func (n *Node) sendReplicationTo(sendCtx context.Context, term Term, peerID clus
 		return
 	}
 
-	// Pending suffix: prev = nextIdx-1 with its stored term.
+	// Pending suffix: prev = nextIdx-1 with its stored term, then a
+	// size-aware batch of the following entries.
 	var prevTerm Term
 	if nextIdx > 1 {
 		prevTerm, err = n.storage.TermOf(nextIdx - 1)
@@ -1400,17 +1450,18 @@ func (n *Node) sendReplicationTo(sendCtx context.Context, term Term, peerID clus
 			return
 		}
 	}
-	end := lastIdx + 1
-	if count := end - nextIdx; count > LogIndex(transport.MaxPeerEntries) {
-		end = nextIdx + LogIndex(transport.MaxPeerEntries)
-	}
-	stored, err := n.storage.Entries(nextIdx, end)
-	if err != nil {
+	wire := n.buildReplicationBatch(nextIdx, lastIdx)
+	if len(wire) == 0 {
+		// No encodable entry this round (storage hiccup between reads):
+		// preserve liveness with an empty heartbeat; retry next round.
+		var tailTerm Term
+		if lastIdx > 0 {
+			if tailTerm, err = n.storage.TermOf(lastIdx); err != nil {
+				return
+			}
+		}
+		n.sendHeartbeatTo(sendCtx, term, peerID, lastIdx, tailTerm, leaderCommit)
 		return
-	}
-	wire := make([]transport.PeerLogEntry, len(stored))
-	for i, e := range stored {
-		wire[i] = transport.PeerLogEntry{Term: uint64(e.Term), Type: e.Type, Data: e.Data}
 	}
 
 	nonce, err := transport.GenerateNonce()
@@ -1428,8 +1479,8 @@ func (n *Node) sendReplicationTo(sendCtx context.Context, term Term, peerID clus
 	}
 	frame, err := transport.EncodeAppendEntries(req, n.peerSender.NextSeqID())
 	if err != nil {
-		// Unencodable suffix (frame limits): degrade to an empty heartbeat
-		// anchored at our tail so liveness is preserved this round.
+		// Defensive: the batch was pre-bounded, so encoding is expected to
+		// succeed. Degrade to an empty heartbeat rather than stalling.
 		var tailTerm Term
 		if lastIdx > 0 {
 			if tailTerm, err = n.storage.TermOf(lastIdx); err != nil {
@@ -1440,6 +1491,39 @@ func (n *Node) sendReplicationTo(sendCtx context.Context, term Term, peerID clus
 		return
 	}
 	_ = n.peerSender.Send(sendCtx, peerID, frame)
+}
+
+// buildReplicationBatch assembles the largest legal AppendEntries batch starting
+// at nextIdx (up to lastIdx): at most transport.MaxPeerEntries entries and at
+// most transport.MaxPayloadLength encoded bytes including framing headers.
+// The first entry is always included: a single entry can never exceed the
+// frame limit because MaxLogEntryDataSize (4 MiB) plus its 13-byte entry
+// header and the 52-byte request header total well under 5 MiB. Later entries
+// stop the batch before the limit is exceeded, so every round makes progress
+// (≥1 entry whenever the suffix is non-empty) and memory stays bounded by one
+// frame. Stored terms, types, payloads, and ordering pass through unmodified.
+// No Node.mu or lifecycle mutex held; storage provides its own locking.
+func (n *Node) buildReplicationBatch(nextIdx, lastIdx LogIndex) []transport.PeerLogEntry {
+	var wire []transport.PeerLogEntry
+	total := uint64(transport.AppendEntriesRequestHeaderSize)
+	for idx := nextIdx; idx <= lastIdx; idx++ {
+		if len(wire) >= transport.MaxPeerEntries {
+			break
+		}
+		e, err := n.storage.Entry(idx)
+		if err != nil {
+			break
+		}
+		// Both operands are bounded small (headers + ≤4 MiB data), so the
+		// sum cannot overflow uint64; the comparison below is exact.
+		sz := uint64(transport.PeerLogEntryHeaderSize) + uint64(len(e.Data))
+		if len(wire) > 0 && total+sz > uint64(transport.MaxPayloadLength) {
+			break
+		}
+		total += sz
+		wire = append(wire, transport.PeerLogEntry{Term: uint64(e.Term), Type: e.Type, Data: e.Data})
+	}
+	return wire
 }
 
 // sendHeartbeatTo transmits a single empty AppendEntries heartbeat.
@@ -1731,7 +1815,7 @@ func (n *Node) HandleRequestVoteResponse(fromPeerID cluster.NodeID, resp *transp
 	// recorded, preserving a valid retry path for the same peer. Inserting
 	// first and then failing would permanently poison this round with a
 	// phantom duplicate entry.
-	lastIdx, lastTerm, err := n.storage.LastIndexAndTerm()
+	lastIdx, _, err := n.storage.LastIndexAndTerm()
 	if err != nil {
 		n.mu.Unlock()
 		return fmt.Errorf("raft: failed to read last index and term on leadership transition: %w", err)
@@ -1750,7 +1834,12 @@ func (n *Node) HandleRequestVoteResponse(fromPeerID cluster.NodeID, resp *transp
 	// Section 12: Quorum reached! Transition Candidate -> Leader
 	oldRole := n.role
 
-	n.becomeLeaderLocked(currTerm, lastIdx)
+	newLastIdx, err := n.appendLeaderNoOpLocked(currTerm, lastIdx)
+	if err != nil {
+		n.mu.Unlock()
+		return fmt.Errorf("raft: failed to append leader no-op on quorum promotion: %w", err)
+	}
+	n.becomeLeaderLocked(currTerm, newLastIdx)
 	shouldHook := (n.transitionHook != nil)
 	n.mu.Unlock()
 
@@ -1764,8 +1853,11 @@ func (n *Node) HandleRequestVoteResponse(fromPeerID cluster.NodeID, resp *transp
 		return nil
 	}
 
+	// Commit the freshly minted no-op if quorum already covers it.
+	n.refreshCommitIndex()
+
 	// Section 15: Send one-time immediate empty AppendEntries heartbeats (no Node.mu held)
-	n.sendImmediateHeartbeats(currTerm, lastIdx, lastTerm)
+	n.sendImmediateHeartbeats(currTerm, newLastIdx, currTerm)
 
 	// Start recurring periodic heartbeat scheduler (P15-S02-M03)
 	n.startHeartbeatScheduler()
@@ -2218,8 +2310,11 @@ func (n *Node) replicateEntries(prevLogIndex uint64, prevLogTerm uint64, entries
 //  7. Same-term leader responses update follower progress monotonically:
 //     Success advances matchIndex (never regresses) and nextIndex, then
 //     re-evaluates quorum commitment under the current-term rule; failure
-//     steps nextIndex back toward matchIndex+1 without touching matchIndex
-//     or commitIndex.
+//     steps nextIndex back by one (floor 1) without touching matchIndex
+//     or commitIndex. A reported MatchIndex beyond the leader's own LastIndex
+//     is implausible (honest followers only echo suffixes the leader sent,
+//     and the leader never truncates its log): such progress is ignored
+//     without mutating match/next/commit state.
 //  8. No state-machine application, no client acknowledgement (Phase 16 scope).
 func (n *Node) HandleAppendEntriesResponse(fromPeerID cluster.NodeID, resp *transport.AppendEntriesResponse) error {
 	if n.closed.Load() {
@@ -2306,15 +2401,28 @@ func (n *Node) HandleAppendEntriesResponse(fromPeerID cluster.NodeID, resp *tran
 	}
 
 	if resp.Success {
-		// Monotonic progress: a delayed lower response must not regress an
-		// already-established position; duplicates are harmless no-ops.
-		if match := LogIndex(resp.MatchIndex); match > n.matchIndex[fromPeerID] {
-			n.matchIndex[fromPeerID] = match
+		// Plausibility bound (crash-fault model): an honest follower only
+		// reports entries drawn from suffixes this leader sent, which never
+		// exceed the leader's own (never self-truncated) LastIndex, read here
+		// under the same mutex as the update. Inflated progress is ignored
+		// entirely so a faulty peer cannot manufacture quorum coverage for
+		// data the leader does not possess.
+		lastIdx, err := n.storage.LastIndex()
+		if err != nil {
+			n.mu.Unlock()
+			return fmt.Errorf("raft: failed to read last index on response: %w", err)
 		}
-		if m := n.matchIndex[fromPeerID]; m < math.MaxUint64 && m+1 > n.nextIndex[fromPeerID] {
-			n.nextIndex[fromPeerID] = m + 1
+		if match := LogIndex(resp.MatchIndex); match <= lastIdx {
+			// Monotonic progress: a delayed lower response must not regress an
+			// already-established position; duplicates are harmless no-ops.
+			if match > n.matchIndex[fromPeerID] {
+				n.matchIndex[fromPeerID] = match
+			}
+			if m := n.matchIndex[fromPeerID]; m < math.MaxUint64 && m+1 > n.nextIndex[fromPeerID] {
+				n.nextIndex[fromPeerID] = m + 1
+			}
+			n.advanceCommitIndexLocked(currTerm)
 		}
-		n.advanceCommitIndexLocked(currTerm)
 	} else {
 		// Log mismatch: step nextIndex back by one (floor 1) so the next
 		// replication attempt uses an earlier PrevLog and converges. This

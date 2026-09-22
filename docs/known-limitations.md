@@ -1268,4 +1268,26 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 75. Phase 15 Raft Scope & Model Boundaries (P15-S01 — P15-S03 + Hardening)
+* **Limitation & Architectural Boundaries**:
+  The single-group Raft core (`internal/raft`: persistent state, elections, heartbeats, proposal ingestion, follower replication, leader quorum commitment) is implemented and hardened, with the following deliberate boundaries:
+  1. *Volatile `commitIndex`*: The leader's commit index is in-memory derived state, reset to 0 on restart and rebuilt by subsequent quorum activity (a re-elected leader's current-term no-op entry recommits the inherited prefix without client traffic). It is never persisted and never implies state-machine application.
+  2. *No follower commit tracking / application*: Leaders transmit `LeaderCommit`, but followers neither store nor apply it; there is no `lastApplied`, no state-machine execution, and no client commit acknowledgement. This is Phase 16 work.
+  3. *Commitment ≠ application*: A committed entry is guaranteed present on future leaders (leader completeness) but is not yet executed against any state machine; client-visible linearizability additionally requires Phase 16 (apply) and Phase 17 (ReadIndex).
+  4. *Crash-fault peer model*: Follower `MatchIndex` reports are trusted within the configured membership (monotonic, plausibility-bounded by the leader's own log length). Byzantine peers that forge responses are outside the threat model.
+  5. *No request/response correlation state*: `matchIndex`/`nextIndex` are updated from response contents with monotonicity and term-session gating rather than per-request tracking; delayed or reordered same-term responses converge (a dipped `nextIndex` heals on the next success) and can never corrupt commit state.
+  6. *Truncate-then-append crash window*: Follower conflict replacement chains the existing durable `TruncateSuffix` and `Append` operations. An interruption between them leaves a valid durable prefix that leader retry re-matches; no false acknowledgement is possible. No new transactional storage primitive was introduced.
+  7. *Static membership*: Topology is immutable after construction; no joint consensus, snapshots, log compaction, or membership changes.
+  8. *Production mTLS*: Peer transport runs over the Phase 14 loopback-guarded framing; universal mTLS remains Phase 19 work.
+* **Why It Exists**:
+  Phase 15 delivers a defensible consensus core with minimal, auditable mechanisms. Persistence-backed commit indexes, application pipelines, and Byzantine defenses belong to later phases with their own failure models.
+* **Impact**:
+  Operators must not treat `CommitIndex()` as an application-level durability signal across restarts, and must not expose uncommitted or committed-but-unapplied entries to clients as applied state.
+* **Dimensional Impact**:
+  * Correctness: **Optimal within scope** (Raft safety invariants hold over the replicated log; state-machine safety applies once Phase 16 applies entries).
+  * Performance: **Optimal** (commit scan is O(log) per response; replication batches are frame-bounded).
+  * Scalability: **None** (single-group topology unchanged).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*

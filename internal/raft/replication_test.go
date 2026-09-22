@@ -3,6 +3,7 @@ package raft_test
 import (
 	stdErrors "errors"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +13,9 @@ import (
 	"github.com/silent-knight19/lattice/internal/raft"
 	"github.com/silent-knight19/lattice/internal/transport"
 )
+
+// errInjectedTruncateFailure simulates disk failure during suffix truncation.
+var errInjectedTruncateFailure = stdErrors.New("injected truncate failure")
 
 // replSpec describes an expected log entry (term + payload).
 type replSpec struct {
@@ -679,29 +683,25 @@ func TestReplicate_ProposeFlowsToFollower(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Propose failed: %v", err)
 	}
+	if prop.Index != 2 {
+		t.Fatalf("expected proposal at index 2 (after no-op), got %d", prop.Index)
+	}
 
 	fn, fs := newReplNode(t, 2, []cluster.NodeID{1})
 	_ = fs.SetTerm(prop.Term - 1)
 
-	prevIdx := uint64(prop.Index) - 1
-	var prevTerm uint64
-	if prevIdx > 0 {
-		prevTerm = uint64(prop.Term)
-	}
+	// The leader's full suffix (no-op + proposal) replicates onto the empty
+	// follower from the (0,0) sentinel.
 	req := &transport.AppendEntriesRequest{
 		Term:         uint64(prop.Term),
 		LeaderID:     1,
-		PrevLogIndex: prevIdx,
-		PrevLogTerm:  prevTerm,
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
 		Nonce:        777,
 		Entries: []transport.PeerLogEntry{
+			{Term: uint64(prop.Term), Type: transport.PeerEntryNoop},
 			{Term: uint64(prop.Term), Type: prop.Type, Data: prop.Data},
 		},
-	}
-	// Follower log is empty but proposal is index 1: adjust to a coherent
-	// scenario — leader's first entry replicates onto the empty follower.
-	if prop.Index != 1 {
-		t.Fatalf("expected first proposal at index 1, got %d", prop.Index)
 	}
 	resp, err := fn.HandleAppendEntries(1, req)
 	if err != nil {
@@ -710,11 +710,113 @@ func TestReplicate_ProposeFlowsToFollower(t *testing.T) {
 	if !resp.Success {
 		t.Fatalf("expected replication success")
 	}
-	stored, err := fs.Entry(1)
+	noop, err := fs.Entry(1)
+	if err != nil {
+		t.Fatalf("follower missing no-op: %v", err)
+	}
+	if noop.Type != transport.PeerEntryNoop || noop.Term != prop.Term {
+		t.Fatalf("follower no-op mismatch: %+v", noop)
+	}
+	stored, err := fs.Entry(2)
 	if err != nil {
 		t.Fatalf("follower missing entry: %v", err)
 	}
 	if string(stored.Data) != "client-cmd" || stored.Term != prop.Term {
 		t.Fatalf("follower entry mismatch: %+v", stored)
+	}
+}
+
+// Lagging follower, empty heartbeat variant: PrevLog beyond the log reports
+// mismatch while still resetting the election timer (liveness ≠ success).
+func TestReplicate_LaggingFollowerEmptyHeartbeatLiveness(t *testing.T) {
+	dir := t.TempDir()
+	s, err := raft.OpenStorage(dir)
+	if err != nil {
+		t.Fatalf("OpenStorage failed: %v", err)
+	}
+	durProvider := func() time.Duration { return 80 * time.Millisecond }
+	follower, err := raft.NewNode(raft.NodeConfig{
+		LocalID:          2,
+		Storage:          s,
+		Peers:            []cluster.NodeID{1},
+		DurationProvider: durProvider,
+	})
+	if err != nil {
+		_ = s.Close()
+		t.Fatalf("NewNode failed: %v", err)
+	}
+	defer func() {
+		_ = follower.Close()
+		_ = s.Close()
+	}()
+	if err := follower.StartElectionTimer(); err != nil {
+		t.Fatalf("StartElectionTimer failed: %v", err)
+	}
+
+	stopCh := make(chan struct{})
+	doneCh := make(chan struct{})
+	go func() {
+		defer close(doneCh)
+		ticker := time.NewTicker(35 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ticker.C:
+				req := replRequest(1, 1, 5, 1, nil)
+				resp, err := follower.HandleAppendEntries(1, req)
+				if err != nil {
+					t.Errorf("HandleAppendEntries failed: %v", err)
+					return
+				}
+				if resp.Success {
+					t.Errorf("expected mismatch failure for lagging follower")
+					return
+				}
+			}
+		}
+	}()
+
+	time.Sleep(200 * time.Millisecond)
+	close(stopCh)
+	<-doneCh
+
+	if follower.Role() != raft.RoleFollower {
+		t.Fatalf("lagging follower timed out: role=%s", follower.Role())
+	}
+	lastIdx, _, err := s.LastIndexAndTerm()
+	if err != nil {
+		t.Fatalf("LastIndexAndTerm failed: %v", err)
+	}
+	if lastIdx != 0 {
+		t.Fatalf("empty heartbeat mutated log: lastIdx=%d", lastIdx)
+	}
+}
+
+// Truncate failure during conflict replacement: no success, original suffix
+// fully intact (validation precedes mutation; staging never touches live log).
+func TestReplicate_TruncateFailureLeavesLogIntact(t *testing.T) {
+	n, s := newReplNode(t, 1, []cluster.NodeID{2})
+	seedReplLog(t, s, []replSpec{{1, "A"}, {1, "X"}})
+	_ = s.SetTerm(2)
+
+	restore := raft.SetRaftCreateTmpFnForTesting(func(path string, flag int, perm os.FileMode) (*os.File, error) {
+		return nil, errInjectedTruncateFailure
+	})
+	defer restore()
+
+	req := replRequest(2, 2, 1, 1, peerEntries(2, "C"))
+	resp, err := n.HandleAppendEntries(2, req)
+	if err != nil {
+		t.Fatalf("HandleAppendEntries failed: %v", err)
+	}
+	if resp.Success {
+		t.Fatalf("truncation failure must not succeed")
+	}
+	assertReplLog(t, s, []replSpec{{1, "A"}, {1, "X"}})
+	// Liveness still holds: the leader signal was valid.
+	if n.LeaderID() != 2 {
+		t.Fatalf("expected LeaderID 2, got %d", n.LeaderID())
 	}
 }

@@ -2443,19 +2443,19 @@ TOTAL: 176 Discrete, Testable Micro-Phases
     * Heartbeat Receive Path: `HandleAppendEntries` processes incoming frames dispatched from `HandlePeerFrame`:
       * Sender Authentication: Authenticated `fromPeerID` must match `req.LeaderID`; self and unknown peers rejected fail-closed.
       * Stale Term (`req.Term < currentTerm`): Rejected with `Success=false, Term=currentTerm`; no role, leaderID, or timer modification.
-      * Higher Term (`req.Term > currentTerm`): Durably advances term via `storage.SetTerm`, clears `votedFor`, steps down to Follower, halts heartbeat scheduler if previously Leader, records `leaderID`, and resets election timer if preceding log matches. Persistence failure fails closed.
+      * Higher Term (`req.Term > currentTerm`): Durably advances term via `storage.SetTerm`, clears `votedFor`, steps down to Follower, halts heartbeat scheduler if previously Leader, records `leaderID`, and resets election timer. Persistence failure fails closed.
       * Same Term (`req.Term == currentTerm`): Candidate/Leader steps down to Follower; preserves term and durable vote; records `leaderID`.
-      * Preceding Log Verification: Checks if `PrevLogIndex == 0` or local log entry at `PrevLogIndex` matches `PrevLogTerm`. If mismatched, returns `Success=false` and does not reset election timer.
-      * Election Timer Reset: On valid heartbeat with matching preceding log, `ResetElectionTimer()` is invoked outside `Node.mu`.
-    * Scope Boundary: Log entry replication, batching, client proposals, `nextIndex` decrement, `matchIndex` advancement, and `commitIndex` calculation are explicitly deferred to P15-S03.
+      * Preceding Log Verification: Checks if `PrevLogIndex == 0` or local log entry at `PrevLogIndex` matches `PrevLogTerm`. If mismatched, returns `Success=false` but still resets the election timer, separating leadership liveness from replication success (a lagging follower must not time out while its legitimate leader is heartbeating).
+      * Election Timer Reset: On any non-stale AppendEntries from the legitimate current-term leader, `ResetElectionTimer()` is invoked outside `Node.mu`, regardless of preceding-log match outcome.
+    * Scope Boundary: Log entry replication, batching, client proposals, `nextIndex` decrement, `matchIndex` advancement, and `commitIndex` calculation were deferred to P15-S03 and are implemented there; see Sub-Phase 15.3.
 
-### Sub-Phase 15.3: Log Replication & Quorum Commit
-* **P15-S03-M01: Proposal Ingestion & Log Append**
+### Sub-Phase 15.3: Log Replication & Quorum Commit (complete)
+* **P15-S03-M01: Proposal Ingestion & Log Append** (complete)
   * *Objective*: Leader appends client proposal to local log, sends `AppendEntries` with `prevLogIndex` and `prevLogTerm`.
-* **P15-S03-M02: Log Matching Verification on Follower**
+* **P15-S03-M02: Log Matching Verification on Follower** (complete)
   * *Objective*: Follower verifies preceding log entry; rejects if mismatched; leader decrements `nextIndex`.
-* **P15-S03-M03: Quorum Commit Index Advancement**
-  * *Objective*: Leader advances `commitIndex` when majority of peers acknowledge match; signals state machine.
+* **P15-S03-M03: Quorum Commit Index Advancement** (complete)
+  * *Objective*: Leader advances volatile `commitIndex` when majority of peers acknowledge match under the current-term commitment rule. No state-machine application (deferred to Phase 16).
 
 ---
 

@@ -37,8 +37,9 @@ func commitResp(term uint64, success bool, match uint64) *transport.AppendEntrie
 func TestCommit_SingleNodeImmediateCommit(t *testing.T) {
 	n, _ := newReplNode(t, 1, nil)
 	mustCommitLead(t, n)
-	if got := n.CommitIndex(); got != 0 {
-		t.Fatalf("initial commitIndex = %d, want 0", got)
+	// The election no-op commits immediately (leader alone is quorum).
+	if got := n.CommitIndex(); got != 1 {
+		t.Fatalf("initial commitIndex = %d, want 1 (election no-op)", got)
 	}
 	e1, err := n.Propose([]byte("a"))
 	if err != nil {
@@ -226,19 +227,19 @@ func TestCommit_OldTermQuorumCannotCommit(t *testing.T) {
 func TestCommit_OldPrefixCommitsThroughNewEntry(t *testing.T) {
 	n, s := newReplNode(t, 1, []cluster.NodeID{2, 3})
 	seedReplLog(t, s, []replSpec{{1, "a"}})
-	term := mustCommitLead(t, n) // term 2
+	term := mustCommitLead(t, n) // term 2; log: [1:t1, 2:noop-t2]
 	e, err := n.Propose([]byte("b"))
 	if err != nil {
 		t.Fatalf("Propose failed: %v", err)
 	}
-	if e.Index != 2 {
-		t.Fatalf("expected index 2, got %d", e.Index)
+	if e.Index != 3 {
+		t.Fatalf("expected index 3 (old + no-op + proposal), got %d", e.Index)
 	}
-	if err := n.HandleAppendEntriesResponse(2, commitResp(uint64(term), true, 2)); err != nil {
+	if err := n.HandleAppendEntriesResponse(2, commitResp(uint64(term), true, 3)); err != nil {
 		t.Fatalf("response failed: %v", err)
 	}
-	if got := n.CommitIndex(); got != 2 {
-		t.Fatalf("commitIndex = %d, want 2 (prefix incl. idx 1)", got)
+	if got := n.CommitIndex(); got != 3 {
+		t.Fatalf("commitIndex = %d, want 3 (prefix incl. idx 1,2)", got)
 	}
 }
 
@@ -343,7 +344,7 @@ func TestCommit_UnknownSenderCannotCommit(t *testing.T) {
 func TestCommit_OldSessionResponseIsolated(t *testing.T) {
 	n, _ := newReplNode(t, 1, []cluster.NodeID{2, 3})
 	mustCommitLead(t, n)
-	// Session A (term 1): replicate idx 1 to peer 2.
+	// Session A (term 1): replicate idx 2 (proposal; idx 1 is the no-op).
 	e, err := n.Propose([]byte("a"))
 	if err != nil {
 		t.Fatalf("Propose failed: %v", err)
@@ -352,8 +353,8 @@ func TestCommit_OldSessionResponseIsolated(t *testing.T) {
 	if err := n.HandleAppendEntriesResponse(2, commitResp(uint64(t1), true, uint64(e.Index))); err != nil {
 		t.Fatalf("response failed: %v", err)
 	}
-	if got := n.CommitIndex(); got != 1 {
-		t.Fatalf("session A commit = %d, want 1", got)
+	if got := n.CommitIndex(); got != e.Index {
+		t.Fatalf("session A commit = %d, want %d", got, e.Index)
 	}
 	// Step down and start session B two terms later with fresh progress.
 	if err := n.BecomeFollower(t1+1, cluster.NodeIDNil); err != nil {
@@ -386,8 +387,8 @@ func TestCommit_OldSessionResponseIsolated(t *testing.T) {
 		t.Fatalf("old session corrupted match: %d", got)
 	}
 	// Commit from session A survives (monotonic), but nothing new commits.
-	if got := n.CommitIndex(); got != 1 {
-		t.Fatalf("commitIndex = %d, want preserved 1", got)
+	if got := n.CommitIndex(); got != e.Index {
+		t.Fatalf("commitIndex = %d, want preserved %d", got, e.Index)
 	}
 }
 
@@ -512,19 +513,69 @@ func TestCommit_EndToEndViaReplicationSender(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Propose failed: %v", err)
 	}
+	if prop.Index != 2 {
+		t.Fatalf("expected proposal at index 2 (after no-op), got %d", prop.Index)
+	}
 
-	// Wait for the periodic round to emit a frame carrying the entry.
-	deadline := time.Now().Add(3 * time.Second)
-	var wire *transport.AppendEntriesRequest
-	var leaderCommitSeen uint64
+	// Round 1: nextIndex was initialized past the no-op (2), so the sender
+	// emits the proposal alone with PrevLog (1,term). The empty follower
+	// rejects it — feed that rejection back to drive the leader's backoff.
+	deadline := time.Now().Add(5 * time.Second)
+	var first *transport.AppendEntriesRequest
 	for time.Now().Before(deadline) {
 		for _, f := range sender.GetSent(2) {
 			req, derr := transport.DecodeAppendEntries(f)
 			if derr != nil {
 				continue
 			}
-			leaderCommitSeen = req.LeaderCommit
-			if len(req.Entries) == 1 {
+			if len(req.Entries) == 1 && string(req.Entries[0].Data) == "e2e" {
+				first = req
+			}
+		}
+		if first != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if first == nil {
+		t.Fatalf("timed out waiting for replication frame with the proposal")
+	}
+	if first.PrevLogIndex != 1 || first.PrevLogTerm != uint64(prop.Term) {
+		t.Fatalf("unexpected PrevLog: %d/%d", first.PrevLogIndex, first.PrevLogTerm)
+	}
+	fresp, err := follower.HandleAppendEntries(1, &transport.AppendEntriesRequest{
+		Term:         first.Term,
+		LeaderID:     first.LeaderID,
+		PrevLogIndex: first.PrevLogIndex,
+		PrevLogTerm:  first.PrevLogTerm,
+		LeaderCommit: first.LeaderCommit,
+		Nonce:        999001,
+		Entries:      first.Entries,
+	})
+	if err != nil {
+		t.Fatalf("follower HandleAppendEntries failed: %v", err)
+	}
+	if fresp.Success {
+		t.Fatalf("empty follower must reject PrevLog beyond its log")
+	}
+	if err := leader.HandleAppendEntriesResponse(2, fresp); err != nil {
+		t.Fatalf("leader response handling failed: %v", err)
+	}
+	if got := leader.NextIndex()[2]; got != 1 {
+		t.Fatalf("nextIndex[2] = %d, want backed-off 1", got)
+	}
+
+	// Round 2: the sender now transmits no-op + proposal; the follower
+	// replicates both, responds success, and the leader commits.
+	var wire *transport.AppendEntriesRequest
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, f := range sender.GetSent(2) {
+			req, derr := transport.DecodeAppendEntries(f)
+			if derr != nil {
+				continue
+			}
+			if len(req.Entries) == 2 {
 				wire = req
 			}
 		}
@@ -534,15 +585,14 @@ func TestCommit_EndToEndViaReplicationSender(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if wire == nil {
-		t.Fatalf("timed out waiting for replication frame with entries")
+		t.Fatalf("timed out waiting for backoff replication frame")
 	}
-	if string(wire.Entries[0].Data) != "e2e" || wire.Entries[0].Term != uint64(prop.Term) {
-		t.Fatalf("replicated payload mismatch: %+v", wire.Entries[0])
+	if wire.Entries[0].Type != transport.PeerEntryNoop || string(wire.Entries[1].Data) != "e2e" {
+		t.Fatalf("unexpected batch contents: %+v", wire.Entries)
 	}
 	if wire.PrevLogIndex != 0 || wire.PrevLogTerm != 0 {
 		t.Fatalf("unexpected PrevLog: %d/%d", wire.PrevLogIndex, wire.PrevLogTerm)
 	}
-	_ = leaderCommitSeen
 
 	// Deliver to the follower through the real wire handler path.
 	frame, err := transport.EncodeAppendEntries(&transport.AppendEntriesRequest{
@@ -551,7 +601,7 @@ func TestCommit_EndToEndViaReplicationSender(t *testing.T) {
 		PrevLogIndex: wire.PrevLogIndex,
 		PrevLogTerm:  wire.PrevLogTerm,
 		LeaderCommit: wire.LeaderCommit,
-		Nonce:        999001,
+		Nonce:        999002,
 		Entries:      wire.Entries,
 	}, 777)
 	if err != nil {
@@ -561,6 +611,13 @@ func TestCommit_EndToEndViaReplicationSender(t *testing.T) {
 		t.Fatalf("follower HandlePeerFrame failed: %v", err)
 	}
 	stored, err := fs.Entry(1)
+	if err != nil {
+		t.Fatalf("follower missing no-op: %v", err)
+	}
+	if stored.Type != transport.PeerEntryNoop {
+		t.Fatalf("follower entry 1 type = %s, want no-op", stored.Type)
+	}
+	stored, err = fs.Entry(2)
 	if err != nil {
 		t.Fatalf("follower missing entry: %v", err)
 	}
@@ -575,7 +632,7 @@ func TestCommit_EndToEndViaReplicationSender(t *testing.T) {
 		PrevLogIndex: wire.PrevLogIndex,
 		PrevLogTerm:  wire.PrevLogTerm,
 		LeaderCommit: wire.LeaderCommit,
-		Nonce:        999002,
+		Nonce:        999003,
 		Entries:      wire.Entries,
 	})
 	if err != nil {
@@ -664,11 +721,10 @@ func TestCommit_ConcurrentProposeAndResponses(t *testing.T) {
 		}(p)
 	}
 
-	for r := 0; r < 2; r++ {
+	for _, peer := range []cluster.NodeID{2, 3} {
 		wg.Add(1)
-		go func(r int) {
+		go func(peer cluster.NodeID) {
 			defer wg.Done()
-			peer := cluster.NodeID(2 + r)
 			for i := 0; i < 40; i++ {
 				lastIdx, _, err := s.LastIndexAndTerm()
 				if err != nil {
@@ -676,7 +732,7 @@ func TestCommit_ConcurrentProposeAndResponses(t *testing.T) {
 				}
 				_ = n.HandleAppendEntriesResponse(peer, commitResp(uint64(term), true, uint64(lastIdx)))
 			}
-		}(r)
+		}(peer)
 	}
 
 	wg.Add(1)
@@ -713,6 +769,130 @@ func TestCommit_ConcurrentProposeAndResponses(t *testing.T) {
 		if _, err := s.Entry(idx); err != nil {
 			t.Fatalf("gap at %d: %v", idx, err)
 		}
+	}
+}
+
+// Inflated MatchIndex values (beyond the leader's own LastIndex) must not
+// manufacture quorum coverage: progress from such a response is ignored.
+func TestCommit_InflatedMatchIndexIgnored(t *testing.T) {
+	n, _ := newReplNode(t, 1, []cluster.NodeID{2, 3})
+	term := mustCommitLead(t, n)
+	e, err := n.Propose([]byte("a"))
+	if err != nil {
+		t.Fatalf("Propose failed: %v", err)
+	}
+	// Peer claims far more than the leader holds (leader lastIdx = e.Index).
+	if err := n.HandleAppendEntriesResponse(2, commitResp(uint64(term), true, uint64(e.Index)+100)); err != nil {
+		t.Fatalf("response failed: %v", err)
+	}
+	if got := n.MatchIndex()[2]; got != 0 {
+		t.Fatalf("inflated match recorded: %d", got)
+	}
+	if got := n.CommitIndex(); got != 0 {
+		t.Fatalf("inflated match committed: %d", got)
+	}
+	// MaxUint64 is likewise implausible and must be ignored safely.
+	if err := n.HandleAppendEntriesResponse(2, commitResp(uint64(term), true, ^uint64(0))); err != nil {
+		t.Fatalf("response failed: %v", err)
+	}
+	if got := n.MatchIndex()[2]; got != 0 {
+		t.Fatalf("MaxUint64 match recorded: %d", got)
+	}
+	if got := n.NextIndex()[2]; got == 0 {
+		t.Fatalf("nextIndex corrupted by inflated match")
+	}
+	// Honest progress still works afterwards.
+	if err := n.HandleAppendEntriesResponse(2, commitResp(uint64(term), true, uint64(e.Index))); err != nil {
+		t.Fatalf("response failed: %v", err)
+	}
+	if got := n.CommitIndex(); got != e.Index {
+		t.Fatalf("commitIndex = %d, want %d", got, e.Index)
+	}
+}
+
+// Even cluster sizes use the same floor(N/2)+1 quorum rule.
+func TestCommit_EvenClusterSizes(t *testing.T) {
+	t.Run("N=2", func(t *testing.T) {
+		n, _ := newReplNode(t, 1, []cluster.NodeID{2})
+		if q := n.QuorumSize(); q != 2 {
+			t.Fatalf("N=2 quorum = %d, want 2", q)
+		}
+		term := mustCommitLead(t, n)
+		e, err := n.Propose([]byte("a"))
+		if err != nil {
+			t.Fatalf("Propose failed: %v", err)
+		}
+		if got := n.CommitIndex(); got != 0 {
+			t.Fatalf("leader alone must not commit in N=2: %d", got)
+		}
+		if err := n.HandleAppendEntriesResponse(2, commitResp(uint64(term), true, uint64(e.Index))); err != nil {
+			t.Fatalf("response failed: %v", err)
+		}
+		if got := n.CommitIndex(); got != e.Index {
+			t.Fatalf("commitIndex = %d, want %d", got, e.Index)
+		}
+	})
+	t.Run("N=4", func(t *testing.T) {
+		peers := []cluster.NodeID{2, 3, 4}
+		n, _ := newReplNode(t, 1, peers)
+		if q := n.QuorumSize(); q != 3 {
+			t.Fatalf("N=4 quorum = %d, want 3", q)
+		}
+		term := mustCommitLead(t, n)
+		e, err := n.Propose([]byte("a"))
+		if err != nil {
+			t.Fatalf("Propose failed: %v", err)
+		}
+		if err := n.HandleAppendEntriesResponse(2, commitResp(uint64(term), true, uint64(e.Index))); err != nil {
+			t.Fatalf("response failed: %v", err)
+		}
+		if got := n.CommitIndex(); got != 0 {
+			t.Fatalf("2/4 must not commit: %d", got)
+		}
+		if err := n.HandleAppendEntriesResponse(3, commitResp(uint64(term), true, uint64(e.Index))); err != nil {
+			t.Fatalf("response failed: %v", err)
+		}
+		if got := n.CommitIndex(); got != e.Index {
+			t.Fatalf("commitIndex = %d, want %d", got, e.Index)
+		}
+	})
+}
+
+// A failure-after-success dips nextIndex, and the next successful round heals
+// it — the delayed/failure-then-success correlation the design relies on.
+func TestCommit_FailureThenSuccessHealsNextIndex(t *testing.T) {
+	n, _ := newReplNode(t, 1, []cluster.NodeID{2})
+	term := mustCommitLead(t, n)
+	prop, err := n.Propose([]byte("v"))
+	if err != nil {
+		t.Fatalf("Propose failed: %v", err)
+	}
+	if err := n.HandleAppendEntriesResponse(2, commitResp(uint64(term), true, uint64(prop.Index))); err != nil {
+		t.Fatalf("response failed: %v", err)
+	}
+	nextAfterSuccess := n.NextIndex()[2]
+	if nextAfterSuccess != prop.Index+1 {
+		t.Fatalf("nextIndex = %d, want %d", nextAfterSuccess, prop.Index+1)
+	}
+	// Delayed failure for an older request: nextIndex dips, match stands.
+	if err := n.HandleAppendEntriesResponse(2, commitResp(uint64(term), false, 0)); err != nil {
+		t.Fatalf("response failed: %v", err)
+	}
+	if got := n.NextIndex()[2]; got != nextAfterSuccess-1 {
+		t.Fatalf("nextIndex = %d, want %d", got, nextAfterSuccess-1)
+	}
+	if got := n.MatchIndex()[2]; got != prop.Index {
+		t.Fatalf("match must stand at %d, got %d", prop.Index, got)
+	}
+	// Next successful round restores nextIndex; commit never moved wrongly.
+	if err := n.HandleAppendEntriesResponse(2, commitResp(uint64(term), true, uint64(prop.Index))); err != nil {
+		t.Fatalf("response failed: %v", err)
+	}
+	if got := n.NextIndex()[2]; got != nextAfterSuccess {
+		t.Fatalf("nextIndex = %d, want healed %d", got, nextAfterSuccess)
+	}
+	if got := n.CommitIndex(); got != prop.Index {
+		t.Fatalf("commitIndex = %d, want %d", got, prop.Index)
 	}
 }
 
@@ -792,8 +972,11 @@ func TestCommit_QuorumMatrixProperty(t *testing.T) {
 		return best
 	}
 
-	for iter := 0; iter < 60; iter++ {
-		for _, size := range []int{1, 3, 5} {
+	// Kept deliberately quick: the scenario matrix is deterministically seeded,
+	// so repetition adds no coverage; the full suite must fit `count=20`
+	// inside the default 10m go test timeout.
+	for iter := 0; iter < 20; iter++ {
+		for size := 1; size <= 7; size++ {
 			peers := make([]cluster.NodeID, 0, size-1)
 			for i := 2; i <= size; i++ {
 				peers = append(peers, cluster.NodeID(i))
@@ -855,10 +1038,8 @@ func TestCommit_QuorumMatrixProperty(t *testing.T) {
 				_ = p
 				m := uint64(0)
 				if lastIdx > 0 {
-					m = uint64(rng.Intn(int(lastIdx) + 2)) // 0..lastIdx+1, may exceed
-					if m > uint64(lastIdx) {
-						m = uint64(lastIdx) // honest followers never exceed leader log
-					}
+					// Deterministic pseudo-random match in 0..lastIdx.
+					m = rng.Uint64() % (uint64(lastIdx) + 1)
 				}
 				matches[i] = m
 				acks = append(acks, ack{peers[i], m})
@@ -876,6 +1057,18 @@ func TestCommit_QuorumMatrixProperty(t *testing.T) {
 				prevCommit = got
 				if got > lastIdx {
 					t.Fatalf("iter %d size %d: commit %d exceeds LastIndex %d", iter, size, got, lastIdx)
+				}
+				// nextIndex invariant while leader: floored at 1 and never
+				// past one beyond the durable tail.
+				for _, p := range peers {
+					if nx := n.NextIndex()[p]; nx < 1 || nx > lastIdx+1 {
+						t.Fatalf("iter %d size %d: nextIndex[%d] = %d out of [1, %d]",
+							iter, size, p, nx, lastIdx+1)
+					}
+					if m := n.MatchIndex()[p]; m > lastIdx {
+						t.Fatalf("iter %d size %d: matchIndex[%d] = %d exceeds LastIndex %d",
+							iter, size, p, m, lastIdx)
+					}
 				}
 			}
 			want := refCommit(logTerms, uint64(leaderTerm), matches, quorum)

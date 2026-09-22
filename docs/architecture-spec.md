@@ -977,6 +977,8 @@ sequenceDiagram
 4. **Leader Completeness**: If a log entry is committed in a given term, that entry will be present in the logs of the leaders for all higher-numbered terms.
 5. **State Machine Safety**: If a server has applied a log entry at a given index to its state machine, no other server will ever apply a different log entry for the same index.
 
+> **Implementation status (Phase 15)**: the engine implements invariants 1–4 over the replicated Raft log, including election, log matching with conflicting-suffix replacement, current-term no-op entries on election, size-bounded replication batches, and volatile leader-side `commitIndex` advancement under the current-term quorum rule. Invariant 5 becomes enforceable once Phase 16 connects the committed log to the LSM state machine; until then no entry is applied anywhere, so the invariant holds vacuously. Steps 5–7 of the diagram above (commit & apply, apply notification, client success response) are the V1.1 target: Phase 15 stops at leader `commitIndex` advancement.
+
 ---
 
 # 30. Leader Election & Heartbeat Design
@@ -1024,9 +1026,11 @@ Reads are guaranteed to see the latest version of any key because queries search
 ### 32.2 Distributed Mode (V1.1): Strict Linearizability
 In distributed mode, Lattice provides **Linearizability** (Strong Consistency). Operations appear to execute atomically at a discrete point in time between their invocation and response.
 
+> **Implementation status**: end-to-end distributed linearizability is the V1.1 design target. Phase 15 provides the replicated durable Raft log with leader-side quorum commitment; client-visible linearizable writes additionally require Phase 16 (state-machine application and commit acknowledgement), and linearizable reads require Phase 17 (ReadIndex).
+
 #### How Lattice Prevents Stale Reads under Network Partitions (`ReadIndex` Protocol)
 If a partitioned leader serves reads from its local state machine without checking consensus, it might return stale data if another partition has elected a new leader and committed updates.
-* To prevent this, Lattice implements **ReadIndex**:
+* To prevent this, Lattice implements **ReadIndex** (Phase 17 design target; not yet implemented):
   1. The leader records its current `commitIndex`.
   2. The leader sends a minimal heartbeat broadcast to all followers.
   3. Once a majority confirms leadership, the leader waits until its state machine has applied entries up to `commitIndex`.
@@ -1596,6 +1600,8 @@ This section provides a study guide designed to prepare you for technical interv
 For an entry-level candidate targeting tier-1 technology companies (Google, Meta, Amazon, Microsoft, Uber), Lattice serves as a high-signal differentiator. Entry-level hiring bars prioritize foundational CS competence: algorithms, data structures, concurrency, operating systems, and systems programming. Lattice demonstrates all of these simultaneously.
 
 ### 48.2 Resume Bullet Points Examples
+
+> **Status note**: the bullets below are forward-looking framing examples, not implementation attestations. As of Phase 15, the engine provides a replicated Raft log with leader-side quorum commitment; state-machine application (Phase 16), ReadIndex linearizable reads (Phase 17), chaos/fault-injection suites (Phase 18), and end-to-end client-visible linearizability are not yet implemented (see `docs/known-limitations.md` #75). Reconcile every bullet with actual implementation status before use.
 
 #### Option A: Storage Systems Focus
 > * **Lattice | Distributed Key-Value Storage Engine (Go)**
