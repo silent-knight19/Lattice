@@ -1651,4 +1651,35 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 87. Deepest Ancestor Canonicalization & Symlink Pre-Creation Boundaries (Phase 19 Audit)
+* **Limitation & Architectural Boundaries**:
+  1. *Uncreated Directory Hierarchy Canonicalization*:
+     - When a target path or its intermediate directories do not yet exist on disk, standard `filepath.EvalSymlinks` returns an error (`os.ErrNotExist`).
+     - `internal/security.evalDeepestExistingAncestor` resolves this by traversing upward to find the deepest existing ancestor directory on physical storage, resolving symlinks on that existing component, and reassembling the remaining uncreated path elements onto the canonical ancestor root.
+  2. *POSIX Runtime File Replacement Window*:
+     - On standard POSIX filesystems without `openat2(RESOLVE_BENEATH)` support, an unprivileged attacker with local write access to the database storage directory during active server runtime could race between path validation and `os.OpenFile`.
+     - *Boundary*: Protection against local directory substitution races requires proper POSIX directory permissions (`0700` or `0750`), ensuring no untrusted local users have write access to the database root.
+* **Why It Exists**:
+  Databases frequently create new WAL segments, SSTables, and subdirectories dynamically. Containment must be evaluated before file or directory creation without falsely allowing symlink breakouts.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Canonical containment proven for both existing and uncreated targets).
+  * Security: **Audited & Hardened** (Ancestors evaluated up to volume root).
+
+---
+
+### 88. Peer Transport Inbound Connection Ceiling & Inter-Node Consensus Isolation (Phase 19 Audit)
+* **Limitation & Architectural Boundaries**:
+  1. *Inbound Peer Connection Ceiling (`MaxInboundPeerConnections = 64`)*:
+     - Raft inter-node peer traffic operates on a dedicated listener separate from client traffic. To prevent remote denial-of-service via peer listener connection flooding (goroutine and buffer amplification), inbound peer connections are capped at 64 concurrent connections.
+     - Sockets exceeding this ceiling are closed immediately in `acceptLoop` prior to goroutine dispatch.
+  2. *Single-Group Raft Cluster Topology*:
+     - In typical 3-node or 5-node clusters, 64 concurrent inbound connections provide abundant headroom for cluster re-elections, restarts, and concurrent RPC streams while strictly preventing remote resource exhaustion.
+* **Why It Exists**:
+  Eliminates remote goroutine amplification attacks targeting the inter-node consensus port.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Peer connection accounting with atomic bounds).
+  * Security: **Audited & Hardened** (Hard resource ceiling on internal consensus listener).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*

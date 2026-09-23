@@ -542,4 +542,29 @@ func TestInspectSSTable_SecurityPathRejection(t *testing.T) {
 			t.Errorf("expected symbolic link error, got: %v", err)
 		}
 	})
+
+	t.Run("intermediate ancestor symlink rejected", func(t *testing.T) {
+		subDir := filepath.Join(tempDir, "real_parent")
+		if err := os.MkdirAll(subDir, 0700); err != nil {
+			t.Fatalf("failed to create real_parent: %v", err)
+		}
+		targetFile := filepath.Join(subDir, "000001.sst")
+		helperBuildSSTable(t, targetFile, 5)
+
+		symlinkDir := filepath.Join(tempDir, "symlink_dir")
+		if err := os.Symlink(subDir, symlinkDir); err != nil {
+			t.Skipf("symlinks not supported: %v", err)
+		}
+
+		// Accessing through intermediate symlink directory
+		accessedViaSymlink := filepath.Join(symlinkDir, "000001.sst")
+		var report ForensicReport
+		err := InspectSSTable(accessedViaSymlink, &report)
+		if err == nil {
+			t.Fatal("expected error on intermediate symlink parent, got nil")
+		}
+		if !strings.Contains(err.Error(), "symlink") {
+			t.Errorf("expected symlink error, got: %v", err)
+		}
+	})
 }

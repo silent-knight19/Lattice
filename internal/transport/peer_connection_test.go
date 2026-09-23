@@ -1520,3 +1520,83 @@ func TestPeerReplayFilter_ZeroSeqIDRejection(t *testing.T) {
 		t.Fatalf("expected ErrReplayedFrame, got %v", err)
 	}
 }
+
+func TestPeerConnectionManager_InboundConnectionLimit(t *testing.T) {
+	ln := createTestListener(t)
+	defer ln.Close()
+
+	topo := createTestTopology(t, 1, ln.Addr().String(), nil)
+	cfg := DefaultPeerConnectionConfig()
+	cfg.DialTimeout = 5 * time.Second
+
+	mgr, err := NewPeerConnectionManager(topo, cfg)
+	if err != nil {
+		t.Fatalf("failed to construct manager: %v", err)
+	}
+	defer mgr.Close()
+
+	if err := mgr.ServeListener(ln); err != nil {
+		t.Fatalf("failed to serve listener: %v", err)
+	}
+
+	// Dial MaxInboundPeerConnections (64)
+	conns := make([]net.Conn, MaxInboundPeerConnections)
+	for i := 0; i < MaxInboundPeerConnections; i++ {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatalf("failed to dial conn %d: %v", i, err)
+		}
+		conns[i] = c
+	}
+
+	// Wait for all 64 to be active
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if mgr.ActiveInboundConnections() == int64(MaxInboundPeerConnections) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := mgr.ActiveInboundConnections(); got != int64(MaxInboundPeerConnections) {
+		t.Fatalf("expected %d active inbound conns, got %d", MaxInboundPeerConnections, got)
+	}
+
+	// Dial the 65th connection - should be closed immediately at ceiling
+	extraConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		// Connection refused or closed immediately is fine
+		return
+	}
+	defer extraConn.Close()
+
+	// Probing read on extraConn should yield EOF or closed error
+	extraConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	var buf [1]byte
+	n, readErr := extraConn.Read(buf[:])
+	if readErr == nil && n > 0 {
+		t.Fatalf("expected 65th connection to be rejected and closed, but read %d bytes", n)
+	}
+
+	if got := mgr.ActiveInboundConnections(); got > int64(MaxInboundPeerConnections) {
+		t.Fatalf("active inbound connections %d exceeded ceiling of %d", got, MaxInboundPeerConnections)
+	}
+
+	// Close all connections
+	for _, c := range conns {
+		if c != nil {
+			_ = c.Close()
+		}
+	}
+
+	// Verify all slots freed
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if mgr.ActiveInboundConnections() == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := mgr.ActiveInboundConnections(); got != 0 {
+		t.Errorf("expected 0 active inbound conns after closing all, got %d", got)
+	}
+}

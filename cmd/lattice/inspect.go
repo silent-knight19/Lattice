@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -148,6 +149,12 @@ func FormatBytes(b []byte) string {
 func InspectSSTable(path string, report *ForensicReport) error {
 	cleanPath, err := security.CleanAndValidatePath(path)
 	if err != nil {
+		return err
+	}
+
+	// Validate intermediate ancestor directory components to prevent symlink redirection
+	dir := filepath.Dir(cleanPath)
+	if err := sstable.ValidatePathNoSymlinks(dir); err != nil {
 		return err
 	}
 

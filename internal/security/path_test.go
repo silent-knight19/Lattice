@@ -382,6 +382,41 @@ func TestValidateContainment_SymlinkEscape(t *testing.T) {
 			t.Fatalf("internal symlink should be contained, got error: %v", err)
 		}
 	})
+
+	t.Run("uncreated_root_symlink_escape_rejection", func(t *testing.T) {
+		// Root does not exist yet on disk
+		uncreatedRoot := filepath.Join(tempDir, "uncreated_db_root")
+		// Malicious target has a symlink in its path pointing outside
+		maliciousTarget := filepath.Join(symlinkPath, "secret.key")
+
+		err := security.ValidateContainment(uncreatedRoot, maliciousTarget)
+		if err == nil {
+			t.Fatalf("CRITICAL: uncreated root permitted symlink escape! target=%q, root=%q", maliciousTarget, uncreatedRoot)
+		}
+		if !stdErrors.Is(err, errors.ErrInvalidPath) {
+			t.Fatalf("expected ErrInvalidPath, got: %v", err)
+		}
+	})
+
+	t.Run("ancestor_symlink_canonical_containment", func(t *testing.T) {
+		// Create a symlink dir pointing to root
+		aliasDir := filepath.Join(tempDir, "alias_to_root")
+		if err := os.Symlink(root, aliasDir); err != nil {
+			t.Fatalf("failed to create alias symlink: %v", err)
+		}
+
+		// When root is specified as the alias directory (which is a symlink pointing to root)
+		targetViaAlias := filepath.Join(aliasDir, "real_subdir", "file.sst")
+		if err := security.ValidateContainment(aliasDir, targetViaAlias); err != nil {
+			t.Fatalf("expected path inside alias root to be contained: %v", err)
+		}
+
+		// An escaping path addressed via alias_to_root/sym_to_outside/secret.key must be rejected
+		escapingViaAlias := filepath.Join(aliasDir, "sym_to_outside", "secret.key")
+		if err := security.ValidateContainment(aliasDir, escapingViaAlias); err == nil {
+			t.Fatalf("expected escaping path through alias root to be rejected, got nil")
+		}
+	})
 }
 
 func FuzzResolvePath(f *testing.F) {

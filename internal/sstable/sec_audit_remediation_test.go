@@ -191,5 +191,25 @@ func TestSEC002_NewTableWriterWithFile_SymlinkRejected(t *testing.T) {
 	}
 }
 
+// TestPhase19_NewTableReader_InvalidFileNameRejection verifies that NewTableReaderWithOptions
+// fails closed when the target SSTable filename contains path traversal tokens or invalid characters.
+func TestPhase19_NewTableReader_InvalidFileNameRejection(t *testing.T) {
+	invalidNames := []string{
+		"..",
+		".",
+		"bad file with space.sst",
+		"bad\x00null.sst",
+		"bad;injection.sst",
+		"test/nested.sst",
+	}
+
+	for _, name := range invalidNames {
+		_, err := sstable.NewTableReaderWithOptions(name, sstable.TableReaderOptions{})
+		if err == nil {
+			t.Errorf("expected NewTableReaderWithOptions to reject invalid name %q, got nil error", name)
+		}
+	}
+}
+
 // Helper to make sure compiler uses math
 var _ = math.MaxInt

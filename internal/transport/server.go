@@ -105,7 +105,7 @@ func isLoopbackAddress(addr string) bool {
 	if err != nil {
 		host = addr
 	}
-	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "pipe" || host == "local" {
 		return true
 	}
 	ip := net.ParseIP(host)
@@ -288,6 +288,12 @@ func (s *Server) Serve(l net.Listener) error {
 		return errors.ErrServerAlreadyStarted
 	}
 
+	addrStr := l.Addr().String()
+	if !s.cfg.InsecureTransport && !isLoopbackAddress(addrStr) {
+		s.started.Store(false)
+		return errors.ErrInsecureTransport
+	}
+
 	s.listener = l
 	s.addr = l.Addr()
 
@@ -424,25 +430,16 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 }
 
-type deadlineSetter interface {
-	SetReadDeadline(time.Time) error
-	SetWriteDeadline(time.Time) error
-}
-
 // readFrameWithDeadlines reads a complete M01 frame while strictly defending against Slowloris attacks.
 func (s *Server) readFrameWithDeadlines(conn net.Conn, isFirst bool) (*Frame, error) {
-	ds, hasDeadlines := conn.(deadlineSetter)
-
 	// Step 1: Set idle or header deadline before reading first byte
-	if hasDeadlines {
-		if isFirst {
-			if err := ds.SetReadDeadline(time.Now().Add(s.cfg.HeaderTimeout)); err != nil {
-				return nil, err
-			}
-		} else {
-			if err := ds.SetReadDeadline(time.Now().Add(s.cfg.IdleTimeout)); err != nil {
-				return nil, err
-			}
+	if isFirst {
+		if err := conn.SetReadDeadline(time.Now().Add(s.cfg.HeaderTimeout)); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := conn.SetReadDeadline(time.Now().Add(s.cfg.IdleTimeout)); err != nil {
+			return nil, err
 		}
 	}
 
@@ -456,8 +453,8 @@ func (s *Server) readFrameWithDeadlines(conn net.Conn, isFirst bool) (*Frame, er
 	// If transitioning from idle state (!isFirst), enforce HeaderTimeout for the remainder of the header.
 	// For the initial request (isFirst == true), HeaderTimeout was already set before the first byte
 	// and remains active, bounding the total time to receive the full 18-byte header to HeaderTimeout.
-	if hasDeadlines && !isFirst {
-		if err := ds.SetReadDeadline(time.Now().Add(s.cfg.HeaderTimeout)); err != nil {
+	if !isFirst {
+		if err := conn.SetReadDeadline(time.Now().Add(s.cfg.HeaderTimeout)); err != nil {
 			return nil, err
 		}
 	}
@@ -472,10 +469,8 @@ func (s *Server) readFrameWithDeadlines(conn net.Conn, isFirst bool) (*Frame, er
 	}
 
 	// Step 2: Enforce PayloadTimeout for payload and trailer read
-	if hasDeadlines {
-		if err := ds.SetReadDeadline(time.Now().Add(s.cfg.PayloadTimeout)); err != nil {
-			return nil, err
-		}
+	if err := conn.SetReadDeadline(time.Now().Add(s.cfg.PayloadTimeout)); err != nil {
+		return nil, err
 	}
 
 	var payload []byte
@@ -521,10 +516,8 @@ func (s *Server) readFrameWithDeadlines(conn net.Conn, isFirst bool) (*Frame, er
 	}
 
 	// Reset read deadline upon successful frame completion
-	if hasDeadlines {
-		if err := ds.SetReadDeadline(time.Time{}); err != nil {
-			return nil, err
-		}
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		return nil, err
 	}
 
 	return &Frame{
@@ -536,12 +529,10 @@ func (s *Server) readFrameWithDeadlines(conn net.Conn, isFirst bool) (*Frame, er
 
 // writeResponseWithDeadline encodes and writes a complete Response frame within WriteTimeout.
 func (s *Server) writeResponseWithDeadline(conn net.Conn, resp *Response) error {
-	if ds, ok := conn.(deadlineSetter); ok {
-		if err := ds.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout)); err != nil {
-			return err
-		}
-		defer func() { _ = ds.SetWriteDeadline(time.Time{}) }()
+	if err := conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout)); err != nil {
+		return err
 	}
+	defer func() { _ = conn.SetWriteDeadline(time.Time{}) }()
 	return WriteResponse(conn, resp)
 }
 
@@ -755,5 +746,7 @@ func (s *Server) TestDispatch(req *Request) *Response {
 func (s *Server) ServeConnForTesting(conn net.Conn) {
 	if s.trackConn(conn) {
 		s.handleConn(conn)
+	} else {
+		_ = conn.Close()
 	}
 }

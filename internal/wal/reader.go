@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 
 	"github.com/silent-knight19/lattice/internal/errors"
 	"github.com/silent-knight19/lattice/internal/security"
@@ -54,6 +55,9 @@ type WALReader struct {
 func OpenReader(path string) (*WALReader, error) {
 	cleanPath, err := security.CleanAndValidatePath(path)
 	if err != nil {
+		return nil, fmt.Errorf("wal: %w", err)
+	}
+	if err := security.ValidateDatabaseFileName(filepath.Base(cleanPath)); err != nil {
 		return nil, fmt.Errorf("wal: %w", err)
 	}
 

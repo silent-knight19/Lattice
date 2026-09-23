@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1340,5 +1342,271 @@ func TestServer_DeadlineError_FailClosed(t *testing.T) {
 
 	if srv.ActiveConnections() != 0 {
 		t.Errorf("expected ActiveConnections == 0 after deadline error, got: %d", srv.ActiveConnections())
+	}
+}
+
+func TestServer_Serve_InsecureTransportRejection(t *testing.T) {
+	eng := newMockEngine()
+	cfg := transport.DefaultServerConfig()
+	cfg.InsecureTransport = false
+
+	srv, err := transport.NewServer(cfg, eng)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+
+	// Create a mock non-loopback listener
+	nonLoopbackLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	defer nonLoopbackLn.Close()
+
+	// Wrap listener with an address reporting a non-loopback IP
+	fakePublicLn := &fakeAddrListener{
+		Listener: nonLoopbackLn,
+		addr:     &net.TCPAddr{IP: net.ParseIP("192.168.1.50"), Port: 9099},
+	}
+
+	err = srv.Serve(fakePublicLn)
+	if err == nil {
+		t.Fatal("expected ErrInsecureTransport when serving non-loopback listener, got nil")
+	}
+	if !stdErrors.Is(err, errors.ErrInsecureTransport) {
+		t.Fatalf("expected ErrInsecureTransport, got: %v", err)
+	}
+}
+
+type fakeAddrListener struct {
+	net.Listener
+	addr net.Addr
+}
+
+func (f *fakeAddrListener) Addr() net.Addr {
+	return f.addr
+}
+
+func TestServer_ServeConnForTesting_SocketCleanupOnReject(t *testing.T) {
+	eng := newMockEngine()
+	cfg := transport.DefaultServerConfig()
+	cfg.MaxConnections = 1
+
+	srv, err := transport.NewServer(cfg, eng)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	// Fill the 1 available connection slot
+	cSlot1, cSlot2 := net.Pipe()
+	defer cSlot1.Close()
+	defer cSlot2.Close()
+
+	go srv.ServeConnForTesting(cSlot2)
+	time.Sleep(20 * time.Millisecond)
+
+	// Now try to serve a 2nd connection on server at capacity
+	srv.ServeConnForTesting(c2)
+
+	// Verify c2 was closed by testing read on c1 (must yield io.EOF / closed)
+	var b [1]byte
+	_, readErr := c1.Read(b[:])
+	if readErr == nil {
+		t.Fatal("expected rejected connection socket to be closed, but read succeeded")
+	}
+}
+
+func TestServer_SimultaneousAdmissions_AtCeiling(t *testing.T) {
+	eng := newMockEngine()
+	cfg := transport.DefaultServerConfig()
+	cfg.MaxConnections = 8
+
+	srv := startTestServer(t, cfg, eng)
+
+	const totalClients = 32
+	var wg sync.WaitGroup
+	var accepted atomic.Int64
+	var rejected atomic.Int64
+
+	clientConns := make([]net.Conn, totalClients)
+
+	for i := 0; i < totalClients; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			c, err := net.Dial("tcp", srv.Addr().String())
+			if err != nil {
+				rejected.Add(1)
+				return
+			}
+			clientConns[idx] = c
+
+			// Probe connection by reading 1 byte with a short deadline
+			// If server rejected at ceiling, connection will be closed promptly
+			var buf [1]byte
+			c.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+			_, rErr := c.Read(buf[:])
+			if rErr == io.EOF || (rErr != nil && strings.Contains(rErr.Error(), "connection reset")) {
+				rejected.Add(1)
+				_ = c.Close()
+			} else {
+				accepted.Add(1)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	active := srv.ActiveConnections()
+	if active > 8 {
+		t.Fatalf("CRITICAL: active connections %d exceeded ceiling of 8!", active)
+	}
+
+	// Close all accepted connections
+	for _, c := range clientConns {
+		if c != nil {
+			_ = c.Close()
+		}
+	}
+
+	// Verify all slots are released
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if srv.ActiveConnections() == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if srv.ActiveConnections() != 0 {
+		t.Errorf("expected 0 active connections after releasing all, got: %d", srv.ActiveConnections())
+	}
+}
+
+func TestServer_MalformedFrameFlood_ResourceBounded(t *testing.T) {
+	eng := newMockEngine()
+	cfg := transport.DefaultServerConfig()
+	cfg.HeaderTimeout = 200 * time.Millisecond
+
+	srv := startTestServer(t, cfg, eng)
+
+	// Hostile client sends various malformed frames
+	malformedPayloads := [][]byte{
+		// Bad magic
+		{0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0},
+		// Invalid opcode 0xFF
+		{'L', 'A', 'T', 'T', 0xFF, 0x00, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0},
+		// Oversized payload declaration (10 MiB > 5 MiB)
+		{'L', 'A', 'T', 'T', 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 3, 0x00, 0xA0, 0x00, 0x00, 0, 0, 0, 0},
+		// Truncated header (10 bytes then disconnect)
+		{'L', 'A', 'T', 'T', 0x01, 0x00, 0, 0, 0, 0},
+	}
+
+	for _, p := range malformedPayloads {
+		c, err := net.Dial("tcp", srv.Addr().String())
+		if err != nil {
+			t.Fatalf("dial failed: %v", err)
+		}
+		_, _ = c.Write(p)
+		_ = c.Close()
+	}
+
+	// Verify server remains responsive and healthy
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if srv.ActiveConnections() == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if srv.ActiveConnections() != 0 {
+		t.Errorf("expected 0 active connections after malformed flood, got: %d", srv.ActiveConnections())
+	}
+
+	// Verify server still handles valid requests
+	validConn, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		t.Fatalf("dial after flood failed: %v", err)
+	}
+	defer validConn.Close()
+
+	req := &transport.Request{
+		OpCode: transport.OpPut,
+		SeqID:  999,
+		Key:    []byte("k"),
+		Value:  []byte("v"),
+	}
+	if err := transport.WriteRequest(validConn, req); err != nil {
+		t.Fatalf("write valid request failed: %v", err)
+	}
+	resp, err := transport.ReadResponse(validConn)
+	if err != nil {
+		t.Fatalf("read valid response failed: %v", err)
+	}
+	if resp.Status != transport.StatusOk {
+		t.Errorf("expected StatusOk, got: %v", resp.Status)
+	}
+}
+
+func TestServer_ShutdownUnderLoad(t *testing.T) {
+	eng := newMockEngine()
+	cfg := transport.DefaultServerConfig()
+	cfg.MaxConnections = 32
+
+	srv := startTestServer(t, cfg, eng)
+
+	const workerCount = 8
+	var wg sync.WaitGroup
+	stopClients := make(chan struct{})
+
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			conn, err := net.Dial("tcp", srv.Addr().String())
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+
+			for {
+				select {
+				case <-stopClients:
+					return
+				default:
+					req := &transport.Request{
+						OpCode: transport.OpPut,
+						SeqID:  uint64(id),
+						Key:    []byte(fmt.Sprintf("k%d", id)),
+						Value:  []byte("val"),
+					}
+					if err := transport.WriteRequest(conn, req); err != nil {
+						return
+					}
+					if _, err := transport.ReadResponse(conn); err != nil {
+						return
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+			}
+		}(i)
+	}
+
+	// Let workers run for a brief moment
+	time.Sleep(50 * time.Millisecond)
+
+	// Invoke Shutdown while under load
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("Shutdown failed: %v", err)
+	}
+	close(stopClients)
+	wg.Wait()
+
+	if srv.ActiveConnections() != 0 {
+		t.Errorf("expected ActiveConnections == 0 after Shutdown, got: %d", srv.ActiveConnections())
 	}
 }

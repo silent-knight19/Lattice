@@ -83,6 +83,9 @@ func OpenWriter(path string) (*WALWriter, error) {
 	if err != nil {
 		return nil, fmt.Errorf("wal: %w", err)
 	}
+	if err := security.ValidateDatabaseFileName(filepath.Base(cleanPath)); err != nil {
+		return nil, fmt.Errorf("wal: %w", err)
+	}
 
 	// Parent directory validation: ensure parent directory exists, is a directory, and is not an unpermitted symlink
 	parentDir := filepath.Dir(cleanPath)
@@ -196,6 +199,9 @@ func OpenSegmentWriter(dbPath string, id uint64) (*WALWriter, error) {
 func CreateWriter(path string) (*WALWriter, error) {
 	cleanPath, err := security.CleanAndValidatePath(path)
 	if err != nil {
+		return nil, fmt.Errorf("wal: %w", err)
+	}
+	if err := security.ValidateDatabaseFileName(filepath.Base(cleanPath)); err != nil {
 		return nil, fmt.Errorf("wal: %w", err)
 	}
 

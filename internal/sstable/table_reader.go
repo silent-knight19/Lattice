@@ -164,8 +164,13 @@ func NewTableReaderWithOptions(path string, opts TableReaderOptions) (*TableRead
 	}
 	path = cleanPath
 
+	baseName := filepath.Base(path)
+	if err := security.ValidateDatabaseFileName(baseName); err != nil {
+		return nil, fmt.Errorf("sstable: %w", err)
+	}
+
 	if opts.FileNum == 0 {
-		if num, ok := parseTableFilename(filepath.Base(path)); ok {
+		if num, ok := parseTableFilename(baseName); ok {
 			opts.FileNum = num
 		}
 	}

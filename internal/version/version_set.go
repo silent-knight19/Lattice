@@ -10,6 +10,7 @@ import (
 
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
+	"github.com/silent-knight19/lattice/internal/security"
 )
 
 // VersionSet coordinates the lifecycle, active version chain, durability synchronization,
@@ -347,6 +348,9 @@ func (vs *VersionSet) validatePhysicalAddedFiles(adds []AddFileEntry) error {
 	}
 	for _, a := range adds {
 		sstPath := TablePath(cleanDir, a.Meta.FileNum)
+		if err := security.ValidateContainment(cleanDir, sstPath); err != nil {
+			return fmt.Errorf("version: %w", err)
+		}
 		info, err := vs.lstatFn(sstPath)
 		if err != nil {
 			if os.IsNotExist(err) {

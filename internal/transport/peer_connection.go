@@ -649,8 +649,12 @@ type PeerConnectionManager struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	listener net.Listener
+	listener           net.Listener
+	activeInboundConns atomic.Int64
 }
+
+// MaxInboundPeerConnections is the maximum number of concurrent inbound connections permitted on the peer listener.
+const MaxInboundPeerConnections = 64
 
 // NewPeerConnectionManager constructs a new PeerConnectionManager.
 //
@@ -834,6 +838,11 @@ func (m *PeerConnectionManager) ListenerAddr() net.Addr {
 	return nil
 }
 
+// ActiveInboundConnections returns the current count of active inbound peer connections.
+func (m *PeerConnectionManager) ActiveInboundConnections() int64 {
+	return m.activeInboundConns.Load()
+}
+
 func (m *PeerConnectionManager) acceptLoop(ln net.Listener) {
 	defer m.wg.Done()
 
@@ -852,8 +861,17 @@ func (m *PeerConnectionManager) acceptLoop(ln net.Listener) {
 			}
 		}
 
+		if m.activeInboundConns.Load() >= MaxInboundPeerConnections {
+			_ = conn.Close()
+			continue
+		}
+
+		m.activeInboundConns.Add(1)
 		m.wg.Add(1)
-		go m.handleInboundConn(conn)
+		go func(c net.Conn) {
+			defer m.activeInboundConns.Add(-1)
+			m.handleInboundConn(c)
+		}(conn)
 	}
 }
 
@@ -861,8 +879,9 @@ func (m *PeerConnectionManager) handleInboundConn(conn net.Conn) {
 	defer m.wg.Done()
 
 	// Deadline for first request frame to defend against Slowloris
-	if ds, ok := conn.(deadlineSetter); ok {
-		_ = ds.SetReadDeadline(time.Now().Add(m.cfg.DialTimeout))
+	if err := conn.SetReadDeadline(time.Now().Add(m.cfg.DialTimeout)); err != nil {
+		_ = conn.Close()
+		return
 	}
 
 	frame, err := DecodeFrame(conn)
@@ -872,8 +891,9 @@ func (m *PeerConnectionManager) handleInboundConn(conn net.Conn) {
 	}
 
 	// Reset read deadline after first frame read
-	if ds, ok := conn.(deadlineSetter); ok {
-		_ = ds.SetReadDeadline(time.Time{})
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		_ = conn.Close()
+		return
 	}
 
 	// Validate opcode
@@ -976,13 +996,11 @@ func (m *PeerConnectionManager) Send(ctx context.Context, peerID cluster.NodeID,
 	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(writeDeadline) {
 		writeDeadline = ctxDeadline
 	}
-	if ds, ok := conn.(deadlineSetter); ok {
-		if err := ds.SetWriteDeadline(writeDeadline); err != nil {
-			sup.disconnect(gen, err)
-			return err
-		}
-		defer func() { _ = ds.SetWriteDeadline(time.Time{}) }()
+	if err := conn.SetWriteDeadline(writeDeadline); err != nil {
+		sup.disconnect(gen, err)
+		return err
 	}
+	defer func() { _ = conn.SetWriteDeadline(time.Time{}) }()
 
 	// Encode and write frame using existing generic framing encoder
 	if err := EncodeFrame(conn, frame); err != nil {

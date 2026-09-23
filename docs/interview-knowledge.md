@@ -4047,6 +4047,32 @@ Offset 68..71 (4B, CRC32-IEEE):
   - **Immediate Unblocking**: Any goroutine blocked in `Read()` or `Write()` immediately awakens with an I/O error / timeout, executes its `defer` cleanup (`conn.Close()` and `s.untrackConn()`), and decrements `s.wg`.
   - **Context-Bounded Join**: `s.wg.Wait()` drains cleanly. If an extreme edge case delays a goroutine, `Shutdown` respects `ctx.Done()`, ensuring deterministic process termination.
 
+### 7. How does canonical containment evaluate non-existent paths against symlink breakouts?
+* **Question**: Why does `filepath.EvalSymlinks` fail when validating paths for files or directories that do not yet exist, and how does Lattice solve this without creating a symlink escape window?
+* **Answer**:
+  - **The Pre-Creation Dilemma**: Database engines dynamically create new WAL segments, SSTables, and subdirectories. Calling `filepath.EvalSymlinks` on a non-existent target returns `os.ErrNotExist`. If the validator skips symlink evaluation when the file is missing, an attacker can create a symlink to an uncreated target or exploit a symlinked ancestor directory (`/root/symlink_dir/new_file.sst`) to escape the root upon creation.
+  - **Deepest Existing Ancestor Canonicalization**: Lattice implements `evalDeepestExistingAncestor(absPath)`. It walks upward component by component until it locates the deepest existing ancestor directory on disk, evaluates `filepath.EvalSymlinks` on that existing component, and reassembles the trailing non-existent components onto the canonical ancestor path.
+  - **Fail-Closed Boundary**: If the canonical target escapes the canonical root (via relative traversal or prefix mismatch), `ValidateContainment` rejects the path before `os.Create` or `os.Mkdir` is ever invoked.
+
+### 8. Why should networking servers call `net.Conn` deadline methods directly instead of private reflection or type assertions?
+* **Question**: In Go transport implementations, why is asserting a custom interface like `type deadlineSetter interface { SetReadDeadline(...) }` an anti-pattern compared to directly invoking `net.Conn` methods?
+* **Answer**:
+  - **Silent Security Failure**: In Go, every `net.Conn` interface statically includes `SetDeadline`, `SetReadDeadline`, and `SetWriteDeadline`. When code introduces a private interface check such as `if ds, ok := conn.(deadlineSetter); ok { ... }`, any connection wrapper or mock that accidentally fails the type assertion causes deadlines to be silently skipped without error.
+  - **Fail-Closed Guarantee**: Directly calling `err := conn.SetReadDeadline(...)` guarantees that deadlines are applied to all `net.Conn` instances. If the deadline cannot be set (e.g. underlying file descriptor error), the server immediately closes the socket and fails closed rather than running un-bounded.
+
+### 9. Why must consensus peer listeners enforce independent connection admission limits?
+* **Question**: If client connections are capped at 4,096, why does the Raft peer communication port need its own connection limit (`MaxInboundPeerConnections = 64`)?
+* **Answer**:
+  - **Target Separation**: Client connections and peer RPC connections listen on distinct TCP ports. An attacker who cannot overwhelm the client port (or who has access to the internal network) could flood the consensus peer port with thousands of half-open TCP connections.
+  - **Goroutine & Memory Amplification**: Without an inbound ceiling, each accepted peer connection spawns a goroutine (`go m.handleInboundConn(conn)`), consuming goroutine stack space and decoder buffers until the process crashes from OOM.
+  - **Consensus Headroom**: Capping inbound peer connections to 64 provides ample capacity for cluster members and re-connections while providing a strict firewall against connection flooding.
+
+### 10. What is the fundamental difference between lexical containment and canonical containment?
+* **Question**: Why is `filepath.Clean` and `filepath.Rel` insufficient for path containment security?
+* **Answer**:
+  - **Lexical Containment**: Operates strictly on string syntax without consulting the filesystem. It resolves `.` and `..` textually. However, lexical analysis has zero awareness of symbolic links. A path like `/data/dir/file.sst` appears completely inside `/data`, but if `/data/dir` is a symlink pointing to `/etc`, the lexical check passes while the physical write escapes to `/etc/file.sst`.
+  - **Canonical Containment**: Resolves all symbolic links, junctions, and relative references down to physical filesystem inodes and canonical paths via `filepath.EvalSymlinks`. It verifies that the *physical destination on disk* resides within the *physical root*.
+
 ---
 
 *End of Technical Interview Knowledge Base — Lattice v1.0.0-KNOWLEDGE-BASE*

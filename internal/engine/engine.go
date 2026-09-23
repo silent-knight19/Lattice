@@ -191,8 +191,6 @@ func NewEngineWithOptions(opts EngineOptions) *Engine {
 	if opts.DBPath != "" {
 		if p, err := security.CleanAndValidatePath(opts.DBPath); err == nil {
 			cleanDBPath = p
-		} else {
-			cleanDBPath = filepath.Clean(opts.DBPath)
 		}
 	}
 	shutTimeout := opts.ShutdownTimeout

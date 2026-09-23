@@ -153,42 +153,58 @@ func ValidateContainment(rootDir, targetPath string) error {
 		}
 	}
 
-	// Symlink containment check for existing paths or existing parent directories
-	// If root exists, resolve its canonical path
-	evalRoot, err := filepath.EvalSymlinks(absRoot)
-	if err == nil {
-		// Walk up target path to find the deepest existing ancestor
-		cur := absTarget
-		for {
-			evalTarget, err := filepath.EvalSymlinks(cur)
-			if err == nil {
-				// We found an existing ancestor. Verify it is contained in evalRoot.
-				evalRootIsVolRoot := evalRoot == string(filepath.Separator) || (filepath.VolumeName(evalRoot) != "" && evalRoot == filepath.VolumeName(evalRoot)+string(filepath.Separator))
-				if !evalRootIsVolRoot {
-					sep := string(filepath.Separator)
-					if evalTarget != evalRoot && !strings.HasPrefix(evalTarget, evalRoot+sep) {
-						return &errors.InvalidPathError{
-							Path:   targetPath,
-							Root:   rootDir,
-							Reason: fmt.Sprintf("canonical target path %q escapes canonical root %q via symbolic link", evalTarget, evalRoot),
-						}
-					}
-				}
-				evalRel, relErr := filepath.Rel(evalRoot, evalTarget)
-				if relErr != nil || evalRel == ".." || strings.HasPrefix(evalRel, ".."+string(filepath.Separator)) {
-					return &errors.InvalidPathError{
-						Path:   targetPath,
-						Root:   rootDir,
-						Reason: fmt.Sprintf("canonical target path %q escapes canonical root %q via symbolic link", evalTarget, evalRoot),
-					}
-				}
-				break
+	// Canonical symlink containment evaluation:
+	// Canonicalize both root and target through their deepest existing ancestors.
+	// This guarantees fail-closed containment even when rootDir or targetPath (or subdirectories)
+	// do not yet exist on disk, closing symlink escape windows across uncreated parent hierarchies.
+	canonicalRoot, err := evalDeepestExistingAncestor(absRoot)
+	if err != nil {
+		return &errors.InvalidPathError{
+			Path:   targetPath,
+			Root:   rootDir,
+			Reason: fmt.Sprintf("failed to canonicalize security root %q: %v", absRoot, err),
+		}
+	}
+
+	canonicalTarget, err := evalDeepestExistingAncestor(absTarget)
+	if err != nil {
+		return &errors.InvalidPathError{
+			Path:   targetPath,
+			Root:   rootDir,
+			Reason: fmt.Sprintf("failed to canonicalize target path %q: %v", absTarget, err),
+		}
+	}
+
+	// Canonical Volume check
+	if filepath.VolumeName(canonicalRoot) != filepath.VolumeName(canonicalTarget) {
+		return &errors.InvalidPathError{
+			Path:   targetPath,
+			Root:   rootDir,
+			Reason: fmt.Sprintf("canonical target volume %q does not match root volume %q", filepath.VolumeName(canonicalTarget), filepath.VolumeName(canonicalRoot)),
+		}
+	}
+
+	// Canonical Lexical Containment Check
+	canonicalRootIsVolRoot := canonicalRoot == string(filepath.Separator) || (filepath.VolumeName(canonicalRoot) != "" && canonicalRoot == filepath.VolumeName(canonicalRoot)+string(filepath.Separator))
+
+	if !canonicalRootIsVolRoot {
+		sep := string(filepath.Separator)
+		if canonicalTarget != canonicalRoot && !strings.HasPrefix(canonicalTarget, canonicalRoot+sep) {
+			return &errors.InvalidPathError{
+				Path:   targetPath,
+				Root:   rootDir,
+				Reason: fmt.Sprintf("canonical target path %q escapes canonical root %q via symbolic link", canonicalTarget, canonicalRoot),
 			}
-			parent := filepath.Dir(cur)
-			if parent == cur {
-				break
-			}
-			cur = parent
+		}
+	}
+
+	// Canonical Relative path check
+	canonicalRel, err := filepath.Rel(canonicalRoot, canonicalTarget)
+	if err != nil || canonicalRel == ".." || strings.HasPrefix(canonicalRel, ".."+string(filepath.Separator)) {
+		return &errors.InvalidPathError{
+			Path:   targetPath,
+			Root:   rootDir,
+			Reason: fmt.Sprintf("canonical target path %q escapes canonical root %q via symbolic link", canonicalTarget, canonicalRoot),
 		}
 	}
 
@@ -226,4 +242,43 @@ func ResolvePath(rootDir, userPath string) (string, error) {
 // SanitizePath is an alias for ResolvePath.
 func SanitizePath(rootDir, userPath string) (string, error) {
 	return ResolvePath(rootDir, userPath)
+}
+
+// evalDeepestExistingAncestor evaluates symlinks on the deepest existing ancestor of absPath
+// and reassembles the canonical path with any non-existent trailing components.
+// This guarantees that canonical containment can be proven even when rootDir or targetPath
+// (or their intermediate subdirectories) do not yet exist on disk.
+func evalDeepestExistingAncestor(absPath string) (string, error) {
+	eval, err := filepath.EvalSymlinks(absPath)
+	if err == nil {
+		return eval, nil
+	}
+
+	var missing []string
+	cur := absPath
+	for {
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			// Reached filesystem root or volume root
+			eval, err := filepath.EvalSymlinks(cur)
+			if err != nil {
+				return "", err
+			}
+			canonical := eval
+			for i := len(missing) - 1; i >= 0; i-- {
+				canonical = filepath.Join(canonical, missing[i])
+			}
+			return canonical, nil
+		}
+		missing = append(missing, filepath.Base(cur))
+		eval, err := filepath.EvalSymlinks(parent)
+		if err == nil {
+			canonical := eval
+			for i := len(missing) - 1; i >= 0; i-- {
+				canonical = filepath.Join(canonical, missing[i])
+			}
+			return canonical, nil
+		}
+		cur = parent
+	}
 }

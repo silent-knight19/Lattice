@@ -9,6 +9,7 @@ import (
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
 	"github.com/silent-knight19/lattice/internal/memtable"
+	"github.com/silent-knight19/lattice/internal/security"
 	"github.com/silent-knight19/lattice/internal/sstable"
 	"github.com/silent-knight19/lattice/internal/version"
 )
@@ -343,6 +344,9 @@ func (e *Engine) flushOne(imm *memtable.SkipList) error {
 		return fmt.Errorf("%w: file number overflow", os.ErrInvalid)
 	}
 	path := version.TablePath(dbPath, fileNum)
+	if err := security.ValidateContainment(dbPath, path); err != nil {
+		return fmt.Errorf("engine: %w", err)
+	}
 	w, err := writerFactory(path, sstable.DefaultTableWriterOptions())
 	if err != nil {
 		return err

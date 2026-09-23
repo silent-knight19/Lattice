@@ -30,9 +30,13 @@ func isSystemSymlinkPrefix(path string) bool {
 	return false
 }
 
-// validatePathNoSymlinks inspects each existing path component from the root down to dir.
+// ValidatePathNoSymlinks inspects each existing path component from the root down to dir.
 // If any component is an unpermitted symbolic link, it returns an error wrapping ErrParentDirectorySymlink.
 // If any component is not a directory, it returns an error wrapping ErrNotADirectory.
+func ValidatePathNoSymlinks(dir string) error {
+	return validatePathNoSymlinks(dir)
+}
+
 func validatePathNoSymlinks(dir string) error {
 	clean := filepath.Clean(dir)
 	if clean == "." || clean == "" {
