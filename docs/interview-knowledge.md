@@ -3705,4 +3705,61 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
+# 44. Deep Systems Interview Questions & Answers: Abrupt SIGKILL Crash Recovery & Durability Boundaries (P18-S01-M02)
+
+### 1. Why is testing with abrupt `SIGKILL` fundamentally stronger than testing with graceful shutdown (`SIGTERM`, `SIGINT`, or `Close()`)?
+* **Question**: In storage engine durability testing, why is invoking graceful shutdown (`SIGTERM`, `SIGINT`, or programmatic `Close()`) insufficient, and what unique failure modes does `SIGKILL` expose?
+* **Answer**:
+  - **Graceful Shutdown Masks Durability Bugs**: During a graceful shutdown, a storage engine executes a structured teardown sequence: stopping incoming connections, draining internal queues, flushing active and immutable MemTables to $L_0$ SSTables, syncing metadata manifests, and flushing/closing open WAL files. In this scenario, disk recovery upon restart is essentially trivial because the database left behind clean, flushed state on disk.
+  - **The Reality of Production Crashes (`SIGKILL`)**: In production, processes crash abruptly due to kernel OOM killer events (`SIGKILL`), hardware watchdog resets, host panics, or unhandled runtime faults. Under `SIGKILL`, the process is terminated instantaneously by the operating system kernel. No userland shutdown hooks run, dirty userland buffers are never flushed, in-flight transactions are interrupted mid-system-call, and MemTables remain uncompacted in volatile RAM.
+  - **What `SIGKILL` Proves**: Reopening the database forces the engine to reconstruct its entire state solely from the write-ahead log (`Engine.RecoverWAL()`). It proves that:
+    1. Every transaction acknowledged to a client was genuinely fsynced to disk *before* the acknowledgement packet left the process.
+    2. Partial or torn writes at the log tail are detected via checksums and safely truncated without failing startup.
+    3. Replayed state is identical to pre-crash memory state without relying on clean shutdown artifacts.
+
+### 2. Why must the ACK ledger be owned by the parent supervisor outside the daemon's data directory?
+* **Question**: Why can't the durability oracle (the record of which writes succeeded) be stored inside the child daemon or inside its data directory?
+* **Answer**:
+  - **Failure Domain Separation**: The supervisor (the parent test process) and the system under test (the child daemon) must occupy distinct failure domains. If the ledger is kept inside the child daemon, an abrupt `SIGKILL` destroys the volatile record of what the daemon believed it acknowledged, preventing accurate verification.
+  - **Anti-Tampering & Containment**: If the ledger is stored in the daemon's data directory, a buggy recovery implementation could conceivably erase, overwrite, or mutate the test ledger during crash recovery or compaction, masking data loss.
+  - **Observational Truth**: Durability is defined from the client's perspective: an operation is durable if the *client observed* the confirmation on the wire. The parent process simulates the client boundary, recording an ACK only when the response bytes are read from the TCP socket. Storing the ACK ledger in a separate directory (`ack-ledger/`) guarantees that the oracle remains immutable, tamper-proof, and independent of child process lifecycles.
+
+### 3. Why is it critical to separate acknowledged writes from in-flight/unacknowledged writes during chaos testing?
+* **Question**: Why doesn't a database guarantee zero loss for *all* attempted writes during a crash? Why must the test oracle strictly differentiate acknowledged writes from in-flight requests?
+* **Answer**:
+  - **The Two Generals Problem / Ambiguous Network Boundary**: When a client sends a write request over TCP and the server process is abruptly killed, the client experiences a connection reset (`ECONNRESET`) or `EOF`. At that exact instant, the client cannot know which of three states occurred:
+    1. The request was dropped before reaching the server's network socket.
+    2. The server received the request and appended it to the WAL, but was killed before the `fdatasync` syscall completed.
+    3. The server synced the WAL to disk, but was killed before transmitting the response packet back across the network.
+  - **The Durability Contract**: Storage engines guarantee durability *only for acknowledged operations* ($StatusOk$). An unacknowledged operation is by definition in-flight and ambiguous. If an engine claimed "zero write loss" for unacknowledged writes, it would be impossible to satisfy because network packets dropped prior to server ingress are physically outside the storage engine's control.
+  - **The Safety Oracle**: The oracle must assert:
+    $$\text{Acknowledged Writes} \subseteq \text{Recovered Writes}$$
+    Every single write for which the client observed `StatusOk` MUST be recoverable after restart with an exact value match. In-flight operations may either be recovered (if synced before death) or safely truncated (if torn at the tail), but can never cause a false failure in the primary durability oracle.
+
+### 4. Why does the ordering of `fdatasync()` and network response write matter in storage architectures?
+* **Question**: What catastrophic bug occurs if an engine responds to a client *before* or *concurrently with* syncing the WAL to disk?
+* **Answer**:
+  - **The Phantom Write Vulnerability**: If a database writes an operation to its in-memory buffer or OS page cache and sends `StatusOk` to the client *before* `fdatasync()` or `fsync()` returns successfully:
+    1. The client assumes the write is durable and updates external systems (e.g. confirming a payment or dispatching an order).
+    2. An abrupt crash (`SIGKILL` or power cut) occurs before the OS flushes the dirty page cache to physical flash memory.
+    3. Upon restart, the transaction is gone. The client observed an acknowledgement for a write that no longer exists—a permanent phantom write causing state corruption.
+  - **The Correct Barrier Order**:
+    $$\text{WAL Append} \longrightarrow \text{fdatasync() Barrier} \longrightarrow \text{MemTable Insert} \longrightarrow \text{Send StatusOk}$$
+    Client acknowledgement must remain strictly blocked until the storage controller has confirmed that the physical media has persisted the log record.
+
+### 5. What does the SIGKILL chaos monkey test prove, and what does it NOT prove?
+* **Question**: How do you precisely qualify the results of this chaos test to avoid over-claiming system capabilities in an architectural review?
+* **Answer**:
+  - **What the Test Proves**:
+    - **Process Crash Resilience**: Proves zero acknowledged write loss across abrupt OS-level process terminations (`SIGKILL`).
+    - **WAL Integrity & Recovery**: Proves that `Engine.RecoverWAL()` accurately replays transactions across multiple consecutive daemon generations on persistent storage without dropping keys or corrupting values.
+    - **Torn Tail Handling**: Proves that incomplete trailing records created when `SIGKILL` strikes mid-write do not prevent the database from restarting or replaying preceding valid records.
+    - **Concurrency Safety**: Proves that concurrent writer goroutines do not race with process lifecycle events to corrupt persistent storage.
+  - **What the Test Does NOT Prove**:
+    - **Arbitrary Hardware Power-Loss**: It does not prove durability against raw power loss on drives with volatile write caches enabled without flush barrier support.
+    - **Physical Media Decay / Bit-Rot**: While CRC32 detects sector corruption, the test does not simulate media degradation across years of cold storage.
+    - **Byzantine Hardware Faults**: It assumes the Linux/POSIX kernel and NVMe controller faithfully implement `fsync` semantics and do not return success on dropped writes.
+
+---
+
 *End of Technical Interview Knowledge Base — Lattice v1.0.0-KNOWLEDGE-BASE*

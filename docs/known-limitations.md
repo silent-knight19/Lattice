@@ -1507,4 +1507,28 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 83. Phase 18 Abrupt SIGKILL Crash Recovery & Durability Boundaries (P18-S01-M02)
+* **Limitation & Architectural Boundaries**:
+  1. *Acknowledged vs. In-Flight Durability Contract*:
+     - Primary Safety Invariant: **Every write for which the client observed a successful `StatusOk` acknowledgement remains 100% recoverable across abrupt `SIGKILL` process crashes and restarts.**
+     - In standalone mode, the Lattice daemon transmits `StatusOk` to the client over TCP *only after* the write-ahead log record has successfully passed the kernel/hardware durability barrier via `wal.Writer.Sync()` (issuing `fdatasync`/`fsync`).
+     - **The Non-Acknowledged Boundary**: Operations that were in-flight, interrupted by connection termination, or where `StatusOk` was never returned to the client before the process was killed are *not* guaranteed to be recovered. If an abrupt crash terminates the daemon while a write is being written to disk, the partial frame at the WAL tail is classified as a torn tail and is safely truncated during startup recovery (`Engine.Open()` -> `Engine.RecoverWAL()`). Such unacknowledged operations are legitimately discarded and do not constitute data loss under the durability contract.
+  2. *Bypassing Graceful Shutdown via SIGKILL*:
+     - Traditional testing that issues `SIGTERM`, `SIGINT`, or programmatic `Close()` allows the daemon to execute its clean shutdown sequence: draining active TCP connections, flushing mutable and immutable MemTables to $L_0$ SSTables, and synchronizing MANIFEST updates.
+     - P18-S01-M02 enforces non-graceful process termination using OS `SIGKILL` (`kill -9` via `(*os.Process).Kill()`) targeting the exact child process PID during active concurrent client workloads.
+     - Graceful shutdown handlers are completely bypassed. Upon restart, the engine has no clean state markers and relies exclusively on replaying WAL log segments from persistent disk.
+  3. *Testing Envelope & Proven Boundaries*:
+     - **Proven**: Zero acknowledged write loss across repeated abrupt process terminations, deterministic restart sequences, torn-tail log recovery, and multi-generation crash loops on persistent disk under high concurrency.
+     - **Not Proven**: The test validates process-crash durability on an active POSIX filesystem. It does not simulate raw unbuffered hardware power cuts with disabled write barriers, physical drive media decay, or Byzantine corruptions beyond CRC32 verification.
+* **Why It Exists**:
+  Validating crash safety requires proving that the write-ahead log and recovery subsystem cannot lose data when the runtime environment terminates abruptly without prior warning.
+* **Impact**:
+  Lattice guarantees zero acknowledged write loss across abrupt process termination, with verified deterministic replay across multiple consecutive crash cycles.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (100% durability of acknowledged writes across abrupt `SIGKILL`).
+  * Performance: **High Throughput** (Zero overhead added to production write path).
+  * Scalability: **High** (Deterministic recovery independently verified across storage generations).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*

@@ -2519,7 +2519,13 @@ TOTAL: 176 Discrete, Testable Micro-Phases
     - **Zero Split-Brain Writes Committed**: Proven across real TCP sockets under `go test -race` with 20 repeated deterministic executions.
 * **P18-S01-M02: Abrupt `SIGKILL` Chaos Monkey Loop**
   * *Objective*: Continuously write data while sending random `kill -9` signals; assert zero acknowledged write loss.
-  * *Status*: **NOT STARTED**
+  * *Status*: **COMPLETE**
+  * *Deliverables & Invariants Verified*:
+    - **Production Binary Supervision**: Test harness compiles the real `cmd/lattice` production binary and supervises child daemon lifecycle via `os.Process.Kill()` without relying on `go run` wrappers or shell execution.
+    - **Parent-Owned Independent ACK Ledger**: All client write confirmations (`StatusOk`) are recorded in an external append-only ledger (`ack-ledger/ack_ledger.jsonl`) residing outside the daemon data directory, guaranteeing an unalterable, crash-independent durability oracle.
+    - **Continuous Active Workload & Jitter Strikes**: Concurrent writer routines pipeline continuous Put operations over real TCP sockets, with pseudo-random millisecond jitter ensuring `SIGKILL` strikes while writes and responses are actively in flight.
+    - **Zero Acknowledged Write Loss Across Generations**: Verified across 5 consecutive crash-restart cycles and a final restart cycle that 100% of operations acknowledged prior to process termination are recovered with exact value matches from the replayed WAL.
+    - **Torn-Tail Boundary Tolerance**: Interrupted in-flight writes that never returned `StatusOk` to the client are cleanly truncated at the WAL tail during startup recovery, establishing a strict distinction between acknowledged durable operations and in-flight requests.
 
 ---
 
