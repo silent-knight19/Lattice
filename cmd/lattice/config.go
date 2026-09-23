@@ -10,12 +10,12 @@ import (
 	"io"
 	"net"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/silent-knight19/lattice/internal/cluster"
 	"github.com/silent-knight19/lattice/internal/errors"
+	"github.com/silent-knight19/lattice/internal/security"
 )
 
 const (
@@ -313,7 +313,11 @@ func (c *Config) Validate() error {
 	if c.DataDir == "" {
 		return fmt.Errorf("config error: --data-dir cannot be empty")
 	}
-	c.DataDir = filepath.Clean(c.DataDir)
+	cleanDataDir, err := security.CleanAndValidatePath(c.DataDir)
+	if err != nil {
+		return fmt.Errorf("config error: invalid --data-dir path: %w", err)
+	}
+	c.DataDir = cleanDataDir
 
 	if c.Port < 0 || c.Port > 65535 {
 		return fmt.Errorf("config error: invalid port %d (must be between 0 and 65535)", c.Port)
@@ -387,7 +391,10 @@ func (c *Config) Validate() error {
 // loadConfigFile parses a configuration file from disk.
 // Supports standard JSON or simple key-value / YAML lines with comments.
 func loadConfigFile(path string) (*Config, error) {
-	cleanPath := filepath.Clean(path)
+	cleanPath, err := security.CleanAndValidatePath(path)
+	if err != nil {
+		return nil, fmt.Errorf("invalid config file path: %w", err)
+	}
 
 	f, err := os.Open(cleanPath)
 	if err != nil {

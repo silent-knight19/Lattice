@@ -427,3 +427,27 @@ func TestConfig_WildcardPortCollision(t *testing.T) {
 		}
 	})
 }
+
+func TestConfig_SecurityPathSanitization(t *testing.T) {
+	t.Run("data-dir with null byte fails validation", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.DataDir = "data\x00evil"
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected error for data-dir with null byte, got nil")
+		}
+		if !strings.Contains(err.Error(), "invalid --data-dir path") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("loadConfigFile with null byte fails", func(t *testing.T) {
+		_, err := loadConfigFile("config\x00evil.json")
+		if err == nil {
+			t.Fatal("expected error for config file path with null byte, got nil")
+		}
+		if !strings.Contains(err.Error(), "invalid config file path") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+}

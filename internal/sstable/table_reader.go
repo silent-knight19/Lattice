@@ -17,6 +17,7 @@ import (
 	"github.com/silent-knight19/lattice/internal/cache"
 	"github.com/silent-knight19/lattice/internal/errors"
 	"github.com/silent-knight19/lattice/internal/filter"
+	"github.com/silent-knight19/lattice/internal/security"
 )
 
 var (
@@ -91,12 +92,12 @@ func isNilBlockCache(c BlockCache) bool {
 // cache lock on the hot path and no lock-order inversion (reader -> shard only).
 // Close acquires an exclusive write lock to safely release file resources.
 type TableReader struct {
-	mu         sync.RWMutex
-	file       *os.File
-	fileSize   int64
-	footer     Footer
-	index      *BlockIndex
-	readAtFn   func(p []byte, off int64) (int, error)
+	mu           sync.RWMutex
+	file         *os.File
+	fileSize     int64
+	footer       Footer
+	index        *BlockIndex
+	readAtFn     func(p []byte, off int64) (int, error)
 	closed       bool
 	fileNum      uint64
 	blockCache   BlockCache
@@ -157,9 +158,11 @@ func OpenTableReader(path string) (*TableReader, error) {
 //  8. Descriptor-centric lifecycle: Once validated, the opened *os.File descriptor is passed to
 //     NewTableReaderWithFileAndOptions.
 func NewTableReaderWithOptions(path string, opts TableReaderOptions) (*TableReader, error) {
-	if path == "" {
-		return nil, os.ErrInvalid
+	cleanPath, err := security.CleanAndValidatePath(path)
+	if err != nil {
+		return nil, fmt.Errorf("sstable: %w", err)
 	}
+	path = cleanPath
 
 	if opts.FileNum == 0 {
 		if num, ok := parseTableFilename(filepath.Base(path)); ok {

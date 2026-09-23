@@ -6,9 +6,9 @@ import (
 	"io"
 	"math"
 	"os"
-	"path/filepath"
 
 	"github.com/silent-knight19/lattice/internal/errors"
+	"github.com/silent-knight19/lattice/internal/security"
 )
 
 // WALReader sequentially streams and decodes Write-Ahead Log records from a segment file
@@ -52,11 +52,10 @@ type WALReader struct {
 //   - Uses read-only mode (os.O_RDONLY); never modifies or creates files.
 //   - Pins the opened descriptor's inode against os.Lstat to prevent file-swap TOCTOU attacks.
 func OpenReader(path string) (*WALReader, error) {
-	if path == "" {
-		return nil, fmt.Errorf("%w: path cannot be empty", os.ErrInvalid)
+	cleanPath, err := security.CleanAndValidatePath(path)
+	if err != nil {
+		return nil, fmt.Errorf("wal: %w", err)
 	}
-
-	cleanPath := filepath.Clean(path)
 
 	// Pre-open inspection: verify target exists and is a regular file, rejecting symlinks and directories
 	info, err := os.Lstat(cleanPath)
@@ -122,7 +121,11 @@ func OpenSegmentReader(dbPath string, id uint64) (*WALReader, error) {
 	if id == 0 {
 		return nil, fmt.Errorf("wal: segment ID must be strictly positive: %w", os.ErrInvalid)
 	}
-	return OpenReader(SegmentPath(dbPath, id))
+	segPath := SegmentPath(dbPath, id)
+	if err := security.ValidateContainment(dbPath, segPath); err != nil {
+		return nil, fmt.Errorf("wal: %w", err)
+	}
+	return OpenReader(segPath)
 }
 
 // Path returns the canonical filesystem path of the WAL segment being read.

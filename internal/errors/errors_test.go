@@ -905,6 +905,91 @@ func TestNotADirectoryError(t *testing.T) {
 	}
 }
 
+func TestErrInvalidPath(t *testing.T) {
+	if errors.ErrInvalidPath == nil {
+		t.Fatalf("ErrInvalidPath must not be nil")
+	}
+
+	wrapped := fmt.Errorf("path traversal check: %w", errors.ErrInvalidPath)
+	if !stdErrors.Is(wrapped, errors.ErrInvalidPath) {
+		t.Errorf("wrapped ErrInvalidPath must match via errors.Is")
+	}
+
+	if stdErrors.Is(errors.ErrInvalidPath, errors.ErrKeyNotFound) {
+		t.Errorf("ErrInvalidPath must not match ErrKeyNotFound")
+	}
+
+	if !strings.Contains(errors.ErrInvalidPath.Error(), "invalid or escaping path") {
+		t.Errorf("unexpected error message: %q", errors.ErrInvalidPath.Error())
+	}
+}
+
+func TestInvalidPathError(t *testing.T) {
+	typedErr := &errors.InvalidPathError{
+		Path:   "../../etc/passwd",
+		Root:   "/var/lib/lattice",
+		Reason: "path escapes security root",
+	}
+
+	// Must match sentinel via errors.Is
+	if !stdErrors.Is(typedErr, errors.ErrInvalidPath) {
+		t.Errorf("InvalidPathError must match ErrInvalidPath via errors.Is")
+	}
+
+	// Negative match against other sentinels
+	if stdErrors.Is(typedErr, errors.ErrKeyNotFound) {
+		t.Errorf("InvalidPathError must not match ErrKeyNotFound")
+	}
+
+	// Wrapped match via errors.Is
+	wrapped := fmt.Errorf("containment verification: %w", typedErr)
+	if !stdErrors.Is(wrapped, errors.ErrInvalidPath) {
+		t.Errorf("wrapped InvalidPathError must match ErrInvalidPath via errors.Is")
+	}
+
+	// Extraction via errors.As
+	var extracted *errors.InvalidPathError
+	if !stdErrors.As(wrapped, &extracted) {
+		t.Fatalf("errors.As failed to extract *InvalidPathError")
+	}
+	if extracted.Path != "../../etc/passwd" {
+		t.Errorf("extracted Path mismatch: got %q, expected ../../etc/passwd", extracted.Path)
+	}
+	if extracted.Root != "/var/lib/lattice" {
+		t.Errorf("extracted Root mismatch: got %q, expected /var/lib/lattice", extracted.Root)
+	}
+	if extracted.Reason != "path escapes security root" {
+		t.Errorf("extracted Reason mismatch: got %q", extracted.Reason)
+	}
+
+	// Error string formatting with path and root
+	msg := typedErr.Error()
+	if !strings.Contains(msg, "../../etc/passwd") || !strings.Contains(msg, "/var/lib/lattice") || !strings.Contains(msg, "escapes security root") {
+		t.Errorf("unexpected error message: %q", msg)
+	}
+
+	// Error string formatting without root
+	noRootErr := &errors.InvalidPathError{
+		Path:   "foo\x00bar",
+		Reason: "null byte detected",
+	}
+	if !strings.Contains(noRootErr.Error(), "foo\\x00bar") || !strings.Contains(noRootErr.Error(), "null byte detected") {
+		t.Errorf("unexpected no-root error message: %q", noRootErr.Error())
+	}
+
+	// Typed nil safety
+	var nilTyped *errors.InvalidPathError
+	if nilTyped.Error() != errors.ErrInvalidPath.Error() {
+		t.Errorf("typed nil error string mismatch: got %q, want %q", nilTyped.Error(), errors.ErrInvalidPath.Error())
+	}
+
+	// Empty fields fallback
+	emptyErr := &errors.InvalidPathError{}
+	if emptyErr.Error() != errors.ErrInvalidPath.Error() {
+		t.Errorf("empty error string mismatch: got %q, want %q", emptyErr.Error(), errors.ErrInvalidPath.Error())
+	}
+}
+
 func TestErrWriterClosed(t *testing.T) {
 	if errors.ErrWriterClosed == nil {
 		t.Fatalf("ErrWriterClosed must not be nil")

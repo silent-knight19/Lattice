@@ -511,3 +511,35 @@ func TestInspectSSTable_FIFORejection(t *testing.T) {
 		t.Fatal("CRITICAL: InspectSSTable blocked indefinitely on FIFO!")
 	}
 }
+
+// TestInspectSSTable_SecurityPathRejection tests P19-S01-M01 security path sanitization.
+func TestInspectSSTable_SecurityPathRejection(t *testing.T) {
+	tempDir := t.TempDir()
+
+	t.Run("null byte rejected", func(t *testing.T) {
+		var report ForensicReport
+		err := InspectSSTable("sstable\x00evil.sst", &report)
+		if err == nil {
+			t.Fatal("expected error on null byte, got nil")
+		}
+	})
+
+	t.Run("symlink rejected", func(t *testing.T) {
+		targetFile := filepath.Join(tempDir, "real.sst")
+		helperBuildSSTable(t, targetFile, 5)
+
+		symlinkPath := filepath.Join(tempDir, "symlink.sst")
+		if err := os.Symlink(targetFile, symlinkPath); err != nil {
+			t.Skipf("symlinks not supported: %v", err)
+		}
+
+		var report ForensicReport
+		err := InspectSSTable(symlinkPath, &report)
+		if err == nil {
+			t.Fatal("expected error on symlink target, got nil")
+		}
+		if !strings.Contains(err.Error(), "symbolic link") {
+			t.Errorf("expected symbolic link error, got: %v", err)
+		}
+	})
+}

@@ -2556,10 +2556,27 @@ TOTAL: 176 Discrete, Testable Micro-Phases
 * **Major Objective**: Eliminate memory leaks, buffer overflows, path traversal, and connection exhaustion vulnerabilities.
 * **Dependencies**: Phase 11, Phase 18.
 
-* **P19-S01-M01: Strict Path Traversal Sanitization**
+* **P19-S01-M01: Strict Path Traversal Sanitization** `[COMPLETE]`
   * *Objective*: Validate all file paths to prevent directory escaping attacks.
-* **P19-S01-M02: Network Connection Limits & Slowloris Protection**
+  * *Delivered Components*:
+    - `internal/errors`: Added `ErrInvalidPath = stdErrors.New("invalid or escaping path")` and `InvalidPathError` struct implementing `errors.Is(target)` for `ErrInvalidPath`, `fs.ErrInvalid`, and `os.ErrInvalid`.
+    - `internal/security`: Implemented strict path containment package (`path.go`) providing:
+      * `ValidateDatabaseFileName`: Strict regex whitelist (`^[a-zA-Z0-9_.-]+$`) rejecting `/`, `\`, `..`, null bytes, control chars, spaces.
+      * `CleanAndValidatePath`: Lexical cleanliness, non-empty, and null byte rejection.
+      * `ValidateContainment`: Exact separator containment (`filepath.Rel`), volume isolation, sibling directory prefix confusion prevention (`/db` vs `/db-evil`), and canonical symlink ancestor evaluation via `filepath.EvalSymlinks`.
+      * `ResolvePath` / `SanitizePath`: Safe relative/absolute path resolution within authorized root.
+    - `internal/wal`: Wired path validation and root containment into `OpenWriter`, `CreateWriter`, `OpenSegmentWriter`, `CreateSegmentWriter`, `OpenReader`, and `OpenSegmentReader`.
+    - `internal/sstable`: Wired path validation and filename whitelisting into `NewTableWriter` and `NewTableReaderWithOptions`.
+    - `internal/engine`: Wired path validation into `NewEngineWithOptions` and `Engine.Open`.
+    - `cmd/lattice`: Hardened `Config.Validate` (`--data-dir`), `loadConfigFile` (`--config`), `InspectSSTable` (symlink rejection via `os.Lstat` and TOCTOU inode pinning via `os.SameFile`), and `DumpWAL`.
+  * *Verification*:
+    - Unit tests: `internal/security/path_test.go` covering basic paths, nested paths, lexical escapes (`../`, `../../`), boundary prefix confusion, null bytes, symlink escape rejection, and valid internal symlink traversal.
+    - Fuzz test: `FuzzResolvePath` executed 1.38M iterations with zero invariant violations.
+    - Integration tests: `cmd/lattice/inspect_test.go`, `cmd/lattice/dump_wal_test.go`, `cmd/lattice/config_test.go`, `internal/errors/errors_test.go`.
+    - Full test suite passing across all packages; clean `go vet`, clean `gofmt`, clean `git diff --check`, clean `-race` on all affected packages.
+* **P19-S01-M02: Network Connection Limits & Slowloris Protection** `[PENDING]`
   * *Objective*: Enforce read/write connection deadlines and client connection limits ($4,096$).
+
 
 ---
 

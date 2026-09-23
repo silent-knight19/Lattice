@@ -12,6 +12,7 @@ import (
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
 	"github.com/silent-knight19/lattice/internal/filter"
+	"github.com/silent-knight19/lattice/internal/security"
 )
 
 // writerState represents the lifecycle phase of an active TableWriter.
@@ -160,11 +161,15 @@ type TableWriter struct {
 // NewTableWriter initializes a TableWriter to write an SSTable to dstPath using a secure staging file.
 // If an SSTable already exists at dstPath, it returns errors.ErrSSTableExists.
 func NewTableWriter(dstPath string, opts TableWriterOptions) (*TableWriter, error) {
-	if dstPath == "" {
-		return nil, os.ErrInvalid
+	cleanDst, err := security.CleanAndValidatePath(dstPath)
+	if err != nil {
+		return nil, fmt.Errorf("sstable: %w", err)
 	}
 
-	cleanDst := filepath.Clean(dstPath)
+	baseName := filepath.Base(cleanDst)
+	if err := security.ValidateDatabaseFileName(baseName); err != nil {
+		return nil, fmt.Errorf("sstable: %w", err)
+	}
 
 	// Reject overwriting an existing finalized SSTable or symlink
 	if _, err := os.Lstat(cleanDst); err == nil {

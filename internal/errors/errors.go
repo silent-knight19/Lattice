@@ -84,6 +84,10 @@ var (
 	// is a regular file, symlink, or other non-directory object.
 	ErrNotADirectory = stdErrors.New("path is not a directory")
 
+	// ErrInvalidPath indicates that a filesystem path escapes its designated security root,
+	// contains illegal characters (e.g. null bytes), or violates containment constraints.
+	ErrInvalidPath = stdErrors.New("invalid or escaping path")
+
 	// ErrWriterClosed indicates that an operation was attempted on a closed WAL writer.
 	ErrWriterClosed = stdErrors.New("wal writer is closed")
 
@@ -736,6 +740,38 @@ func (e *NotADirectoryError) Error() string {
 // Is reports whether this error matches target sentinel ErrNotADirectory.
 func (e *NotADirectoryError) Is(target error) bool {
 	return target == ErrNotADirectory
+}
+
+// InvalidPathError provides structured context when a filesystem path violates containment,
+// contains null bytes, or escapes its designated security root.
+// It matches ErrInvalidPath when interrogated with errors.Is().
+type InvalidPathError struct {
+	Path   string
+	Root   string
+	Reason string
+}
+
+func (e *InvalidPathError) Error() string {
+	if e == nil {
+		return ErrInvalidPath.Error()
+	}
+	if e.Root != "" && e.Path != "" {
+		return fmt.Sprintf("invalid path %q outside root %q: %s", e.Path, e.Root, e.Reason)
+	}
+	if e.Path != "" {
+		return fmt.Sprintf("invalid path %q: %s", e.Path, e.Reason)
+	}
+	return ErrInvalidPath.Error()
+}
+
+// Is reports whether this error matches target sentinel ErrInvalidPath or fs.ErrInvalid / os.ErrInvalid.
+func (e *InvalidPathError) Is(target error) bool {
+	return target == ErrInvalidPath || target == fs.ErrInvalid
+}
+
+// Unwrap returns the underlying sentinel error ErrInvalidPath.
+func (e *InvalidPathError) Unwrap() error {
+	return ErrInvalidPath
 }
 
 // SegmentGapError provides structured context when a gap is detected in the sequence of WAL segment IDs.

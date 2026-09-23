@@ -3896,4 +3896,87 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
+# 24. Deep Systems Interview Questions & Answers: Strict Path Traversal Sanitization & Filesystem Containment (P19-S01-M01)
+
+### 1. Why are `filepath.Clean` and `filepath.Join` insufficient on their own as security boundaries?
+* **Question**: Why is relying solely on `filepath.Join(rootDir, userInput)` or `filepath.Clean(userInput)` a classic directory traversal vulnerability in Go?
+* **Answer**:
+  - **`filepath.Clean` is Lexical Only**: `filepath.Clean` evaluates relative path elements (`.`, `..`, redundant slashes) purely through string manipulation without inspecting the underlying filesystem. It turns `foo/../bar` into `bar`, but if given `../../etc/passwd`, it cleans it to `../../etc/passwd`—it does *not* anchor the path to any root.
+  - **`filepath.Join` Traversal Bypass**: `filepath.Join("/var/lib/lattice", "../../etc/passwd")` lexically resolves the `..` against the preceding elements, producing `/etc/passwd`. The result completely escapes the intended root directory without triggering an error.
+  - **Absolute Path Injection**: On Unix and Windows, joining paths where the second component is absolute (or contains volume specifiers) can override the root or result in unexpected lexical combinations.
+  - **Security Containment Requirement**: A secure containment boundary must explicitly compute the relative relationship between the canonical root and the target (`filepath.Rel`), verify that the relative path does not begin with `..` and does not cross drive/volume boundaries, and validate that canonical symlink targets remain strictly inside the root.
+
+### 2. What is sibling-prefix boundary confusion, and how do you prevent it?
+* **Question**: Why is checking `strings.HasPrefix(targetPath, rootDir)` vulnerable to directory escaping, and what is the correct containment test?
+* **Answer**:
+  - **The Sibling-Prefix Flaw**: Suppose the authorized root directory is `/tmp/db`. An attacker provides a path that resolves to `/tmp/db-evil/malicious.sst`.
+  - Calling `strings.HasPrefix("/tmp/db-evil/malicious.sst", "/tmp/db")` returns `true` because the character string `/tmp/db-evil` begins with the substring `/tmp/db`.
+  - The attacker bypasses containment and accesses a completely separate sibling directory on disk.
+  - **The Proper Lexical Containment Solution**:
+    1. Ensure the root path includes a trailing separator, or
+    2. Use `filepath.Rel(cleanRoot, cleanTarget)`:
+       ```go
+       rel, err := filepath.Rel(cleanRoot, cleanTarget)
+       if err != nil || (rel != "." && strings.HasPrefix(rel, "..")) {
+           return errors.ErrInvalidPath
+       }
+       ```
+    `filepath.Rel` decomposes paths into directory segments. For `/tmp/db` and `/tmp/db-evil/file`, `filepath.Rel` returns `../db-evil/file`, which immediately triggers the `strings.HasPrefix(rel, "..")` guard and is rejected.
+
+### 3. Why should database filenames adhere to a strict character whitelist regex?
+* **Question**: In LSM-tree storage engines, why is validating database filenames against a strict regex whitelist (`^[a-zA-Z0-9_.-]+$`) superior to blacklisting dangerous strings?
+* **Answer**:
+  - **Blacklists Are Incomplete**: Blacklisting specific patterns like `..` or `/` fails against unexpected filesystem features: null bytes (`\x00`), Windows alternate data streams (`file.txt::$DATA`), control characters (`\r`, `\n`), wildcard characters (`*`, `?`), or Unicode normalization tricks.
+  - **Whitelisting Constrains Attack Surface to Zero**: Internal storage files (e.g. `000001.sst`, `wal_000000000001.log`, `MANIFEST`) only ever require alphanumeric characters, underscores, hyphens, and periods.
+  - By enforcing:
+    ```go
+    var validDBFileNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
+    ```
+    and checking that the name is not `.` or `..`, any input containing directory separators (`/`, `\`), null bytes, shell metacharacters, or spaces is rejected at the entrypoint before any filesystem syscall is ever issued.
+
+### 4. How does `internal/security.ValidateContainment` handle symlink breakout without breaking legit symlinked roots?
+* **Question**: Why does calling `filepath.EvalSymlinks` naively on non-existent target files fail, and how do you validate symlink containment across the directory hierarchy?
+* **Answer**:
+  - **The Non-Existent Target Problem**: When creating a new file (e.g. `NewTableWriter` or `CreateSegmentWriter`), the target file *does not yet exist* on disk. Calling `filepath.EvalSymlinks(targetPath)` returns `os.ErrNotExist`, which would prevent creating any new file if handled incorrectly.
+  - **Deepest-Existing-Ancestor Resolution**:
+    1. Resolve the canonical root directory first using `filepath.EvalSymlinks(absRoot)`. This accounts for OS-level directory symlinks (such as macOS symlinking `/var` to `/private/var` or `/tmp` to `/private/tmp`).
+    2. Walk upward from the target path to find its deepest ancestor directory that actually exists on disk.
+    3. Evaluate symlinks on that existing ancestor directory.
+    4. Compute `filepath.Rel(evalRoot, evalAncestor)` and assert that `evalAncestor` is strictly contained within `evalRoot`.
+    5. Reconstruct the remaining trailing non-existent components and verify lexical containment within the canonical root.
+  - This guarantees that even if an existing parent directory in the path is a symlink pointing outside the database root, the escape is detected and rejected before file creation.
+
+### 5. What is the TOCTOU window in file inspection tools, and how does inode pinning eliminate it?
+* **Question**: In diagnostic tools like `InspectSSTable`, why is calling `os.Stat(path)` before `os.Open(path)` vulnerable to a TOCTOU race, and how do `os.Lstat` and `os.SameFile` mitigate it?
+* **Answer**:
+  - **The TOCTOU Replacement Window**:
+    1. The tool calls `os.Stat(path)`. The kernel follows symlinks, finds a regular file, and reports success.
+    2. Between `os.Stat` and `os.Open`, a concurrent process replaces the target file with a symbolic link pointing to `/dev/urandom` or a named pipe (`FIFO`).
+    3. The tool executes `os.Open(path)`. It follows the new symlink, blocking indefinitely on the FIFO or reading unconstrained attacker data.
+  - **The Remediation**:
+    1. Call `os.Lstat(cleanPath)`: `Lstat` does not follow symlinks. If `info.Mode() & os.ModeSymlink != 0`, immediately fail closed.
+    2. If `!info.Mode().IsRegular()`, fail closed (rejects FIFOs, character devices, sockets before opening).
+    3. Open the file descriptor: `file, err := os.Open(cleanPath)`.
+    4. Query `stat, err := file.Stat()` directly on the opened file descriptor.
+    5. Check `os.SameFile(info, stat)`: If the file was replaced, deleted, or unlinked between `Lstat` and `Open`, the device and inode numbers mismatch. The tool closes the descriptor and fails closed immediately.
+
+### 6. Why must invalid path errors wrap `errors.ErrInvalidPath` and `os.ErrInvalid`?
+* **Question**: How do you design path validation error types to provide rich diagnostic context while maintaining standard library error compatibility?
+* **Answer**:
+  - **Domain-Specific Classification**: Storage systems need to distinguish I/O failures (disk full `ENOSPC`, permission denied `EACCES`, hardware I/O `EIO`) from malicious or malformed path traversal attempts (`ErrInvalidPath`).
+  - **Custom Error Type with Multi-Target `Is` Method**:
+    ```go
+    type InvalidPathError struct {
+        Path   string
+        Root   string
+        Reason string
+    }
+    func (e *InvalidPathError) Is(target error) bool {
+        return target == ErrInvalidPath || target == fs.ErrInvalid || target == os.ErrInvalid
+    }
+    ```
+  - This allows existing tests and callers asserting `errors.Is(err, os.ErrInvalid)` to pass seamlessly, while enabling security monitors, audit logs, and network handlers to detect `errors.Is(err, errors.ErrInvalidPath)` and reject or alert on malicious traversal probes.
+
+---
+
 *End of Technical Interview Knowledge Base — Lattice v1.0.0-KNOWLEDGE-BASE*

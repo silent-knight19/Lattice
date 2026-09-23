@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 
 	"github.com/silent-knight19/lattice/internal/errors"
+	"github.com/silent-knight19/lattice/internal/security"
 	"github.com/silent-knight19/lattice/internal/wal"
 )
 
@@ -56,7 +56,11 @@ type DumpWALReport struct {
 //   - Deterministic distinction between clean EOF (Exit 0) and truncated tails (Exit 3).
 //   - Terminal-safe escaping of binary keys and values using FormatBytes.
 func DumpWAL(path string, verbose bool, stdout, stderr io.Writer) int {
-	cleanPath := filepath.Clean(path)
+	cleanPath, err := security.CleanAndValidatePath(path)
+	if err != nil {
+		fmt.Fprintf(stderr, "lattice dump-wal: %v\n", err)
+		return ExitDumpFileError
+	}
 
 	// Step 1: Open WAL reader (enforcing regular file, no symlinks, no dirs, inode pinning)
 	r, err := wal.OpenReader(cleanPath)

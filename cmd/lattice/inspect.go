@@ -6,13 +6,13 @@ import (
 	"io"
 	"math"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/filter"
+	"github.com/silent-knight19/lattice/internal/security"
 	"github.com/silent-knight19/lattice/internal/sstable"
 )
 
@@ -146,13 +146,20 @@ func FormatBytes(b []byte) string {
 // InspectSSTable performs a read-only forensic inspection of an SSTable file at path.
 // It populates a ForensicReport without mutating the file or initializing the storage Engine.
 func InspectSSTable(path string, report *ForensicReport) error {
-	cleanPath := filepath.Clean(path)
-
-	// Pre-open stat: verify target exists and is a regular file before calling os.Open.
-	// This prevents blocking indefinitely on named pipes (FIFOs) waiting for a writer (SEC-P12-001).
-	info, err := os.Stat(cleanPath)
+	cleanPath, err := security.CleanAndValidatePath(path)
 	if err != nil {
 		return err
+	}
+
+	// Pre-open stat: verify target exists and is a regular file before calling os.Open.
+	// This prevents blocking indefinitely on named pipes (FIFOs) waiting for a writer (SEC-P12-001)
+	// and prevents symlink redirection attacks.
+	info, err := os.Lstat(cleanPath)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("path %q is a symbolic link: %w", cleanPath, os.ErrInvalid)
 	}
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("path %q is not a regular file (mode: %s)", cleanPath, info.Mode())
@@ -170,6 +177,9 @@ func InspectSSTable(path string, report *ForensicReport) error {
 	}
 	if !stat.Mode().IsRegular() {
 		return fmt.Errorf("path %q is not a regular file (mode: %s)", cleanPath, stat.Mode())
+	}
+	if !os.SameFile(info, stat) {
+		return fmt.Errorf("path %q was replaced during open: %w", cleanPath, os.ErrInvalid)
 	}
 
 	report.Path = cleanPath

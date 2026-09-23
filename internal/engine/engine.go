@@ -16,6 +16,7 @@ import (
 	"github.com/silent-knight19/lattice/internal/cache"
 	"github.com/silent-knight19/lattice/internal/errors"
 	"github.com/silent-knight19/lattice/internal/memtable"
+	"github.com/silent-knight19/lattice/internal/security"
 	"github.com/silent-knight19/lattice/internal/sstable"
 	"github.com/silent-knight19/lattice/internal/version"
 	"github.com/silent-knight19/lattice/internal/wal"
@@ -188,7 +189,11 @@ func NewEngineWithOptions(opts EngineOptions) *Engine {
 	}
 	cleanDBPath := ""
 	if opts.DBPath != "" {
-		cleanDBPath = filepath.Clean(opts.DBPath)
+		if p, err := security.CleanAndValidatePath(opts.DBPath); err == nil {
+			cleanDBPath = p
+		} else {
+			cleanDBPath = filepath.Clean(opts.DBPath)
+		}
 	}
 	shutTimeout := opts.ShutdownTimeout
 	if shutTimeout <= 0 {
@@ -275,6 +280,11 @@ func (e *Engine) Open() error {
 	if dbPath == "" {
 		return fmt.Errorf("%w: engine dbPath cannot be empty", os.ErrInvalid)
 	}
+	cleanDBPath, err := security.CleanAndValidatePath(dbPath)
+	if err != nil {
+		return fmt.Errorf("engine: %w", err)
+	}
+	dbPath = cleanDBPath
 	if err := os.MkdirAll(dbPath, 0700); err != nil {
 		return fmt.Errorf("engine: failed to create database directory: %w", err)
 	}

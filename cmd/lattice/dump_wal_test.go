@@ -571,6 +571,14 @@ func TestDumpWAL_CLIUsageAndFileErrors(t *testing.T) {
 	if code != ExitDumpFileError {
 		t.Errorf("expected ExitDumpFileError (2) on symlink target, got %d", code)
 	}
+
+	// 9. Null byte path
+	stdout.Reset()
+	stderr.Reset()
+	code = runDumpWAL([]string{"wal\x00evil.log"}, &stdout, &stderr)
+	if code != ExitDumpFileError {
+		t.Errorf("expected ExitDumpFileError (2) on null byte path, got %d", code)
+	}
 }
 
 // -----------------------------------------------------------------------------

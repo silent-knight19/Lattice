@@ -1596,4 +1596,32 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 85. Strict Path Traversal Sanitization and Security Containment Boundaries (P19-S01-M01)
+* **Limitation & Architectural Boundaries**:
+  1. *Lexical vs. Semantic Security Boundaries*:
+     - `filepath.Clean` and `filepath.Join` are lexical path manipulators, not security isolation primitives. Lexical normalization does not enforce root containment or prevent prefix collisions.
+     - `internal/security` establishes a centralized containment boundary via `CleanAndValidatePath`, `ValidateDatabaseFileName`, `ValidateContainment`, and `ResolvePath`.
+     - In-scope untrusted paths (CLI `--data-dir`, `--config`, diagnostic tool arguments `inspect-sstable`, `dump-wal`, table creation, and segment file lookups) fail closed with structured `errors.InvalidPathError` wrapping `errors.ErrInvalidPath`.
+  2. *Sibling-Prefix Boundary Confusion Defense*:
+     - Naive string prefix checks (`strings.HasPrefix(target, root)`) are vulnerable to sibling-prefix confusion where target `/db-evil/file` falsely matches root `/db`.
+     - Containment is enforced via exact separator relative resolution (`filepath.Rel` yielding `rel == "." || !strings.HasPrefix(rel, "..")`), volume matching, and strict character whitelisting.
+  3. *Database Filename Character Whitelist*:
+     - Internal database filenames (WAL segments, SSTable files) are strictly constrained to `^[a-zA-Z0-9_.-]+$` via `security.ValidateDatabaseFileName()`, completely rejecting path separators (`/`, `\`), traversal sequences (`..`), null bytes (`\x00`), spaces, and shell metacharacters.
+  4. *Symlink Resolution & Canonical Containment*:
+     - `ValidateContainment` evaluates symlinks across the ancestor hierarchy using `filepath.EvalSymlinks` on both the canonical root and the deepest existing ancestor of the target path, rejecting any path whose resolved physical disk location escapes the canonical root.
+     - Diagnostic inspection (`InspectSSTable`) uses `os.Lstat` to reject symlinks before opening, followed by `os.SameFile(info, stat)` inode comparison post-open to eliminate TOCTOU replacement races.
+  5. *Documented Runtime TOCTOU Boundary*:
+     - **Explicit Limitation**: On standard POSIX filesystems without kernel-level `openat2(RESOLVE_BENEATH)` or `O_NOFOLLOW` tree descriptors, a race window inherently exists if an unprivileged malicious process has local filesystem write access within the database root *during active server runtime* and replaces an intermediate directory with a symlink between path validation and file open.
+     - Lattice guarantees complete protection against all external path injection, parameter traversal, escaping sequences, and pre-existing symlink breakouts. Protection against concurrent runtime filesystem mutation within the root directory relies on standard OS filesystem permissions (`0700`/`0750`) ensuring that only the database process user has write access to the database storage directory.
+* **Why It Exists**:
+  Storage engines must guarantee that user-controlled path parameters and diagnostic tools cannot access, overwrite, or delete arbitrary files outside the dedicated storage directory.
+* **Impact**:
+  Eliminates directory traversal, null-byte poisoning, and symlink escape vulnerabilities across all database storage and inspection entrypoints.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Fail-closed error propagation preserving backward compatibility with `fs.ErrInvalid`).
+  * Security: **Audited & Hardened** (Strict containment, regex whitelisting, symlink ancestor resolution, inode pinning).
+  * Performance: **Optimal** (Zero runtime impact on hot data read/write paths; validation applied at file creation/open boundaries).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*

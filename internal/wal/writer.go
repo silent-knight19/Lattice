@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/silent-knight19/lattice/internal/errors"
+	"github.com/silent-knight19/lattice/internal/security"
 )
 
 // FileMode defines the restrictive POSIX file permission mode (0600) for WAL segment files:
@@ -78,11 +79,10 @@ type WALWriter struct {
 // If the file already exists, existing contents are preserved intact (no truncation).
 // If the target path is a directory or symlink, opening is rejected with an error.
 func OpenWriter(path string) (*WALWriter, error) {
-	if path == "" {
-		return nil, fmt.Errorf("%w: path cannot be empty", os.ErrInvalid)
+	cleanPath, err := security.CleanAndValidatePath(path)
+	if err != nil {
+		return nil, fmt.Errorf("wal: %w", err)
 	}
-
-	cleanPath := filepath.Clean(path)
 
 	// Parent directory validation: ensure parent directory exists, is a directory, and is not an unpermitted symlink
 	parentDir := filepath.Dir(cleanPath)
@@ -177,7 +177,11 @@ func OpenSegmentWriter(dbPath string, id uint64) (*WALWriter, error) {
 	if id == 0 {
 		return nil, fmt.Errorf("wal: segment ID must be strictly positive: %w", os.ErrInvalid)
 	}
-	return OpenWriter(SegmentPath(dbPath, id))
+	segPath := SegmentPath(dbPath, id)
+	if err := security.ValidateContainment(dbPath, segPath); err != nil {
+		return nil, fmt.Errorf("wal: %w", err)
+	}
+	return OpenWriter(segPath)
 }
 
 // CreateWriter creates a new WAL segment file at the specified filesystem path
@@ -190,11 +194,10 @@ func OpenSegmentWriter(dbPath string, id uint64) (*WALWriter, error) {
 //   - Rejects symbolic links, directories, and non-regular objects.
 //   - Pins the opened file descriptor to the disk inode via os.SameFile.
 func CreateWriter(path string) (*WALWriter, error) {
-	if path == "" {
-		return nil, fmt.Errorf("%w: path cannot be empty", os.ErrInvalid)
+	cleanPath, err := security.CleanAndValidatePath(path)
+	if err != nil {
+		return nil, fmt.Errorf("wal: %w", err)
 	}
-
-	cleanPath := filepath.Clean(path)
 
 	// Parent directory validation: ensure parent directory exists, is a directory, and is not an unpermitted symlink
 	parentDir := filepath.Dir(cleanPath)
@@ -283,7 +286,11 @@ func CreateSegmentWriter(dbPath string, id uint64) (*WALWriter, error) {
 	if id == 0 {
 		return nil, fmt.Errorf("wal: segment ID must be strictly positive: %w", os.ErrInvalid)
 	}
-	return CreateWriter(SegmentPath(dbPath, id))
+	segPath := SegmentPath(dbPath, id)
+	if err := security.ValidateContainment(dbPath, segPath); err != nil {
+		return nil, fmt.Errorf("wal: %w", err)
+	}
+	return CreateWriter(segPath)
 }
 
 // Path returns the canonical filesystem path of the active WAL segment file.
