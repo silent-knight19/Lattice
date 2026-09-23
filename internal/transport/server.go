@@ -336,6 +336,7 @@ func (s *Server) acceptLoop(l net.Listener) {
 				return
 			}
 			var ne net.Error
+			//nolint:staticcheck // Temporary is used intentionally to handle transient network errors (e.g. EMFILE)
 			if stdErrors.As(err, &ne) && ne.Temporary() {
 				if tempDelay == 0 {
 					tempDelay = 5 * time.Millisecond

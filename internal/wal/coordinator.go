@@ -104,6 +104,7 @@ type RecoveryReport struct {
 //     honestly reflecting the physical filesystem state.
 //  10. Quiescent Startup Assumption:
 //     Assumes WAL segments are quiescent (no concurrent RotatingWriter is running).
+//
 // RecoverWAL coordinates multi-segment crash recovery across a database WAL directory.
 func RecoverWAL(dbPath string, sink ReplaySink) (RecoveryReport, error) {
 	return RecoverWALFrom(dbPath, sink, 1)

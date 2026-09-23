@@ -138,6 +138,12 @@ func DecodeFrame(r io.Reader) (*Frame, error) {
 		return nil, err
 	}
 
+	// Defense-in-depth: explicitly re-verify payload length against MaxPayloadLength
+	// before any buffer acquisition or stream consumption.
+	if hdr.PayloadLength > MaxPayloadLength {
+		return nil, &errors.FrameTooLargeError{PayloadSize: hdr.PayloadLength, MaxSize: MaxPayloadLength}
+	}
+
 	var payload []byte
 	if hdr.PayloadLength > 0 {
 		bufPtr, is64K := getPooledBuffer(hdr.PayloadLength)

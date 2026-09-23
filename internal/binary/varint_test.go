@@ -1036,4 +1036,3 @@ func FuzzDecodeVarint(f *testing.F) {
 		_, _, _ = binary.GetVarint32Canonical(data)
 	})
 }
-

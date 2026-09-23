@@ -562,7 +562,7 @@ func (s *Storage) Close() error {
 
 	var firstErr error
 	if s.logFile != nil {
-		if err := fdatasync(s.logFile); err != nil && firstErr == nil {
+		if err := fdatasync(s.logFile); err != nil {
 			firstErr = err
 		}
 		if err := s.logFile.Close(); err != nil && firstErr == nil {

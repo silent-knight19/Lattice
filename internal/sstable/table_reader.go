@@ -66,7 +66,7 @@ func isNilBlockCache(c BlockCache) bool {
 	}
 	v := reflect.ValueOf(c)
 	switch v.Kind() {
-	case reflect.Ptr, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func, reflect.Interface:
+	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func, reflect.Interface:
 		return v.IsNil()
 	default:
 		return false

@@ -435,7 +435,7 @@ func TestBinarySubprocess_InspectSSTable(t *testing.T) {
 
 	// 2. Test binary with non-existent file
 	cmd = exec.Command(binPath, "inspect-sstable", filepath.Join(tempDir, "missing.sst"))
-	out, err = cmd.CombinedOutput()
+	_, err = cmd.CombinedOutput()
 	if err == nil {
 		t.Fatal("expected non-zero exit for missing file, got 0")
 	}

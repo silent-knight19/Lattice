@@ -595,4 +595,3 @@ func TestFilterBlock_AdversarialParameterDesync(t *testing.T) {
 		}
 	}
 }
-

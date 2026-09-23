@@ -88,7 +88,6 @@ func (it *Iterator) Next() bool {
 		return false
 	}
 
-
 	switch it.state {
 	case stateUnpositioned:
 		it.curr = it.sl.head.forward[0].Load()
@@ -194,7 +193,6 @@ func (it *Iterator) Seek(userKey []byte) error {
 		return err
 	}
 
-
 	curr := it.sl.head
 	h := int(it.sl.height.Load())
 	if h > MaxHeight {
@@ -237,7 +235,6 @@ func (it *Iterator) SeekToFirst() {
 		return
 	}
 
-
 	it.curr = it.sl.head.forward[0].Load()
 	if it.curr != nil {
 		it.state = statePositioned
@@ -276,7 +273,6 @@ func (it *Iterator) SeekInternalKey(target binary.InternalKey) error {
 		it.state = stateExhausted
 		return err
 	}
-
 
 	curr := it.sl.head
 	h := int(it.sl.height.Load())

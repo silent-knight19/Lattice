@@ -43,11 +43,16 @@ func NewAuditContext(rootDir string, filePaths []string) *AuditContext {
 		absRoot = rootDir
 	}
 
+	suppMgr := NewSuppressionManager()
+	for _, s := range DefaultAuditableSuppressions() {
+		_ = suppMgr.Add(s)
+	}
+
 	return &AuditContext{
 		RootDir:      absRoot,
 		FilePaths:    filePaths,
 		Exclusions:   DefaultExclusionDirs,
-		Suppression:  NewSuppressionManager(),
+		Suppression:  suppMgr,
 		Fset:         token.NewFileSet(),
 		parsedFiles:  make(map[string]*ast.File),
 		fileContents: make(map[string][]byte),

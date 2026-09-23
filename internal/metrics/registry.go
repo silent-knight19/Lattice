@@ -125,10 +125,10 @@ func (g *Gauge) Value() int64 {
 // Histogram tracks the statistical distribution of observations across fixed bucket boundaries.
 // Observations are recorded lock-free with zero heap allocations on the hot path.
 type Histogram struct {
-	boundaries []float64        // Upper boundaries (strictly ascending, does not include +Inf)
-	buckets    []atomic.Uint64  // Discrete observation counts per bucket; len = len(boundaries) + 1 (last is overflow)
-	count      atomic.Uint64    // Total number of observations
-	sumNs      atomic.Int64     // Cumulative sum of observed durations in nanoseconds
+	boundaries []float64       // Upper boundaries (strictly ascending, does not include +Inf)
+	buckets    []atomic.Uint64 // Discrete observation counts per bucket; len = len(boundaries) + 1 (last is overflow)
+	count      atomic.Uint64   // Total number of observations
+	sumNs      atomic.Int64    // Cumulative sum of observed durations in nanoseconds
 }
 
 // NewHistogram constructs a Histogram with the specified bucket boundaries.
@@ -173,10 +173,10 @@ func (h *Histogram) observeNs(seconds float64, ns int64) {
 
 // HistogramSnapshot contains a point-in-time consistent view of histogram state.
 type HistogramSnapshot struct {
-	Count       uint64
-	SumSeconds  float64
-	Boundaries  []float64
-	Cumulative  []uint64 // Cumulative counts corresponding to Boundaries; final entry is +Inf
+	Count      uint64
+	SumSeconds float64
+	Boundaries []float64
+	Cumulative []uint64 // Cumulative counts corresponding to Boundaries; final entry is +Inf
 }
 
 // Snapshot returns a point-in-time calculation of cumulative bucket counts.
@@ -216,11 +216,10 @@ func (h *Histogram) Snapshot() HistogramSnapshot {
 // All label keys and their permitted discrete values are declared at initialization,
 // guaranteeing strict O(1) bounded cardinality and zero dynamic map expansion.
 type HistogramVec struct {
-	boundaries   []float64
-	labelNames   []string
-	labelValues  []string
-	entries      map[string]*Histogram
-	orderedKeys  []string
+	boundaries  []float64
+	labelNames  []string
+	entries     map[string]*Histogram
+	orderedKeys []string
 }
 
 // NewHistogramVec constructs a HistogramVec with strictly bounded label values.

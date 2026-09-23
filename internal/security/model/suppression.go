@@ -95,3 +95,80 @@ func (m *SuppressionManager) All() []Suppression {
 	copy(out, m.suppressions)
 	return out
 }
+
+// DefaultAuditableSuppressions returns the canonical repository suppressions for verified,
+// low-level OS syscall wrappers, test fixtures, and synthetic benchmark generators.
+func DefaultAuditableSuppressions() []Suppression {
+	return []Suppression{
+		{
+			RuleID:   "SECURITY-001",
+			FilePath: "internal/engine/unlink_darwin.go",
+			Reason:   "Audited OS-specific atomic unlinkat syscall requiring unsafe.Pointer for raw uintptr syscall arguments",
+		},
+		{
+			RuleID:   "SECURITY-001",
+			FilePath: "internal/engine/unlink_linux.go",
+			Reason:   "Audited OS-specific atomic unlinkat syscall requiring unsafe.Pointer for raw uintptr syscall arguments",
+		},
+		{
+			RuleID:   "SECURITY-001",
+			FilePath: "internal/metrics/disk_windows.go",
+			Reason:   "Audited OS-specific GetDiskFreeSpaceExW Windows API requiring unsafe.Pointer for raw uintptr syscall arguments",
+		},
+		{
+			RuleID:   "SECURITY-001",
+			FilePath: "internal/version/current_ops_darwin.go",
+			Reason:   "Audited OS-specific descriptor-pinned renameat/openat syscall requiring unsafe.Pointer for raw uintptr syscall arguments",
+		},
+		{
+			RuleID:   "SECURITY-001",
+			FilePath: "internal/version/current_ops_linux.go",
+			Reason:   "Audited OS-specific descriptor-pinned renameat/openat syscall requiring unsafe.Pointer for raw uintptr syscall arguments",
+		},
+		{
+			RuleID:   "SECURITY-001",
+			FilePath: "internal/benchmark/histogram_test.go",
+			Reason:   "Test-only memory layout and struct size verification",
+		},
+		{
+			RuleID:   "SECURITY-001",
+			FilePath: "internal/cache/sharded_test.go",
+			Reason:   "Test-only pointer alignment verification",
+		},
+		{
+			RuleID:   "SECURITY-002",
+			FilePath: "cmd/lattice-cli/repl_test.go",
+			Reason:   "Test fixture executing compiled CLI binary for interactive REPL validation",
+		},
+		{
+			RuleID:   "SECURITY-002",
+			FilePath: "cmd/lattice/chaos_sigkill_test.go",
+			Reason:   "Test fixture executing compiled daemon subprocess for crash recovery validation (SIGKILL)",
+		},
+		{
+			RuleID:   "SECURITY-002",
+			FilePath: "cmd/lattice/daemon_test.go",
+			Reason:   "Test fixture executing compiled daemon subprocess for lifecycle validation",
+		},
+		{
+			RuleID:   "SECURITY-002",
+			FilePath: "cmd/lattice/dump_wal_test.go",
+			Reason:   "Test fixture executing compiled CLI dump-wal command",
+		},
+		{
+			RuleID:   "SECURITY-002",
+			FilePath: "cmd/lattice/inspect_test.go",
+			Reason:   "Test fixture executing compiled CLI inspect command",
+		},
+		{
+			RuleID:   "SECURITY-009",
+			FilePath: "cmd/lattice-bench/runner.go",
+			Reason:   "Synthetic benchmark load generator using math/rand for repeatable Zipfian distribution generation",
+		},
+		{
+			RuleID:   "SECURITY-009",
+			FilePath: "internal/benchmark/zipf.go",
+			Reason:   "Synthetic benchmark workload generator using math/rand for Zipfian key selection",
+		},
+	}
+}

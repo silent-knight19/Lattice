@@ -14,7 +14,7 @@ Security updates and patches are provided for the following releases:
 
 | Version | Supported | Notes |
 |---|---|---|
-| `v0.1.x` (current main) | :white_check_mark: | Active development (Phases 00–12 completed) |
+| `v0.1.x` (current main) | :white_check_mark: | Production engine & distributed consensus (Phases 00–21 complete) |
 | `< v0.1.0` | :x: | Experimental / pre-release phases |
 
 ---
@@ -48,14 +48,23 @@ Please include in your report:
 
 ## 4. Trust Boundaries & Scope
 
-As defined in [`docs/threat-model.md`](docs/threat-model.md), Lattice enforces three distinct trust boundaries:
+As defined in [`docs/threat-model.md`](docs/threat-model.md), Lattice enforces four distinct trust boundaries:
 
 1. **Trust Boundary 1: Client / Transport Layer (`internal/transport`)**
-   - Defensive TCP binary framing with hard byte limits to prevent frame-bomb DoS and unbounded allocations.
-2. **Trust Boundary 2: Storage & Host Filesystem (`internal/sstable`, `internal/wal`, `internal/version`)**
-   - Path traversal prevention, strict file permissions (`0600`/`0700`), parent directory descriptor pinning, symlink validation (`validatePathNoSymlinks`), atomic publication via hard link (`os.Link`) without destructive `os.Rename` fallbacks.
-3. **Trust Boundary 3: Internal Logging & Diagnostics (`internal/logger`)**
+   - Defensive TCP binary framing with magic validation (`0x4C415454`), CRC32-IEEE checksum verification, and hard payload length bounds (`MaxPayloadLength = 5 MiB`) enforced before memory allocation.
+   - Connection concurrency ceilings (`MaxConnections = 4096`), Slowloris timeouts (`HeaderTimeout`, `PayloadTimeout`, `IdleTimeout`), and listener backoff on transient errors.
+2. **Trust Boundary 2: Storage & Host Filesystem (`internal/sstable`, `internal/wal`, `internal/version`, `internal/engine`)**
+   - Strict path confinement (`ValidateContainment`), path canonicalization, and symlink escape defenses.
+   - Strict POSIX file permissions (`0600`/`0700`), parent directory file descriptor pinning (`renameAt`, `openat`), and atomic publication via hard link (`os.Link`) without destructive `os.Rename` fallbacks.
+   - CRC32 verification and atomic file-replacement across WAL segments, SSTable blocks, and MANIFEST / CURRENT state transitions.
+3. **Trust Boundary 3: Distributed Cluster & Peer Transport (`internal/raft`, `internal/cluster`, `internal/transport`)**
+   - Node identity binding (`fromPeerID` matching authenticated peer address and request sender), self-vote rejection, and unknown node isolation.
+   - Monotonic terms and epochs, nonce tracking with sliding-window replay rejection (`DefaultReplayWindowSize = 4096`), and opcode-level peer isolation (`0x81`..`0x84`).
+   - Fail-closed cluster mode blocking direct engine write bypasses, and linearizable read verification (`ReadIndex` + `WaitForApplied` + quorum heartbeat confirmation).
+4. **Trust Boundary 4: Internal Logging, Observability & Diagnostics (`internal/logger`, `internal/metrics`, `cmd/lattice`)**
    - Automated redaction of sensitive credentials, passwords, cryptographic keys, tokens, session IDs, and seeds across flat attributes, nested structures, maps, slices, structs, and formatted messages.
+   - Bounded metric label cardinality (`O(1)` pre-allocated dimension matrices) preventing metric memory exhaustion.
+   - Diagnostic pprof endpoints strictly bound to loopback addresses (`127.0.0.1` / `::1`) with pre- and post-bind address assertion.
 
 ---
 
@@ -63,6 +72,7 @@ As defined in [`docs/threat-model.md`](docs/threat-model.md), Lattice enforces t
 
 Lattice maintains comprehensive security audit artifacts and verification tests:
 - Threat Model: [`docs/threat-model.md`](docs/threat-model.md)
+- Whole-Codebase Security Audit Report: [`docs/security/security-audit-report.md`](docs/security/security-audit-report.md)
 - Phase 00 Security Seal: [`docs/security/security-audit-phase-00.md`](docs/security/security-audit-phase-00.md)
 - Phase 00–05 Combined Audit: [`docs/security-audit-phase-00-05.md`](docs/security-audit-phase-00-05.md)
 - Phase 06 Security Seal: [`docs/security/security-audit-phase-06.md`](docs/security/security-audit-phase-06.md)

@@ -21,7 +21,7 @@ type secMockStateMachine struct {
 	puts    []secMockPut
 	deletes []secMockDelete
 	blockCh chan struct{} // if non-nil, Put/Delete block until closed
-	failErr error        // if non-nil, all operations return this error
+	failErr error         // if non-nil, all operations return this error
 }
 
 type secMockPut struct {
@@ -1035,7 +1035,7 @@ func TestSecurity_GAP_B_ActualStepdownReturnsNotLeaderRedirect(t *testing.T) {
 type noopEngine struct{}
 
 func (e *noopEngine) Put(ctx context.Context, key, val []byte) error { return nil }
-func (e *noopEngine) Get(key []byte) ([]byte, error)                { return nil, errors.ErrKeyNotFound }
+func (e *noopEngine) Get(key []byte) ([]byte, error)                 { return nil, errors.ErrKeyNotFound }
 func (e *noopEngine) Delete(ctx context.Context, key []byte) error   { return nil }
 
 // countingEngine counts direct Engine.Put/Delete calls.

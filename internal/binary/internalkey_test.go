@@ -717,4 +717,3 @@ func TestInternalKeyTrailerOffsetInvariant(t *testing.T) {
 		t.Fatalf("InternalKeyTrailerLen - 1 must be 8, got %d", binary.InternalKeyTrailerLen-1)
 	}
 }
-

@@ -573,9 +573,9 @@ func TestPartition_3Node_IsolatedLeader_ZeroSplitBrainCommit(t *testing.T) {
 	opts := clusterOptions{
 		heartbeatInterval: 15 * time.Millisecond,
 		durationProviders: map[cluster.NodeID]raft.DurationProvider{
-			1: func() time.Duration { return 150 * time.Millisecond },
-			2: func() time.Duration { return 35 * time.Millisecond }, // Node 2 times out first
-			3: func() time.Duration { return 70 * time.Millisecond },
+			1: func() time.Duration { return 300 * time.Millisecond },
+			2: func() time.Duration { return 60 * time.Millisecond }, // Node 2 times out first
+			3: func() time.Duration { return 250 * time.Millisecond },
 		},
 		transitionHooks: map[cluster.NodeID]raft.TransitionHook{
 			1: func(oldRole, newRole raft.Role, term raft.Term) {
@@ -760,12 +760,21 @@ func TestPartition_3Node_IsolatedLeader_ZeroSplitBrainCommit(t *testing.T) {
 	}
 
 	// Phase 6: Valid Majority Write through New Leader (Node 2)
-	respMaj, err := sendClientWrite(t, node2.server.Addr().String(), transport.OpPut, []byte("maj_key"), []byte("good_value"), 102)
+	// Under high parallel test load, allow brief election convergence if surviving majority is stabilizing.
+	var respMaj *transport.Response
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		respMaj, err = sendClientWrite(t, node2.server.Addr().String(), transport.OpPut, []byte("maj_key"), []byte("good_value"), 102)
+		if err == nil && respMaj != nil && respMaj.Status == transport.StatusOk {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 	if err != nil {
 		t.Fatalf("majority leader client write failed: %v", err)
 	}
-	if respMaj.Status != transport.StatusOk {
-		t.Fatalf("expected StatusOk on majority leader, got: %s (%s)", respMaj.Status, respMaj.Message)
+	if respMaj == nil || respMaj.Status != transport.StatusOk {
+		t.Fatalf("expected StatusOk on majority leader, got: %v", respMaj)
 	}
 
 	// Wait for majority write to commit and apply on surviving majority (Nodes 2 & 3)

@@ -519,3 +519,28 @@ func TestEncodeFrame_ConcurrentSharedFrameNoRace(t *testing.T) {
 		}
 	}
 }
+
+func TestDecodeFrame_OversizedPayloadDefenseInDepth(t *testing.T) {
+	// Construct an 18-byte header claiming a 10MB payload (exceeding MaxPayloadLength = 5MB)
+	var headerBuf [transport.HeaderSize]byte
+	binary.PutUint32(headerBuf[0:4], transport.Magic)
+	headerBuf[4] = byte(transport.OpPut)
+	headerBuf[5] = transport.FlagNone
+	binary.PutUint64(headerBuf[6:14], 100)
+	binary.PutUint32(headerBuf[14:18], 10*1024*1024)
+
+	// DecodeFrame must fail fast immediately with FrameTooLargeError without allocating
+	r := bytes.NewReader(headerBuf[:])
+	_, err := transport.DecodeFrame(r)
+	if err == nil {
+		t.Fatal("expected error decoding frame with 10MB payload length, got nil")
+	}
+
+	var largeErr *errors.FrameTooLargeError
+	if !stdErrors.As(err, &largeErr) {
+		t.Fatalf("expected *errors.FrameTooLargeError, got %T: %v", err, err)
+	}
+	if largeErr.PayloadSize != 10*1024*1024 || largeErr.MaxSize != transport.MaxPayloadLength {
+		t.Errorf("unexpected error payload size info: %+v", largeErr)
+	}
+}

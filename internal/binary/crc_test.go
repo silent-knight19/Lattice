@@ -493,4 +493,3 @@ func TestVerifyChecksum_FailClosed(t *testing.T) {
 		t.Fatalf("expected error for nil slice with wrong CRC, got nil")
 	}
 }
-

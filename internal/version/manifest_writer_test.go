@@ -877,7 +877,7 @@ func FuzzManifestRecordDecode(f *testing.F) {
 	// Seed 5: Large length field
 	f.Add([]byte{0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01})
 
-		f.Fuzz(func(t *testing.T, data []byte) {
+	f.Fuzz(func(t *testing.T, data []byte) {
 		r := bytes.NewReader(data)
 		payload, _, err := decodeManifestRecord(r)
 		if err == nil {

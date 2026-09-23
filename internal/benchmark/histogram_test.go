@@ -471,7 +471,6 @@ func TestHistogram_BoundaryValues(t *testing.T) {
 // captured in the presence of 99.9% fast operations.
 func TestHistogram_P999TailResolution(t *testing.T) {
 	h := NewLatencyHistogram()
-	const total = 100_000
 	const fastLatency = 200 * time.Microsecond
 	const tailLatency = 50 * time.Millisecond
 

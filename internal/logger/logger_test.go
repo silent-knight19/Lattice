@@ -1242,4 +1242,3 @@ func TestSEC_P00_003_ScrubValueByteSliceRedacted(t *testing.T) {
 		t.Errorf("raw byte payload leaked into log output: %s", buf.String())
 	}
 }
-

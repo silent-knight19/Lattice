@@ -56,16 +56,6 @@ type readQuorumRound struct {
 	acks       map[cluster.NodeID]struct{}
 	done       chan struct{}
 	err        error
-	waiters    int
-}
-
-func (r *readQuorumRound) isDone() bool {
-	select {
-	case <-r.done:
-		return true
-	default:
-		return false
-	}
 }
 
 // Node represents the core Raft consensus state machine governing role transitions
@@ -2457,7 +2447,6 @@ func (n *Node) replicateEntries(prevLogIndex uint64, prevLogTerm uint64, entries
 				return 0, false
 			}
 			appendFrom = i
-			lastIdx = e.Index - 1
 			break
 		}
 	}
@@ -3071,4 +3060,3 @@ func (n *Node) ValidateLeadership(expectedTerm Term, expectedEpoch uint64) error
 
 	return nil
 }
-
