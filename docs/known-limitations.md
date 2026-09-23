@@ -1573,6 +1573,18 @@ This document tracks all **genuine architectural and operational limitations** o
       - Verified that majority nodes remain connected, isolated nodes cannot reconnect while partitioned, and full mesh is re-established upon healing.
   13. *Deterministic Torn-Tail Recovery Verification (Finding P)*:
       - Added targeted test `TestWAL_DeterministicTornTailRecovery` proving that when an incomplete/truncated record exists at the WAL tail, startup recovery safely detects and truncates the torn record without losing prior valid records.
+  14. *Physical Disk-Based Oracle Ingestion (Finding FID-01)*:
+      - Hardened `AckLedger` with `ReadRecordsFromDisk()` to deserialize the synced `ack_ledger.jsonl` file directly from persistent storage during verification, ensuring that the verification oracle tests real disk durability rather than volatile heap cache.
+  15. *Synchronized Child Binary Race Instrumentation (Finding FID-02)*:
+      - Implemented build-tag reflection (`chaos_race_tag_test.go` and `chaos_norace_tag_test.go`) to detect `-race` execution in the parent test harness and automatically append `-race` to the `go build` command for child daemon binaries.
+  16. *Physical File In-Place Truncation Invariants (Finding FID-03)*:
+      - Updated `TestWAL_DeterministicTornTailRecovery` to invoke `wal.RecoverSegment` directly, proving that physical disk truncation occurs in-place, verifying file size reduction (`RecoveredOffset < CorruptSize`), and confirming subsequent clean reader decoding.
+  17. *Hermetic Subprocess Filesystem Isolation (Finding SEC-01)*:
+      - Enhanced `buildChildEnv(testRoot)` to allocate sandboxed `HOME` and `TMPDIR` directories with `0700` permissions inside the temporary test root, completely preventing daemon interactions with ambient user host environments.
+  18. *Redundant Worker Stop Drainage (Finding CONC-01)*:
+      - Added non-blocking `stopCh` drainage in `ContinuousWriter.workerLoop` immediately following condition unpausing, preventing race windows where terminated workers register superfluous operations.
+  19. *Fail-Safe Incremental Cluster Teardown (Finding SIL-01)*:
+      - Wrapped cluster teardown inside `createPartitionCluster` with `t.Cleanup` and `sync.Once`, guaranteeing that all bound TCP listeners and storage handles are reclaimed even if initialization fails partway through.
 * **Why It Exists**:
   Guarantees that chaos-testing frameworks provide mathematically rigorous, race-free, and fail-closed verification of production durability and consensus invariants.
 * **Impact**:

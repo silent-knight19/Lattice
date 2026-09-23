@@ -3827,6 +3827,73 @@ Offset 68..71 (4B, CRC32-IEEE):
     - Upon healing, reconnection attempts succeed, handshakes complete, and Raft consensus catch-up reconciles divergent logs across the re-established TCP transport.
   - **Fidelity**: This tests the entire distributed stack: socket lifecycles, reconnect backoff timers, state machine stepdowns, and log truncation over real TCP transports.
 
+### 6. Why must test oracles reconstruct truth from physical disk files rather than in-memory cache slices?
+* **Question**: In fault-injection and crash-recovery testing, why is reading verification snapshots from an in-memory slice (`records []AckRecord`) an oracle-integrity defect, and how does physical disk ingestion fix it?
+* **Answer**:
+  - **The Ephemeral Cache Illusion**: If the test oracle reads expectations from RAM (`l.records`), the verification test only proves that writes matched what the test remembered in memory. It does *not* prove that the test's own persistent log (`ack_ledger.jsonl`) was durably flushed, correctly serialized, or readable without corruption. If disk flushes had silently failed or corrupted JSON syntax, the test would still pass because it verified against RAM.
+  - **Direct On-Disk Ingestion (`ReadRecordsFromDisk`)**:
+    - During each crash recovery verification cycle, the test bypasses volatile heap structures and opens `ack_ledger.jsonl` from disk using a fresh file descriptor.
+    - It parses each JSONL record sequentially, validating JSON framing and structural fields.
+    - It verifies the recovered database state against this disk-reconstructed oracle.
+  - **Dual Durability Proof**: This proves both that the database durably persisted its state and that the parent test oracle durably and accurately recorded its expectations.
+
+### 7. How does build-tag reflection enable synchronized `-race` child process instrumentation in integration tests?
+* **Question**: When a parent test is executed under `go test -race`, child processes compiled via `exec.Command("go", "build", ...)` run without race detection by default. How do you automatically propagate race instrumentation without hardcoding `-race` into production builds?
+* **Answer**:
+  - **The Subprocess Instrumentation Gap**: The `-race` flag passed to `go test` applies exclusively to the test binary itself. When the test invokes `go build -o ...` to compile the production daemon binary, the Go compiler builds a standard binary without the ThreadSanitizer runtime unless explicitly told otherwise. Data races occurring inside the child daemon process go undetected.
+  - **Build-Tag Reflection Pattern**:
+    - Create two mutually exclusive test files:
+      1. `chaos_race_tag_test.go` with `//go:build race` containing `const isRaceEnabled = true`.
+      2. `chaos_norace_tag_test.go` with `//go:build !race` containing `const isRaceEnabled = false`.
+    - In the test harness build command:
+      ```go
+      buildArgs := []string{"build"}
+      if isRaceEnabled {
+          buildArgs = append(buildArgs, "-race")
+      }
+      buildArgs = append(buildArgs, "-o", binPath, ".")
+      ```
+    - When `go test -race` runs, `isRaceEnabled` evaluates to `true`, compiling the child daemon with `-race`. When run normally, the child is compiled without instrumentation overhead.
+
+### 8. How does `wal.RecoverSegment` physically truncate torn tails in place, and why must tests verify on-disk file size reduction?
+* **Question**: Why is verifying that `wal.OpenReader` stops reading at corrupted bytes insufficient to prove torn tail recovery, and how do you test physical truncation?
+* **Answer**:
+  - **Passive Reader Halting vs Active Physical Truncation**: A reader scanning a WAL segment will stop and return `io.EOF` or an error when encountering incomplete torn bytes at EOF. However, passive halting leaves the corrupt bytes physically present on disk. If a subsequent write appends to that segment without truncation, the corruption is embedded within the segment body, breaking future reads.
+  - **Active Physical Truncation (`wal.RecoverSegment`)**:
+    - `wal.RecoverSegment` scans to the last valid record boundary, records the byte offset (`res.RecoveredOffset`), and calls `os.Truncate(path, res.RecoveredOffset)`.
+    - It then issues an `fsync` barrier on the file descriptor and directory to commit the truncation to physical disk.
+  - **Verification Invariant**:
+    - The test must record the file size before recovery (`statCorrupt.Size()`).
+    - After calling `wal.RecoverSegment`, the test asserts:
+      1. `res.Truncated == true`
+      2. `res.ValidRecords == 3`
+      3. `statRecovered.Size() == res.RecoveredOffset`
+      4. `statRecovered.Size() < statCorrupt.Size()`
+    - Finally, `wal.OpenReader` is opened to confirm all valid records are cleanly read to EOF.
+
+### 9. Why should cluster integration harness cleanup be registered incrementally using `t.Cleanup` rather than batched at return?
+* **Question**: Why is returning a `cleanup()` closure from cluster initialization functions vulnerable to resource leaks, and how does `t.Cleanup` solve it?
+* **Answer**:
+  - **The Partial Setup Leak**: In a multi-node cluster setup (e.g. 3 nodes), node 1 binds ports and allocates disk storage, node 2 binds ports, but node 3 encounters an unexpected error (port conflict, disk failure) and calls `t.Fatalf()`. If cleanup is only returned at the end of the helper via `return cluster, cleanup`, the caller never receives the closure. The listeners for nodes 1 and 2 remain open in the OS, leaking sockets and preventing future test runs from binding ports.
+  - **Incremental Guarding with `t.Cleanup` and `sync.Once`**:
+    - Define the cleanup closure at the start of cluster initialization:
+      ```go
+      var cleanupOnce sync.Once
+      cleanup := func() {
+          cleanupOnce.Do(func() {
+              for _, n := range cluster.nodes {
+                  n.Close()
+              }
+              for _, ln := range listeners {
+                  ln.Close()
+              }
+          })
+      }
+      t.Cleanup(cleanup)
+      ```
+    - Because `t.Cleanup` is registered before iterations begin, any `t.Fatalf` triggered during loop iteration $K$ guarantees that the Go test runtime invokes `cleanup()`, tearing down resources created in iterations $1 \dots K-1$.
+    - Wrapping the body in `cleanupOnce.Do` allows callers to also call `defer cleanup()` safely without double-free errors.
+
 ---
 
 *End of Technical Interview Knowledge Base — Lattice v1.0.0-KNOWLEDGE-BASE*

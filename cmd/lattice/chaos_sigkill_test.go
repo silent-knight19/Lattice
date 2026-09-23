@@ -42,6 +42,7 @@ type AckRecord struct {
 // It resides outside the daemon data directory with 0700 dir and 0600 file permissions.
 // Publication into memory occurs ONLY AFTER complete physical file write and Sync (Finding D, E).
 type AckLedger struct {
+	path    string
 	mu      sync.RWMutex
 	records []AckRecord
 	byKey   map[string]AckRecord
@@ -58,11 +59,13 @@ func newAckLedger(dir string) (*AckLedger, error) {
 		return nil, fmt.Errorf("failed to create ack-ledger dir: %w", err)
 	}
 	// Finding 20: 0600 file permissions
-	f, err := os.OpenFile(filepath.Join(dir, "ack_ledger.jsonl"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	filePath := filepath.Join(dir, "ack_ledger.jsonl")
+	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open ack ledger file: %w", err)
 	}
 	return &AckLedger{
+		path:   filePath,
 		byKey:  make(map[string]AckRecord),
 		byOpID: make(map[string]AckRecord),
 		bySeq:  make(map[uint64]AckRecord),
@@ -136,6 +139,42 @@ func (l *AckLedger) Snapshot() []AckRecord {
 	return cp
 }
 
+// ReadRecordsFromDisk bypasses volatile memory and reconstructs the oracle snapshot
+// directly from the synced physical JSONL file on disk (FINDING-FID-01).
+func (l *AckLedger) ReadRecordsFromDisk() ([]AckRecord, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	f, err := os.Open(l.path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to open ack ledger file for reading: %w", err)
+	}
+	defer f.Close()
+
+	var records []AckRecord
+	scanner := bufio.NewScanner(f)
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var rec AckRecord
+		if err := json.Unmarshal(line, &rec); err != nil {
+			return nil, fmt.Errorf("corrupt ack record on line %d: %w", lineNum, err)
+		}
+		records = append(records, rec)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scanner error reading ack ledger: %w", err)
+	}
+	return records, nil
+}
+
 func (l *AckLedger) Count() int {
 	return int(l.count.Load())
 }
@@ -181,10 +220,11 @@ func (c *safeStderrCollector) String() string {
 	return c.buf.String()
 }
 
-// buildChildEnv constructs an allowlisted child environment to prevent ambient secret leakage (Finding G).
-func buildChildEnv() []string {
+// buildChildEnv constructs an allowlisted child environment to prevent ambient secret leakage (Finding G)
+// and sandboxes HOME and TMPDIR inside testRoot to prevent ambient host pollution (FINDING-SEC-01).
+func buildChildEnv(testRoot string) []string {
 	allowlist := []string{
-		"PATH", "HOME", "TMPDIR", "SYSTEMROOT", "USER",
+		"PATH", "SYSTEMROOT", "USER",
 	}
 	var env []string
 	for _, k := range allowlist {
@@ -192,6 +232,15 @@ func buildChildEnv() []string {
 			env = append(env, k+"="+v)
 		}
 	}
+
+	homeDir := filepath.Join(testRoot, "home")
+	_ = os.MkdirAll(homeDir, 0700)
+	env = append(env, "HOME="+homeDir)
+
+	tmpDir := filepath.Join(testRoot, "tmp")
+	_ = os.MkdirAll(tmpDir, 0700)
+	env = append(env, "TMPDIR="+tmpDir)
+
 	return env
 }
 
@@ -216,8 +265,9 @@ var serverListeningRegex = regexp.MustCompile(`lattice: server listening on (127
 func startDaemonProcess(t *testing.T, binPath, dataDir string, gen int64) (*DaemonProcess, error) {
 	// Finding J: bind port 0 to prevent TOCTOU port races and OS TIME_WAIT delays
 	cmd := exec.Command(binPath, "--data-dir", dataDir, "--port", "0")
-	// Finding G: allowlisted environment
-	cmd.Env = buildChildEnv()
+	// Finding G & FINDING-SEC-01: allowlisted environment with sandboxed HOME and TMPDIR
+	testRoot := filepath.Dir(filepath.Clean(dataDir))
+	cmd.Env = buildChildEnv(testRoot)
 	// Finding 21: explicit working directory inside temporary test root
 	cmd.Dir = filepath.Dir(binPath)
 
@@ -486,6 +536,13 @@ func (w *ContinuousWriter) workerLoop() {
 			}
 			w.pauseCond.Wait()
 		}
+		// Redundant stopCh drainage on worker unpause to eliminate stale wakeups (FINDING-CONC-01)
+		select {
+		case <-w.stopCh:
+			w.pauseMu.Unlock()
+			return
+		default:
+		}
 		// Register active operation before unlocking pauseMu to eliminate race window (Finding B)
 		w.activeOps.Add(1)
 		w.pauseMu.Unlock()
@@ -704,8 +761,13 @@ func TestSIGKILLChaos(t *testing.T) {
 		t.Fatalf("failed to create binDir: %v", err)
 	}
 
-	// Step 2: Build Real Production Daemon Binary
-	buildCmd := exec.Command("go", "build", "-o", binPath, ".")
+	// Step 2: Build Real Production Daemon Binary (FINDING-FID-02: pass -race if race testing enabled)
+	buildArgs := []string{"build"}
+	if isRaceEnabled {
+		buildArgs = append(buildArgs, "-race")
+	}
+	buildArgs = append(buildArgs, "-o", binPath, ".")
+	buildCmd := exec.Command("go", buildArgs...)
 	buildCmd.Dir = "."
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build production lattice binary: %v, output: %s", err, string(out))
@@ -794,8 +856,11 @@ func TestSIGKILLChaos(t *testing.T) {
 		// Finding B: TRUE QUIESCENCE BARRIER
 		writer.PauseAndWait()
 
-		// Snapshot ACK ledger for verification
-		snapshot := ledger.Snapshot()
+		// Read ACK ledger directly from synced disk file for verification (FINDING-FID-01)
+		snapshot, err := ledger.ReadRecordsFromDisk()
+		if err != nil {
+			t.Fatalf("cycle %d: failed to read ack records from disk: %v", cycle, err)
+		}
 		acksBeforeCrash := len(snapshot)
 
 		// Finding C: increment generation under complete writer quiescence
@@ -827,7 +892,10 @@ func TestSIGKILLChaos(t *testing.T) {
 	writer.Stop()
 
 	finalRecordedAcks := ledger.Count()
-	finalSnapshot := ledger.Snapshot()
+	finalSnapshot, err := ledger.ReadRecordsFromDisk()
+	if err != nil {
+		t.Fatalf("failed to read final ack records from disk: %v", err)
+	}
 
 	// Step 8: Final Restart & Oracle Verification
 	currentDaemonMu.Lock()
@@ -1130,18 +1198,38 @@ func TestContinuousWriter_PropagatesFatalErrorWithoutOrphan(t *testing.T) {
 }
 
 // TestDaemon_ChildEnvironmentIsolation proves sensitive parent environment variables
-// are not propagated to the child process (Finding G).
+// are not propagated to the child process (Finding G) and HOME/TMPDIR are sandboxed (FINDING-SEC-01).
 func TestDaemon_ChildEnvironmentIsolation(t *testing.T) {
 	// Set dummy sensitive secret in parent
 	secretKey := "LATTICE_TEST_SECRET_TOKEN"
 	secretVal := "secret-super-sensitive-12345"
 	t.Setenv(secretKey, secretVal)
 
-	env := buildChildEnv()
+	testRoot := t.TempDir()
+	env := buildChildEnv(testRoot)
+	var foundHome, foundTmp bool
 	for _, entry := range env {
 		if strings.HasPrefix(entry, secretKey+"=") {
 			t.Fatalf("ENVIRONMENT ISOLATION VIOLATION: secret %s leaked into child environment!", secretKey)
 		}
+		if strings.HasPrefix(entry, "HOME=") {
+			foundHome = true
+			if !strings.HasPrefix(entry, "HOME="+testRoot) {
+				t.Fatalf("HOME not sandboxed in testRoot: %s", entry)
+			}
+		}
+		if strings.HasPrefix(entry, "TMPDIR=") {
+			foundTmp = true
+			if !strings.HasPrefix(entry, "TMPDIR="+testRoot) {
+				t.Fatalf("TMPDIR not sandboxed in testRoot: %s", entry)
+			}
+		}
+	}
+	if !foundHome {
+		t.Fatalf("expected HOME to be configured in child env")
+	}
+	if !foundTmp {
+		t.Fatalf("expected TMPDIR to be configured in child env")
 	}
 }
 
@@ -1151,7 +1239,12 @@ func TestDaemon_ProcessIdentityAuthoritative(t *testing.T) {
 	binDir := t.TempDir()
 	binPath := filepath.Join(binDir, "lattice")
 
-	buildCmd := exec.Command("go", "build", "-o", binPath, ".")
+	buildArgs := []string{"build"}
+	if isRaceEnabled {
+		buildArgs = append(buildArgs, "-race")
+	}
+	buildArgs = append(buildArgs, "-o", binPath, ".")
+	buildCmd := exec.Command("go", buildArgs...)
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to build binary: %v, output: %s", err, string(out))
 	}
@@ -1228,10 +1321,38 @@ func TestWAL_DeterministicTornTailRecovery(t *testing.T) {
 	_ = f.Sync()
 	_ = f.Close()
 
-	// 3. Open Reader and verify recovery: records 1..3 must be valid, torn tail truncated
+	statCorrupt, err := os.Stat(segmentPath)
+	if err != nil {
+		t.Fatalf("failed to stat corrupt segment: %v", err)
+	}
+
+	// 3. Call wal.RecoverSegment to physically truncate the torn tail in-place (FINDING-FID-03)
+	res, err := wal.RecoverSegment(segmentPath)
+	if err != nil {
+		t.Fatalf("failed to recover segment: %v", err)
+	}
+	if !res.Truncated {
+		t.Fatalf("expected res.Truncated == true, got false")
+	}
+	if res.ValidRecords != 3 {
+		t.Fatalf("expected 3 valid records, got %d", res.ValidRecords)
+	}
+
+	statRecovered, err := os.Stat(segmentPath)
+	if err != nil {
+		t.Fatalf("failed to stat recovered segment: %v", err)
+	}
+	if statRecovered.Size() >= statCorrupt.Size() {
+		t.Fatalf("expected recovered file size (%d) < corrupt file size (%d)", statRecovered.Size(), statCorrupt.Size())
+	}
+	if statRecovered.Size() != res.RecoveredOffset {
+		t.Fatalf("expected recovered file size (%d) == res.RecoveredOffset (%d)", statRecovered.Size(), res.RecoveredOffset)
+	}
+
+	// 4. Open Reader and verify recovery: records 1..3 must be valid, cleanly reading up to io.EOF
 	reader, err := wal.OpenReader(segmentPath)
 	if err != nil {
-		t.Fatalf("failed to open WAL reader on torn tail segment: %v", err)
+		t.Fatalf("failed to open WAL reader on recovered segment: %v", err)
 	}
 	defer reader.Close()
 
@@ -1251,5 +1372,58 @@ func TestWAL_DeterministicTornTailRecovery(t *testing.T) {
 	if readCount != 3 {
 		t.Fatalf("TORN-TAIL RECOVERY VIOLATION: expected 3 valid records recovered, got %d", readCount)
 	}
-	t.Logf("Deterministic torn tail recovery verified: 3 valid records recovered, torn tail safely ignored.")
+	t.Logf("Deterministic torn tail recovery verified: 3 valid records recovered, physical file truncated from %d to %d bytes.",
+		statCorrupt.Size(), statRecovered.Size())
+}
+
+// TestAckLedger_ReadRecordsFromDisk verifies that ReadRecordsFromDisk accurately parses
+// records directly from disk and handles empty ledgers cleanly (FINDING-FID-01).
+func TestAckLedger_ReadRecordsFromDisk(t *testing.T) {
+	dir := t.TempDir()
+	ledger, err := newAckLedger(dir)
+	if err != nil {
+		t.Fatalf("failed to create ack ledger: %v", err)
+	}
+	defer ledger.Close()
+
+	// Initial empty check
+	recs, err := ledger.ReadRecordsFromDisk()
+	if err != nil {
+		t.Fatalf("unexpected error on empty ledger: %v", err)
+	}
+	if len(recs) != 0 {
+		t.Fatalf("expected 0 records, got %d", len(recs))
+	}
+
+	// Record 3 writes
+	for i := 1; i <= 3; i++ {
+		rec := AckRecord{
+			OpID:         fmt.Sprintf("op-%d", i),
+			SeqNum:       uint64(i),
+			Key:          fmt.Sprintf("k%d", i),
+			Value:        fmt.Sprintf("v%d", i),
+			RequestID:    uint64(i),
+			Generation:   0,
+			Timestamp:    time.Now(),
+			Order:        i,
+			ClientStatus: "OK",
+		}
+		if err := ledger.RecordAck(rec); err != nil {
+			t.Fatalf("RecordAck failed: %v", err)
+		}
+	}
+
+	recs, err = ledger.ReadRecordsFromDisk()
+	if err != nil {
+		t.Fatalf("ReadRecordsFromDisk failed: %v", err)
+	}
+	if len(recs) != 3 {
+		t.Fatalf("expected 3 records, got %d", len(recs))
+	}
+	for i, r := range recs {
+		expectedOpID := fmt.Sprintf("op-%d", i+1)
+		if r.OpID != expectedOpID {
+			t.Fatalf("record %d OpID mismatch: expected %s, got %s", i, expectedOpID, r.OpID)
+		}
+	}
 }

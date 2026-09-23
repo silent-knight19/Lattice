@@ -317,6 +317,35 @@ func createPartitionCluster(t *testing.T, count int, opts clusterOptions) (*part
 		hbInterval = 15 * time.Millisecond
 	}
 
+	var cleanupOnce sync.Once
+	cleanup := func() {
+		cleanupOnce.Do(func() {
+			for i := 1; i <= count; i++ {
+				id := cluster.NodeID(i)
+				if n, ok := clusterObj.nodes[id]; ok {
+					if n.server != nil {
+						_ = n.server.Close()
+					}
+					if n.mgr != nil {
+						_ = n.mgr.Close()
+					}
+					if n.node != nil {
+						n.node.StopElectionTimer()
+						_ = n.node.Close()
+					}
+					if n.storage != nil {
+						_ = n.storage.Close()
+					}
+				}
+				if ln, ok := peerListeners[id]; ok {
+					_ = ln.Close()
+				}
+			}
+		})
+	}
+	// FINDING-SIL-01: register fail-safe incremental cleanup in case t.Fatalf occurs during setup
+	t.Cleanup(cleanup)
+
 	for i := 1; i <= count; i++ {
 		id := cluster.NodeID(i)
 		topo, err := cluster.NewTopology(id, peerAddrs[id], rawPeers)
@@ -424,27 +453,6 @@ func createPartitionCluster(t *testing.T, count int, opts clusterOptions) (*part
 		}
 
 		clusterObj.nodes[id] = nodeEntry
-	}
-
-	cleanup := func() {
-		for i := 1; i <= count; i++ {
-			id := cluster.NodeID(i)
-			if n, ok := clusterObj.nodes[id]; ok {
-				if n.server != nil {
-					_ = n.server.Close()
-				}
-				if n.mgr != nil {
-					_ = n.mgr.Close()
-				}
-				if n.node != nil {
-					n.node.StopElectionTimer()
-					_ = n.node.Close()
-				}
-				if n.storage != nil {
-					_ = n.storage.Close()
-				}
-			}
-		}
 	}
 
 	return clusterObj, cleanup
