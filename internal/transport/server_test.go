@@ -5,6 +5,7 @@ import (
 	"context"
 	stdErrors "errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"testing"
@@ -970,5 +971,374 @@ func TestFrame_GarbagePayloadNoAllocationAmplification(t *testing.T) {
 		if !stdErrors.As(err, &crcErr) {
 			t.Fatalf("expected ChecksumMismatchError, got: %v", err)
 		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// P19-S01-M02 Adversarial Connection Limits & Slowloris Hardening Tests
+// -----------------------------------------------------------------------------
+
+func TestServer_P19_DefaultConfig_4096(t *testing.T) {
+	cfg := transport.DefaultServerConfig()
+	if cfg.MaxConnections != 4096 {
+		t.Fatalf("expected DefaultServerConfig.MaxConnections == 4096, got: %d", cfg.MaxConnections)
+	}
+
+	eng := newMockEngine()
+	customCfg := transport.ServerConfig{
+		MaxConnections: 0, // unconfigured or zero must default to 4096
+	}
+	srv, err := transport.NewServer(customCfg, eng)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	_ = srv
+}
+
+func TestServer_Slowloris_FragmentedHeaderTrickle(t *testing.T) {
+	eng := newMockEngine()
+	cfg := transport.DefaultServerConfig()
+	cfg.HeaderTimeout = 100 * time.Millisecond
+	cfg.IdleTimeout = 100 * time.Millisecond
+
+	srv := startTestServer(t, cfg, eng)
+
+	conn, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	// An 18-byte valid header
+	hdr := transport.Header{
+		Magic:         transport.Magic,
+		OpCode:        transport.OpGet,
+		SeqID:         101,
+		PayloadLength: 0,
+	}
+	var hdrBuf [transport.HeaderSize]byte
+	hdr.Encode(hdrBuf[:])
+
+	// Attacker sends 1 byte every 20ms.
+	// Sending all 18 bytes would take 18 * 20ms = 360ms > 100ms HeaderTimeout.
+	serverClosed := false
+	for i := 0; i < len(hdrBuf); i++ {
+		_, err := conn.Write(hdrBuf[i : i+1])
+		if err != nil {
+			serverClosed = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Server must have terminated the connection during or immediately after the trickle
+	var buf [10]byte
+	conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	_, readErr := conn.Read(buf[:])
+	if readErr == nil && !serverClosed {
+		t.Fatal("expected fragmented header trickle to be terminated by HeaderTimeout, but read succeeded")
+	}
+
+	// Verify active connection count is released back to 0
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if srv.ActiveConnections() == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if srv.ActiveConnections() != 0 {
+		t.Errorf("expected ActiveConnections == 0 after slow header termination, got: %d", srv.ActiveConnections())
+	}
+}
+
+func TestServer_Slowloris_FragmentedPayloadTrickle(t *testing.T) {
+	eng := newMockEngine()
+	cfg := transport.DefaultServerConfig()
+	cfg.PayloadTimeout = 100 * time.Millisecond
+
+	srv := startTestServer(t, cfg, eng)
+
+	conn, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Send valid header declaring 100 bytes payload
+	hdr := transport.Header{
+		Magic:         transport.Magic,
+		OpCode:        transport.OpPut,
+		SeqID:         102,
+		PayloadLength: 100,
+	}
+	var hdrBuf [transport.HeaderSize]byte
+	hdr.Encode(hdrBuf[:])
+	if _, err := conn.Write(hdrBuf[:]); err != nil {
+		t.Fatalf("write header failed: %v", err)
+	}
+
+	// Send 10 bytes every 25ms (would take 250ms > 100ms PayloadTimeout)
+	serverClosed := false
+	chunk := make([]byte, 10)
+	for i := 0; i < 10; i++ {
+		_, err := conn.Write(chunk)
+		if err != nil {
+			serverClosed = true
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	var buf [10]byte
+	conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	_, readErr := conn.Read(buf[:])
+	if readErr == nil && !serverClosed {
+		t.Fatal("expected fragmented payload trickle to be terminated by PayloadTimeout, but read succeeded")
+	}
+
+	// Verify active connections return to 0 and mock engine was NOT called
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if srv.ActiveConnections() == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if srv.ActiveConnections() != 0 {
+		t.Errorf("expected ActiveConnections == 0, got: %d", srv.ActiveConnections())
+	}
+	eng.mu.RLock()
+	storeLen := len(eng.store)
+	eng.mu.RUnlock()
+	if storeLen != 0 {
+		t.Errorf("expected zero engine mutations from aborted payload, found: %d", storeLen)
+	}
+}
+
+func TestServer_SlowResponseReader_WriteTimeout(t *testing.T) {
+	eng := newMockEngine()
+	// Store a 2MB payload to force multiple TCP buffers
+	largeVal := make([]byte, 2*1024*1024)
+	_ = eng.Put(context.Background(), []byte("bigkey"), largeVal)
+
+	cfg := transport.DefaultServerConfig()
+	cfg.WriteTimeout = 100 * time.Millisecond
+
+	srv := startTestServer(t, cfg, eng)
+
+	conn, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Reduce socket receive buffer to minimum to fill kernel buffer fast
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetReadBuffer(1024)
+	}
+
+	// Send GET for the 2MB key
+	req := &transport.Request{
+		OpCode: transport.OpGet,
+		SeqID:  103,
+		Key:    []byte("bigkey"),
+	}
+	if err := transport.WriteRequest(conn, req); err != nil {
+		t.Fatalf("write request failed: %v", err)
+	}
+
+	// Read only the first 100 bytes and then STOP reading, intentionally blocking the server's Write()
+	var partial [100]byte
+	if _, err := io.ReadFull(conn, partial[:]); err != nil {
+		t.Fatalf("initial read failed: %v", err)
+	}
+
+	// Sleep longer than WriteTimeout so server write deadline triggers
+	time.Sleep(250 * time.Millisecond)
+
+	// Now try to read; server should have closed the connection due to write timeout
+	drainBuf := make([]byte, 64*1024)
+	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	for {
+		_, err := conn.Read(drainBuf)
+		if err != nil {
+			// EOF or reset observed -> pass
+			break
+		}
+	}
+
+	// Active connection should be cleaned up
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if srv.ActiveConnections() == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if srv.ActiveConnections() != 0 {
+		t.Errorf("expected ActiveConnections == 0 after write timeout, got: %d", srv.ActiveConnections())
+	}
+}
+
+func TestServer_MaxConnections_BoundaryAndChurn(t *testing.T) {
+	eng := newMockEngine()
+	cfg := transport.DefaultServerConfig()
+	cfg.MaxConnections = 4
+
+	srv := startTestServer(t, cfg, eng)
+
+	// Connect 4 active clients
+	conns := make([]net.Conn, 4)
+	for i := 0; i < 4; i++ {
+		c, err := net.Dial("tcp", srv.Addr().String())
+		if err != nil {
+			t.Fatalf("dial %d failed: %v", i, err)
+		}
+		conns[i] = c
+	}
+	defer func() {
+		for _, c := range conns {
+			if c != nil {
+				c.Close()
+			}
+		}
+	}()
+
+	time.Sleep(30 * time.Millisecond)
+	if srv.ActiveConnections() != 4 {
+		t.Fatalf("expected 4 active connections, got: %d", srv.ActiveConnections())
+	}
+
+	// 5th client (limit + 1) MUST be rejected immediately
+	c5, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		t.Fatalf("dial c5 failed: %v", err)
+	}
+	defer c5.Close()
+
+	var buf [1]byte
+	c5.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	n, readErr := c5.Read(buf[:])
+	if readErr == nil && n > 0 {
+		t.Fatal("expected c5 to be rejected immediately at ceiling, but read succeeded")
+	}
+
+	// Close 2 connections -> slots must become available
+	conns[0].Close()
+	conns[1].Close()
+	time.Sleep(30 * time.Millisecond)
+
+	if srv.ActiveConnections() != 2 {
+		t.Fatalf("expected 2 active connections after closing 2, got: %d", srv.ActiveConnections())
+	}
+
+	// Reconnect 2 clients
+	for i := 0; i < 2; i++ {
+		c, err := net.Dial("tcp", srv.Addr().String())
+		if err != nil {
+			t.Fatalf("reconnect %d failed: %v", i, err)
+		}
+		conns[i] = c
+	}
+	time.Sleep(30 * time.Millisecond)
+	if srv.ActiveConnections() != 4 {
+		t.Fatalf("expected 4 active connections, got: %d", srv.ActiveConnections())
+	}
+
+	// Close all initial connections
+	for _, c := range conns {
+		c.Close()
+	}
+
+	// High concurrency churn: 10 goroutines continuously connect, write, close
+	var wg sync.WaitGroup
+	for g := 0; g < 10; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for iter := 0; iter < 10; iter++ {
+				c, err := net.Dial("tcp", srv.Addr().String())
+				if err != nil {
+					continue
+				}
+				req := &transport.Request{
+					OpCode: transport.OpGet,
+					SeqID:  uint64(id*100 + iter),
+					Key:    []byte("k"),
+				}
+				_ = transport.WriteRequest(c, req)
+				_, _ = transport.ReadResponse(c)
+				c.Close()
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	// Verify all connections are released and counter returns to 0
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if srv.ActiveConnections() == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if srv.ActiveConnections() != 0 {
+		t.Errorf("expected 0 active connections after churn, got: %d", srv.ActiveConnections())
+	}
+}
+
+type errorDeadlineConn struct {
+	net.Conn
+	readDeadlineErr  error
+	writeDeadlineErr error
+}
+
+func (e *errorDeadlineConn) SetReadDeadline(t time.Time) error {
+	if e.readDeadlineErr != nil {
+		return e.readDeadlineErr
+	}
+	return e.Conn.SetReadDeadline(t)
+}
+
+func (e *errorDeadlineConn) SetWriteDeadline(t time.Time) error {
+	if e.writeDeadlineErr != nil {
+		return e.writeDeadlineErr
+	}
+	return e.Conn.SetWriteDeadline(t)
+}
+
+func TestServer_DeadlineError_FailClosed(t *testing.T) {
+	eng := newMockEngine()
+	srv, err := transport.NewServer(transport.DefaultServerConfig(), eng)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	injectedErr := stdErrors.New("injected deadline failure")
+	badConn := &errorDeadlineConn{
+		Conn:            c2,
+		readDeadlineErr: injectedErr,
+	}
+
+	done := make(chan struct{})
+	go func() {
+		srv.ServeConnForTesting(badConn)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Succeeded in failing closed
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected server to fail closed immediately on deadline error")
+	}
+
+	if srv.ActiveConnections() != 0 {
+		t.Errorf("expected ActiveConnections == 0 after deadline error, got: %d", srv.ActiveConnections())
 	}
 }

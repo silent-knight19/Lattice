@@ -3979,4 +3979,74 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
+# 25. Deep Systems Interview Questions & Answers: Network Connection Limits & Slowloris Defense Architecture (P19-S01-M02)
+
+### 1. Why are connection limits alone insufficient to protect a server without socket deadlines (Slowloris mechanics)?
+* **Question**: Why does an application with `MaxConnections = 4,096` remain completely vulnerable to denial-of-service if read and write socket deadlines are not strictly enforced?
+* **Answer**:
+  - **The Slowloris Asymmetry**: An attacker does not need high network bandwidth or a botnet to exhaust server capacity. By opening $4,096$ legitimate TCP connections and sending partial request fragments at a trickle rate (e.g. 1 byte every 10 seconds), the attacker consumes all available connection slots.
+  - **Resource Starvation**: Without socket deadlines, the server's per-connection goroutines block indefinitely in kernel read syscalls (`conn.Read()`). The server reaches `MaxConnections = 4,096`, file descriptors and stack memory remain pinned, and all subsequent legitimate client connections are rejected at the admission gate.
+  - **Dual Defense Requirement**: Connection limits cap the maximum concurrent capacity ($4,096$), while socket deadlines (`HeaderTimeout`, `PayloadTimeout`, `IdleTimeout`, `WriteTimeout`) bound the *lifetime* of any unproductive or stalled connection. Both controls are mutually necessary.
+
+### 2. How do Go `net.Conn` deadline semantics differ from sliding inactivity timers?
+* **Question**: In Go's `net` package, does `SetReadDeadline(time.Now().Add(5 * time.Second))` reset automatically whenever bytes are received, and why is this critical for Slowloris mitigation?
+* **Answer**:
+  - **Absolute Point-in-Time Semantics**: `net.Conn.SetReadDeadline(t)` sets an absolute point in wall-clock time (`time.Time`), not a relative duration or sliding window. Subsequent `Read()` calls do *not* push the deadline further out when bytes arrive.
+  - **Total Budget Enforcement**: If `SetReadDeadline(time.Now().Add(100ms))` is set before calling `io.ReadFull(conn, buf)` for a 100-byte buffer:
+    - If a client trickles 10 bytes every 20ms, the deadline is reached at 100ms (after receiving 50 bytes).
+    - The next `Read()` call immediately fails with `os.ErrDeadlineExceeded` / `net.Error.Timeout() == true`.
+  - **Why Sliding Inactivity Timers Fail**: If an engine resets the deadline on *every byte received*, an attacker trickling 1 byte right before timeout expiration can retain a connection indefinitely. Absolute deadlines guarantee that the total time to complete the phase (header or payload) is strictly bounded.
+
+### 3. Why is resetting `HeaderTimeout` after the first byte an anti-pattern?
+* **Question**: In framing protocols where an idle keep-alive connection waits on the first byte, why must newly established connections NOT reset their deadline after receiving byte 0?
+* **Answer**:
+  - **The Distinction Between Initial and Reused Sockets**:
+    - On a *keep-alive connection* (`isFirst == false`), the socket is legitimately idle between transactions, waiting up to `IdleTimeout` (e.g. 60s) for the next command. Once byte 0 arrives, the connection transitions from idle to active, requiring `HeaderTimeout` (e.g. 5s) for the remainder of the header.
+    - On an *initial connection* (`isFirst == true`), the client just connected specifically to send a request. It must not be granted an idle grace period.
+  - **The Double-Budget Trap**: If an implementation sets `HeaderTimeout` before byte 0 and then unconditionally resets `HeaderTimeout` after byte 0 arrives, an attacker sending byte 0 at $t = 4.9\text{s}$ receives an additional $5.0\text{s}$, effectively doubling the header budget to nearly $10\text{s}$.
+  - **The Invariant**: For `isFirst == true`, `HeaderTimeout` is set once and remains unchanged, guaranteeing that all 18 bytes of the frame header arrive within `HeaderTimeout`.
+
+### 4. How do you prevent oversubscription races during connection admission?
+* **Question**: Why is checking `activeConns >= MaxConnections` in the accept loop before acquiring the connection mutex vulnerable to oversubscription, and how is it made atomic?
+* **Answer**:
+  - **The Accept-Loop Race**: In high-concurrency connection burst scenarios, checking an atomic counter or condition prior to taking the mutex allows multiple connections to pass the check concurrently before any of them increments the counter, temporarily oversubscribing the ceiling beyond `MaxConnections`.
+  - **Atomic Admission Gate in `trackConn`**:
+    ```go
+    func (s *Server) trackConn(conn net.Conn) bool {
+        s.mu.Lock()
+        defer s.mu.Unlock()
+        if s.closed.Load() {
+            return false
+        }
+        if s.cfg.MaxConnections > 0 && len(s.conns) >= s.cfg.MaxConnections {
+            return false
+        }
+        s.conns[conn] = struct{}{}
+        s.activeConns.Add(1)
+        s.wg.Add(1)
+        return true
+    }
+    ```
+    - The accept loop can retain `activeConns.Load() >= MaxConnections` as a non-blocking fast-path filter.
+    - The authoritative admission decision is executed strictly under `s.mu.Lock()`, inspecting `len(s.conns)`.
+    - If at capacity, `trackConn` returns `false` without launching a goroutine or allocating buffers, and `conn.Close()` is called immediately.
+
+### 5. Why is write-side timeout enforcement (`WriteTimeout`) as important as read timeouts?
+* **Question**: How can a malicious or malfunctioning client exhaust server resources by simply refusing to read server responses?
+* **Answer**:
+  - **TCP Flow Control & Send Buffer Blocking**: TCP implements flow control via receive windows (sliding window). If a client sends a valid request (e.g. GET returning a 2MB payload) and stops reading from its socket, the server's kernel TCP send buffer fills up ($~64\text{KB}-256\text{KB}$).
+  - **Unbounded Goroutine Blocking**: Subsequent `conn.Write()` calls by the server block waiting for the client to acknowledge bytes and open the TCP window.
+  - **Without `WriteTimeout`**: The server's handler goroutine remains permanently blocked in `conn.Write()`, holding memory buffers and an active connection slot indefinitely.
+  - **With `WriteTimeout`**: `SetWriteDeadline(time.Now().Add(WriteTimeout))` ensures that if the client cannot drain the response within `WriteTimeout`, `conn.Write()` unblocks with a timeout error, the server severs the socket, and `s.untrackConn()` releases the connection slot back to the pool.
+
+### 6. How does graceful server shutdown handle stalled or adversarial Slowloris connections?
+* **Question**: When `Server.Shutdown(ctx)` is invoked, how does the server guarantee it does not hang indefinitely waiting for slow connection handlers to finish?
+* **Answer**:
+  - **Listener Halting**: The listener is closed immediately, preventing any new connections from entering the pipeline.
+  - **Forced Deadline Expiration**: Under `s.mu.Lock()`, the server iterates over all active sockets in `s.conns` and sets `conn.SetDeadline(time.Now())` before calling `conn.Close()`.
+  - **Immediate Unblocking**: Any goroutine blocked in `Read()` or `Write()` immediately awakens with an I/O error / timeout, executes its `defer` cleanup (`conn.Close()` and `s.untrackConn()`), and decrements `s.wg`.
+  - **Context-Bounded Join**: `s.wg.Wait()` drains cleanly. If an extreme edge case delays a goroutine, `Shutdown` respects `ctx.Done()`, ensuring deterministic process termination.
+
+---
+
 *End of Technical Interview Knowledge Base — Lattice v1.0.0-KNOWLEDGE-BASE*

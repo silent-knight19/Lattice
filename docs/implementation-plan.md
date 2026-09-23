@@ -2574,8 +2574,22 @@ TOTAL: 176 Discrete, Testable Micro-Phases
     - Fuzz test: `FuzzResolvePath` executed 1.38M iterations with zero invariant violations.
     - Integration tests: `cmd/lattice/inspect_test.go`, `cmd/lattice/dump_wal_test.go`, `cmd/lattice/config_test.go`, `internal/errors/errors_test.go`.
     - Full test suite passing across all packages; clean `go vet`, clean `gofmt`, clean `git diff --check`, clean `-race` on all affected packages.
-* **P19-S01-M02: Network Connection Limits & Slowloris Protection** `[PENDING]`
+* **P19-S01-M02: Network Connection Limits & Slowloris Protection** `[COMPLETE]`
   * *Objective*: Enforce read/write connection deadlines and client connection limits ($4,096$).
+  * *Delivered Components*:
+    - `internal/transport/server.go`:
+      * Aligned default client connection limit to `MaxConnections = 4,096` in `ServerConfig` and `DefaultServerConfig()`.
+      * Hardened atomic connection admission: enforced `len(s.conns) >= s.cfg.MaxConnections` check directly under `s.mu.Lock()` in `s.trackConn(conn)` to prevent concurrent oversubscription races, with immediate socket closure and zero goroutine/buffer allocation for rejected connections.
+      * Hardened Slowloris header defense: bounded initial connection header reception strictly to `HeaderTimeout` without granting a second timeout budget upon byte 0 reception; restricted header reset to keep-alive idle transitions (`!isFirst`).
+      * Hardened deadline API error handling: verified and propagated return values from `SetReadDeadline` and `SetWriteDeadline`, failing closed on socket configuration failures.
+      * Enforced `PayloadTimeout` (10s default), `IdleTimeout` (60s default), `WriteTimeout` (5s default), and `RequestTimeout` (5s default).
+      * Added `ServeConnForTesting` for direct in-memory connection testing.
+    - Architectural Scope Boundary: Client connection limit ($4,096$) is enforced on `transport.Server`. Raft inter-node cluster peer connections are isolated in `transport.PeerConnectionManager` over a dedicated listener, preventing client saturation from starving cluster consensus.
+  * *Verification*:
+    - Unit tests: `TestServer_P19_DefaultConfig_4096`, `TestServer_Slowloris_SlowHeaderDefense`, `TestServer_Slowloris_FragmentedHeaderTrickle`, `TestServer_Slowloris_SlowPayloadDefense`, `TestServer_Slowloris_FragmentedPayloadTrickle`, `TestServer_Slowloris_IdleTimeoutDefense`, `TestServer_SlowResponseReader_WriteTimeout`, `TestServer_MaxConnectionsCeiling`, `TestServer_MaxConnections_BoundaryAndChurn`, `TestServer_DeadlineError_FailClosed`.
+    - Concurrency & Race Tests: 5 consecutive iterations of uncached race detector (`go test -count=1 -race -run TestServer_ ./internal/transport`) with zero races.
+    - Static analysis: `go vet ./...` clean; `git diff --check` clean.
+
 
 
 ---

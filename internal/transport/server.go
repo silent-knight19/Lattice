@@ -49,7 +49,7 @@ type ServerConfig struct {
 	// When false (default), binding to any non-loopback address (e.g. 0.0.0.0, public IP) is rejected with ErrInsecureTransport.
 	InsecureTransport bool
 
-	// MaxConnections is the maximum number of concurrent client connections (default: 1024).
+	// MaxConnections is the maximum number of concurrent client connections (default: 4096).
 	MaxConnections int
 
 	// HeaderTimeout is the maximum duration allowed to read a frame header (default: 5s).
@@ -89,7 +89,7 @@ type ServerConfig struct {
 func DefaultServerConfig() ServerConfig {
 	return ServerConfig{
 		Address:         "127.0.0.1:9099",
-		MaxConnections:  1024,
+		MaxConnections:  4096,
 		HeaderTimeout:   5 * time.Second,
 		PayloadTimeout:  10 * time.Second,
 		IdleTimeout:     60 * time.Second,
@@ -355,11 +355,14 @@ func (s *Server) acceptLoop(l net.Listener) {
 	}
 }
 
-// trackConn registers an accepted connection under s.mu. Returns false if server is closing.
+// trackConn registers an accepted connection under s.mu. Returns false if server is closing or at capacity.
 func (s *Server) trackConn(conn net.Conn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed.Load() {
+		return false
+	}
+	if s.cfg.MaxConnections > 0 && len(s.conns) >= s.cfg.MaxConnections {
 		return false
 	}
 	s.conns[conn] = struct{}{}
@@ -433,9 +436,13 @@ func (s *Server) readFrameWithDeadlines(conn net.Conn, isFirst bool) (*Frame, er
 	// Step 1: Set idle or header deadline before reading first byte
 	if hasDeadlines {
 		if isFirst {
-			_ = ds.SetReadDeadline(time.Now().Add(s.cfg.HeaderTimeout))
+			if err := ds.SetReadDeadline(time.Now().Add(s.cfg.HeaderTimeout)); err != nil {
+				return nil, err
+			}
 		} else {
-			_ = ds.SetReadDeadline(time.Now().Add(s.cfg.IdleTimeout))
+			if err := ds.SetReadDeadline(time.Now().Add(s.cfg.IdleTimeout)); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -445,9 +452,14 @@ func (s *Server) readFrameWithDeadlines(conn net.Conn, isFirst bool) (*Frame, er
 		return nil, err
 	}
 
-	// First byte received: enforce HeaderTimeout for remaining 17 bytes
-	if hasDeadlines {
-		_ = ds.SetReadDeadline(time.Now().Add(s.cfg.HeaderTimeout))
+	// First byte received:
+	// If transitioning from idle state (!isFirst), enforce HeaderTimeout for the remainder of the header.
+	// For the initial request (isFirst == true), HeaderTimeout was already set before the first byte
+	// and remains active, bounding the total time to receive the full 18-byte header to HeaderTimeout.
+	if hasDeadlines && !isFirst {
+		if err := ds.SetReadDeadline(time.Now().Add(s.cfg.HeaderTimeout)); err != nil {
+			return nil, err
+		}
 	}
 	if _, err := io.ReadFull(conn, headerBuf[1:]); err != nil {
 		return nil, err
@@ -461,10 +473,8 @@ func (s *Server) readFrameWithDeadlines(conn net.Conn, isFirst bool) (*Frame, er
 
 	// Step 2: Enforce PayloadTimeout for payload and trailer read
 	if hasDeadlines {
-		if hdr.PayloadLength > 0 {
-			_ = ds.SetReadDeadline(time.Now().Add(s.cfg.PayloadTimeout))
-		} else {
-			_ = ds.SetReadDeadline(time.Now().Add(s.cfg.HeaderTimeout))
+		if err := ds.SetReadDeadline(time.Now().Add(s.cfg.PayloadTimeout)); err != nil {
+			return nil, err
 		}
 	}
 
@@ -512,7 +522,9 @@ func (s *Server) readFrameWithDeadlines(conn net.Conn, isFirst bool) (*Frame, er
 
 	// Reset read deadline upon successful frame completion
 	if hasDeadlines {
-		_ = ds.SetReadDeadline(time.Time{})
+		if err := ds.SetReadDeadline(time.Time{}); err != nil {
+			return nil, err
+		}
 	}
 
 	return &Frame{
@@ -525,7 +537,9 @@ func (s *Server) readFrameWithDeadlines(conn net.Conn, isFirst bool) (*Frame, er
 // writeResponseWithDeadline encodes and writes a complete Response frame within WriteTimeout.
 func (s *Server) writeResponseWithDeadline(conn net.Conn, resp *Response) error {
 	if ds, ok := conn.(deadlineSetter); ok {
-		_ = ds.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
+		if err := ds.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout)); err != nil {
+			return err
+		}
 		defer func() { _ = ds.SetWriteDeadline(time.Time{}) }()
 	}
 	return WriteResponse(conn, resp)
@@ -735,4 +749,11 @@ func (s *Server) Close() error {
 // TestDispatch exposes dispatch for testing internal request routing without opening network connections.
 func (s *Server) TestDispatch(req *Request) *Response {
 	return s.dispatch(req)
+}
+
+// ServeConnForTesting runs handleConn synchronously on conn for testing connection error paths.
+func (s *Server) ServeConnForTesting(conn net.Conn) {
+	if s.trackConn(conn) {
+		s.handleConn(conn)
+	}
 }

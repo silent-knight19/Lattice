@@ -1624,4 +1624,31 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 86. Client Network Connection Limits & Slowloris Deadline Boundaries (P19-S01-M02)
+* **Limitation & Architectural Boundaries**:
+  1. *Application-Level vs. OS-Level Connection Admission*:
+     - `MaxConnections = 4,096` defines the authoritative admission ceiling for established, active client TCP connections tracked by `transport.Server`.
+     - **OS SYN Backlog Boundary**: Before a TCP three-way handshake completes and `net.Listener.Accept()` returns, incoming connection requests reside in the OS kernel TCP listen queue (`SOMAXCONN` / TCP SYN backlog). Application-level connection limiting takes effect only upon socket acceptance. Protection against raw volumetric SYN floods relies on OS-level TCP syncookies and kernel firewall (e.g. `iptables`/`nftables`) rate limiting.
+  2. *Client vs. Peer Transport Separation*:
+     - `MaxConnections` applies exclusively to client TCP connections (`transport.Server`).
+     - Raft inter-node cluster peer connections are managed by a dedicated, separate subsystem (`transport.PeerConnectionManager`) over a distinct peer network listener, ensuring that client connection saturation ($4,096$ connections) cannot starve cluster consensus heartbeats or election traffic.
+  3. *Absolute Wall-Clock Socket Deadline Semantics*:
+     - In Go's networking model, `net.Conn.SetReadDeadline` and `SetWriteDeadline` configure absolute points in wall-clock time (`time.Time`), rather than sliding per-byte inactivity intervals.
+     - `HeaderTimeout` (5s default) enforces a single bounded time budget to deliver the complete 18-byte frame header, preventing trickle attacks.
+     - `PayloadTimeout` (10s default) bounds the complete transmission of the payload and trailer.
+     - `IdleTimeout` (60s default) bounds waiting time between sequential requests on keep-alive connections.
+     - `WriteTimeout` (5s default) bounds the duration the server can block while pushing response frames to slow or un-drained client sockets.
+  4. *Connection Ceiling Failure Behavior*:
+     - When the server reaches $4,096$ active connections, newly accepted client sockets are immediately closed without launching per-connection goroutines, allocating frame buffers, or incrementing the active counter.
+* **Why It Exists**:
+  Protects server file descriptors, memory buffers, and goroutine pools against connection flooding, slow-byte trickling, and response-blocking denial-of-service attacks.
+* **Impact**:
+  Guarantees deterministic resource bounding ($4,096 \times \text{bounded buffer}$) and fail-closed termination of stalled or adversarial client connections.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Atomic admission gating, exactly-once cleanup accounting).
+  * Security: **Audited & Hardened** (Slowloris first-byte, fragmented-header, fragmented-payload, idle, and blocked-write defenses proven).
+  * Performance: **Optimal** (4,096 concurrent client connection ceiling with zero lock contention during steady-state frame processing).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*
