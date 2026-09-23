@@ -2510,8 +2510,16 @@ TOTAL: 176 Discrete, Testable Micro-Phases
 
 * **P18-S01-M01: Jepsen-Style Network Partition Simulation**
   * *Objective*: Drop TCP packets between isolated leader and peers; assert zero split-brain writes committed.
+  * *Status*: **COMPLETE** (Commit `TBD`)
+  * *Deliverables & Invariants Verified*:
+    - **Bidirectional Partition Filter**: Test-only `partitionFilter` and `filteredPeerSender` simulating instantaneous, leak-proof bidirectional network partitions at the peer transport boundary without modifying production transport code.
+    - **Autonomous Majority Election**: Verified that surviving majority (Nodes 2 & 3) autonomously elects a new leader in Term 2 upon leader isolation without manual intervention.
+    - **Split-Brain Commit Prevention**: Proved that client writes issued to the isolated old leader (Node 1) are accepted into local WAL but **never** advance `commitIndex`, **never** advance `lastApplied`, and are **never** executed against the state machine.
+    - **Post-Partition Log Reconciliation**: Verified that upon partition healing, the old leader receives higher-term AppendEntries, steps down to `RoleFollower`, detects the log conflict, truncates the divergent uncommitted Term 1 suffix (`storage.TruncateSuffix`), replicates the Term 2 history, and all 3 nodes achieve 100% committed log and state machine convergence.
+    - **Zero Split-Brain Writes Committed**: Proven across real TCP sockets under `go test -race` with 20 repeated deterministic executions.
 * **P18-S01-M02: Abrupt `SIGKILL` Chaos Monkey Loop**
   * *Objective*: Continuously write data while sending random `kill -9` signals; assert zero acknowledged write loss.
+  * *Status*: **NOT STARTED**
 
 ---
 

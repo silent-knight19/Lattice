@@ -97,3 +97,13 @@ func (n *Node) SignalAppliedForTest(idx LogIndex) {
 	n.mu.Unlock()
 	n.notifyApplyWaiters(idx, nil)
 }
+
+// LeaderEpochForTest returns the volatile leaderEpoch counter for testing.
+func (n *Node) LeaderEpochForTest() uint64 {
+	if n == nil {
+		return 0
+	}
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.leaderEpoch
+}

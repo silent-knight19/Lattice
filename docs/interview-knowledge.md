@@ -3680,4 +3680,29 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
+# 43. Deep Systems Interview Questions & Answers: Jepsen Network Partition Simulation & Split-Brain Commit Prevention (P18-S01-M01)
+
+### 1. In a Raft cluster, how do you mathematically and programmatically prove zero split-brain writes can commit during a network partition?
+* **Question**: When a 3-node Raft cluster splits into an isolated leader $\{N_1\}$ and a surviving majority $\{N_2, N_3\}$, what exact code path prevents $N_1$ from committing a concurrent write?
+* **Answer**:
+  - **Quorum Mathematics**: In an $N=3$ cluster, quorum is $Q = \lfloor 3/2 \rfloor + 1 = 2$.
+  - **Commit Condition (`advanceCommitIndexLocked` in `internal/raft/node.go`)**:
+    When $N_1$ ingests a client proposal, it appends the entry to its local log and invokes `refreshCommitIndex()`.
+    `advanceCommitIndexLocked` counts the number of cluster nodes that have replicated the entry up to index $i$:
+    $$\text{count} = 1 \text{ (self)} + \sum_{p \in \text{peers}, p \ne \text{self}} \mathbf{1}_{(\text{matchIndex}[p] \ge i)}$$
+    Because $N_1$ is partitioned, its outbound `AppendEntries` RPCs are dropped. No follower responses arrive. $N_1$'s `matchIndex` for $N_2$ and $N_3$ remains at the baseline.
+    Therefore, $\text{count} = 1 < 2$. The quorum threshold is not met.
+  - **State Machine Isolation**: `n.commitIndex` does not advance. The state machine apply loop (`applyLoop` in `internal/raft/apply.go`) only drains entries up to `commitIndex`. Thus, the entry is **never applied to the state machine**. Even though the client received a local durable append acknowledgement under Phase 16 semantics, the write was never committed and never altered the state machine.
+
+### 2. What happens to the conflicting uncommitted log entry on the old leader when the partition heals?
+* **Question**: Post-heal, the old leader has uncommitted entry $E_1$ (Index 3, Term 1), while the new leader committed entry $E_2$ (Index 3, Term 2). How does Lattice reconcile this divergence without human intervention or data corruption?
+* **Answer**:
+  - **Step 1: Stale Leader Stepdown**: The new leader ($N_2$) transmits periodic `AppendEntries` heartbeats carrying $\text{Term} = 2$. In `HandleAppendEntries`, $N_1$ reads $req.\text{Term} > currTerm$. It immediately persists Term 2 to `storage.SetTerm(2)`, increments volatile `leaderEpoch`, steps down to `RoleFollower`, halts its heartbeat scheduler, and resets its election timer.
+  - **Step 2: Log Matching Failure**: $N_2$ sends `AppendEntries` with $\text{PrevLogIndex} = 2, \text{PrevLogTerm} = 2$. $N_1$ checks `prevLogMatches(2, 2)`: its local log at index 2 holds Term 1. It returns `Success = false`.
+  - **Step 3: NextIndex Rollback**: In `HandleAppendEntriesResponse`, $N_2$ observes `Success = false` and decrements `nextIndex[N_1] = nextIndex[N_1] - 1` (stepping back to 1).
+  - **Step 4: Atomic Suffix Truncation (`storage.TruncateSuffix`)**: $N_2$ retries with $\text{PrevLogIndex} = 1, \text{PrevLogTerm} = 1$. This matches $N_1$'s log. $N_1$ enters `replicateEntries`. At index 2, $localTerm (1) \ne entryTerm (2)$. $N_1$ calls `storage.TruncateSuffix(2)`, which atomically stages a truncated log in `raft.log.tmp`, fsyncs, and replaces the active log via `os.Rename`. The divergent Term 1 entry is physically purged from disk and memory.
+  - **Step 5: Catch-up & State Machine Convergence**: $N_1$ appends $N_2$'s Term 2 entries, advances its `commitIndex` to `req.LeaderCommit`, and its apply loop applies the committed Term 2 commands. All 3 nodes converge on identical log and state machine states.
+
+---
+
 *End of Technical Interview Knowledge Base — Lattice v1.0.0-KNOWLEDGE-BASE*
