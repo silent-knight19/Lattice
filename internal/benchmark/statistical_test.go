@@ -83,8 +83,8 @@ func TestZipf_TheoreticalConcentration_DomainScaling(t *testing.T) {
 		expectedMaxFrac float64
 	}{
 		{n: 10, top20Ranks: 2, expectedMinFrac: 0.50, expectedMaxFrac: 0.52},     // ~50.86%
-		{n: 50, top20Ranks: 10, expectedMinFrac: 0.64, expectedMaxFrac: 0.66},   // ~64.59%
-		{n: 100, top20Ranks: 20, expectedMinFrac: 0.68, expectedMaxFrac: 0.70},  // ~68.81%
+		{n: 50, top20Ranks: 10, expectedMinFrac: 0.64, expectedMaxFrac: 0.66},    // ~64.59%
+		{n: 100, top20Ranks: 20, expectedMinFrac: 0.68, expectedMaxFrac: 0.70},   // ~68.81%
 		{n: 1000, top20Ranks: 200, expectedMinFrac: 0.77, expectedMaxFrac: 0.79}, // ~77.89%
 	}
 

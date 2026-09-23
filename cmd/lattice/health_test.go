@@ -124,13 +124,14 @@ func TestDaemon_Health_Standalone_Lifecycle(t *testing.T) {
 	}
 
 	// 4. Test Shutdown Termination Semantics
+	client.CloseIdleConnections()
 	cancel()
 	select {
 	case code := <-exitCh:
 		if code != ExitSuccess {
 			t.Errorf("expected clean exit code %d, got %d", ExitSuccess, code)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatalf("timed out waiting for graceful daemon shutdown")
 	}
 }

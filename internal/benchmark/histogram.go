@@ -71,12 +71,12 @@ var (
 // extrema (Min, Max) with zero memory allocations on the recording hot path and bounded O(1) memory.
 //
 // Mathematical Model:
-// - Latencies in [0, 127] ns have exact 1-nanosecond resolution (128 linear buckets).
-// - Latencies in [128, 2^44 - 1] ns (~4.88 hours) are grouped into base-2 octaves [2^k, 2^(k+1)-1].
-//   Each octave is subdivided into 128 equal sub-buckets. The bucket width in octave k is
-//   2^(k-7) ns, ensuring that the maximum relative quantization error (bucket width / value)
-//   never exceeds 1/128 = 0.78125% (< 1.0%).
-// - Latencies >= 2^44 ns are captured in an overflow bucket. Exact Max is tracked independently.
+//   - Latencies in [0, 127] ns have exact 1-nanosecond resolution (128 linear buckets).
+//   - Latencies in [128, 2^44 - 1] ns (~4.88 hours) are grouped into base-2 octaves [2^k, 2^(k+1)-1].
+//     Each octave is subdivided into 128 equal sub-buckets. The bucket width in octave k is
+//     2^(k-7) ns, ensuring that the maximum relative quantization error (bucket width / value)
+//     never exceeds 1/128 = 0.78125% (< 1.0%).
+//   - Latencies >= 2^44 ns are captured in an overflow bucket. Exact Max is tracked independently.
 //
 // Percentile Semantics:
 // Percentiles use the standard discrete nearest-rank convention: rank = ceil(p * Count).
