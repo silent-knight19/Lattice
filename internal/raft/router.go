@@ -37,13 +37,6 @@ func NewProposalRouter(node *Node, topology *cluster.Topology, engine ...transpo
 	}
 }
 
-// SetEngine updates the storage engine used by RouteRead.
-func (r *ProposalRouter) SetEngine(eng transport.Engine) {
-	if r != nil {
-		r.engine = eng
-	}
-}
-
 // Engine returns the configured storage engine.
 func (r *ProposalRouter) Engine() transport.Engine {
 	if r == nil {
@@ -387,6 +380,11 @@ func (n *Node) routeReadWithTopology(ctx context.Context, req *transport.Request
 		if n.closed.Load() || stdErrors.Is(err, errors.ErrRaftStateClosed) {
 			resp.Status = transport.StatusServerClosed
 			resp.Message = "server is closed"
+			return resp, nil
+		}
+		if stdErrors.Is(err, errors.ErrReadIndexThrottled) {
+			resp.Status = transport.StatusThrottled
+			resp.Message = "read throttled under load"
 			return resp, nil
 		}
 		if ctx.Err() != nil || stdErrors.Is(err, context.Canceled) || stdErrors.Is(err, context.DeadlineExceeded) {

@@ -71,3 +71,29 @@ func (s *Storage) LogFileDescriptorNilForTesting() bool {
 	defer s.mu.RUnlock()
 	return s.logFile == nil
 }
+
+// SetReadIndexTestHook sets an optional hook called during ReadIndex after sending
+// heartbeats, before awaiting confirmation. This is strictly a test-only helper
+// located in export_test.go and is not part of the production API.
+func (n *Node) SetReadIndexTestHook(fn func()) {
+	if n != nil {
+		n.mu.Lock()
+		n.readIndexTestHook = fn
+		n.mu.Unlock()
+	}
+}
+
+// SignalAppliedForTest allows test suites to deterministically simulate lastApplied advancement
+// and wake barrier waiters. This is strictly a test-only helper located in export_test.go
+// and is not part of the production API.
+func (n *Node) SignalAppliedForTest(idx LogIndex) {
+	if n == nil {
+		return
+	}
+	n.mu.Lock()
+	if idx > n.lastApplied {
+		n.lastApplied = idx
+	}
+	n.mu.Unlock()
+	n.notifyApplyWaiters(idx, nil)
+}

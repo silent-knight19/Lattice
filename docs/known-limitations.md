@@ -1429,12 +1429,16 @@ This document tracks all **genuine architectural and operational limitations** o
   3. *Client-Facing Read Routing & Cluster vs Standalone Mode*:
      - In standalone mode (single process, non-replicated), `transport.Server` serves direct `engine.Get()` without consensus overhead, preserving existing standalone semantics.
      - In cluster mode, `transport.Server` requires a registered `ReadRouter`. If the consensus router is missing in cluster mode, requests fail closed (`StatusError`: "cluster mode active but consensus router unavailable") to prevent unverified local engine access.
-     - Followers intercept `OpGet` and return `StatusNotLeader` along with the trusted topology leader endpoint (`LeaderAddr`) and `LeaderID`. Client-supplied redirect addresses are strictly rejected. Candidates and unknown leaders return `StatusNotLeader` without arbitrary redirects.
+     - Followers intercept `OpGet` and return `StatusNotLeader` along with the trusted topology leader endpoint (`LeaderAddr`) and `LeaderID`. Client-supplied redirect addresses are strictly rejected.
   4. *Write Acknowledgement Semantic Boundary (Phase 16 Boundary)*:
-     - Under Phase 16 semantics, write proposals distinguish three stages: locally durably appended to leader log, committed by quorum, and applied to the state machine.
-     - `RouteWrite` acknowledges proposals once durably appended to the leader log and committed by quorum.
-     - The M02 read barrier guarantees that any client read establishing a safe `ReadIndex` will strictly wait until all entries up to that index have been applied to the local state machine before reading.
-     - However, if a client attempts a read before its own prior write has achieved quorum commitment, linearizability applies only to the globally committed prefix. End-to-end "read-your-own-uncommitted-writes" is not guaranteed for writes that have not yet achieved quorum commitment. Full linearizability holds for all committed and acknowledged state.
+     - Under Phase 16 semantics, the system strictly distinguishes four states:
+       1. *Local Durable Append*: Entry is fsynced to the active leader's local Raft log (`Storage.Append()`).
+       2. *Quorum Commit*: Entry is acknowledged by a majority of cluster nodes and `commitIndex` is advanced (`refreshCommitIndex()`).
+       3. *State Machine Application*: Entry is executed by the apply loop against the local LSM engine (`lastApplied` advances).
+       4. *Linearizable Read Verification*: `ReadIndex` confirms majority current-term leadership and waits for `lastApplied >= commitIndex`.
+     - In multi-node clusters ($N > 1$), `RouteWrite()` / `ProposeWithContext()` acknowledges proposals upon **local durable append** on the leader while leadership epoch remains valid; it does *not* block waiting for quorum commit or state machine application.
+     - In single-node clusters ($N = 1$), local append immediately advances `commitIndex` because the leader is a quorum of 1.
+     - Therefore, `ReadIndex` guarantees linearizability over the **quorum-committed and applied prefix**. If a client proposes a write and immediately reads before asynchronous peer replication commits that write, the read is linearizable with respect to the committed state machine, but may not yet reflect the uncommitted write.
 * **Why It Exists**:
   Eliminates stale reads under network partitions, leader stepdowns, and apply lags, ensuring cluster-mode `GET` operations observe monotonic, linearizable state transitions consistent with Raft consensus.
 * **Impact**:
@@ -1446,5 +1450,39 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
-*End of Known Limitations — To be updated continuously throughout implementation.*
+### 81. Phase 17 Read-Path Security Hardening & Pre-Phase-18 Security Gate (P17-SEC)
+* **Limitation & Architectural Boundaries**:
+  A post-implementation security audit of the P17 read-path identified and remediated critical resource exhaustion, lock discipline, and state-machine integrity boundaries:
+  1. *Bounded ReadIndex Resource Ceiling & Throttling (Finding A)*:
+     - `Node` enforces a hard ceiling on concurrent in-flight read rounds: `DefaultMaxActiveReadRounds = 512` (configurable via `NodeConfig.MaxActiveReadRounds`).
+     - Admission fails fast: if `len(n.readRounds) >= n.maxActiveReadRounds`, `ReadIndex` immediately returns `ErrReadIndexThrottled` without allocating a round, acquiring a nonce, or creating waiter channels.
+     - `RouteRead` maps `ErrReadIndexThrottled` to `transport.StatusThrottled` (0x04) with wire message `"read throttled under load"`, preventing internal implementation details from leaking to clients.
+     - Capacity is deterministically released upon round completion, client context cancellation, node stepdown (`abortReadRoundsLocked`), and node close (`Close`).
+  2. *Lock Discipline & TOCTOU Elimination in ValidateLeadership (Finding B)*:
+     - Holding `Node.mu` across blocking/cross-component calls (`Storage.Term()`) is strictly prohibited.
+     - `ValidateLeadership()` takes `Node.mu.RLock()`, captures a snapshot of current `role` and `leaderEpoch`, and verifies `role == RoleLeader` and `epoch == expectedEpoch`.
+     - It releases `Node.mu.RLock()` before calling `Storage.Term()`.
+     - It then reacquires `Node.mu.RLock()` to verify that `role == RoleLeader`, `leaderEpoch == expectedEpoch`, and `term == expectedTerm`, eliminating TOCTOU race conditions where concurrent stepdown could result in a false successful validation.
+     - `ReadIndex()` similarly releases `Node.mu` before reading `Storage.Term()`, re-verifying leader state upon reacquisition.
+  3. *Engine Immutability on ProposalRouter (Finding F)*:
+     - The mutable `ProposalRouter.SetEngine()` method was eliminated.
+     - Ensures that the read path cannot verify one state machine under Raft consensus and read from another due to dynamic engine replacement.
+  4. *Encapsulation of Safety-Sensitive Test Hooks (Finding E)*:
+     - `SignalAppliedForTest` and `SetReadIndexTestHook` were moved exclusively into `export_test.go`, stripping them from production builds and preventing external code from injecting synthetic apply events.
+  5. *Real TCP Data-Plane & Partition Assurance (Findings D & Section 8)*:
+     - Fully verified over physical client TCP sockets via `transport.Server`, covering standalone GET, cluster leader GET, follower redirection, missing router fail-closed, committed-not-applied barrier wait, delete linearizability, stepdown during wait, and physical TCP peer disconnect fail-closed.
+     - Wire `SeqID` is preserved across all response codes.
+  6. *Remaining Unauthenticated Peer Transport Limitation*:
+     - In Phase 17, peer TCP communication over `PeerConnectionManager` is unauthenticated and unencrypted. Full mutual TLS (mTLS) and peer identity verification remain explicitly deferred to Phase 19 (Comprehensive Security Hardening).
+* **Why It Exists**:
+  Guarantees that the linearizable read subsystem cannot be starved or exhausted by adversarial client read storms, ensures zero lock inversions or cross-component deadlocks, and prevents stale reads when network connectivity to peers is severed.
+* **Impact**:
+  The Phase 17 linearizable read path is hardened, bounded, and verified across real TCP transports, establishing a secure baseline prior to Phase 18 chaos testing.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Linearizable reads over committed state; TOCTOU eliminated; fail-closed on partition).
+  * Security: **Audited & Hardened** (Fail-fast throttling at 512 rounds; unauthenticated test hooks removed; unauthenticated peer transport documented).
+  * Performance: **Bounded Overhead** (Zero lock contention across storage I/O; immediate admission rejection when saturated).
 
+---
+
+*End of Known Limitations — To be updated continuously throughout implementation.*

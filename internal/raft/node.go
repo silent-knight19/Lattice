@@ -16,6 +16,9 @@ import (
 // DefaultHeartbeatInterval is the standard heartbeat cadence specified by Raft (50ms).
 const DefaultHeartbeatInterval = 50 * time.Millisecond
 
+// DefaultMaxActiveReadRounds is the maximum concurrent active ReadIndex rounds (512).
+const DefaultMaxActiveReadRounds = 512
+
 // TransitionHook is an optional callback invoked synchronously when a role transition completes.
 // Passed previous role, new role, and new term.
 type TransitionHook func(from, to Role, term Term)
@@ -103,8 +106,9 @@ type Node struct {
 	proposeTestHook func()
 
 	// ReadIndex leadership quorum verification state (P17-S01-M01)
-	readRounds        map[uint64]*readQuorumRound
-	readIndexTestHook func()
+	readRounds          map[uint64]*readQuorumRound
+	maxActiveReadRounds int
+	readIndexTestHook   func()
 
 	// Election subsystem & Quorum (P15-S02-M01 & P15-S02-M02)
 	topology         *cluster.Topology
@@ -172,16 +176,17 @@ type Node struct {
 
 // NodeConfig provides initialization parameters for a Raft Node.
 type NodeConfig struct {
-	LocalID           cluster.NodeID
-	Storage           *Storage
-	TransitionHook    TransitionHook
-	Topology          *cluster.Topology
-	Peers             []cluster.NodeID
-	PeerSender        PeerSender
-	DurationProvider  DurationProvider
-	HeartbeatInterval time.Duration
-	StateMachine      StateMachine // Phase 16: optional StateMachine for applying committed entries
-	ApplyBatchSize    int          // Phase 16: max entries to fetch/apply per batch (default 64)
+	LocalID             cluster.NodeID
+	Storage             *Storage
+	TransitionHook      TransitionHook
+	Topology            *cluster.Topology
+	Peers               []cluster.NodeID
+	PeerSender          PeerSender
+	DurationProvider    DurationProvider
+	HeartbeatInterval   time.Duration
+	StateMachine        StateMachine // Phase 16: optional StateMachine for applying committed entries
+	ApplyBatchSize      int          // Phase 16: max entries to fetch/apply per batch (default 64)
+	MaxActiveReadRounds int          // Phase 17: max concurrent active ReadIndex rounds (default 512)
 }
 
 // NewNode initializes a Raft node.
@@ -237,21 +242,26 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	maxRounds := cfg.MaxActiveReadRounds
+	if maxRounds <= 0 {
+		maxRounds = DefaultMaxActiveReadRounds
+	}
 	n := &Node{
-		localID:           cfg.LocalID,
-		storage:           cfg.Storage,
-		role:              RoleFollower,
-		leaderID:          cluster.NodeIDNil,
-		transitionHook:    cfg.TransitionHook,
-		topology:          cfg.Topology,
-		peers:             remotePeers,
-		peerSender:        cfg.PeerSender,
-		electionTimer:     NewElectionTimer(cfg.DurationProvider),
-		electionCtx:       ctx,
-		electionCancel:    cancel,
-		heartbeatInterval: hbInterval,
-		readRounds:        make(map[uint64]*readQuorumRound),
-		applyWaiters:      make(map[uint64]*applyWaiter),
+		localID:             cfg.LocalID,
+		storage:             cfg.Storage,
+		role:                RoleFollower,
+		leaderID:            cluster.NodeIDNil,
+		transitionHook:      cfg.TransitionHook,
+		topology:            cfg.Topology,
+		peers:               remotePeers,
+		peerSender:          cfg.PeerSender,
+		electionTimer:       NewElectionTimer(cfg.DurationProvider),
+		electionCtx:         ctx,
+		electionCancel:      cancel,
+		heartbeatInterval:   hbInterval,
+		readRounds:          make(map[uint64]*readQuorumRound),
+		maxActiveReadRounds: maxRounds,
+		applyWaiters:        make(map[uint64]*applyWaiter),
 	}
 
 	if cfg.StateMachine != nil {
@@ -2768,6 +2778,25 @@ func (n *Node) ReadIndex(ctx context.Context) (ReadIndexResult, error) {
 		return ReadIndexResult{}, fmt.Errorf("raft: read index context cancelled before start: %w", ctx.Err())
 	}
 
+	n.mu.RLock()
+	if n.closed.Load() {
+		n.mu.RUnlock()
+		return ReadIndexResult{}, errors.ErrRaftStateClosed
+	}
+	if n.role != RoleLeader {
+		role := n.role
+		n.mu.RUnlock()
+		return ReadIndexResult{}, fmt.Errorf("%w: only the leader can verify read index (current role %s)",
+			errors.ErrRaftInvalidRoleTransition, role)
+	}
+	epochBefore := n.leaderEpoch
+	n.mu.RUnlock()
+
+	currTerm, err := n.storage.Term()
+	if err != nil {
+		return ReadIndexResult{}, fmt.Errorf("raft: failed to read current term: %w", err)
+	}
+
 	n.mu.Lock()
 	if n.closed.Load() {
 		n.mu.Unlock()
@@ -2779,11 +2808,10 @@ func (n *Node) ReadIndex(ctx context.Context) (ReadIndexResult, error) {
 		return ReadIndexResult{}, fmt.Errorf("%w: only the leader can verify read index (current role %s)",
 			errors.ErrRaftInvalidRoleTransition, role)
 	}
-
-	currTerm, err := n.storage.Term()
-	if err != nil {
+	if n.leaderEpoch != epochBefore {
 		n.mu.Unlock()
-		return ReadIndexResult{}, fmt.Errorf("raft: failed to read current term: %w", err)
+		return ReadIndexResult{}, fmt.Errorf("%w: leadership epoch changed during read index initiation",
+			errors.ErrRaftInvalidRoleTransition)
 	}
 
 	readCommitIndex := n.commitIndex
@@ -2798,6 +2826,12 @@ func (n *Node) ReadIndex(ctx context.Context) (ReadIndexResult, error) {
 			Term:  currTerm,
 			Epoch: epoch,
 		}, nil
+	}
+
+	// Finding A: Bound concurrent active read rounds (N>1).
+	if len(n.readRounds) >= n.maxActiveReadRounds {
+		n.mu.Unlock()
+		return ReadIndexResult{}, errors.ErrReadIndexThrottled
 	}
 
 	// Multi-node cluster (N>1): mint unique nonce and register active read round.
@@ -2891,15 +2925,6 @@ func (n *Node) ReadIndex(ctx context.Context) (ReadIndexResult, error) {
 	}, nil
 }
 
-// SetReadIndexTestHook sets an optional hook called during ReadIndex after sending
-// read-confirmation heartbeats but before waiting for quorum confirmation.
-// Used exclusively by tests to inject deterministic races (e.g. stepdown).
-func (n *Node) SetReadIndexTestHook(fn func()) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.readIndexTestHook = fn
-}
-
 // ActiveReadRoundsCount returns the number of active read quorum rounds currently registered.
 func (n *Node) ActiveReadRoundsCount() int {
 	n.mu.RLock()
@@ -2990,7 +3015,7 @@ func (n *Node) WaitForApplied(ctx context.Context, targetIndex LogIndex) error {
 // ValidateLeadership verifies that this node remains the active leader in expectedTerm
 // with unchanged leaderEpoch (P17-S01-M02).
 // Protects the interval between ReadIndex quorum confirmation and state machine read dispatch.
-// Never holds Node.mu across I/O.
+// Never holds Node.mu across I/O or storage operations (Finding B lock discipline).
 func (n *Node) ValidateLeadership(expectedTerm Term, expectedEpoch uint64) error {
 	if n == nil {
 		return errors.ErrNilReceiver
@@ -3000,18 +3025,21 @@ func (n *Node) ValidateLeadership(expectedTerm Term, expectedEpoch uint64) error
 	}
 
 	n.mu.RLock()
-	defer n.mu.RUnlock()
-
 	if n.closed.Load() {
+		n.mu.RUnlock()
 		return errors.ErrRaftStateClosed
 	}
-	if n.role != RoleLeader {
+	roleBefore := n.role
+	epochBefore := n.leaderEpoch
+	n.mu.RUnlock()
+
+	if roleBefore != RoleLeader {
 		return fmt.Errorf("%w: node is not leader (current role %s)",
-			errors.ErrRaftInvalidRoleTransition, n.role)
+			errors.ErrRaftInvalidRoleTransition, roleBefore)
 	}
-	if n.leaderEpoch != expectedEpoch {
+	if epochBefore != expectedEpoch {
 		return fmt.Errorf("%w: leadership epoch changed (expected %d, got %d)",
-			errors.ErrRaftInvalidRoleTransition, expectedEpoch, n.leaderEpoch)
+			errors.ErrRaftInvalidRoleTransition, expectedEpoch, epochBefore)
 	}
 
 	currTerm, err := n.storage.Term()
@@ -3023,14 +3051,24 @@ func (n *Node) ValidateLeadership(expectedTerm Term, expectedEpoch uint64) error
 			errors.ErrRaftInvalidRoleTransition, expectedTerm, currTerm)
 	}
 
-	return nil
-}
+	n.mu.RLock()
+	if n.closed.Load() {
+		n.mu.RUnlock()
+		return errors.ErrRaftStateClosed
+	}
+	roleAfter := n.role
+	epochAfter := n.leaderEpoch
+	n.mu.RUnlock()
 
-// SignalAppliedForTest allows test suites to deterministically simulate lastApplied advancement and wake barrier waiters.
-func (n *Node) SignalAppliedForTest(idx LogIndex) {
-	n.mu.Lock()
-	n.lastApplied = idx
-	n.mu.Unlock()
-	n.notifyApplyWaiters(idx, nil)
+	if roleAfter != RoleLeader {
+		return fmt.Errorf("%w: node stepped down during leadership validation (current role %s)",
+			errors.ErrRaftInvalidRoleTransition, roleAfter)
+	}
+	if epochAfter != expectedEpoch {
+		return fmt.Errorf("%w: leadership epoch changed during validation (expected %d, got %d)",
+			errors.ErrRaftInvalidRoleTransition, expectedEpoch, epochAfter)
+	}
+
+	return nil
 }
 

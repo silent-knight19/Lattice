@@ -160,6 +160,9 @@ var (
 	// ErrWriteThrottled indicates that an operation was rejected due to backpressure rate limits.
 	ErrWriteThrottled = stdErrors.New("engine write throttled under backpressure")
 
+	// ErrReadIndexThrottled indicates that a read index request was rejected due to saturated active read rounds.
+	ErrReadIndexThrottled = stdErrors.New("read index throttled: active rounds capacity reached")
+
 	// ErrIteratorClosed indicates that an operation was attempted on a closed iterator.
 	ErrIteratorClosed = stdErrors.New("iterator is closed")
 
