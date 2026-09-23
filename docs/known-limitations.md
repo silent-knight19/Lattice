@@ -1680,6 +1680,26 @@ This document tracks all **genuine architectural and operational limitations** o
   * Correctness: **Optimal** (Peer connection accounting with atomic bounds).
   * Security: **Audited & Hardened** (Hard resource ceiling on internal consensus listener).
 
+### 89. Prometheus Text Exposition Scope, Scraper Connection Ceilings & Metric Cardinality Boundaries (P20-S01-M01)
+* **Limitation & Architectural Boundaries**:
+  1. *Exposition Format Scope*:
+     - The metrics endpoint exposes standard Prometheus text exposition format version 0.0.4 (`text/plain; version=0.0.4; charset=utf-8`).
+     - OpenMetrics text format and binary Protocol Buffers format are not implemented in this micro-phase, as standard Prometheus scrapers and VictoriaMetrics default to the 0.0.4 text format.
+  2. *Scraper Connection Ceiling (`DefaultMaxScraperConnections = 256`)*:
+     - The metrics listener enforces a hard concurrent connection limit of 256 active scrapers to prevent socket descriptor exhaustion.
+     - Scrape connection bursts exceeding 256 simultaneous connections are closed immediately upon acceptance without launching handler goroutines.
+  3. *Static Label Cardinality Boundedness*:
+     - Metric label sets are strictly finite and statically declared during initialization (`HistogramVec` and `CounterVec`).
+     - Dynamic query attributes (e.g. client IP addresses, user keys, transaction IDs, or arbitrary error strings) are strictly prohibited as metric labels to prevent unbounded memory growth.
+  4. *Observability Separation*:
+     - The metrics endpoint provides operational telemetry and performance histograms. It does not provide automated alerting, push gateways, distributed tracing, or cluster health probes (which are scheduled for P20-S01-M02).
+* **Why It Exists**:
+  Guarantees deterministic memory boundedness ($O(1)$ memory consumption for telemetry) and protects daemon resources from adversarial scraping.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Deterministic histogram bucket arithmetic and thread-safe lock-free observations).
+  * Security: **Audited & Hardened** (Cardinality explosion defense, connection limits, Slowloris deadlines, label escaping).
+  * Performance: **Optimal** (Zero allocations on hot-path write/read observations).
+
 ---
 
 *End of Known Limitations — To be updated continuously throughout implementation.*

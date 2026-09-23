@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/silent-knight19/lattice/internal/errors"
+	"github.com/silent-knight19/lattice/internal/metrics"
 )
 
 // DefaultSegmentSize is the standard maximum size (64 MiB) of a WAL segment file
@@ -497,11 +498,26 @@ func (rw *RotatingWriter) AppendSync(rec Record) error {
 		return fmt.Errorf("wal: writer has no active segment (previous rotation failed)")
 	}
 
+	recWireSize := RecordWireSize(rec)
 	if err := rw.appendLocked(rec); err != nil {
 		return err
 	}
 
-	return rw.active.Sync()
+	if err := rw.active.Sync(); err != nil {
+		return err
+	}
+	metrics.WALBytesWritten.Add(uint64(recWireSize))
+	return nil
+}
+
+// ActiveLen returns the physical byte size of the currently active WAL segment.
+func (rw *RotatingWriter) ActiveLen() int64 {
+	if rw == nil {
+		return 0
+	}
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	return rw.activeLen
 }
 
 // Rotate explicitly seals the current active segment and transitions to segment N+1.

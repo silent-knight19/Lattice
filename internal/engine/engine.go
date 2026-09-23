@@ -16,6 +16,7 @@ import (
 	"github.com/silent-knight19/lattice/internal/cache"
 	"github.com/silent-knight19/lattice/internal/errors"
 	"github.com/silent-knight19/lattice/internal/memtable"
+	"github.com/silent-knight19/lattice/internal/metrics"
 	"github.com/silent-knight19/lattice/internal/security"
 	"github.com/silent-knight19/lattice/internal/sstable"
 	"github.com/silent-knight19/lattice/internal/version"
@@ -470,6 +471,10 @@ func (e *Engine) Backpressure() *BackpressureController {
 // failures after a durable WAL append return the insert error (the record
 // remains recoverable via WAL replay).
 func (e *Engine) Put(ctx context.Context, key, val []byte) error {
+	start := time.Now()
+	defer func() {
+		metrics.EngineWriteLatency.WithLabelValues("put").ObserveDuration(time.Since(start))
+	}()
 	if e == nil {
 		return errors.ErrNilReceiver
 	}
@@ -588,6 +593,10 @@ func (e *Engine) Put(ctx context.Context, key, val []byte) error {
 // compaction provably drops it. Durability mirrors Put: WAL AppendSync first,
 // then MemTable tombstone; failures propagate without reporting success.
 func (e *Engine) Delete(ctx context.Context, key []byte) error {
+	start := time.Now()
+	defer func() {
+		metrics.EngineWriteLatency.WithLabelValues("delete").ObserveDuration(time.Since(start))
+	}()
 	if e == nil {
 		return errors.ErrNilReceiver
 	}
@@ -692,6 +701,10 @@ func (e *Engine) Delete(ctx context.Context, key []byte) error {
 // corruption, closed reader) are returned as errors and never mapped to
 // not-found. Returned values are defensive copies.
 func (e *Engine) Get(key []byte) ([]byte, error) {
+	start := time.Now()
+	defer func() {
+		metrics.EngineReadLatency.ObserveDuration(time.Since(start))
+	}()
 	if e == nil {
 		return nil, errors.ErrNilReceiver
 	}

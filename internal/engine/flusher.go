@@ -9,6 +9,7 @@ import (
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
 	"github.com/silent-knight19/lattice/internal/memtable"
+	"github.com/silent-knight19/lattice/internal/metrics"
 	"github.com/silent-knight19/lattice/internal/security"
 	"github.com/silent-knight19/lattice/internal/sstable"
 	"github.com/silent-knight19/lattice/internal/version"
@@ -284,6 +285,7 @@ func (e *Engine) flushLoop() {
 // flushOne persists a captured immutable MemTable to L0 and publishes it.
 // It holds no Engine write mutex during I/O; ownership of imm is by pointer.
 func (e *Engine) flushOne(imm *memtable.SkipList) error {
+	start := time.Now()
 	if imm == nil {
 		return nil
 	}
@@ -406,6 +408,7 @@ func (e *Engine) flushOne(imm *memtable.SkipList) error {
 		// The immutable MemTable is retained by the caller.
 		return err
 	}
+	metrics.FlushDuration.ObserveDuration(time.Since(start))
 	return nil
 }
 

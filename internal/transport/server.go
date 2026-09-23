@@ -13,6 +13,7 @@ import (
 
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
+	"github.com/silent-knight19/lattice/internal/metrics"
 )
 
 // Engine defines the storage engine contract required by the transport server dispatcher.
@@ -373,6 +374,7 @@ func (s *Server) trackConn(conn net.Conn) bool {
 	}
 	s.conns[conn] = struct{}{}
 	s.activeConns.Add(1)
+	metrics.ActiveConnections.Add(1)
 	s.wg.Add(1)
 	return true
 }
@@ -384,6 +386,7 @@ func (s *Server) untrackConn(conn net.Conn) {
 	if _, ok := s.conns[conn]; ok {
 		delete(s.conns, conn)
 		s.activeConns.Add(-1)
+		metrics.ActiveConnections.Add(-1)
 		s.wg.Done()
 	}
 }
@@ -537,7 +540,38 @@ func (s *Server) writeResponseWithDeadline(conn net.Conn, resp *Response) error 
 }
 
 // dispatch routes a decoded request to the appropriate Engine method and translates outcomes to a Response.
-func (s *Server) dispatch(req *Request) *Response {
+func (s *Server) dispatch(req *Request) (finalResp *Response) {
+	start := time.Now()
+	defer func() {
+		if finalResp != nil {
+			var opStr string
+			switch req.OpCode {
+			case OpPut:
+				opStr = "put"
+			case OpGet:
+				opStr = "get"
+			case OpDelete:
+				opStr = "delete"
+			default:
+				return
+			}
+			var statusStr string
+			switch finalResp.Status {
+			case StatusOk:
+				statusStr = "ok"
+			case StatusKeyNotFound:
+				statusStr = "not_found"
+			case StatusNotLeader:
+				statusStr = "not_leader"
+			case StatusThrottled:
+				statusStr = "throttled"
+			default:
+				statusStr = "error"
+			}
+			metrics.RequestDuration.WithLabelValues(opStr, statusStr).ObserveDuration(time.Since(start))
+		}
+	}()
+
 	resp := &Response{
 		OpCode: req.OpCode,
 		SeqID:  req.SeqID,

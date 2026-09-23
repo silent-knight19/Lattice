@@ -2616,8 +2616,32 @@ TOTAL: 176 Discrete, Testable Micro-Phases
 * **Major Objective**: Instrument Prometheus metrics, structured health checks, and diagnostics.
 * **Dependencies**: Phase 19.
 
-* **P20-S01-M01: Prometheus Metrics HTTP Endpoint (`:9100/metrics`)**
-  * *Objective*: Export histograms for write/read latency, WAL bytes, compaction duration.
+* **P20-S01-M01: Prometheus Metrics HTTP Endpoint (`:9100/metrics`)** `[COMPLETED]`
+  * *Objective*: Export histograms for write/read latency, WAL bytes, compaction duration, and operational health.
+  * *Implementation Details*:
+    - **Pure Standard Library Prometheus Engine**: Implemented `internal/metrics` without external dependencies (`go.mod` untouched), exporting standard Prometheus text exposition format (version 0.0.4).
+    - **Lock-Free Hot-Path Telemetry**: Engineered `Histogram` with discrete `atomic.Uint64` bucket counters and `atomic.Int64` nanosecond sum. Binary search bucket resolution performs 0 heap allocations (`testing.AllocsPerRun == 0`) and zero lock contention on hot storage and transport paths. Cumulative bucket counts are computed dynamically at scrape time.
+    - **Strict Cardinality Defense**: Implemented `HistogramVec` and `CounterVec` with pre-computed Cartesian products of authorized discrete label enums (`op`, `status`, `target_level`). Unrecognized or attacker-controlled runtime label values route to an internal no-op collector and never expand internal maps, guaranteeing strictly bounded memory consumption ($O(1)$ series).
+    - **Prometheus Text Escaping & Injection Immunity**: Escapes label values (`\\`, `\"`, `\n`) and help text (`\\`, `\n`) to prevent line or metric injection attacks.
+    - **Dedicated Hardened Metrics HTTP Server**: Implemented `metrics.Server` backed by an isolated `http.NewServeMux()` (never `http.DefaultServeMux`), connection limiter (`MaxConnections = 256`), Slowloris socket timeouts (`ReadHeaderTimeout=5s`, `ReadTimeout=10s`, `WriteTimeout=10s`, `IdleTimeout=30s`), and strict GET-only method enforcement (HTTP 405 with `Allow: GET` for other verbs).
+    - **Subsystem Telemetry Instrumentation**:
+      - `lattice_engine_write_latency_seconds`: Tracks internal storage engine write execution (`Put`, `Delete`) measuring WAL sync + MemTable insertion.
+      - `lattice_engine_read_latency_seconds`: Tracks internal storage engine read execution (MemTable + SSTable/Cache).
+      - `lattice_raft_proposal_latency_seconds`: Tracks Raft consensus write duration from proposal submission to quorum replication commit.
+      - `lattice_raft_read_index_latency_seconds`: Tracks Raft linearizable ReadIndex quorum heartbeat verification duration.
+      - `lattice_request_duration_seconds`: Tracks client end-to-end request duration on the binary transport wire protocol.
+      - `lattice_wal_bytes_written_total`: Tracks cumulative bytes appended and durably synced to WAL log files.
+      - `lattice_compaction_duration_seconds`: Tracks leveled compaction execution duration partitioned by target LSM level (1..6).
+      - `lattice_flush_duration_seconds`: Tracks background MemTable flush duration to Level 0 SSTables.
+      - `lattice_block_cache_hits_total` & `lattice_block_cache_misses_total`: Tracks read block cache efficiency.
+      - `lattice_connections_active`: Tracks active client TCP connections.
+      - Dynamic Gauges: `lattice_memtable_active_bytes`, `lattice_wal_active_segment_bytes`, `lattice_lsm_level_files{level="L0"..L6"}`.
+    - **Daemon Lifecycle Integration**: Configurable via `--metrics-address` and config file `metrics_address`. Enforces SEC-P11-001 loopback security policy (non-loopback requires `--insecure-transport`), detects port collisions with server/pprof/peer ports at configuration validation, and performs context-bounded graceful shutdown draining active HTTP connections before engine close.
+  * *Verification*:
+    - Unit tests: `internal/metrics/registry_test.go`, `internal/metrics/server_test.go`, `cmd/lattice/metrics_test.go`.
+    - Fuzz tests: `FuzzHistogram_Observe`, `FuzzRegistry_LabelEscaping`, `FuzzRegistry_WritePrometheus`.
+    - Adversarial tests: Concurrent scraping under heavy write/read load, slow scraper Slowloris timeouts, malformed requests, metric output line injection tests, port collision fail-closed tests.
+    - Full repository test suite clean (`go test ./...`), race detector clean (`go test -race ./internal/metrics/... ./cmd/lattice/...`), static analysis clean (`go vet ./...`), diff hygiene clean (`git diff --check`).
 * **P20-S01-M02: Liveness & Readiness Probes**
   * *Objective*: HTTP endpoints reporting cluster health and disk storage thresholds.
 

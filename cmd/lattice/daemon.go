@@ -11,6 +11,7 @@ import (
 
 	"github.com/silent-knight19/lattice/internal/cluster"
 	"github.com/silent-knight19/lattice/internal/engine"
+	"github.com/silent-knight19/lattice/internal/metrics"
 	"github.com/silent-knight19/lattice/internal/raft"
 	"github.com/silent-knight19/lattice/internal/transport"
 )
@@ -58,22 +59,24 @@ func runWithContext(ctx context.Context, args []string, stdout, stderr io.Writer
 	return runDaemon(ctx, cfg, stdout, stderr, readyCh)
 }
 
-// runDaemon coordinates the strict lifecycle of the Engine, Pprof Server, and Transport Server:
+// runDaemon coordinates the strict lifecycle of the Engine, Pprof Server, Metrics Server, and Transport Server:
 //
 // Startup Order:
 //  1. Validate configuration & loopback policy.
 //  2. Open storage engine (directory initialization, crash recovery replay).
 //  3. Initialize pprof diagnostics server (if enabled).
-//  4. Construct and bind TCP transport server.
-//  5. Start pprof HTTP server (if enabled).
-//  6. Signal readiness and enter running state.
+//  4. Initialize prometheus metrics server (if enabled).
+//  5. Construct and bind TCP transport server.
+//  6. Start pprof & metrics HTTP servers (if enabled).
+//  7. Signal readiness and enter running state.
 //
 // Shutdown Order:
 //  1. Signal received or context cancelled.
 //  2. Transport Server.Shutdown drains active TCP connections within deadline.
-//  3. Pprof Server.Shutdown drains diagnostics HTTP connections.
-//  4. Engine.Close drains immutable memtables, writes L0 SSTable, and syncs WAL/MANIFEST.
-//  5. Exit with success.
+//  3. PeerConnectionManager & Raft node stopped.
+//  4. Pprof Server & Metrics Server drain HTTP connections.
+//  5. Engine.Close drains immutable memtables, writes L0 SSTable, and syncs WAL/MANIFEST.
+//  6. Exit with success.
 func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, readyCh chan<- struct{}) int {
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -107,15 +110,85 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 	default:
 	}
 
+	var (
+		pprofSrv    *PprofServer
+		metricsSrv  *metrics.Server
+		srv         *transport.Server
+		raftStorage *raft.Storage
+		raftNode    *raft.Node
+		peerMgr     *transport.PeerConnectionManager
+	)
+
+	cleanup := func() {
+		if srv != nil {
+			_ = srv.Close()
+		}
+		if peerMgr != nil {
+			_ = peerMgr.Close()
+		}
+		if raftNode != nil {
+			_ = raftNode.Close()
+		}
+		if raftStorage != nil {
+			_ = raftStorage.Close()
+		}
+		if pprofSrv != nil {
+			_ = pprofSrv.Shutdown(context.Background())
+		}
+		if metricsSrv != nil {
+			_ = metricsSrv.Shutdown(context.Background())
+			metrics.DefaultRegistry.UnregisterGaugeFunc("lattice_memtable_active_bytes")
+			metrics.DefaultRegistry.UnregisterGaugeFunc("lattice_wal_active_segment_bytes")
+			metrics.DefaultRegistry.UnregisterGaugeFunc("lattice_lsm_level_files")
+		}
+		_ = eng.Close()
+	}
+
 	// Step 2: Initialize Pprof Server if configured
-	var pprofSrv *PprofServer
 	if cfg.PprofAddress != "" {
 		var err error
 		pprofSrv, err = NewPprofServer(cfg.PprofAddress)
 		if err != nil {
-			_ = eng.Close()
+			cleanup()
 			fmt.Fprintf(stderr, "lattice: failed to start pprof listener on %s: %v\n", cfg.PprofAddress, err)
 			return ExitStartupError
+		}
+	}
+
+	// Step 2b: Initialize Prometheus Metrics Server if configured
+	if cfg.MetricsAddress != "" {
+		var err error
+		metricsSrv, err = metrics.NewServer(cfg.MetricsAddress, metrics.DefaultRegistry)
+		if err != nil {
+			cleanup()
+			fmt.Fprintf(stderr, "lattice: failed to start metrics listener on %s: %v\n", cfg.MetricsAddress, err)
+			return ExitStartupError
+		}
+
+		// Register dynamic storage engine gauges
+		metrics.DefaultRegistry.RegisterGaugeFunc("lattice_memtable_active_bytes", "Current memory allocated to active mutable MemTable in bytes", nil, func() int64 {
+			if mt := eng.ActiveMemTable(); mt != nil {
+				return int64(mt.ByteSize())
+			}
+			return 0
+		})
+		metrics.DefaultRegistry.RegisterGaugeFunc("lattice_wal_active_segment_bytes", "Current size in bytes of active WAL segment", nil, func() int64 {
+			if rot, ok := eng.WAL().(interface{ ActiveLen() int64 }); ok {
+				return rot.ActiveLen()
+			}
+			return 0
+		})
+		for lvl := 0; lvl <= 6; lvl++ {
+			levelNum := lvl
+			labels := []metrics.Label{{Name: "level", Value: fmt.Sprintf("L%d", levelNum)}}
+			metrics.DefaultRegistry.RegisterGaugeFunc("lattice_lsm_level_files", "Number of SSTables at LSM tree level", labels, func() int64 {
+				if vs := eng.VersionSet(); vs != nil {
+					if cur := vs.Current(); cur != nil {
+						return int64(cur.NumFiles(levelNum))
+					}
+				}
+				return 0
+			})
 		}
 	}
 
@@ -124,22 +197,13 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 	srvCfg.Address = cfg.Address
 	srvCfg.InsecureTransport = cfg.InsecureTransport
 
-	var (
-		raftStorage *raft.Storage
-		raftNode    *raft.Node
-		peerMgr     *transport.PeerConnectionManager
-	)
-
 	// In cluster mode: wire persistent Raft storage, Node, ProposalRouter, and apply loop
 	if cfg.IsClusterEnabled() {
 		srvCfg.ClusterMode = true
 
 		raftDir := filepath.Join(cfg.DataDir, "raft")
 		if err := os.MkdirAll(raftDir, 0750); err != nil {
-			if pprofSrv != nil {
-				_ = pprofSrv.Shutdown(context.Background())
-			}
-			_ = eng.Close()
+			cleanup()
 			fmt.Fprintf(stderr, "lattice: failed to create raft storage directory at %s: %v\n", raftDir, err)
 			return ExitStartupError
 		}
@@ -147,10 +211,7 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 		var err error
 		raftStorage, err = raft.OpenStorage(raftDir)
 		if err != nil {
-			if pprofSrv != nil {
-				_ = pprofSrv.Shutdown(context.Background())
-			}
-			_ = eng.Close()
+			cleanup()
 			fmt.Fprintf(stderr, "lattice: failed to open raft storage at %s: %v\n", raftDir, err)
 			return ExitStartupError
 		}
@@ -165,11 +226,7 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 
 		peerMgr, err = transport.NewPeerConnectionManager(cfg.Topology, peerCfg)
 		if err != nil {
-			_ = raftStorage.Close()
-			if pprofSrv != nil {
-				_ = pprofSrv.Shutdown(context.Background())
-			}
-			_ = eng.Close()
+			cleanup()
 			fmt.Fprintf(stderr, "lattice: failed to initialize peer connection manager: %v\n", err)
 			return ExitStartupError
 		}
@@ -183,12 +240,7 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 		}
 		raftNode, err = raft.NewNode(raftCfg)
 		if err != nil {
-			_ = peerMgr.Close()
-			_ = raftStorage.Close()
-			if pprofSrv != nil {
-				_ = pprofSrv.Shutdown(context.Background())
-			}
-			_ = eng.Close()
+			cleanup()
 			fmt.Fprintf(stderr, "lattice: failed to initialize raft node: %v\n", err)
 			return ExitStartupError
 		}
@@ -200,13 +252,7 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 		// Start peer listener if cluster topology has local address and remote peers exist
 		if cfg.Topology != nil && cfg.Topology.LocalAddress() != "" && cfg.Topology.Size() > 1 {
 			if err := peerMgr.StartListener(cfg.Topology.LocalAddress()); err != nil {
-				_ = raftNode.Close()
-				_ = peerMgr.Close()
-				_ = raftStorage.Close()
-				if pprofSrv != nil {
-					_ = pprofSrv.Shutdown(context.Background())
-				}
-				_ = eng.Close()
+				cleanup()
 				fmt.Fprintf(stderr, "lattice: failed to start peer listener on %s: %v\n", cfg.Topology.LocalAddress(), err)
 				return ExitStartupError
 			}
@@ -214,13 +260,7 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 
 		// Start peer connection supervisor loops
 		if err := peerMgr.Start(); err != nil {
-			_ = raftNode.Close()
-			_ = peerMgr.Close()
-			_ = raftStorage.Close()
-			if pprofSrv != nil {
-				_ = pprofSrv.Shutdown(context.Background())
-			}
-			_ = eng.Close()
+			cleanup()
 			fmt.Fprintf(stderr, "lattice: failed to start peer connection manager: %v\n", err)
 			return ExitStartupError
 		}
@@ -233,52 +273,23 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 			}
 		}
 		if err := raftNode.StartElectionTimer(); err != nil {
-			_ = raftNode.Close()
-			_ = peerMgr.Close()
-			_ = raftStorage.Close()
-			if pprofSrv != nil {
-				_ = pprofSrv.Shutdown(context.Background())
-			}
-			_ = eng.Close()
+			cleanup()
 			fmt.Fprintf(stderr, "lattice: failed to start election timer: %v\n", err)
 			return ExitStartupError
 		}
 	}
 
-	srv, err := transport.NewServer(srvCfg, eng)
+	var err error
+	srv, err = transport.NewServer(srvCfg, eng)
 	if err != nil {
-		if peerMgr != nil {
-			_ = peerMgr.Close()
-		}
-		if raftNode != nil {
-			_ = raftNode.Close()
-		}
-		if raftStorage != nil {
-			_ = raftStorage.Close()
-		}
-		if pprofSrv != nil {
-			_ = pprofSrv.Shutdown(context.Background())
-		}
-		_ = eng.Close()
+		cleanup()
 		fmt.Fprintf(stderr, "lattice: failed to initialize transport server: %v\n", err)
 		return ExitStartupError
 	}
 
 	// Step 4: Bind Listener and Start Accept Loop
 	if err := srv.Listen(cfg.Address); err != nil {
-		if peerMgr != nil {
-			_ = peerMgr.Close()
-		}
-		if raftNode != nil {
-			_ = raftNode.Close()
-		}
-		if raftStorage != nil {
-			_ = raftStorage.Close()
-		}
-		if pprofSrv != nil {
-			_ = pprofSrv.Shutdown(context.Background())
-		}
-		_ = eng.Close()
+		cleanup()
 		fmt.Fprintf(stderr, "lattice: failed to start listener on %s: %v\n", cfg.Address, err)
 		return ExitStartupError
 	}
@@ -286,37 +297,11 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 	// Startup Signal Race Check (after Server.Listen)
 	select {
 	case <-ctx.Done():
-		_ = srv.Close()
-		if peerMgr != nil {
-			_ = peerMgr.Close()
-		}
-		if raftNode != nil {
-			_ = raftNode.Close()
-		}
-		if raftStorage != nil {
-			_ = raftStorage.Close()
-		}
-		if pprofSrv != nil {
-			_ = pprofSrv.Shutdown(context.Background())
-		}
-		_ = eng.Close()
+		cleanup()
 		return ExitSuccess
 	case sig := <-sigCh:
 		fmt.Fprintf(stdout, "lattice: received signal %s during startup, shutting down...\n", sig)
-		_ = srv.Close()
-		if peerMgr != nil {
-			_ = peerMgr.Close()
-		}
-		if raftNode != nil {
-			_ = raftNode.Close()
-		}
-		if raftStorage != nil {
-			_ = raftStorage.Close()
-		}
-		if pprofSrv != nil {
-			_ = pprofSrv.Shutdown(context.Background())
-		}
-		_ = eng.Close()
+		cleanup()
 		return ExitSuccess
 	default:
 	}
@@ -324,23 +309,23 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 	// Step 5: Start Pprof Server if configured
 	if pprofSrv != nil {
 		if err := pprofSrv.Start(); err != nil {
-			_ = srv.Close()
-			if peerMgr != nil {
-				_ = peerMgr.Close()
-			}
-			if raftNode != nil {
-				_ = raftNode.Close()
-			}
-			if raftStorage != nil {
-				_ = raftStorage.Close()
-			}
-			_ = pprofSrv.Shutdown(context.Background())
-			_ = eng.Close()
+			cleanup()
 			fmt.Fprintf(stderr, "lattice: failed to start pprof server: %v\n", err)
 			return ExitStartupError
 		}
 		pprofAddr := pprofSrv.Addr().String()
 		fmt.Fprintf(stdout, "lattice: pprof diagnostics listening on http://%s/debug/pprof/\n", pprofAddr)
+	}
+
+	// Step 5b: Start Prometheus Metrics Server if configured
+	if metricsSrv != nil {
+		if err := metricsSrv.Start(); err != nil {
+			cleanup()
+			fmt.Fprintf(stderr, "lattice: failed to start metrics server: %v\n", err)
+			return ExitStartupError
+		}
+		metricsAddr := metricsSrv.Addr().String()
+		fmt.Fprintf(stdout, "lattice: prometheus metrics listening on http://%s/metrics\n", metricsAddr)
 	}
 
 	// Step 6: Running State Established
@@ -378,7 +363,7 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 	// Step 8: Ordered Graceful Shutdown
 	// Invariant: Halt network ingestion and drain data clients BEFORE Raft/pprof/storage,
 	// stop Raft node and apply loop, close Raft persistent storage,
-	// drain pprof diagnostics, and close storage engine LAST.
+	// drain pprof diagnostics and metrics HTTP servers, and close storage engine LAST.
 	shutCtx, cancel := context.WithTimeout(context.Background(), srvCfg.ShutdownTimeout)
 	defer cancel()
 
@@ -406,6 +391,17 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 		} else if sErr := pprofSrv.Err(); sErr != nil {
 			fmt.Fprintf(stderr, "lattice: warning: pprof server accept error: %v\n", sErr)
 		}
+	}
+
+	if metricsSrv != nil {
+		if metricsErr := metricsSrv.Shutdown(shutCtx); metricsErr != nil {
+			fmt.Fprintf(stderr, "lattice: warning: metrics server shutdown error: %v\n", metricsErr)
+		} else if sErr := metricsSrv.Err(); sErr != nil {
+			fmt.Fprintf(stderr, "lattice: warning: metrics server accept error: %v\n", sErr)
+		}
+		metrics.DefaultRegistry.UnregisterGaugeFunc("lattice_memtable_active_bytes")
+		metrics.DefaultRegistry.UnregisterGaugeFunc("lattice_wal_active_segment_bytes")
+		metrics.DefaultRegistry.UnregisterGaugeFunc("lattice_lsm_level_files")
 	}
 
 	if engErr := eng.Close(); engErr != nil {

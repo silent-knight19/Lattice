@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"time"
 
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
+	"github.com/silent-knight19/lattice/internal/metrics"
 	"github.com/silent-knight19/lattice/internal/sstable"
 	"github.com/silent-knight19/lattice/internal/version"
 )
@@ -191,6 +194,7 @@ func BuildCompactionOutput(
 	alloc FileNumAllocator,
 	cfg CompactionOutputConfig,
 ) (*CompactionOutput, error) {
+	start := time.Now()
 	if iter == nil {
 		return nil, errors.ErrNilReceiver
 	}
@@ -443,6 +447,10 @@ func BuildCompactionOutput(
 	} else if currentWriter != nil {
 		_ = currentWriter.Close()
 		currentWriter = nil
+	}
+
+	if cfg.TargetLevel > 0 {
+		metrics.CompactionDuration.WithLabelValues(strconv.Itoa(cfg.TargetLevel)).ObserveDuration(time.Since(start))
 	}
 
 	return &CompactionOutput{

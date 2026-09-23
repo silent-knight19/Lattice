@@ -4,10 +4,12 @@ import (
 	"context"
 	stdErrors "errors"
 	"fmt"
+	"time"
 
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/cluster"
 	"github.com/silent-knight19/lattice/internal/errors"
+	"github.com/silent-knight19/lattice/internal/metrics"
 	"github.com/silent-knight19/lattice/internal/transport"
 )
 
@@ -204,9 +206,15 @@ func (n *Node) routeWriteWithTopology(ctx context.Context, req *transport.Reques
 	}
 
 	// Submit proposal to leader's durable Raft log (P16-SEC-F03: context-aware)
+	start := time.Now()
 	_, err = n.ProposeWithContext(ctx, cmdBytes)
 	if err == nil {
 		// Proposal accepted and durably persisted in leader's local Raft log (P16-S01-M02)
+		opStr := "put"
+		if req.OpCode == transport.OpDelete {
+			opStr = "delete"
+		}
+		metrics.RaftProposalLatency.WithLabelValues(opStr).ObserveDuration(time.Since(start))
 		resp.Status = transport.StatusOk
 		return resp, nil
 	}
@@ -375,7 +383,11 @@ func (n *Node) routeReadWithTopology(ctx context.Context, req *transport.Request
 
 	// 6. Case: Leader -> Execute linearizable read sequence
 	// Step A: ReadIndex quorum verification (P17-S01-M01)
+	readStart := time.Now()
 	readRes, err := n.ReadIndex(ctx)
+	if err == nil {
+		metrics.RaftReadIndexLatency.ObserveDuration(time.Since(readStart))
+	}
 	if err != nil {
 		if n.closed.Load() || stdErrors.Is(err, errors.ErrRaftStateClosed) {
 			resp.Status = transport.StatusServerClosed

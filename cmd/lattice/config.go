@@ -74,6 +74,7 @@ type Config struct {
 	ConfigPath        string            `json:"-"`
 	InsecureTransport bool              `json:"insecure_transport"`
 	PprofAddress      string            `json:"pprof_address"`
+	MetricsAddress    string            `json:"metrics_address"`
 	NodeID            uint64            `json:"node_id"`
 	PeerAddress       string            `json:"peer_address"`
 	ClusterPeers      ClusterPeersList  `json:"cluster_peers"`
@@ -128,6 +129,7 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 		flagConfig            string
 		flagInsecureTransport bool
 		flagPprofAddress      string
+		flagMetricsAddress    string
 		flagNodeID            uint64
 		flagPeerAddress       string
 		flagClusterPeers      string
@@ -143,6 +145,7 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 	fs.StringVar(&flagConfig, "config", "", "Path to configuration file (JSON or key-value)")
 	fs.BoolVar(&flagInsecureTransport, "insecure-transport", false, "Explicit opt-in permitting unencrypted plaintext TCP on non-loopback addresses")
 	fs.StringVar(&flagPprofAddress, "pprof-address", "", "TCP bind address for HTTP pprof profiling diagnostics (e.g. 127.0.0.1:6060, loopback only)")
+	fs.StringVar(&flagMetricsAddress, "metrics-address", "", "TCP bind address for Prometheus metrics HTTP endpoint (e.g. 127.0.0.1:9100, :9100)")
 	fs.Uint64Var(&flagNodeID, "node-id", 0, "Cluster node ID (> 0 in cluster mode; 0 for single-node)")
 	fs.StringVar(&flagPeerAddress, "peer-address", "", "TCP bind address for Raft peer transport (e.g. 127.0.0.1:9098)")
 	fs.StringVar(&flagClusterPeers, "cluster-peers", "", "Comma-separated list of cluster peers (format: id=host:port, e.g. 1=10.0.0.1:9098,2=10.0.0.2:9098)")
@@ -216,6 +219,9 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 	if provided["pprof-address"] {
 		cfg.PprofAddress = flagPprofAddress
 	}
+	if provided["metrics-address"] {
+		cfg.MetricsAddress = flagMetricsAddress
+	}
 	if provided["node-id"] {
 		cfg.NodeID = flagNodeID
 	}
@@ -254,6 +260,15 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 		cfg.Address = net.JoinHostPort(host, strconv.Itoa(cfg.Port))
 	} else if !provided["address"] && !provided["port"] && cfg.Address == "" {
 		cfg.Address = net.JoinHostPort(DefaultHost, strconv.Itoa(cfg.Port))
+	}
+
+	// Normalize MetricsAddress if configured (default port without host binds to DefaultHost)
+	if cfg.MetricsAddress != "" {
+		if strings.HasPrefix(cfg.MetricsAddress, ":") {
+			cfg.MetricsAddress = net.JoinHostPort(DefaultHost, strings.TrimPrefix(cfg.MetricsAddress, ":"))
+		} else if !strings.Contains(cfg.MetricsAddress, ":") {
+			cfg.MetricsAddress = net.JoinHostPort(DefaultHost, cfg.MetricsAddress)
+		}
 	}
 
 	// Reject unexpected positional arguments (e.g. typos like 'lattice dump_wal' or unknown subcommands)
@@ -357,6 +372,31 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// Phase 20 M01 Metrics Security Policy:
+	if c.MetricsAddress != "" {
+		mHost, mPortStr, err := net.SplitHostPort(c.MetricsAddress)
+		if err != nil {
+			return fmt.Errorf("config error: invalid --metrics-address %q (expected host:port): %w", c.MetricsAddress, err)
+		}
+		mPort, err := strconv.Atoi(mPortStr)
+		if err != nil || mPort < 0 || mPort > 65535 {
+			return fmt.Errorf("config error: invalid port in --metrics-address %q (must be between 0 and 65535)", c.MetricsAddress)
+		}
+		if !c.InsecureTransport && !isLoopback(mHost) {
+			return fmt.Errorf("config error: --metrics-address %q requires --insecure-transport for non-loopback interfaces: %w", c.MetricsAddress, errors.ErrInsecureTransport)
+		}
+		if mPort != 0 {
+			if portsCollide(c.MetricsAddress, c.Address) {
+				_, srvPortStr, _ := net.SplitHostPort(c.Address)
+				return fmt.Errorf("config error: --metrics-address port %s conflicts with server --address port %s", mPortStr, srvPortStr)
+			}
+			if c.PprofAddress != "" && portsCollide(c.MetricsAddress, c.PprofAddress) {
+				_, pPortStr, _ := net.SplitHostPort(c.PprofAddress)
+				return fmt.Errorf("config error: --metrics-address port %s conflicts with pprof address port %s", mPortStr, pPortStr)
+			}
+		}
+	}
+
 	// Phase 14 M01 Cluster Topology Policy:
 	// If any cluster parameter is provided, validate cluster configuration.
 	// Single-node V1 operation remains active when unconfigured.
@@ -381,6 +421,11 @@ func (c *Config) Validate() error {
 				_, peerPortStr, _ := net.SplitHostPort(c.Topology.LocalAddress())
 				_, pPortStr, _ := net.SplitHostPort(c.PprofAddress)
 				return fmt.Errorf("config error: peer address port %s conflicts with pprof address port %s", peerPortStr, pPortStr)
+			}
+			if c.MetricsAddress != "" && portsCollide(c.Topology.LocalAddress(), c.MetricsAddress) {
+				_, peerPortStr, _ := net.SplitHostPort(c.Topology.LocalAddress())
+				_, mPortStr, _ := net.SplitHostPort(c.MetricsAddress)
+				return fmt.Errorf("config error: peer address port %s conflicts with metrics address port %s", peerPortStr, mPortStr)
 			}
 		}
 	}
@@ -481,6 +526,9 @@ func loadConfigFile(path string) (*Config, error) {
 		case "pprof_address", "pprof-address", "server.pprof_address", "server.pprof-address":
 			canonicalKey = "pprof_address"
 			cfg.PprofAddress = val
+		case "metrics_address", "metrics-address", "server.metrics_address", "server.metrics-address", "monitoring.metrics_address":
+			canonicalKey = "metrics_address"
+			cfg.MetricsAddress = val
 		case "node_id", "node-id", "raft.node_id", "cluster.node_id":
 			canonicalKey = "node_id"
 			id, err := strconv.ParseUint(val, 10, 64)

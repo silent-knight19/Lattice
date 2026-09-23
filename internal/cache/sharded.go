@@ -5,6 +5,7 @@ import (
 
 	"github.com/silent-knight19/lattice/internal/errors"
 	"github.com/silent-knight19/lattice/internal/filter"
+	"github.com/silent-knight19/lattice/internal/metrics"
 )
 
 // NumShards is the fixed count of independent LRU cache shards (16).
@@ -113,10 +114,17 @@ func ShardIndex(key BlockKey) int {
 // A nil receiver reports a miss.
 func (c *ShardedCache) Get(key BlockKey) ([]byte, bool) {
 	if c == nil {
+		metrics.BlockCacheMisses.Inc()
 		return nil, false
 	}
 	idx := ShardIndex(key)
-	return c.shards[idx].Get(key)
+	val, ok := c.shards[idx].Get(key)
+	if ok {
+		metrics.BlockCacheHits.Inc()
+	} else {
+		metrics.BlockCacheMisses.Inc()
+	}
+	return val, ok
 }
 
 // GetBlock is a convenience method for querying by raw SSTable file number and block byte offset.
