@@ -31,6 +31,15 @@ type ProposalRouter interface {
 	RouteWrite(ctx context.Context, req *Request) (*Response, error)
 }
 
+// ReadRouter defines the interface for routing client read requests in replicated mode (P17-S01-M02).
+type ReadRouter interface {
+	// RouteRead handles client read requests (OpGet) in a Raft cluster.
+	// If the current node is the leader, ReadIndex is executed, waits for lastApplied >= readIndex,
+	// revalidates continuous leadership, and serves from the local engine.
+	// If the current node is a follower/non-leader, leader redirection is returned.
+	RouteRead(ctx context.Context, req *Request) (*Response, error)
+}
+
 // ServerConfig configures the TCP transport server.
 type ServerConfig struct {
 	// Address is the TCP address to bind and listen on (default: "127.0.0.1:9099").
@@ -65,10 +74,14 @@ type ServerConfig struct {
 	// When nil (default), Server operates in standalone local engine mode.
 	ProposalRouter ProposalRouter
 
+	// ReadRouter routes client read requests to consensus in replicated mode (P17-S01-M02).
+	// When nil and ClusterMode is true, Server checks if ProposalRouter satisfies ReadRouter.
+	// If neither is available in cluster mode, reads fail closed with StatusError.
+	ReadRouter ReadRouter
+
 	// ClusterMode indicates that this server is part of a Raft cluster (P16-SEC-F01).
-	// When true, all client write mutations (PUT, DELETE) MUST go through the ProposalRouter.
-	// If ProposalRouter is nil while ClusterMode is true, writes are rejected fail-closed
-	// rather than falling through to direct Engine mutations.
+	// When true, all client write mutations (PUT, DELETE) MUST go through the ProposalRouter,
+	// and all client reads (GET) MUST go through the ReadRouter.
 	ClusterMode bool
 }
 
@@ -120,6 +133,7 @@ type Server struct {
 
 	routerMu    sync.RWMutex
 	router      ProposalRouter
+	readRouter  ReadRouter
 	clusterMode bool // immutable after construction (P16-SEC-F01)
 }
 
@@ -158,10 +172,18 @@ func NewServer(cfg ServerConfig, eng Engine) (*Server, error) {
 		cfg.ShutdownTimeout = defaults.ShutdownTimeout
 	}
 
+	readRouter := cfg.ReadRouter
+	if readRouter == nil {
+		if rr, ok := cfg.ProposalRouter.(ReadRouter); ok {
+			readRouter = rr
+		}
+	}
+
 	return &Server{
 		cfg:          cfg,
 		engine:       eng,
 		router:       cfg.ProposalRouter,
+		readRouter:   readRouter,
 		clusterMode:  cfg.ClusterMode,
 		conns:        make(map[net.Conn]struct{}),
 		shutdownCh:   make(chan struct{}),
@@ -190,6 +212,32 @@ func (s *Server) ProposalRouter() ProposalRouter {
 	s.routerMu.RLock()
 	defer s.routerMu.RUnlock()
 	return s.router
+}
+
+// SetReadRouter configures the authoritative consensus read router for linearizable reads (P17-S01-M02).
+func (s *Server) SetReadRouter(r ReadRouter) {
+	if s == nil {
+		return
+	}
+	s.routerMu.Lock()
+	defer s.routerMu.Unlock()
+	s.readRouter = r
+}
+
+// ReadRouter returns the currently configured read router, or nil if operating in local engine mode.
+func (s *Server) ReadRouter() ReadRouter {
+	if s == nil {
+		return nil
+	}
+	s.routerMu.RLock()
+	defer s.routerMu.RUnlock()
+	if s.readRouter != nil {
+		return s.readRouter
+	}
+	if rr, ok := s.router.(ReadRouter); ok {
+		return rr
+	}
+	return nil
 }
 
 // IsClusterMode reports whether the server was constructed in cluster mode (P16-SEC-F01).
@@ -522,6 +570,22 @@ func (s *Server) dispatch(req *Request) *Response {
 		s.mapEngineError(err, resp)
 
 	case OpGet:
+		readRouter := s.ReadRouter()
+		if readRouter != nil {
+			r, err := readRouter.RouteRead(ctx, req)
+			if err != nil {
+				resp.Status = StatusError
+				resp.Message = "internal routing error"
+				return resp
+			}
+			return r
+		}
+		// In cluster mode, NEVER fall through to direct unverified Engine reads (P17-S01-M02).
+		if s.clusterMode {
+			resp.Status = StatusError
+			resp.Message = "cluster mode active but consensus router unavailable"
+			return resp
+		}
 		val, err := s.engine.Get(req.Key)
 		if err == nil {
 			if uint32(len(val)) > MaxPayloadLength {

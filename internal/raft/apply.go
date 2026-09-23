@@ -157,6 +157,8 @@ func (n *Node) setApplyError(err error) {
 		n.applyErr = err
 	}
 	n.applyErrMu.Unlock()
+
+	n.notifyApplyWaiters(0, err)
 }
 
 // signalApplyLocked notifies the apply loop that commitIndex has advanced.
@@ -290,6 +292,9 @@ func (n *Node) drainCommittedEntries() {
 			n.lastApplied = entry.Index
 			appliedIdx = entry.Index
 			n.mu.Unlock()
+
+			// Broadcast progress to read-barrier waiters (P17-S01-M02)
+			n.notifyApplyWaiters(entry.Index, nil)
 		}
 	}
 }
@@ -356,5 +361,34 @@ func (n *Node) applySingleEntry(entry LogEntry) error {
 	default:
 		return fmt.Errorf("%w: unrecognized entry type 0x%02x at index %d",
 			errors.ErrRaftInvalidEntryType, byte(entry.Type), entry.Index)
+	}
+}
+
+// notifyApplyWaiters broadcasts application progress or terminal failures to all registered read-barrier waiters (P17-S01-M02).
+// Does not acquire Node.mu; safe to call with or without Node.mu held.
+func (n *Node) notifyApplyWaiters(appliedIndex LogIndex, terminalErr error) {
+	if n == nil {
+		return
+	}
+	n.applyWaitMu.Lock()
+	defer n.applyWaitMu.Unlock()
+
+	if appliedIndex > n.maxNotifiedApplied {
+		n.maxNotifiedApplied = appliedIndex
+	}
+
+	if terminalErr != nil {
+		for id, w := range n.applyWaiters {
+			close(w.ch)
+			delete(n.applyWaiters, id)
+		}
+		return
+	}
+
+	for id, w := range n.applyWaiters {
+		if w.index <= appliedIndex {
+			close(w.ch)
+			delete(n.applyWaiters, id)
+		}
 	}
 }

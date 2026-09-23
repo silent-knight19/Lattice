@@ -1411,6 +1411,39 @@ This document tracks all **genuine architectural and operational limitations** o
   * Security: **Audited & Hardened** (Fail-closed on stepdown, unknown peers rejected, bounded memory with automatic round deregistration).
   * Performance: **Low overhead** (Single round of heartbeat probes; single-node clusters execute with zero network delay; connection reuse over PeerConnectionManager).
 
+### 80. Phase 17 State Machine Read Barrier Execution & Linearizable GET Semantics (P17-S01-M02)
+* **Limitation & Architectural Boundaries**:
+  The client-facing linearizable read path in cluster mode (`ReadIndex` -> `WaitForApplied` -> `ValidateLeadership` -> `Engine.Get`) implements linearizable read semantics for all committed state with the following documented properties and semantic boundaries:
+  1. *Read Barrier Synchronization (`WaitForApplied`)*:
+     - Waits until `lastApplied >= targetIndex` (the safe committed index confirmed by `ReadIndex`).
+     - Uses a dedicated `applyWaiters` map and `applyWaitMu` condition broadcast. The internal `applyNotifyCh` channel consumed by the apply loop is strictly preserved to prevent notification stealing or lost wakeups.
+     - Tracks `maxNotifiedApplied` monotonically to prevent race conditions where state machine application advances between the initial condition check and waiter registration.
+     - Wakes immediately without waiting if `lastApplied >= targetIndex` on arrival.
+     - Node closure wakes all waiters fail-closed with `ErrRaftStateClosed`.
+     - State machine apply errors (terminal failure) wake all waiters fail-closed with the terminal apply error, ensuring reads are never served from a compromised or corrupted state machine.
+     - Context cancellation or deadline expiration unregisters the waiter and preserves pure context errors (`context.Canceled`, `context.DeadlineExceeded`), returning `StatusThrottled`.
+  2. *Leadership Post-Wait Fencing (`ValidateLeadership`)*:
+     - Protects the critical window between `ReadIndex` quorum confirmation, state machine apply wait, and local engine read.
+     - Revalidates that current role is `RoleLeader`, current term equals the `ReadIndex` term, and current `leaderEpoch` equals the `ReadIndex` epoch.
+     - If the node stepped down or lost leadership authority during the barrier wait, the read fails closed with `StatusNotLeader`, triggering follower redirection rather than serving stale data from local engine state.
+  3. *Client-Facing Read Routing & Cluster vs Standalone Mode*:
+     - In standalone mode (single process, non-replicated), `transport.Server` serves direct `engine.Get()` without consensus overhead, preserving existing standalone semantics.
+     - In cluster mode, `transport.Server` requires a registered `ReadRouter`. If the consensus router is missing in cluster mode, requests fail closed (`StatusError`: "cluster mode active but consensus router unavailable") to prevent unverified local engine access.
+     - Followers intercept `OpGet` and return `StatusNotLeader` along with the trusted topology leader endpoint (`LeaderAddr`) and `LeaderID`. Client-supplied redirect addresses are strictly rejected. Candidates and unknown leaders return `StatusNotLeader` without arbitrary redirects.
+  4. *Write Acknowledgement Semantic Boundary (Phase 16 Boundary)*:
+     - Under Phase 16 semantics, write proposals distinguish three stages: locally durably appended to leader log, committed by quorum, and applied to the state machine.
+     - `RouteWrite` acknowledges proposals once durably appended to the leader log and committed by quorum.
+     - The M02 read barrier guarantees that any client read establishing a safe `ReadIndex` will strictly wait until all entries up to that index have been applied to the local state machine before reading.
+     - However, if a client attempts a read before its own prior write has achieved quorum commitment, linearizability applies only to the globally committed prefix. End-to-end "read-your-own-uncommitted-writes" is not guaranteed for writes that have not yet achieved quorum commitment. Full linearizability holds for all committed and acknowledged state.
+* **Why It Exists**:
+  Eliminates stale reads under network partitions, leader stepdowns, and apply lags, ensuring cluster-mode `GET` operations observe monotonic, linearizable state transitions consistent with Raft consensus.
+* **Impact**:
+  Lattice now guarantees linearizable reads across cluster deployments without stale data exposure.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Complete linearizability across partitions, leadership fencing, fail-closed apply errors, and trusted topology redirects).
+  * Security: **Audited & Hardened** (Fail-closed on isolation, zero untrusted redirect injection, sanitized client responses, bounded waiter allocations).
+  * Performance: **High Throughput** (Zero lock contention between read barrier waiters and apply loop; condition broadcast avoids tight polling; single-node clusters execute immediately).
+
 ---
 
 *End of Known Limitations — To be updated continuously throughout implementation.*

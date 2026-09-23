@@ -193,8 +193,9 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 			return ExitStartupError
 		}
 
-		router := raft.NewProposalRouter(raftNode, cfg.Topology)
+		router := raft.NewProposalRouter(raftNode, cfg.Topology, eng)
 		srvCfg.ProposalRouter = router
+		srvCfg.ReadRouter = router
 
 		// Start peer listener if cluster topology has local address and remote peers exist
 		if cfg.Topology != nil && cfg.Topology.LocalAddress() != "" && cfg.Topology.Size() > 1 {

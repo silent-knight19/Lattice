@@ -11,24 +11,45 @@ import (
 	"github.com/silent-knight19/lattice/internal/transport"
 )
 
-// ProposalRouter intercepts client write requests (OpPut, OpDelete) and routes them to the
-// Raft leader or returns leader redirection information (P16-S01-M02).
-// Satisfies transport.ProposalRouter.
+// ProposalRouter intercepts client write requests (OpPut, OpDelete) and read requests (OpGet)
+// routing them to consensus or returning leader redirection information (P16-S01-M02, P17-S01-M02).
+// Satisfies transport.ProposalRouter and transport.ReadRouter.
 type ProposalRouter struct {
 	node     *Node
 	topology *cluster.Topology
+	engine   transport.Engine
 }
 
-// NewProposalRouter constructs a ProposalRouter bound to a Node and optional cluster Topology.
+// NewProposalRouter constructs a ProposalRouter bound to a Node, optional cluster Topology, and optional Engine.
 // If topology is nil, the router falls back to node.Topology().
-func NewProposalRouter(node *Node, topology *cluster.Topology) *ProposalRouter {
+func NewProposalRouter(node *Node, topology *cluster.Topology, engine ...transport.Engine) *ProposalRouter {
 	if topology == nil && node != nil {
 		topology = node.Topology()
+	}
+	var eng transport.Engine
+	if len(engine) > 0 {
+		eng = engine[0]
 	}
 	return &ProposalRouter{
 		node:     node,
 		topology: topology,
+		engine:   eng,
 	}
+}
+
+// SetEngine updates the storage engine used by RouteRead.
+func (r *ProposalRouter) SetEngine(eng transport.Engine) {
+	if r != nil {
+		r.engine = eng
+	}
+}
+
+// Engine returns the configured storage engine.
+func (r *ProposalRouter) Engine() transport.Engine {
+	if r == nil {
+		return nil
+	}
+	return r.engine
 }
 
 // RouteWrite intercepts client mutations, routing to consensus on the leader or returning
@@ -46,6 +67,24 @@ func (r *ProposalRouter) RouteWrite(ctx context.Context, req *transport.Request)
 		}, nil
 	}
 	return r.node.routeWriteWithTopology(ctx, req, r.topology)
+}
+
+// RouteRead intercepts client read requests (OpGet), performing linearizable read verification on the
+// leader (ReadIndex -> WaitForApplied -> ValidateLeadership -> engine.Get) or returning
+// leader redirection on followers and candidates (P17-S01-M02).
+func (r *ProposalRouter) RouteRead(ctx context.Context, req *transport.Request) (*transport.Response, error) {
+	if r == nil || r.node == nil {
+		if req == nil {
+			return nil, errors.ErrNilReceiver
+		}
+		return &transport.Response{
+			OpCode:  req.OpCode,
+			Status:  transport.StatusServerClosed,
+			SeqID:   req.SeqID,
+			Message: "server is closed",
+		}, nil
+	}
+	return r.node.routeReadWithTopology(ctx, req, r.topology, r.engine)
 }
 
 // Topology returns the configured cluster topology, or nil if none.
@@ -265,5 +304,158 @@ func (n *Node) routeNonLeader(req *transport.Request, top *cluster.Topology) (*t
 	resp.Message = transport.FormatRedirectMessage(uint64(leaderID), peer.Address)
 	resp.LeaderID = uint64(leaderID)
 	resp.LeaderAddr = peer.Address
+	return resp, nil
+}
+
+// RouteRead implements transport.ReadRouter directly on Node.
+func (n *Node) RouteRead(ctx context.Context, req *transport.Request) (*transport.Response, error) {
+	if n == nil {
+		if req == nil {
+			return nil, errors.ErrNilReceiver
+		}
+		return &transport.Response{
+			OpCode:  req.OpCode,
+			Status:  transport.StatusServerClosed,
+			SeqID:   req.SeqID,
+			Message: "server is closed",
+		}, nil
+	}
+	var eng transport.Engine
+	if e, ok := n.stateMachine.(transport.Engine); ok {
+		eng = e
+	}
+	return n.routeReadWithTopology(ctx, req, n.Topology(), eng)
+}
+
+// routeReadWithTopology encapsulates authoritative linearizable read routing logic.
+func (n *Node) routeReadWithTopology(ctx context.Context, req *transport.Request, top *cluster.Topology, eng transport.Engine) (*transport.Response, error) {
+	if req == nil {
+		return nil, errors.ErrNilReceiver
+	}
+
+	resp := &transport.Response{
+		OpCode: req.OpCode,
+		SeqID:  req.SeqID,
+	}
+
+	if n == nil || n.closed.Load() {
+		resp.Status = transport.StatusServerClosed
+		resp.Message = "server is closed"
+		return resp, nil
+	}
+
+	// 1. Validate operation code
+	if req.OpCode != transport.OpGet {
+		resp.Status = transport.StatusInvalidRequest
+		resp.Message = fmt.Sprintf("unsupported operation for read router: 0x%02x", byte(req.OpCode))
+		return resp, nil
+	}
+
+	// 2. Validate request bounds
+	if err := binary.ValidateKey(req.Key); err != nil {
+		resp.Status = transport.StatusInvalidRequest
+		resp.Message = err.Error()
+		return resp, nil
+	}
+
+	// Check context cancellation before ReadIndex verification
+	if ctx.Err() != nil {
+		resp.Status = transport.StatusThrottled
+		resp.Message = "request timed out before read index verification"
+		return resp, nil
+	}
+
+	// 3. Inspect role
+	role := n.Role()
+
+	// 4. Case: Candidate (election in progress, no confirmed leader)
+	if role == RoleCandidate {
+		resp.Status = transport.StatusNotLeader
+		resp.Message = "not leader: node is candidate, retry later"
+		return resp, nil
+	}
+
+	// 5. Case: Follower (or non-leader role)
+	if role != RoleLeader {
+		return n.routeNonLeader(req, top)
+	}
+
+	// 6. Case: Leader -> Execute linearizable read sequence
+	// Step A: ReadIndex quorum verification (P17-S01-M01)
+	readRes, err := n.ReadIndex(ctx)
+	if err != nil {
+		if n.closed.Load() || stdErrors.Is(err, errors.ErrRaftStateClosed) {
+			resp.Status = transport.StatusServerClosed
+			resp.Message = "server is closed"
+			return resp, nil
+		}
+		if ctx.Err() != nil || stdErrors.Is(err, context.Canceled) || stdErrors.Is(err, context.DeadlineExceeded) {
+			resp.Status = transport.StatusThrottled
+			resp.Message = "request context cancelled or timed out under read index verification"
+			return resp, nil
+		}
+		if stdErrors.Is(err, errors.ErrRaftInvalidRoleTransition) {
+			// Leadership was lost concurrently during ReadIndex; fall back to follower redirect
+			return n.routeNonLeader(req, top)
+		}
+		resp.Status = transport.StatusError
+		resp.Message = "internal read index error"
+		return resp, nil
+	}
+
+	// Step B: Wait for state machine to apply up to read index (P17-S01-M02)
+	if err := n.WaitForApplied(ctx, readRes.Index); err != nil {
+		if n.closed.Load() || stdErrors.Is(err, errors.ErrRaftStateClosed) {
+			resp.Status = transport.StatusServerClosed
+			resp.Message = "server is closed"
+			return resp, nil
+		}
+		if ctx.Err() != nil || stdErrors.Is(err, context.Canceled) || stdErrors.Is(err, context.DeadlineExceeded) {
+			resp.Status = transport.StatusThrottled
+			resp.Message = "request context cancelled or timed out waiting for state machine barrier"
+			return resp, nil
+		}
+		if stdErrors.Is(err, errors.ErrRaftApplyFailed) || stdErrors.Is(err, errors.ErrRaftCorruptedState) {
+			resp.Status = transport.StatusError
+			resp.Message = "state machine apply failed"
+			return resp, nil
+		}
+		resp.Status = transport.StatusError
+		resp.Message = "internal apply wait error"
+		return resp, nil
+	}
+
+	// Step C: Revalidate leadership authority after barrier wait (Section 6)
+	if err := n.ValidateLeadership(readRes.Term, readRes.Epoch); err != nil {
+		// Leadership was lost during the barrier wait; fall back to follower redirect
+		return n.routeNonLeader(req, top)
+	}
+
+	// Step D: Execute state machine read
+	if eng == nil {
+		resp.Status = transport.StatusError
+		resp.Message = "storage engine unavailable for read router"
+		return resp, nil
+	}
+
+	val, err := eng.Get(req.Key)
+	if err == nil {
+		if uint32(len(val)) > transport.MaxPayloadLength {
+			resp.Status = transport.StatusError
+			resp.Message = "response value exceeds maximum protocol frame limit"
+			return resp, nil
+		}
+		resp.Status = transport.StatusOk
+		resp.Value = val
+		return resp, nil
+	}
+
+	if stdErrors.Is(err, errors.ErrKeyNotFound) {
+		resp.Status = transport.StatusKeyNotFound
+		return resp, nil
+	}
+
+	resp.Status = transport.StatusError
+	resp.Message = "internal storage error"
 	return resp, nil
 }

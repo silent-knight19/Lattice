@@ -28,10 +28,18 @@ type PeerSender interface {
 }
 
 // ReadIndexResult represents the committed log position and leadership evidence
-// established by a successful ReadIndex leader quorum verification round (P17-S01-M01).
+// established by a successful ReadIndex leader quorum verification round (P17-S01-M01, P17-S01-M02).
 type ReadIndexResult struct {
 	Index LogIndex
 	Term  Term
+	Epoch uint64
+}
+
+// applyWaiter tracks a pending caller waiting for state machine lastApplied advancement (P17-S01-M02).
+type applyWaiter struct {
+	id    uint64
+	index LogIndex
+	ch    chan struct{}
 }
 
 // readQuorumRound tracks in-flight leader quorum verification state for ReadIndex (P17-S01-M01).
@@ -138,6 +146,12 @@ type Node struct {
 	applyCtx         context.Context
 	applyCancel      context.CancelFunc
 
+	// Read barrier waiters state (P17-S01-M02)
+	applyWaitMu        sync.Mutex
+	applyWaiters       map[uint64]*applyWaiter
+	nextApplyWaiterID  atomic.Uint64
+	maxNotifiedApplied LogIndex
+
 	// Periodic heartbeat scheduler (P15-S02-M03)
 	heartbeatInterval    time.Duration
 	heartbeatLifecycleMu sync.Mutex
@@ -237,6 +251,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		electionCancel:    cancel,
 		heartbeatInterval: hbInterval,
 		readRounds:        make(map[uint64]*readQuorumRound),
+		applyWaiters:      make(map[uint64]*applyWaiter),
 	}
 
 	if cfg.StateMachine != nil {
@@ -982,6 +997,9 @@ func (n *Node) Close() error {
 	}
 	n.abortReadRoundsLocked(errors.ErrRaftStateClosed)
 	n.mu.Unlock()
+
+	// Wake all blocked read-barrier waiters fail-closed (P17-S01-M02)
+	n.notifyApplyWaiters(0, errors.ErrRaftStateClosed)
 
 	return nil
 }
@@ -2778,6 +2796,7 @@ func (n *Node) ReadIndex(ctx context.Context) (ReadIndexResult, error) {
 		return ReadIndexResult{
 			Index: readCommitIndex,
 			Term:  currTerm,
+			Epoch: epoch,
 		}, nil
 	}
 
@@ -2868,6 +2887,7 @@ func (n *Node) ReadIndex(ctx context.Context) (ReadIndexResult, error) {
 	return ReadIndexResult{
 		Index: finalCommitIndex,
 		Term:  currTermAfter,
+		Epoch: round.epoch,
 	}, nil
 }
 
@@ -2885,5 +2905,132 @@ func (n *Node) ActiveReadRoundsCount() int {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	return len(n.readRounds)
+}
+
+// WaitForApplied blocks until the state machine apply loop has applied at least up to targetIndex,
+// or returns an error if ctx is cancelled/timed out, the node closes, or a terminal apply error occurs (P17-S01-M02).
+//
+// Invariants enforced (P17-S01-M02):
+//  1. Already applied: If lastApplied >= targetIndex, returns nil immediately without waiting.
+//  2. Behind: If lastApplied < targetIndex, waits on dedicated applyWaiters channel until applied.
+//  3. No lost wakeups: State is checked under applyWaitMu before waiter registration.
+//  4. Context preservation: Cancellation and deadline expiration return ctx.Err() directly.
+//  5. Apply failure: Terminal apply errors release all waiters fail-closed with the underlying error.
+//  6. Node closure: Closing the node wakes all waiters with ErrRaftStateClosed.
+//  7. Zero interference: Does NOT read or consume applyNotifyCh (which is reserved for the apply loop).
+func (n *Node) WaitForApplied(ctx context.Context, targetIndex LogIndex) error {
+	if n == nil {
+		return errors.ErrNilReceiver
+	}
+	if n.closed.Load() {
+		return errors.ErrRaftStateClosed
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if targetIndex == 0 {
+		return nil
+	}
+
+	// Fast path: already applied
+	if n.LastApplied() >= targetIndex {
+		return nil
+	}
+
+	n.applyWaitMu.Lock()
+	if n.closed.Load() {
+		n.applyWaitMu.Unlock()
+		return errors.ErrRaftStateClosed
+	}
+	if err := n.ApplyError(); err != nil {
+		n.applyWaitMu.Unlock()
+		return err
+	}
+	if n.maxNotifiedApplied >= targetIndex {
+		n.applyWaitMu.Unlock()
+		return nil
+	}
+
+	id := n.nextApplyWaiterID.Add(1)
+	w := &applyWaiter{
+		id:    id,
+		index: targetIndex,
+		ch:    make(chan struct{}),
+	}
+	if n.applyWaiters == nil {
+		n.applyWaiters = make(map[uint64]*applyWaiter)
+	}
+	n.applyWaiters[id] = w
+	n.applyWaitMu.Unlock()
+
+	defer func() {
+		n.applyWaitMu.Lock()
+		delete(n.applyWaiters, id)
+		n.applyWaitMu.Unlock()
+	}()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-w.ch:
+	}
+
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if n.closed.Load() {
+		return errors.ErrRaftStateClosed
+	}
+	if err := n.ApplyError(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ValidateLeadership verifies that this node remains the active leader in expectedTerm
+// with unchanged leaderEpoch (P17-S01-M02).
+// Protects the interval between ReadIndex quorum confirmation and state machine read dispatch.
+// Never holds Node.mu across I/O.
+func (n *Node) ValidateLeadership(expectedTerm Term, expectedEpoch uint64) error {
+	if n == nil {
+		return errors.ErrNilReceiver
+	}
+	if n.closed.Load() {
+		return errors.ErrRaftStateClosed
+	}
+
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	if n.closed.Load() {
+		return errors.ErrRaftStateClosed
+	}
+	if n.role != RoleLeader {
+		return fmt.Errorf("%w: node is not leader (current role %s)",
+			errors.ErrRaftInvalidRoleTransition, n.role)
+	}
+	if n.leaderEpoch != expectedEpoch {
+		return fmt.Errorf("%w: leadership epoch changed (expected %d, got %d)",
+			errors.ErrRaftInvalidRoleTransition, expectedEpoch, n.leaderEpoch)
+	}
+
+	currTerm, err := n.storage.Term()
+	if err != nil {
+		return fmt.Errorf("raft: failed to read current term from storage: %w", err)
+	}
+	if currTerm != expectedTerm {
+		return fmt.Errorf("%w: term changed (expected %d, got %d)",
+			errors.ErrRaftInvalidRoleTransition, expectedTerm, currTerm)
+	}
+
+	return nil
+}
+
+// SignalAppliedForTest allows test suites to deterministically simulate lastApplied advancement and wake barrier waiters.
+func (n *Node) SignalAppliedForTest(idx LogIndex) {
+	n.mu.Lock()
+	n.lastApplied = idx
+	n.mu.Unlock()
+	n.notifyApplyWaiters(idx, nil)
 }
 

@@ -886,3 +886,351 @@ func TestRouter_InputValidation(t *testing.T) {
 		}
 	})
 }
+
+// -----------------------------------------------------------------------------
+// Test: RouteRead Linearizable GET (P17-S01-M02)
+// -----------------------------------------------------------------------------
+type testEngine struct {
+	mu    sync.RWMutex
+	store map[string][]byte
+}
+
+func newTestEngine() *testEngine {
+	return &testEngine{store: make(map[string][]byte)}
+}
+
+func (e *testEngine) Put(ctx context.Context, key, val []byte) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.store[string(key)] = val
+	return nil
+}
+
+func (e *testEngine) Delete(ctx context.Context, key []byte) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.store, string(key))
+	return nil
+}
+
+func (e *testEngine) Get(key []byte) ([]byte, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if v, ok := e.store[string(key)]; ok {
+		return v, nil
+	}
+	return nil, latticeErrors.ErrKeyNotFound
+}
+
+func TestRouter_RouteRead(t *testing.T) {
+	peers := map[cluster.NodeID]string{
+		1: "127.0.0.1:9001",
+		2: "127.0.0.1:9002",
+	}
+	top := newTestTopology(t, 1, peers)
+
+	t.Run("candidate returns not leader", func(t *testing.T) {
+		dir := t.TempDir()
+		st, err := OpenStorage(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer st.Close()
+
+		n, err := NewNode(NodeConfig{
+			LocalID:  1,
+			Storage:  st,
+			Topology: top,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer n.Close()
+
+		if err := n.BecomeCandidate(); err != nil {
+			t.Fatal(err)
+		}
+
+		eng := newTestEngine()
+		r := NewProposalRouter(n, top, eng)
+
+		req := &transport.Request{
+			OpCode: transport.OpGet,
+			SeqID:  1,
+			Key:    []byte("mykey"),
+		}
+		resp, err := r.RouteRead(context.Background(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.Status != transport.StatusNotLeader {
+			t.Fatalf("expected StatusNotLeader, got: %s", resp.Status)
+		}
+	})
+
+	t.Run("follower redirects to known leader", func(t *testing.T) {
+		dir := t.TempDir()
+		st, err := OpenStorage(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer st.Close()
+
+		n, err := NewNode(NodeConfig{
+			LocalID:  1,
+			Storage:  st,
+			Topology: top,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer n.Close()
+
+		// Node 1 is follower, discovers Node 2 as leader in term 1
+		_ = st.SetTerm(1)
+		_, _ = n.HandleAppendEntries(cluster.NodeID(2), &transport.AppendEntriesRequest{
+			Term:     1,
+			LeaderID: 2,
+		})
+
+		eng := newTestEngine()
+		r := NewProposalRouter(n, top, eng)
+
+		req := &transport.Request{
+			OpCode: transport.OpGet,
+			SeqID:  2,
+			Key:    []byte("mykey"),
+		}
+		resp, err := r.RouteRead(context.Background(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.Status != transport.StatusNotLeader {
+			t.Fatalf("expected StatusNotLeader, got: %s", resp.Status)
+		}
+		if resp.LeaderID != 2 || resp.LeaderAddr != "127.0.0.1:9002" {
+			t.Fatalf("unexpected redirect details: id=%d addr=%s", resp.LeaderID, resp.LeaderAddr)
+		}
+	})
+
+	t.Run("single node leader executes ReadIndex and serves Get", func(t *testing.T) {
+		dir := t.TempDir()
+		st, err := OpenStorage(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer st.Close()
+
+		singleTop := newTestTopology(t, 1, map[cluster.NodeID]string{1: "127.0.0.1:9001"})
+		eng := newTestEngine()
+		_ = eng.Put(context.Background(), []byte("alpha"), []byte("omega"))
+
+		n, err := NewNode(NodeConfig{
+			LocalID:      1,
+			Storage:      st,
+			Topology:     singleTop,
+			StateMachine: eng,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer n.Close()
+
+		if err := n.BecomeCandidate(); err != nil {
+			t.Fatal(err)
+		}
+		if err := n.BecomeLeader(); err != nil {
+			t.Fatal(err)
+		}
+
+		r := NewProposalRouter(n, singleTop, eng)
+
+		req := &transport.Request{
+			OpCode: transport.OpGet,
+			SeqID:  3,
+			Key:    []byte("alpha"),
+		}
+		resp, err := r.RouteRead(context.Background(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.Status != transport.StatusOk {
+			t.Fatalf("expected StatusOk, got: %s (%s)", resp.Status, resp.Message)
+		}
+		if string(resp.Value) != "omega" {
+			t.Fatalf("expected omega, got: %s", string(resp.Value))
+		}
+	})
+
+	t.Run("leader returns key not found when missing", func(t *testing.T) {
+		dir := t.TempDir()
+		st, err := OpenStorage(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer st.Close()
+
+		singleTop := newTestTopology(t, 1, map[cluster.NodeID]string{1: "127.0.0.1:9001"})
+		eng := newTestEngine()
+
+		n, err := NewNode(NodeConfig{
+			LocalID:      1,
+			Storage:      st,
+			Topology:     singleTop,
+			StateMachine: eng,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer n.Close()
+
+		if err := n.BecomeCandidate(); err != nil {
+			t.Fatal(err)
+		}
+		if err := n.BecomeLeader(); err != nil {
+			t.Fatal(err)
+		}
+
+		r := NewProposalRouter(n, singleTop, eng)
+
+		req := &transport.Request{
+			OpCode: transport.OpGet,
+			SeqID:  4,
+			Key:    []byte("nonexistent"),
+		}
+		resp, err := r.RouteRead(context.Background(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.Status != transport.StatusKeyNotFound {
+			t.Fatalf("expected StatusKeyNotFound, got: %s", resp.Status)
+		}
+	})
+
+	t.Run("leader steps down during wait redirects to new leader", func(t *testing.T) {
+		dir := t.TempDir()
+		st, err := OpenStorage(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer st.Close()
+
+		eng := newTestEngine()
+		n, err := NewNode(NodeConfig{
+			LocalID:      1,
+			Storage:      st,
+			Topology:     top,
+			StateMachine: eng,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer n.Close()
+
+		if err := n.BecomeCandidate(); err != nil {
+			t.Fatal(err)
+		}
+		if err := n.BecomeLeader(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Inject test hook to step down during ReadIndex
+		n.SetReadIndexTestHook(func() {
+			n.StepDownSameTerm(2)
+		})
+
+		r := NewProposalRouter(n, top, eng)
+
+		req := &transport.Request{
+			OpCode: transport.OpGet,
+			SeqID:  5,
+			Key:    []byte("key"),
+		}
+		resp, err := r.RouteRead(context.Background(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.Status != transport.StatusNotLeader {
+			t.Fatalf("expected StatusNotLeader after stepdown, got: %s", resp.Status)
+		}
+		if resp.LeaderID != 2 {
+			t.Fatalf("expected LeaderID 2, got: %d", resp.LeaderID)
+		}
+	})
+
+	t.Run("context cancelled returns StatusThrottled", func(t *testing.T) {
+		dir := t.TempDir()
+		st, err := OpenStorage(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer st.Close()
+
+		eng := newTestEngine()
+		n, err := NewNode(NodeConfig{
+			LocalID:      1,
+			Storage:      st,
+			Topology:     top,
+			StateMachine: eng,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer n.Close()
+
+		r := NewProposalRouter(n, top, eng)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // pre-cancelled
+
+		req := &transport.Request{
+			OpCode: transport.OpGet,
+			SeqID:  6,
+			Key:    []byte("key"),
+		}
+		resp, err := r.RouteRead(ctx, req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.Status != transport.StatusThrottled {
+			t.Fatalf("expected StatusThrottled, got: %s", resp.Status)
+		}
+	})
+
+	t.Run("closed node returns StatusServerClosed", func(t *testing.T) {
+		dir := t.TempDir()
+		st, err := OpenStorage(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer st.Close()
+
+		eng := newTestEngine()
+		n, err := NewNode(NodeConfig{
+			LocalID:      1,
+			Storage:      st,
+			Topology:     top,
+			StateMachine: eng,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = n.Close()
+
+		r := NewProposalRouter(n, top, eng)
+
+		req := &transport.Request{
+			OpCode: transport.OpGet,
+			SeqID:  7,
+			Key:    []byte("key"),
+		}
+		resp, err := r.RouteRead(context.Background(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.Status != transport.StatusServerClosed {
+			t.Fatalf("expected StatusServerClosed, got: %s", resp.Status)
+		}
+	})
+}
+
