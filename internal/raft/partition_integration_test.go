@@ -1262,3 +1262,124 @@ func TestPartition_ConnectionLevelSeveranceAndReconnection(t *testing.T) {
 	}
 	t.Log("Connection-level severance, rejection, and post-heal reconnection verified.")
 }
+
+// TestPartition_3Node_ReadinessTransitions verifies Section 23, 24, 25:
+// 1. In a healthy 3-node cluster, leader and connected followers are READY (200).
+// 2. When leader (Node 1) is isolated from all peers:
+//   - Node 1 loses quorum -> NOT READY (503 no_leader_or_quorum).
+//   - Nodes 2 & 3 elect a new leader (Node 2).
+//   - Node 2 (Leader with majority) -> READY (200).
+//   - Node 3 (Follower with active connection to Node 2) -> READY (200).
+//
+// 3. When partition is healed:
+//   - Node 1 reconnects as Follower to Node 2.
+//   - Node 1's readiness recovers to READY (200).
+func TestPartition_3Node_ReadinessTransitions(t *testing.T) {
+	c, cleanup := createPartitionCluster(t, 3, clusterOptions{})
+	defer cleanup()
+
+	waitForClusterPeerMesh(t, c, 3)
+
+	// Elect Node 1 as initial leader
+	node1 := c.nodes[1]
+	node2 := c.nodes[2]
+
+	if err := node1.node.BecomeCandidate(); err != nil {
+		t.Fatalf("node 1 BecomeCandidate failed: %v", err)
+	}
+	if err := node1.node.BecomeLeader(); err != nil {
+		t.Fatalf("node 1 BecomeLeader failed: %v", err)
+	}
+
+	// Helper to evaluate readiness logic matching daemon.go
+	checkReadiness := func(n *partitionClusterNode) (bool, string) {
+		role := n.node.Role()
+		switch role {
+		case raft.RoleLeader:
+			quorum := n.node.QuorumSize()
+			connected := len(n.mgr.ConnectedPeers())
+			if connected+1 >= quorum {
+				return true, "READY"
+			}
+			return false, "no_leader_or_quorum"
+		case raft.RoleFollower:
+			leaderID := n.node.LeaderID()
+			if leaderID == cluster.NodeIDNil {
+				return false, "no_leader_or_quorum"
+			}
+			if !n.mgr.IsConnected(leaderID) {
+				return false, "isolated_from_cluster"
+			}
+			return true, "READY"
+		default:
+			return false, "election_in_progress"
+		}
+	}
+
+	// 1. Initial State: Node 1 is Leader (2 peers connected >= 2 quorum) -> READY
+	r1, reason1 := checkReadiness(node1)
+	if !r1 {
+		t.Fatalf("expected node 1 (Leader) to be READY, got %s", reason1)
+	}
+
+	// 2. Sever Node 1 from {Node 2, Node 3}
+	c.filter.Cut(1, 2)
+	c.filter.Cut(1, 3)
+
+	severed := waitForCondition(2*time.Second, func() bool {
+		return !node1.mgr.IsConnected(2) && !node1.mgr.IsConnected(3)
+	})
+	if !severed {
+		t.Fatal("expected TCP connections to be severed upon partition cut")
+	}
+
+	// Node 1 loses quorum -> immediately NOT READY
+	r1, reason1 = checkReadiness(node1)
+	if r1 {
+		t.Fatalf("expected node 1 to fail readiness upon losing quorum, got %s", reason1)
+	}
+	if reason1 != "no_leader_or_quorum" {
+		t.Fatalf("expected reason no_leader_or_quorum, got %s", reason1)
+	}
+
+	// Node 2 becomes new Leader on majority side
+	if err := node2.node.BecomeCandidate(); err != nil {
+		t.Fatalf("node 2 BecomeCandidate failed: %v", err)
+	}
+	if err := node2.node.BecomeLeader(); err != nil {
+		t.Fatalf("node 2 BecomeLeader failed: %v", err)
+	}
+
+	// Node 2 (new leader with Node 3 connected: 1+1 >= 2) -> READY
+	r2, reason2 := checkReadiness(node2)
+	if !r2 {
+		t.Fatalf("expected node 2 (new Leader) to be READY, got %s", reason2)
+	}
+
+	// Node 1 remains isolated -> NOT READY
+	r1, reason1 = checkReadiness(node1)
+	if r1 {
+		t.Fatalf("expected node 1 to remain NOT READY while isolated, got %s", reason1)
+	}
+
+	// 3. Heal partition
+	c.filter.HealAll()
+	waitForClusterPeerMesh(t, c, 3)
+
+	// After healing, Node 1 transitions to follower of Node 2 and is reconnected
+	term, _ := node2.node.Term()
+	if err := node1.node.BecomeFollower(term, 2); err != nil {
+		t.Fatalf("node 1 BecomeFollower failed: %v", err)
+	}
+
+	healed := waitForCondition(3*time.Second, func() bool {
+		r1, _ := checkReadiness(node1)
+		return r1 && node1.node.Role() == raft.RoleFollower && node1.mgr.IsConnected(2)
+	})
+	if !healed {
+		t.Fatalf("node 1 failed to recover readiness after partition healed: role=%v leader=%d",
+			node1.node.Role(), node1.node.LeaderID())
+	}
+
+	t.Log("Partition-induced readiness transitions and post-heal recovery successfully verified.")
+}

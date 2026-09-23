@@ -41,7 +41,8 @@ func Handler(reg *Registry) http.Handler {
 	})
 }
 
-// Server manages an isolated HTTP server exposing the /metrics Prometheus endpoint.
+// Server manages an isolated HTTP server exposing the /metrics Prometheus endpoint
+// as well as the /live and /ready health endpoints.
 type Server struct {
 	listener    net.Listener
 	server      *http.Server
@@ -53,6 +54,9 @@ type Server struct {
 	serveErr    error
 	done        chan struct{}
 	mu          sync.Mutex
+
+	liveCheck  atomic.Pointer[LivenessCheck]
+	readyCheck atomic.Pointer[ReadinessCheck]
 }
 
 // connLimiterListener limits the number of concurrent active TCP connections.
@@ -129,8 +133,30 @@ func NewServer(addr string, reg *Registry) (*Server, error) {
 		maxConns: DefaultMaxScraperConnections,
 	}
 
+	s := &Server{
+		listener:    limitedLn,
+		registry:    reg,
+		activeConns: &activeConns,
+		maxConns:    DefaultMaxScraperConnections,
+		done:        make(chan struct{}),
+	}
+
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", Handler(reg))
+	mux.HandleFunc("/live", func(w http.ResponseWriter, r *http.Request) {
+		var check LivenessCheck
+		if ptr := s.liveCheck.Load(); ptr != nil {
+			check = *ptr
+		}
+		LivenessHandler(check).ServeHTTP(w, r)
+	})
+	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
+		var check ReadinessCheck
+		if ptr := s.readyCheck.Load(); ptr != nil {
+			check = *ptr
+		}
+		ReadinessHandler(check).ServeHTTP(w, r)
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
 			http.Redirect(w, r, "/metrics", http.StatusMovedPermanently)
@@ -147,15 +173,23 @@ func NewServer(addr string, reg *Registry) (*Server, error) {
 		IdleTimeout:       30 * time.Second,
 		MaxHeaderBytes:    1 << 20, // 1 MiB
 	}
+	s.server = srv
 
-	return &Server{
-		listener:    limitedLn,
-		server:      srv,
-		registry:    reg,
-		activeConns: &activeConns,
-		maxConns:    DefaultMaxScraperConnections,
-		done:        make(chan struct{}),
-	}, nil
+	return s, nil
+}
+
+// SetLivenessCheck configures the liveness probe callback for the /live endpoint.
+func (s *Server) SetLivenessCheck(check LivenessCheck) {
+	if s != nil {
+		s.liveCheck.Store(&check)
+	}
+}
+
+// SetReadinessCheck configures the readiness probe callback for the /ready endpoint.
+func (s *Server) SetReadinessCheck(check ReadinessCheck) {
+	if s != nil {
+		s.readyCheck.Store(&check)
+	}
 }
 
 // Start initiates the HTTP server accept loop in a background goroutine.

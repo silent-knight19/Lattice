@@ -2642,8 +2642,47 @@ TOTAL: 176 Discrete, Testable Micro-Phases
     - Fuzz tests: `FuzzHistogram_Observe`, `FuzzRegistry_LabelEscaping`, `FuzzRegistry_WritePrometheus`.
     - Adversarial tests: Concurrent scraping under heavy write/read load, slow scraper Slowloris timeouts, malformed requests, metric output line injection tests, port collision fail-closed tests.
     - Full repository test suite clean (`go test ./...`), race detector clean (`go test -race ./internal/metrics/... ./cmd/lattice/...`), static analysis clean (`go vet ./...`), diff hygiene clean (`git diff --check`).
-* **P20-S01-M02: Liveness & Readiness Probes**
-  * *Objective*: HTTP endpoints reporting cluster health and disk storage thresholds.
+* **P20-S01-M02: Liveness & Readiness Probes + Disk Health (`:9100/live`, `:9100/ready`)** `[COMPLETED]`
+  * *Objective*: HTTP endpoints reporting process liveness, cluster readiness, and disk storage thresholds.
+  * *Implementation Details*:
+    - **Shared Metrics HTTP Server Coexistence**: Integrated directly into the existing isolated `http.ServeMux` of the P20-S01-M01 metrics server (`:9100`). Zero secondary listeners, zero port collisions.
+    - **Liveness Semantics (`/live`)**:
+      - Represents process vitality and event loop survival.
+      - Does NOT fail on low disk, Raft follower role, lost quorum, WAL pressure, or engine read-only state.
+      - Returns HTTP 200 `{"status":"UP"}` while serving; returns HTTP 503 `{"status":"DOWN","reason":"terminating"}` during shutdown.
+      - Completely wait-free and non-blocking: $O(1)$ memory allocation, zero disk I/O, zero network calls, zero locks.
+    - **Readiness Semantics (`/ready`)**:
+      - Evaluates safe operational serving capacity across standalone and clustered topologies.
+      - Common storage prerequisites:
+        - Engine state: must be recovered and not closed (returns HTTP 503 `{"status":"NOT_READY","reason":"engine_recovering"}` or `"engine_closed"`).
+        - WAL writer: must not be poisoned (wait-free `IsPoisoned()` check via `atomic.Bool`).
+        - Client transport: `IsServing()` must be true.
+        - Disk health: must not be critical (`free_percent <= 5%` or `free_bytes <= 512MiB`) or unknown.
+      - Cluster prerequisites:
+        - Single-node cluster ($N=1$): node must be leader.
+        - Cluster leader: connected peers + 1 $\ge$ `QuorumSize()`.
+        - Cluster follower: live, active TCP connection to authoritative leader (`peerMgr.IsConnected(leaderID)`), preventing partition illusions where a follower retains a stale `LeaderID`.
+      - Returns HTTP 200 `{"status":"READY","mode":"standalone"|"cluster","disk":"healthy"|"warning",...}` or HTTP 503 `{"status":"NOT_READY","reason":"<bounded_reason>"}`.
+    - **Dedicated Disk Health Abstraction (`internal/metrics`)**:
+      - Platform-specific filesystem statistics: `disk_unix.go` (`syscall.Statfs`), `disk_windows.go` (`kernel32.dll!GetDiskFreeSpaceExW`), `disk_fallback.go` (`DiskStatusUnknown`). Zero third-party dependencies (`x/sys` avoided).
+      - Singleflight cached sampler: 5-second TTL cache with `sync.Mutex` singleflight protection preventing filesystem stat stampedes under high health-check scraping concurrency.
+      - Boundary precedence matrix: Critical takes strict precedence over Warning, which takes strict precedence over Healthy:
+        - Critical: `free_percent <= 5%` OR `free_bytes <= 512 MiB`.
+        - Warning: Not critical, AND (`free_percent <= 15%` OR `free_bytes <= 2 GiB`).
+        - Healthy: `free_percent > 15%` AND `free_bytes > 2 GiB`.
+      - Operational disk metrics: `lattice_disk_free_bytes` and `lattice_disk_total_bytes` dynamically registered as gauges in `internal/metrics`, updated from the authoritative cached sample with zero additional disk I/O.
+    - **Startup Lifecycle Reconciliation (Outcome A)**:
+      - Dedicated metrics/health HTTP server binds and starts listening early in `daemon.Start()` before storage engine recovery.
+      - During engine recovery / WAL replay, `/live` returns HTTP 200 (`UP`) and `/ready` returns HTTP 503 (`engine_recovering`), matching container orchestrator (Kubernetes/Borg) requirements without partial initialization security bypasses.
+    - **Sanitization & Information Disclosure Defense**:
+      - Strictly bounded JSON responses (`application/json; charset=utf-8`).
+      - Zero leakage of file paths, directory trees, database names, memory addresses, or raw Go error strings. Reasons are strictly constrained to predefined machine-readable tokens (`engine_recovering`, `storage_poisoned`, `disk_storage_exhausted`, `no_leader_or_quorum`, `isolated_from_cluster`, `election_in_progress`, `terminating`).
+  * *Verification*:
+    - Boundary matrix test suite in `internal/metrics/disk_test.go` verifying 15% $\pm \varepsilon$, 5% $\pm \varepsilon$, 2GiB $\pm 1$B, 512MiB $\pm 1$B, all 6 mixed condition permutations, cache TTL expiration, singleflight concurrency, and live platform syscall.
+    - HTTP contract test suite in `internal/metrics/health_test.go` verifying 200/503 status codes, JSON schema, Method Not Allowed (405) enforcement, and data privacy.
+    - End-to-end integration test suite in `cmd/lattice/health_test.go` covering standalone lifecycle, disk exhaustion, WAL poison, single-node cluster, follower partition detection, leader quorum loss, and table-driven state transitions.
+    - Partition integration test in `internal/raft/partition_integration_test.go` (`TestPartition_3Node_ReadinessTransitions`) testing 3-node cluster network partition, quorum loss, follower isolation, and post-heal readiness recovery.
+    - Full repository test suite (`go test ./...`), race detector (`go test -race ./internal/metrics/... ./cmd/lattice/...`), static analysis (`go vet ./...`), and diff hygiene (`git diff --check`) clean.
 
 ---
 

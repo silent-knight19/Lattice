@@ -250,6 +250,15 @@ func (s *Server) IsClusterMode() bool {
 	return s.clusterMode
 }
 
+// IsServing reports whether the transport server is active and accepting connections.
+// Returns false if the server is nil, not yet started, or currently shutting down/closed.
+func (s *Server) IsServing() bool {
+	if s == nil {
+		return false
+	}
+	return s.started.Load() && !s.closed.Load()
+}
+
 // Listen binds on addr and starts the accept loop in a background goroutine.
 // If addr is empty, the configured Address is used.
 func (s *Server) Listen(addr string) error {

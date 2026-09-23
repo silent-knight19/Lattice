@@ -1702,4 +1702,27 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 90. Health Probe Bounded Semantics, Disk Sampling Caching & Non-Alerting Boundaries (P20-S01-M02)
+* **Limitation & Architectural Boundaries**:
+  1. *Disk Capacity Sampling Caching (5-Second TTL)*:
+     - Filesystem statistics are sampled using platform syscalls (`syscall.Statfs` on Unix/Darwin/Linux, `GetDiskFreeSpaceExW` on Windows) and cached with a 5-second TTL window.
+     - Scrapers or orchestrators querying `/ready` or `/metrics` more frequently than 5 seconds receive the cached measurement. High-frequency health probes cannot cause filesystem stat stampedes or NVMe metadata lock contention.
+     - Conversely, a sudden large write burst that fills disk within <5 seconds will not be reflected on `/ready` until the 5-second cache window expires or the next sample cycle executes.
+  2. *Safety Fail-Closed Classification*:
+     - If the filesystem measurement syscall fails, the disk sampler returns `DiskUnknown` (not 0/100%/healthy). Readiness fails closed with HTTP 503 (`disk_storage_unknown`) because a safety-critical storage system must never report ready without positive evidence of storage health.
+  3. *Health Probes Observe, Never Remediate*:
+     - The health probe handlers (`/live` and `/ready`) are passive observers. They do not trigger automated shutdowns, disk unlinks, WAL compactions, or cluster failovers on disk pressure or quorum loss. Automated remediation and failover policies are left to cluster orchestrators (e.g. Kubernetes, Nomad) consuming the standard HTTP 503 response codes.
+  4. *Follower Readiness Relationship Requirement*:
+     - A follower node in cluster mode is only marked `READY` when it can establish an active, live TCP connection to the authoritative leader (`peerMgr.IsConnected(leaderID)`). Merely having a non-nil `LeaderID` in Raft state is insufficient, preventing partitioned or partitioned-off followers from claiming readiness.
+  5. *Information Disclosure Immunity*:
+     - Health responses are bounded JSON structures containing only enumerated status strings (`UP`, `DOWN`, `READY`, `standalone`, `cluster`, `leader`, `follower`, `healthy`, `warning`, `critical`) and bounded numeric terms/node IDs. Internal filesystem paths, error strings, and memory addresses are never exposed.
+* **Why It Exists**:
+  Preserves clear separation of concerns: health probes report raw state accurately and safely without performing repairs or leaking internal system details.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Safety-first fail-closed semantics for storage, WAL poison, and consensus).
+  * Security: **Audited & Hardened** (Zero information disclosure, lock-free queries, method enforcement).
+  * Performance: **Optimal** (Lock-free memory reads, wait-free health handlers, 5s singleflight cached disk queries).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*

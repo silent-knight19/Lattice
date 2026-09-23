@@ -124,12 +124,20 @@ func TestDaemon_MetricsServer_LifecycleAndLiveOperations(t *testing.T) {
 		t.Fatalf("failed to connect to daemon: %v", err)
 	}
 
-	resp, err = httpClient.Get(metricsURL)
-	if err != nil {
-		t.Fatalf("failed to scrape /metrics after connecting: %v", err)
+	var connBody []byte
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err = httpClient.Get(metricsURL)
+		if err != nil {
+			t.Fatalf("failed to scrape /metrics after connecting: %v", err)
+		}
+		connBody, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if strings.Contains(string(connBody), "lattice_connections_active 1") {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	connBody, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
 	if !strings.Contains(string(connBody), "lattice_connections_active 1") {
 		t.Errorf("expected lattice_connections_active 1 after client connection:\n%s", string(connBody))
 	}

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/silent-knight19/lattice/internal/cluster"
@@ -32,6 +33,9 @@ const (
 	// ExitShutdownError indicates failure during storage engine flush or manifest sync during shutdown.
 	ExitShutdownError = 4
 )
+
+// newDiskSamplerFn is an internal test seam for injecting mock filesystem metrics in daemon tests.
+var newDiskSamplerFn = metrics.NewDiskSampler
 
 // run parses arguments, configures the daemon, and executes the lifecycle loop.
 func run(args []string, stdout, stderr io.Writer) int {
@@ -78,6 +82,8 @@ func runWithContext(ctx context.Context, args []string, stdout, stderr io.Writer
 //  5. Engine.Close drains immutable memtables, writes L0 SSTable, and syncs WAL/MANIFEST.
 //  6. Exit with success.
 func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, readyCh chan<- struct{}) int {
+	var terminating atomic.Bool
+
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
@@ -85,41 +91,27 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 	// Early abort check
 	select {
 	case <-ctx.Done():
+		terminating.Store(true)
 		return ExitSuccess
 	case <-sigCh:
-		return ExitSuccess
-	default:
-	}
-
-	// Step 1: Open Storage Engine
-	eng := engine.NewEngineWithOptions(engine.EngineOptions{DBPath: cfg.DataDir})
-	if err := eng.Open(); err != nil {
-		fmt.Fprintf(stderr, "lattice: failed to open storage engine at %s: %v\n", cfg.DataDir, err)
-		return ExitStartupError
-	}
-
-	// Startup Signal Race Check (after Engine.Open, before Server setup)
-	select {
-	case <-ctx.Done():
-		_ = eng.Close()
-		return ExitSuccess
-	case sig := <-sigCh:
-		fmt.Fprintf(stdout, "lattice: received signal %s during startup, closing engine...\n", sig)
-		_ = eng.Close()
+		terminating.Store(true)
 		return ExitSuccess
 	default:
 	}
 
 	var (
+		eng         *engine.Engine
 		pprofSrv    *PprofServer
 		metricsSrv  *metrics.Server
 		srv         *transport.Server
 		raftStorage *raft.Storage
 		raftNode    *raft.Node
 		peerMgr     *transport.PeerConnectionManager
+		diskSampler *metrics.DiskSampler
 	)
 
 	cleanup := func() {
+		terminating.Store(true)
 		if srv != nil {
 			_ = srv.Close()
 		}
@@ -140,22 +132,16 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 			metrics.DefaultRegistry.UnregisterGaugeFunc("lattice_memtable_active_bytes")
 			metrics.DefaultRegistry.UnregisterGaugeFunc("lattice_wal_active_segment_bytes")
 			metrics.DefaultRegistry.UnregisterGaugeFunc("lattice_lsm_level_files")
+			metrics.DefaultRegistry.UnregisterGaugeFunc("lattice_disk_free_bytes")
+			metrics.DefaultRegistry.UnregisterGaugeFunc("lattice_disk_total_bytes")
 		}
-		_ = eng.Close()
-	}
-
-	// Step 2: Initialize Pprof Server if configured
-	if cfg.PprofAddress != "" {
-		var err error
-		pprofSrv, err = NewPprofServer(cfg.PprofAddress)
-		if err != nil {
-			cleanup()
-			fmt.Fprintf(stderr, "lattice: failed to start pprof listener on %s: %v\n", cfg.PprofAddress, err)
-			return ExitStartupError
+		if eng != nil {
+			_ = eng.Close()
 		}
 	}
 
-	// Step 2b: Initialize Prometheus Metrics Server if configured
+	// Step 1: Initialize Prometheus Metrics & Health Server if configured
+	// (Outcome A: Available early so container orchestrators can observe /live and /ready during recovery)
 	if cfg.MetricsAddress != "" {
 		var err error
 		metricsSrv, err = metrics.NewServer(cfg.MetricsAddress, metrics.DefaultRegistry)
@@ -165,7 +151,207 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 			return ExitStartupError
 		}
 
-		// Register dynamic storage engine gauges
+		diskSampler = newDiskSamplerFn(cfg.DataDir, metrics.DefaultDiskSampleTTL)
+
+		metricsSrv.SetLivenessCheck(func(checkCtx context.Context) (bool, string) {
+			if terminating.Load() {
+				return false, "terminating"
+			}
+			return true, ""
+		})
+
+		metricsSrv.SetReadinessCheck(func(checkCtx context.Context) (bool, metrics.ReadinessDetails) {
+			if terminating.Load() {
+				return false, metrics.ReadinessDetails{Reason: "terminating"}
+			}
+
+			mode := "standalone"
+			if cfg.IsClusterEnabled() {
+				mode = "cluster"
+			}
+
+			// Storage disk health check
+			diskSample := diskSampler.Sample()
+			diskStr := string(diskSample.Status)
+			if diskSample.Status == metrics.DiskStatusCritical {
+				return false, metrics.ReadinessDetails{
+					Mode:   mode,
+					Disk:   diskStr,
+					Reason: "disk_storage_exhausted",
+				}
+			}
+			if diskSample.Status == metrics.DiskStatusUnknown {
+				return false, metrics.ReadinessDetails{
+					Mode:   mode,
+					Disk:   diskStr,
+					Reason: "disk_storage_unknown",
+				}
+			}
+
+			// Storage engine recovery & lifecycle checks
+			if eng == nil || eng.IsRecovering() {
+				return false, metrics.ReadinessDetails{
+					Mode:   mode,
+					Disk:   diskStr,
+					Reason: "engine_recovering",
+				}
+			}
+			if !eng.IsRecovered() {
+				return false, metrics.ReadinessDetails{
+					Mode:   mode,
+					Disk:   diskStr,
+					Reason: "engine_recovering",
+				}
+			}
+			if eng.IsClosed() {
+				return false, metrics.ReadinessDetails{
+					Mode:   mode,
+					Disk:   diskStr,
+					Reason: "engine_closed",
+				}
+			}
+
+			// WAL poison check
+			if eng.IsWALPoisoned() {
+				return false, metrics.ReadinessDetails{
+					Mode:   mode,
+					Disk:   diskStr,
+					Reason: "storage_poisoned",
+				}
+			}
+
+			// Transport server serving check
+			if srv == nil || !srv.IsServing() {
+				return false, metrics.ReadinessDetails{
+					Mode:   mode,
+					Disk:   diskStr,
+					Reason: "transport_not_serving",
+				}
+			}
+
+			// Standalone mode is fully ready once local checks pass
+			if !cfg.IsClusterEnabled() {
+				return true, metrics.ReadinessDetails{
+					Mode: "standalone",
+					Disk: diskStr,
+				}
+			}
+
+			// Cluster mode consensus checks
+			if raftNode == nil {
+				return false, metrics.ReadinessDetails{
+					Mode:   "cluster",
+					Disk:   diskStr,
+					Reason: "no_leader_or_quorum",
+				}
+			}
+
+			role := raftNode.Role()
+			term, _ := raftNode.Term()
+
+			switch role {
+			case raft.RoleLeader:
+				quorum := raftNode.QuorumSize()
+				connectedPeers := 0
+				if peerMgr != nil {
+					connectedPeers = len(peerMgr.ConnectedPeers())
+				}
+				if connectedPeers+1 >= quorum {
+					return true, metrics.ReadinessDetails{
+						Mode: "cluster",
+						Role: "leader",
+						Term: uint64(term),
+						Disk: diskStr,
+					}
+				}
+				return false, metrics.ReadinessDetails{
+					Mode:   "cluster",
+					Role:   "leader",
+					Term:   uint64(term),
+					Disk:   diskStr,
+					Reason: "no_leader_or_quorum",
+				}
+
+			case raft.RoleFollower:
+				leaderID := raftNode.LeaderID()
+				if leaderID == cluster.NodeIDNil {
+					return false, metrics.ReadinessDetails{
+						Mode:   "cluster",
+						Role:   "follower",
+						Term:   uint64(term),
+						Disk:   diskStr,
+						Reason: "no_leader_or_quorum",
+					}
+				}
+				if peerMgr == nil || !peerMgr.IsConnected(leaderID) {
+					return false, metrics.ReadinessDetails{
+						Mode:     "cluster",
+						Role:     "follower",
+						Term:     uint64(term),
+						LeaderID: uint64(leaderID),
+						Disk:     diskStr,
+						Reason:   "isolated_from_cluster",
+					}
+				}
+				return true, metrics.ReadinessDetails{
+					Mode:     "cluster",
+					Role:     "follower",
+					Term:     uint64(term),
+					LeaderID: uint64(leaderID),
+					Disk:     diskStr,
+				}
+
+			default: // RoleCandidate
+				return false, metrics.ReadinessDetails{
+					Mode:   "cluster",
+					Role:   "candidate",
+					Term:   uint64(term),
+					Disk:   diskStr,
+					Reason: "election_in_progress",
+				}
+			}
+		})
+
+		// Start metrics server accept loop immediately
+		if err := metricsSrv.Start(); err != nil {
+			cleanup()
+			fmt.Fprintf(stderr, "lattice: failed to start metrics server: %v\n", err)
+			return ExitStartupError
+		}
+		metricsAddr := metricsSrv.Addr().String()
+		fmt.Fprintf(stdout, "lattice: prometheus metrics listening on http://%s/metrics\n", metricsAddr)
+
+		// Register disk metrics reading from cached sample
+		metrics.DefaultRegistry.RegisterGaugeFunc("lattice_disk_free_bytes", "Current free disk space in bytes on database storage volume", nil, func() int64 {
+			return int64(diskSampler.Sample().FreeBytes)
+		})
+		metrics.DefaultRegistry.RegisterGaugeFunc("lattice_disk_total_bytes", "Total disk capacity in bytes on database storage volume", nil, func() int64 {
+			return int64(diskSampler.Sample().TotalBytes)
+		})
+	}
+
+	// Step 2: Open Storage Engine
+	eng = engine.NewEngineWithOptions(engine.EngineOptions{DBPath: cfg.DataDir})
+	if err := eng.Open(); err != nil {
+		cleanup()
+		fmt.Fprintf(stderr, "lattice: failed to open storage engine at %s: %v\n", cfg.DataDir, err)
+		return ExitStartupError
+	}
+
+	// Startup Signal Race Check (after Engine.Open, before Server setup)
+	select {
+	case <-ctx.Done():
+		cleanup()
+		return ExitSuccess
+	case sig := <-sigCh:
+		fmt.Fprintf(stdout, "lattice: received signal %s during startup, closing engine...\n", sig)
+		cleanup()
+		return ExitSuccess
+	default:
+	}
+
+	// Register storage engine gauges now that engine is opened
+	if metricsSrv != nil {
 		metrics.DefaultRegistry.RegisterGaugeFunc("lattice_memtable_active_bytes", "Current memory allocated to active mutable MemTable in bytes", nil, func() int64 {
 			if mt := eng.ActiveMemTable(); mt != nil {
 				return int64(mt.ByteSize())
@@ -189,6 +375,17 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 				}
 				return 0
 			})
+		}
+	}
+
+	// Step 2b: Initialize Pprof Server if configured
+	if cfg.PprofAddress != "" {
+		var err error
+		pprofSrv, err = NewPprofServer(cfg.PprofAddress)
+		if err != nil {
+			cleanup()
+			fmt.Fprintf(stderr, "lattice: failed to start pprof listener on %s: %v\n", cfg.PprofAddress, err)
+			return ExitStartupError
 		}
 	}
 
@@ -317,17 +514,6 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 		fmt.Fprintf(stdout, "lattice: pprof diagnostics listening on http://%s/debug/pprof/\n", pprofAddr)
 	}
 
-	// Step 5b: Start Prometheus Metrics Server if configured
-	if metricsSrv != nil {
-		if err := metricsSrv.Start(); err != nil {
-			cleanup()
-			fmt.Fprintf(stderr, "lattice: failed to start metrics server: %v\n", err)
-			return ExitStartupError
-		}
-		metricsAddr := metricsSrv.Addr().String()
-		fmt.Fprintf(stdout, "lattice: prometheus metrics listening on http://%s/metrics\n", metricsAddr)
-	}
-
 	// Step 6: Running State Established
 	if cfg.Topology != nil {
 		fmt.Fprintf(stdout, "lattice: cluster topology initialized (node_id: %d, peers: %d, endpoint: %s)\n",
@@ -348,8 +534,10 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 	// Step 7: Wait for Termination Event
 	select {
 	case sig := <-sigCh:
+		terminating.Store(true)
 		fmt.Fprintf(stdout, "lattice: received signal %s, initiating graceful shutdown...\n", sig)
 	case <-ctx.Done():
+		terminating.Store(true)
 		fmt.Fprintf(stdout, "lattice: context cancelled, initiating graceful shutdown...\n")
 	}
 
@@ -402,6 +590,8 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 		metrics.DefaultRegistry.UnregisterGaugeFunc("lattice_memtable_active_bytes")
 		metrics.DefaultRegistry.UnregisterGaugeFunc("lattice_wal_active_segment_bytes")
 		metrics.DefaultRegistry.UnregisterGaugeFunc("lattice_lsm_level_files")
+		metrics.DefaultRegistry.UnregisterGaugeFunc("lattice_disk_free_bytes")
+		metrics.DefaultRegistry.UnregisterGaugeFunc("lattice_disk_total_bytes")
 	}
 
 	if engErr := eng.Close(); engErr != nil {

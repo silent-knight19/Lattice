@@ -40,6 +40,7 @@
 29. [Deep Systems Interview Questions & Answers: Atomic MemTable Freeze, Linearization Points, & In-Place Immutability (P03-S03-M02)](#29-deep-systems-interview-questions--answers-atomic-memtable-freeze-linearization-points--in-place-immutability-p03-s03-m02)
 41. [Deep Systems Interview Questions & Answers: Node Identity & Cluster Configuration Model (P14-S01-M01)](#41-deep-systems-interview-questions--answers-node-identity--cluster-configuration-model-p14-s01-m01)
 42. [Deep Systems Interview Questions & Answers: Peer-to-Peer RPC Framing Protocol (P14-S01-M02)](#42-deep-systems-interview-questions--answers-peer-to-peer-rpc-framing-protocol-p14-s01-m02)
+43. [Deep Systems Interview Questions & Answers: Liveness, Readiness, & Disk Health Probes (P20-S01-M02)](#43-deep-systems-interview-questions--answers-liveness-readiness--disk-health-probes-p20-s01-m02)
 
 ---
 
@@ -4169,6 +4170,101 @@ Offset 68..71 (4B, CRC32-IEEE):
     3. Metrics and Pprof Server `Shutdown()`: Closes the metrics listener and drains active scrapers with a bounded timeout (`shutCtx`).
     4. Dynamic Gauge Unregistration: Calls `metrics.DefaultRegistry.UnregisterGaugeFunc(...)` to release closures referencing the database engine, preventing memory leaks in embedded testing environments.
     5. Storage Engine `Close()`: Executes last, ensuring all MemTables are flushed, SSTables synced, and MANIFEST updated after all network servers have terminated.
+
+---
+
+# 43. Deep Systems Interview Questions & Answers: Liveness, Readiness, & Disk Health Probes (P20-S01-M02)
+
+### 1. Liveness vs. Readiness Decoupling in Distributed Storage
+* **Question**: Why is equating liveness (`/live`) and readiness (`/ready`) a fatal architectural anti-pattern in a distributed database managed by container orchestrators (Kubernetes, Nomad, Borg)?
+* **Answer**:
+  - **Liveness Semantics**: Answers "Is the process alive and making progress in its runtime event loop?"
+    - Liveness failure triggers a destructive action: the orchestrator sends `SIGKILL`/`SIGTERM` and restarts the container.
+    - If `/live` fails because disk is running low (warning/critical), or because the node lost its Raft quorum leader connection, or because the WAL is undergoing heavy flush backpressure, the orchestrator repeatedly kills the container in a catastrophic crash loop. During disk pressure, restarting creates new WAL segments and core dumps, accelerating storage exhaustion. During network partitions, restarting triggers unneeded election churn and re-replay storms across the surviving cluster.
+    - Therefore, `/live` must represent strictly process vitality and event loop survival. It returns HTTP 200 (`UP`) while running and HTTP 503 (`DOWN`) only when shutdown has commenced (`terminating`).
+  - **Readiness Semantics**: Answers "Is this specific node currently safe and capable of serving client traffic?"
+    - Readiness failure triggers a non-destructive routing action: the load balancer / service mesh removes the pod from the active routing endpoints pool while keeping the process running.
+    - If a node is recovering its WAL, if storage is poisoned, if disk is exhausted, or if an isolated follower has lost connectivity to the Raft leader, `/ready` returns HTTP 503. The node remains running so it can continue background catch-up, replay, or await partition healing without serving corrupted or stale reads to clients.
+
+### 2. Wait-Free, Lock-Free Health Query Architecture
+* **Question**: Why must health probe endpoints never acquire storage write locks (`Engine.mu`, `RotatingWriter.mu`, `TableWriter.mu`) or issue network RPCs, and how does Lattice achieve wait-free health evaluation?
+* **Answer**:
+  - **The Deadlock & Cascade Hazard**: In an LSM-tree database under heavy write saturation, threads may queue behind `RotatingWriter.mu` waiting for `fdatasync()` on rotational media or NVMe flush flushes. If `/live` or `/ready` acquired `RotatingWriter.mu`, health checks would block. When health checks exceed the orchestrator's probe timeout (e.g. 1s or 5s), the orchestrator assumes the node is dead and kills it, creating an operational disaster.
+  - **Wait-Free WAL Poison Detection**:
+    - Lattice stores WAL poison state in an `atomic.Bool` (`wal.WALWriter.poisoned`) set atomically during unrecoverable I/O or checksum errors.
+    - In `RotatingWriter`, the active segment pointer is stored in an `atomic.Pointer[WALWriter]`.
+    - Evaluating `RotatingWriter.IsPoisoned()` performs an atomic load of the pointer and an atomic load of the bool: $O(1)$ instructions, zero mutexes, zero allocations, and zero blocking.
+  - **Wait-Free Engine State**:
+    - The database lifecycle state (`engineStateRecovering`, `engineStateRecovered`, `engineStateClosing`, `engineStateClosed`) is queried via atomic loads or read-only status accessors without acquiring write locks.
+  - **Local Cluster Health**:
+    - Readiness queries local in-memory peer connection tables (`mgr.ConnectedPeers()`, `mgr.IsConnected()`) and Raft term/role state. It never issues outbound RPCs or blocks on quorum responses within the HTTP handler.
+
+### 3. The Follower Partition Dilemma in Raft Readiness
+* **Question**: Why is checking `node.LeaderID() != cluster.NodeIDNil` alone fundamentally flawed when determining if a Raft follower is ready to serve client requests?
+* **Answer**:
+  - **Stale Cached Leader State**: In Raft, when a follower participates in an election or receives an `AppendEntries` heartbeat, it caches the leader's ID (`r.leaderID = leader`). If a network partition occurs and severs this follower from the rest of the cluster:
+    - The follower's local `r.leaderID` remains populated with the old leader's ID indefinitely until an election timeout ticks and it becomes a Candidate (or if election timers are paused during linearizable read evaluations).
+    - If the node only checked `LeaderID() != nil`, an isolated follower would falsely report HTTP 200 `READY`.
+    - Clients routing queries to this follower would receive stale reads or fail on proxied writes.
+  - **Authoritative Peer Connection Verification**:
+    - Lattice checks `node.Role() == RoleFollower`, retrieves `leaderID := node.LeaderID()`, and then explicitly queries the transport layer:
+      ```go
+      if !peerMgr.IsConnected(leaderID) {
+          return false, "isolated_from_cluster"
+      }
+      ```
+    - Because the peer manager maintains active TCP connection state and severs connections upon heartbeat timeout or socket reset, `IsConnected(leaderID)` guarantees a live, verified bidirectional channel to the authoritative leader. If partitioned, `/ready` immediately returns HTTP 503 (`isolated_from_cluster`).
+
+### 4. Singleflight Cached Disk Statfs Sampling & Stampede Protection
+* **Question**: Why is executing `syscall.Statfs` on every `/ready` or `/metrics` request a severe operational vulnerability, and how does Lattice implement singleflight caching?
+* **Answer**:
+  - **Filesystem Stat Overhead**: `statfs` / `GetDiskFreeSpaceEx` issues kernel VFS calls that traverse mount points, read filesystem superblock metadata, and query block allocation bitmap counts. Under aggressive Prometheus scraping or multi-pod Kubernetes probe intervals (e.g. 100 req/sec), repeated `statfs` calls induce unnecessary kernel context switches, VFS lock contention, and I/O bus overhead.
+  - **5-Second Cache TTL**:
+    - Lattice implements `DiskSampler` with a 5-second TTL. If `time.Since(sample.SampledAt) < 5s`, the cached sample is returned immediately via an `atomic.Pointer[DiskSample]`.
+  - **Singleflight Stampede Protection**:
+    - When the 5-second TTL expires, 50 concurrent incoming scrapers must not all invoke `syscall.Statfs` simultaneously (cache stampede).
+    - `DiskSampler` uses a `sync.Mutex` during refresh. The winning thread takes the lock, re-checks if another thread updated the cache while waiting (double-checked locking), executes `statfs` once, atomically stores the new sample, and releases the lock.
+    - If `statfs` fails, the sampler returns `DiskStatusUnknown` and logs the error, ensuring the node fails closed without returning fabricated 100% free metrics.
+
+### 5. Disk Health Threshold Precedence & Mixed-Condition Boundary Arithmetic
+* **Question**: Explain the precedence rules between Critical, Warning, and Healthy disk states. Why is this precedence essential for data safety?
+* **Answer**:
+  - **Threshold Model**:
+    - **Critical**: `free_percent <= 5%` OR `free_bytes <= 512 MiB`.
+    - **Warning**: Not Critical, AND (`free_percent <= 15%` OR `free_bytes <= 2 GiB`).
+    - **Healthy**: `free_percent > 15%` AND `free_bytes > 2 GiB`.
+  - **Strict Precedence (`Critical > Warning > Healthy`)**:
+    - *Scenario A (Huge disk, low percentage)*: A 10 TB volume with 3% free space has 300 GB free. 300 GB is $> 2$ GiB (bytes healthy), but 3% $\le 5\%$ (percentage critical). Because percentage is critical, the volume is classified as **Critical**. An LSM compaction on a 10 TB drive can write hundreds of gigabytes; 3% free means the volume is dangerously close to running out of metadata/inodes or suffering allocation failures.
+    - *Scenario B (Tiny disk, high percentage)*: A 1 GiB ramdisk/volume with 50% free space has only 512 MiB remaining. 50% is $> 15\%$ (percentage healthy), but 512 MiB $\le 512$ MiB (bytes critical). It must be classified as **Critical**, because a single 512 MiB batch or memtable dump will completely fill the filesystem.
+    - Evaluating Critical *before* Warning ensures that a Warning condition (e.g. 10% free) can never mask or override a Critical byte floor (e.g. 256 MiB free).
+
+### 6. Daemon Lifecycle Startup Availability (Outcome A)
+* **Question**: In container environments, orchestrators probe `/live` and `/ready` immediately upon process execution. How does Lattice ensure probes are reachable during long WAL replay without opening security holes?
+* **Answer**:
+  - **The Startup Dilemma**: If the metrics/health HTTP server is started *after* storage engine recovery and client transport binding, container orchestrators with short initial probe delays (e.g. 2s) receive TCP connection refused errors during a 10-second WAL replay. The orchestrator concludes the pod is dead and kills it, preventing the database from ever completing recovery.
+  - **Outcome A Implementation**:
+    - In `daemon.Start()`, the metrics/health HTTP server binds its dedicated listener (:9100) and starts serving *before* calling `eng.Open()`.
+    - During recovery replay:
+      - `/live` returns HTTP 200 `{"status":"UP"}` because the process is running its initialization event loop.
+      - `/ready` returns HTTP 503 `{"status":"NOT_READY","reason":"engine_recovering"}` because the storage engine has not yet finished replay.
+    - The client binary transport port (:9099) remains unbound until storage recovery and Raft initialization succeed, completely preventing premature client access while keeping orchestrator liveness satisfied.
+
+### 7. Information Disclosure & Privacy Defenses in Health Observability
+* **Question**: What information disclosure constraints must be enforced on `/live` and `/ready` endpoints, and why?
+* **Answer**:
+  - **Threat Vector**: Health and metrics endpoints are often accessible by lower-privileged monitoring scrapers or internal network segments. If health probes return raw Go `error.Error()` strings, filesystem paths, or memory addresses, attackers can map the internal environment (e.g. learning username, OS directory hierarchy, disk layout, or software versions).
+  - **Sanitization Invariants**:
+    - Responses use strictly bounded JSON schemas (`application/json; charset=utf-8`).
+    - Failure reasons are constrained to a closed whitelist of machine-readable enum tokens:
+      - `engine_recovering`
+      - `engine_closed`
+      - `storage_poisoned`
+      - `disk_storage_exhausted`
+      - `no_leader_or_quorum`
+      - `isolated_from_cluster`
+      - `election_in_progress`
+      - `terminating`
+    - Absolute file paths (e.g. `/var/lib/lattice/data`), segment filenames, raw syscall errors, and memory pointers are strictly omitted from responses.
 
 ---
 

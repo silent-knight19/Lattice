@@ -234,6 +234,66 @@ func (e *Engine) SetWALForTesting(w walWriter) {
 	e.wal = w
 }
 
+// IsRecovered reports whether the engine has completed startup recovery and is ready for mutations.
+// Never acquires a write lock; safe for high-frequency health probes.
+func (e *Engine) IsRecovered() bool {
+	if e == nil {
+		return false
+	}
+	if e.closed.Load() {
+		return false
+	}
+	e.mu.RLock()
+	st := e.state
+	e.mu.RUnlock()
+	return st == engineStateRecovered
+}
+
+// IsRecovering reports whether the engine is actively executing startup recovery.
+// Never acquires a write lock; safe for high-frequency health probes.
+func (e *Engine) IsRecovering() bool {
+	if e == nil {
+		return false
+	}
+	e.mu.RLock()
+	st := e.state
+	e.mu.RUnlock()
+	return st == engineStateRecovering
+}
+
+// IsClosed reports whether the engine has closed or is in the process of closing.
+// Never acquires a write lock; safe for high-frequency health probes.
+func (e *Engine) IsClosed() bool {
+	if e == nil {
+		return true
+	}
+	if e.closed.Load() {
+		return true
+	}
+	e.mu.RLock()
+	st := e.state
+	e.mu.RUnlock()
+	return st == engineStateClosing || st == engineStateClosed
+}
+
+// IsWALPoisoned reports whether the engine's underlying WAL writer has entered the poisoned state.
+// Never acquires a write lock; delegates to lock-free writer query.
+func (e *Engine) IsWALPoisoned() bool {
+	if e == nil {
+		return false
+	}
+	e.mu.RLock()
+	wal := e.wal
+	e.mu.RUnlock()
+	if wal == nil {
+		return false
+	}
+	if p, ok := wal.(interface{ IsPoisoned() bool }); ok {
+		return p.IsPoisoned()
+	}
+	return false
+}
+
 // BlockCache returns the Engine's shared block cache, or nil if caching is disabled.
 func (e *Engine) BlockCache() *cache.ShardedCache {
 	if e == nil {

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"github.com/silent-knight19/lattice/internal/errors"
 	"github.com/silent-knight19/lattice/internal/security"
@@ -65,7 +66,7 @@ type WALWriter struct {
 	file      *os.File
 	path      string
 	closed    bool
-	poisoned  bool
+	poisoned  atomic.Bool
 	poisonErr error
 
 	// Internal test seams for deterministic fault injection
@@ -312,14 +313,14 @@ func (w *WALWriter) Path() string {
 // preserving the first root-cause I/O or sync error.
 // Must be called with w.mu held.
 func (w *WALWriter) poisonLocked(err error) {
-	if !w.poisoned {
-		w.poisoned = true
+	if !w.poisoned.Load() {
+		w.poisoned.Store(true)
 		w.poisonErr = err
 	}
 }
 
 func (w *WALWriter) checkPoisonLocked() error {
-	if w.poisoned {
+	if w.poisoned.Load() {
 		return &errors.WALWriterPoisonedError{
 			Path:   w.path,
 			Reason: w.poisonErr,
@@ -330,16 +331,12 @@ func (w *WALWriter) checkPoisonLocked() error {
 
 // IsPoisoned reports whether the writer has entered the poisoned state due to a write or sync failure.
 // Returns false if the writer is nil.
-// AUDIT-F-003: nil-receiver safe; all mutating/query methods below likewise
-// return explicit errors instead of panicking, and zero-value writers
-// (file == nil, never constructed) report errors.ErrNotInitialized.
+// Lock-free and wait-free for non-blocking observability queries.
 func (w *WALWriter) IsPoisoned() bool {
 	if w == nil {
 		return false
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.poisoned
+	return w.poisoned.Load()
 }
 
 // Size returns the current physical byte length of the segment file.
@@ -388,7 +385,7 @@ func (w *WALWriter) Close() error {
 	// If writer was poisoned, skip durability sync to avoid further corruption,
 	// ensure descriptor is closed cleanly to prevent resource leak,
 	// and propagate the poisoning error.
-	if w.poisoned {
+	if w.poisoned.Load() {
 		if w.file != nil {
 			_ = w.file.Close()
 		}
@@ -552,14 +549,18 @@ func (w *WALWriter) AppendSync(rec Record) error {
 	return w.syncLocked()
 }
 
-// setSyncFnForTesting injects a custom synchronization function for fault injection tests.
-func (w *WALWriter) setSyncFnForTesting(fn func(f *os.File) error) {
+// SetSyncFnForTesting injects a custom synchronization function for fault injection tests.
+func (w *WALWriter) SetSyncFnForTesting(fn func(f *os.File) error) {
 	if w == nil {
 		return
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.syncFn = fn
+}
+
+func (w *WALWriter) setSyncFnForTesting(fn func(f *os.File) error) {
+	w.SetSyncFnForTesting(fn)
 }
 
 // setWriteFnForTesting injects a custom write function for fault injection tests.

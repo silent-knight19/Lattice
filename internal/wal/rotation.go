@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/silent-knight19/lattice/internal/errors"
 	"github.com/silent-knight19/lattice/internal/metrics"
@@ -190,6 +191,7 @@ type RotatingWriter struct {
 	dbPath    string
 	opts      Options
 	active    *WALWriter
+	activePtr atomic.Pointer[WALWriter]
 	activeID  uint64
 	activeLen int64
 	closed    bool
@@ -291,6 +293,7 @@ func OpenRotatingWriter(dbPath string, opts Options) (*RotatingWriter, error) {
 		createWriterFn: CreateWriter,
 		syncDirFn:      SyncDir,
 	}
+	rw.activePtr.Store(activeWriter)
 
 	return rw, nil
 }
@@ -367,6 +370,20 @@ func (rw *RotatingWriter) DBPath() string {
 		return ""
 	}
 	return rw.dbPath
+}
+
+// IsPoisoned reports whether the active segment writer is poisoned.
+// Returns false if the writer is nil, closed, or has no active segment.
+// Lock-free and wait-free for non-blocking observability queries.
+func (rw *RotatingWriter) IsPoisoned() bool {
+	if rw == nil {
+		return false
+	}
+	w := rw.activePtr.Load()
+	if w == nil {
+		return false
+	}
+	return w.IsPoisoned()
 }
 
 // ActiveWriter returns a read-only handle for the active segment.
@@ -597,6 +614,7 @@ func (rw *RotatingWriter) rotateLocked() error {
 		// Crucial invariant: A failed rotation must not silently report the new segment as active.
 		// Mark active as nil so subsequent appends cannot corrupt or write to closed segments.
 		rw.active = nil
+		rw.activePtr.Store(nil)
 		return fmt.Errorf("wal: failed to create next segment %d at %s: %w", nextID, nextPath, err)
 	}
 
@@ -605,12 +623,14 @@ func (rw *RotatingWriter) rotateLocked() error {
 		if err := rw.syncDirFn(Dir(rw.dbPath)); err != nil {
 			_ = newWriter.Close()
 			rw.active = nil
+			rw.activePtr.Store(nil)
 			return fmt.Errorf("wal: failed to sync directory during rotation: %w", err)
 		}
 	}
 
 	// Step 3: Transition active state to new segment
 	rw.active = newWriter
+	rw.activePtr.Store(newWriter)
 	rw.activeID = nextID
 	rw.activeLen = 0
 	return nil
@@ -634,6 +654,7 @@ func (rw *RotatingWriter) Close() error {
 	if rw.active != nil {
 		err := rw.active.Close()
 		rw.active = nil
+		rw.activePtr.Store(nil)
 		return err
 	}
 	return nil
