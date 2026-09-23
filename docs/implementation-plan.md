@@ -2510,7 +2510,7 @@ TOTAL: 176 Discrete, Testable Micro-Phases
 
 * **P18-S01-M01: Jepsen-Style Network Partition Simulation**
   * *Objective*: Drop TCP packets between isolated leader and peers; assert zero split-brain writes committed.
-  * *Status*: **COMPLETE** (Commit `TBD`)
+  * *Status*: **COMPLETE** (Commit `04f46e964e0105e51342f395af9e91c799a3e46f`)
   * *Deliverables & Invariants Verified*:
     - **Bidirectional Partition Filter**: Test-only `partitionFilter` and `filteredPeerSender` simulating instantaneous, leak-proof bidirectional network partitions at the peer transport boundary without modifying production transport code.
     - **Autonomous Majority Election**: Verified that surviving majority (Nodes 2 & 3) autonomously elects a new leader in Term 2 upon leader isolation without manual intervention.
