@@ -24,6 +24,7 @@ type partitionFilter struct {
 	cuts          map[[2]cluster.NodeID]bool
 	droppedCount  atomic.Uint64
 	droppedByEdge sync.Map // [2]cluster.NodeID -> *atomic.Uint64
+	onCut         func(a, b cluster.NodeID)
 }
 
 func newPartitionFilter() *partitionFilter {
@@ -35,9 +36,13 @@ func newPartitionFilter() *partitionFilter {
 // Cut isolates node A and node B bidirectionally.
 func (f *partitionFilter) Cut(a, b cluster.NodeID) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.cuts[[2]cluster.NodeID{a, b}] = true
 	f.cuts[[2]cluster.NodeID{b, a}] = true
+	cb := f.onCut
+	f.mu.Unlock()
+	if cb != nil {
+		cb(a, b)
+	}
 }
 
 // CutDirectional cuts traffic strictly in the from -> to direction.
@@ -113,6 +118,133 @@ func (s *filteredPeerSender) Send(ctx context.Context, peerID cluster.NodeID, fr
 	return s.inner.Send(ctx, peerID, frame)
 }
 
+// trackedConn is a net.Conn wrapper that executes a callback upon Close (Finding L).
+type trackedConn struct {
+	net.Conn
+	onClose func()
+	once    sync.Once
+}
+
+func (c *trackedConn) Close() error {
+	c.once.Do(func() {
+		if c.onClose != nil {
+			c.onClose()
+		}
+	})
+	return c.Conn.Close()
+}
+
+// partitionNetwork coordinates connection-level fault injection across peer TCP transports (Finding L).
+type partitionNetwork struct {
+	mu           sync.Mutex
+	filter       *partitionFilter
+	addrToNode   map[string]cluster.NodeID
+	activeConns  map[[2]cluster.NodeID]map[net.Conn]struct{}
+	dialAttempts atomic.Uint64
+	dialsCut     atomic.Uint64
+}
+
+func newPartitionNetwork(filter *partitionFilter) *partitionNetwork {
+	pn := &partitionNetwork{
+		filter:      filter,
+		addrToNode:  make(map[string]cluster.NodeID),
+		activeConns: make(map[[2]cluster.NodeID]map[net.Conn]struct{}),
+	}
+	filter.onCut = pn.SeverEdge
+	return pn
+}
+
+func (pn *partitionNetwork) registerAddr(id cluster.NodeID, addr string) {
+	pn.mu.Lock()
+	defer pn.mu.Unlock()
+	pn.addrToNode[addr] = id
+}
+
+func (pn *partitionNetwork) dialFunc(localID cluster.NodeID) transport.DialFunc {
+	return func(ctx context.Context, addr string) (net.Conn, error) {
+		pn.dialAttempts.Add(1)
+
+		pn.mu.Lock()
+		targetID, ok := pn.addrToNode[addr]
+		pn.mu.Unlock()
+
+		if ok && pn.filter.IsCut(localID, targetID) {
+			pn.dialsCut.Add(1)
+			pn.filter.RecordDrop(localID, targetID)
+			return nil, &errors.PeerUnavailableError{
+				NodeID: uint64(targetID),
+				State:  "ConnectionRefused (Partitioned)",
+			}
+		}
+
+		dialer := net.Dialer{Timeout: 2 * time.Second}
+		rawConn, err := dialer.DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+
+		if ok && pn.filter.IsCut(localID, targetID) {
+			_ = rawConn.Close()
+			pn.dialsCut.Add(1)
+			pn.filter.RecordDrop(localID, targetID)
+			return nil, &errors.PeerUnavailableError{
+				NodeID: uint64(targetID),
+				State:  "ConnectionRefused (Partitioned)",
+			}
+		}
+
+		if ok {
+			pn.registerConn(localID, targetID, rawConn)
+		}
+
+		return &trackedConn{
+			Conn: rawConn,
+			onClose: func() {
+				if ok {
+					pn.unregisterConn(localID, targetID, rawConn)
+				}
+			},
+		}, nil
+	}
+}
+
+func (pn *partitionNetwork) registerConn(from, to cluster.NodeID, c net.Conn) {
+	pn.mu.Lock()
+	defer pn.mu.Unlock()
+	edge := [2]cluster.NodeID{from, to}
+	if pn.activeConns[edge] == nil {
+		pn.activeConns[edge] = make(map[net.Conn]struct{})
+	}
+	pn.activeConns[edge][c] = struct{}{}
+}
+
+func (pn *partitionNetwork) unregisterConn(from, to cluster.NodeID, c net.Conn) {
+	pn.mu.Lock()
+	defer pn.mu.Unlock()
+	edge := [2]cluster.NodeID{from, to}
+	if m := pn.activeConns[edge]; m != nil {
+		delete(m, c)
+	}
+}
+
+func (pn *partitionNetwork) SeverEdge(a, b cluster.NodeID) {
+	pn.mu.Lock()
+	defer pn.mu.Unlock()
+
+	edges := [][2]cluster.NodeID{
+		{a, b},
+		{b, a},
+	}
+	for _, edge := range edges {
+		if conns, exists := pn.activeConns[edge]; exists {
+			for c := range conns {
+				_ = c.Close()
+			}
+			delete(pn.activeConns, edge)
+		}
+	}
+}
+
 // partitionClusterNode encapsulates a running node in the partition test cluster.
 type partitionClusterNode struct {
 	id      cluster.NodeID
@@ -129,8 +261,9 @@ type partitionClusterNode struct {
 
 // partitionCluster represents a multi-node cluster with full peer and client TCP networking.
 type partitionCluster struct {
-	nodes  map[cluster.NodeID]*partitionClusterNode
-	filter *partitionFilter
+	nodes   map[cluster.NodeID]*partitionClusterNode
+	filter  *partitionFilter
+	network *partitionNetwork
 }
 
 // clusterOptions configures election timing and transition notifications for the test cluster.
@@ -167,9 +300,16 @@ func createPartitionCluster(t *testing.T, count int, opts clusterOptions) (*part
 	}
 
 	filter := newPartitionFilter()
+	pn := newPartitionNetwork(filter)
+	for i := 1; i <= count; i++ {
+		id := cluster.NodeID(i)
+		pn.registerAddr(id, peerAddrs[id])
+	}
+
 	clusterObj := &partitionCluster{
-		nodes:  make(map[cluster.NodeID]*partitionClusterNode, count),
-		filter: filter,
+		nodes:   make(map[cluster.NodeID]*partitionClusterNode, count),
+		filter:  filter,
+		network: pn,
 	}
 
 	hbInterval := opts.heartbeatInterval
@@ -208,6 +348,7 @@ func createPartitionCluster(t *testing.T, count int, opts clusterOptions) (*part
 		peerCfg.DialTimeout = 2 * time.Second
 		peerCfg.ReconnectMin = 10 * time.Millisecond
 		peerCfg.ReconnectMax = 50 * time.Millisecond
+		peerCfg.DialFunc = pn.dialFunc(id)
 
 		// Inbound filter check
 		peerCfg.OnFrameReceived = func(peerID cluster.NodeID, frame *transport.Frame) {
@@ -523,12 +664,25 @@ func TestPartition_3Node_IsolatedLeader_ZeroSplitBrainCommit(t *testing.T) {
 	}
 	t.Logf("Audit: Baseline write committed: %+v", baselineAudit)
 
-	// Phase 3: INJECT BIDIRECTIONAL NETWORK PARTITION
+	// Phase 3: INJECT BIDIRECTIONAL NETWORK PARTITION (Connection-Level Fault Injection - Finding L)
 	// Node 1 isolated from {Node 2, Node 3}
 	c.filter.Cut(1, 2)
 	c.filter.Cut(1, 3)
 
-	t.Log("Partition active: Node 1 isolated from Node 2 and Node 3")
+	t.Log("Partition active: Node 1 isolated from Node 2 and Node 3 (TCP connections severed)")
+
+	// Assert connection-level severance on isolated node (Finding M)
+	disconnected := waitForCondition(2*time.Second, func() bool {
+		return !node1.mgr.IsConnected(2) && !node1.mgr.IsConnected(3)
+	})
+	if !disconnected {
+		t.Fatal("expected Node 1 peer connections to 2 and 3 to be severed at TCP connection level")
+	}
+
+	// Assert majority peer connection remains connected (Finding M)
+	if !node2.mgr.IsConnected(3) || !node3.mgr.IsConnected(2) {
+		t.Fatal("majority nodes 2 and 3 erroneously disconnected")
+	}
 
 	// Phase 4: Await autonomous election of Node 2 by surviving majority {Node 2, Node 3}
 	var newTerm raft.Term
@@ -651,6 +805,10 @@ func TestPartition_3Node_IsolatedLeader_ZeroSplitBrainCommit(t *testing.T) {
 	// Phase 7: HEAL THE PARTITION (Restore full connectivity)
 	t.Log("Healing network partition...")
 	c.filter.HealAll()
+
+	// Wait for peer connections to re-establish across all edges (Finding M)
+	waitForClusterPeerMesh(t, c, 3)
+	t.Log("Cluster peer mesh fully re-established at TCP connection level")
 
 	// Wait for Node 1 to observe higher term and step down to RoleFollower
 	select {
@@ -1022,4 +1180,77 @@ func TestPartition_3Node_IsolatedLeader_CannotCommit(t *testing.T) {
 	}
 
 	t.Log("Zero commits across 5 isolated proposals verified.")
+}
+
+// -----------------------------------------------------------------------------
+// Test 6: Connection-Level Severance & Reconnection Verification (Findings L & M)
+// -----------------------------------------------------------------------------
+// Explicitly verifies:
+//  1. Active TCP connections between partitioned peers are severed immediately.
+//  2. While partitioned, background reconnection attempts fail closed.
+//  3. Majority-side connections remain healthy.
+//  4. Upon healing, reconnection succeeds and the full mesh is restored.
+func TestPartition_ConnectionLevelSeveranceAndReconnection(t *testing.T) {
+	c, cleanup := createPartitionCluster(t, 3, clusterOptions{})
+	defer cleanup()
+
+	waitForClusterPeerMesh(t, c, 3)
+
+	node1 := c.nodes[1]
+	node2 := c.nodes[2]
+	node3 := c.nodes[3]
+
+	// 1. Initial state: all connected
+	for _, id := range []cluster.NodeID{2, 3} {
+		if !node1.mgr.IsConnected(id) {
+			t.Fatalf("expected node 1 initially connected to %d", id)
+		}
+	}
+	if !node2.mgr.IsConnected(3) {
+		t.Fatal("expected node 2 initially connected to 3")
+	}
+
+	dialsBefore := c.network.dialsCut.Load()
+
+	// 2. Sever edges {1-2, 1-3}
+	c.filter.Cut(1, 2)
+	c.filter.Cut(1, 3)
+
+	// Connections must be closed immediately
+	severed := waitForCondition(2*time.Second, func() bool {
+		return !node1.mgr.IsConnected(2) && !node1.mgr.IsConnected(3)
+	})
+	if !severed {
+		t.Fatal("expected TCP connections to be severed upon partition cut")
+	}
+
+	// 3. Majority connectivity remains intact
+	if !node2.mgr.IsConnected(3) || !node3.mgr.IsConnected(2) {
+		t.Fatal("majority nodes 2 and 3 erroneously disconnected")
+	}
+
+	// 4. While partitioned, reconnection attempts must fail
+	// Allow manager's reconnect loop (10-50ms) to attempt dials
+	time.Sleep(150 * time.Millisecond)
+
+	if node1.mgr.IsConnected(2) || node1.mgr.IsConnected(3) {
+		t.Fatal("reconnect succeeded while edge was partitioned!")
+	}
+	dialsAfter := c.network.dialsCut.Load()
+	if dialsAfter <= dialsBefore {
+		t.Logf("Note: dials intercepted by partition: %d -> %d", dialsBefore, dialsAfter)
+	}
+
+	// 5. Heal partition
+	c.filter.HealAll()
+
+	// 6. Full mesh must be re-established
+	waitForClusterPeerMesh(t, c, 3)
+
+	for _, id := range []cluster.NodeID{2, 3} {
+		if !node1.mgr.IsConnected(id) {
+			t.Fatalf("expected node 1 reconnected to %d after heal", id)
+		}
+	}
+	t.Log("Connection-level severance, rejection, and post-heal reconnection verified.")
 }

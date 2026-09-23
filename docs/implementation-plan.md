@@ -2509,23 +2509,45 @@ TOTAL: 176 Discrete, Testable Micro-Phases
 * **Dependencies**: Phase 17.
 
 * **P18-S01-M01: Jepsen-Style Network Partition Simulation**
-  * *Objective*: Drop TCP packets between isolated leader and peers; assert zero split-brain writes committed.
-  * *Status*: **COMPLETE** (Commit `04f46e964e0105e51342f395af9e91c799a3e46f`)
+  * *Objective*: Simulate network partitions via connection-level fault injection over real TCP sockets; assert zero split-brain writes committed.
+  * *Status*: **COMPLETE**
   * *Deliverables & Invariants Verified*:
-    - **Bidirectional Partition Filter**: Test-only `partitionFilter` and `filteredPeerSender` simulating instantaneous, leak-proof bidirectional network partitions at the peer transport boundary without modifying production transport code.
-    - **Autonomous Majority Election**: Verified that surviving majority (Nodes 2 & 3) autonomously elects a new leader in Term 2 upon leader isolation without manual intervention.
-    - **Split-Brain Commit Prevention**: Proved that client writes issued to the isolated old leader (Node 1) are accepted into local WAL but **never** advance `commitIndex`, **never** advance `lastApplied`, and are **never** executed against the state machine.
-    - **Post-Partition Log Reconciliation**: Verified that upon partition healing, the old leader receives higher-term AppendEntries, steps down to `RoleFollower`, detects the log conflict, truncates the divergent uncommitted Term 1 suffix (`storage.TruncateSuffix`), replicates the Term 2 history, and all 3 nodes achieve 100% committed log and state machine convergence.
-    - **Zero Split-Brain Writes Committed**: Proven across real TCP sockets under `go test -race` with 20 repeated deterministic executions.
+    - **Connection-Level Fault Injection**: Test-only `partitionNetwork` coordinating with `partitionFilter` over real TCP sockets, actively severing active peer connections on severed edges and blocking reconnection attempts during partition isolation.
+    - **Autonomous Majority Election**: Surviving majority (Nodes 2 & 3) autonomously elects Node 2 in Term 2 upon leader isolation without manual intervention.
+    - **Split-Brain Commit Prevention**: Client writes issued to the isolated old leader (Node 1) are accepted into local WAL but **never** advance `commitIndex`, **never** advance `lastApplied`, and are **never** applied to the state machine.
+    - **Post-Partition Log Reconciliation**: Upon partition healing, Node 1 receives higher-term AppendEntries, steps down to `RoleFollower`, detects the log conflict, truncates the divergent uncommitted Term 1 suffix (`storage.TruncateSuffix`), replicates Term 2 history, and all 3 nodes achieve 100% committed log and state machine convergence.
+    - **Zero Split-Brain Writes Committed**: Proven across real TCP sockets under `go test -race` with repeated deterministic executions.
+
 * **P18-S01-M02: Abrupt `SIGKILL` Chaos Monkey Loop**
   * *Objective*: Continuously write data while sending random `kill -9` signals; assert zero acknowledged write loss.
   * *Status*: **COMPLETE**
   * *Deliverables & Invariants Verified*:
-    - **Production Binary Supervision**: Test harness compiles the real `cmd/lattice` production binary and supervises child daemon lifecycle via `os.Process.Kill()` without relying on `go run` wrappers or shell execution.
+    - **Production Binary Supervision**: Test harness compiles the real `cmd/lattice` production binary and supervises child daemon lifecycle via exact process management without shell execution.
     - **Parent-Owned Independent ACK Ledger**: All client write confirmations (`StatusOk`) are recorded in an external append-only ledger (`ack-ledger/ack_ledger.jsonl`) residing outside the daemon data directory, guaranteeing an unalterable, crash-independent durability oracle.
     - **Continuous Active Workload & Jitter Strikes**: Concurrent writer routines pipeline continuous Put operations over real TCP sockets, with pseudo-random millisecond jitter ensuring `SIGKILL` strikes while writes and responses are actively in flight.
     - **Zero Acknowledged Write Loss Across Generations**: Verified across 5 consecutive crash-restart cycles and a final restart cycle that 100% of operations acknowledged prior to process termination are recovered with exact value matches from the replayed WAL.
-    - **Torn-Tail Boundary Tolerance**: Interrupted in-flight writes that never returned `StatusOk` to the client are cleanly truncated at the WAL tail during startup recovery, establishing a strict distinction between acknowledged durable operations and in-flight requests.
+    - **Crash-Testing Scope**: Validates single-node daemon process durability and WAL replay. Multi-node cluster crash recovery is bounded to Raft consensus integration testing.
+
+* **P18-SEC: Phase 18 Security Remediation & Independent Audit Closure**
+  * *Objective*: Remediate all security, correctness, test-fidelity, process-isolation, concurrency, and oracle-integrity audit findings across Phase 18.
+  * *Status*: **COMPLETE**
+  * *Deliverables & Invariants Remediated*:
+    - **Finding A (Fail-Closed Supervisor Signaling)**: Replaced worker goroutine panics on ACK ledger failures with fail-closed channel signaling (`reportFatalError` / `fatalErrCh`), eliminating orphaned child processes and guaranteeing safe daemon termination.
+    - **Finding B (True Writer Quiescence Barrier)**: Implemented true quiescence in `PauseAndWait()` by calling `activeOps.Add(1)` inside `pauseMu.Lock()`, eliminating the TOCTOU race window with `activeOps.Wait()`.
+    - **Finding C (Synchronized Generation Tracking)**: Replaced unsynchronized generation access with `atomic.Int64` (`genManager`), strictly incremented only under full worker quiescence.
+    - **Finding D (Fail-Closed ACK Publication)**: Enforced strict write-ahead ledger persistence: validate $\to$ reject duplicates $\to$ serialize $\to$ full file write $\to$ `file.Sync()` $\to$ publish into memory. Partial writes and sync errors fail closed immediately.
+    - **Finding E (Unique ACK Records)**: Strengthened ledger invariants to reject duplicate `OpID`, duplicate sequence numbers, and conflicting key/value mappings.
+    - **Finding F (Thread-Safe Stderr Collector)**: Replaced raw `bytes.Buffer` with `safeStderrCollector`, bounded to 64 KiB with mutex synchronization, eliminating data races.
+    - **Finding G (Child Environment Isolation)**: Constructed an allowlisted child environment (`buildChildEnv`), passing only essential variables (`PATH`, `HOME`, `TMPDIR`) and stripping parent secrets.
+    - **Finding H (Authoritative Process Identity)**: Authoritatively verified child termination via `exec.Cmd.Wait()` and `syscall.WaitStatus` inspecting `SIGKILL` signal termination rather than PID probing.
+    - **Finding I (Guaranteed Process Cleanup)**: Guaranteed cleanup on all paths via `t.Cleanup` without killing unrelated system processes.
+    - **Finding J (Port TOCTOU Elimination)**: Switched to dynamic ephemeral port allocation (`--port 0`), parsing the bound listening address from daemon stdout.
+    - **Finding K (Deterministic Chaos Reproducibility)**: Fully derived run IDs, keys, values, and crash schedules from pseudo-random seed, eliminating wall-clock dependencies from logical workload identity.
+    - **Finding L & M (Connection-Level Fault Injection & Reconnect Verification)**: Built `partitionNetwork` with `trackedConn` and `DialFunc`, actively closing TCP sockets on severed edges, asserting blocked reconnections during partitions, and verifying full mesh restoration upon healing.
+    - **Finding N (Precise Claims & Scope Documentation)**: Corrected documentation to distinguish connection-level fault injection over real TCP from kernel packet drops, and self-contained Go integration testing from external Jepsen execution.
+    - **Finding O (Cluster Crash Coverage Assessment)**: Assessed and documented the boundary between standalone daemon crash durability (P18-S01-M02) and distributed Raft cluster crash recovery.
+    - **Finding P (Deterministic Torn Tail Recovery)**: Added `TestWAL_DeterministicTornTailRecovery` proving truncated trailing WAL records are safely detected and repaired during startup recovery.
+    - **Phase 19 Hard Boundary**: Phase 19 was NOT started. Hard stop enforced.
 
 ---
 

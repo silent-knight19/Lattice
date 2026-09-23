@@ -1601,7 +1601,7 @@ For an entry-level candidate targeting tier-1 technology companies (Google, Meta
 
 ### 48.2 Resume Bullet Points Examples
 
-> **Status note**: the bullets below are forward-looking framing examples, not implementation attestations. As of Phase 15, the engine provides a replicated Raft log with leader-side quorum commitment; state-machine application (Phase 16), ReadIndex linearizable reads (Phase 17), chaos/fault-injection suites (Phase 18), and end-to-end client-visible linearizability are not yet implemented (see `docs/known-limitations.md` #75). Reconcile every bullet with actual implementation status before use.
+> **Status note**: the bullets below are framing examples. As of Phase 18 closure, the engine provides persistent LSM storage, replicated Raft consensus, state-machine application (Phase 16), ReadIndex linearizable reads (Phase 17), and fault-injection/chaos test verification (Phase 18). Phase 19 (comprehensive security hardening) is not yet started. Reconcile every bullet with actual implementation status before use.
 
 #### Option A: Storage Systems Focus
 > * **Lattice | Distributed Key-Value Storage Engine (Go)**

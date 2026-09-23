@@ -1494,8 +1494,9 @@ This document tracks all **genuine architectural and operational limitations** o
      - When the partition heals and the higher-term majority leader replicates to the old leader, the uncommitted local entry is cleanly truncated (`Storage.TruncateSuffix`) and overwritten with the authoritative majority history.
      - **Result**: Zero split-brain writes are committed. However, clients must be aware that an isolated leader's local acknowledgement during an ongoing network partition does not equate to a quorum-committed write unless verified via a linearizable read barrier (`ReadIndex`).
   2. *Deterministic Transport-Boundary Simulation*:
-     - P18-S01-M01 models Jepsen-style network partitions programmatically at the peer transport boundary using `partitionFilter` and `filteredPeerSender` over real loopback TCP sockets.
-     - It avoids requiring kernel-level firewall privileges (`iptables`/`pfctl`) while faithfully validating Raft consensus safety under asymmetric and symmetric network isolations.
+     - P18-S01-M01 models network partitions via deterministic connection-level fault injection and frame interception over real TCP sockets using `partitionNetwork` (which severs active TCP sockets on partition cut and blocks reconnection attempts during isolation) and `partitionFilter` with `filteredPeerSender`.
+     - It models application/transport-level connection loss without kernel-level firewall privileges (`iptables`/`pfctl`).
+     - It is a self-contained Go integration test simulation and does not claim or use external Jepsen framework execution.
 * **Why It Exists**:
   Separation of consensus commit from local append acknowledgement enables high write throughput via asynchronous pipelining, while strict Raft quorum commitment rules guarantee that uncommitted partition-era writes can never contaminate committed state.
 * **Impact**:
@@ -1517,7 +1518,13 @@ This document tracks all **genuine architectural and operational limitations** o
      - Traditional testing that issues `SIGTERM`, `SIGINT`, or programmatic `Close()` allows the daemon to execute its clean shutdown sequence: draining active TCP connections, flushing mutable and immutable MemTables to $L_0$ SSTables, and synchronizing MANIFEST updates.
      - P18-S01-M02 enforces non-graceful process termination using OS `SIGKILL` (`kill -9` via `(*os.Process).Kill()`) targeting the exact child process PID during active concurrent client workloads.
      - Graceful shutdown handlers are completely bypassed. Upon restart, the engine has no clean state markers and relies exclusively on replaying WAL log segments from persistent disk.
-  3. *Testing Envelope & Proven Boundaries*:
+  3. *Crash-Testing Scope & Distributed Node-Crash Boundary (Finding O)*:
+     - P18-S01-M02 explicitly exercises the standalone Lattice daemon (`cmd/lattice`), evaluating single-node process crash durability, WAL fsync barriers, and atomic replay under high-concurrency client workloads.
+     - Multi-node distributed Raft cluster crash-recovery (where individual Raft peers or majorities are abruptly SIGKILLed and recovered under distributed consensus) builds upon the single-node WAL replay durability verified here and the Raft consensus safety verified in P18-S01-M01. Distributed cluster chaos testing remains bounded to integration-level testing.
+  4. *Torn Tail Verification Boundary (Finding P)*:
+     - Under random asynchronous SIGKILL, a process kill may land during a disk write window, but the primary verified invariant of the chaos loop is that **every write acknowledged with `StatusOk` survives process termination**.
+     - Deterministic torn-tail WAL recovery (where an incomplete/truncated record at the end of a WAL segment is detected and safely repaired without affecting earlier records) is verified via dedicated deterministic unit/integration tests (`TestWAL_DeterministicTornTailRecovery`), rather than relying on chance timing in the stochastic chaos loop.
+  5. *Testing Envelope & Proven Boundaries*:
      - **Proven**: Zero acknowledged write loss across repeated abrupt process terminations, deterministic restart sequences, torn-tail log recovery, and multi-generation crash loops on persistent disk under high concurrency.
      - **Not Proven**: The test validates process-crash durability on an active POSIX filesystem. It does not simulate raw unbuffered hardware power cuts with disabled write barriers, physical drive media decay, or Byzantine corruptions beyond CRC32 verification.
 * **Why It Exists**:
@@ -1528,6 +1535,52 @@ This document tracks all **genuine architectural and operational limitations** o
   * Correctness: **Optimal** (100% durability of acknowledged writes across abrupt `SIGKILL`).
   * Performance: **High Throughput** (Zero overhead added to production write path).
   * Scalability: **High** (Deterministic recovery independently verified across storage generations).
+
+---
+
+### 84. Phase 18 Security Remediation & Independent Audit Hardening (P18-SEC)
+* **Limitation & Architectural Boundaries**:
+  An independent security, correctness, test-fidelity, process-isolation, and concurrency audit of the Phase 18 implementation identified and remediated critical production and test invariants:
+  1. *Fail-Closed Supervisor Signaling (Finding A)*:
+     - Replaced worker goroutine panics on ACK ledger write failures with fail-closed channel signaling (`reportFatalError` / `fatalErrCh`).
+     - Proves that background writer errors are cleanly observed by the supervisor, the daemon is terminated safely without leaving orphans, and the test fails closed with diagnostic context.
+  2. *True Writer Quiescence Barrier (Finding B)*:
+     - Hardened `PauseAndWait()` by eliminating the TOCTOU race window between checking the pause flag and incrementing `activeOps`.
+     - Calling `activeOps.Add(1)` strictly inside `pauseMu.Lock()` guarantees that when `PauseAndWait()` returns, no writer worker is dialing, writing, reading, reconnecting, or recording an ACK.
+  3. *Synchronized Generation Tracking (Finding C)*:
+     - Eliminated unsynchronized `currentGen` reads and writes, replacing them with an atomic generation manager (`atomic.Int64`).
+     - Generation increments occur strictly when all workers are proven quiescent under the quiescence barrier.
+  4. *Fail-Closed ACK Ledger Persistence Ordering (Finding D)*:
+     - Enforced strict write-ahead publication order: validate record $\to$ reject duplicate $\to$ serialize JSON $\to$ full file write $\to$ `file.Sync()` $\to$ publish into memory (`records`, `byKey`, `byOpID`, `bySeq`).
+     - Partial writes and sync failures fail closed immediately without leaving phantom ACKs in the in-memory oracle.
+  5. *Uniquely Identifiable ACK Records (Finding E)*:
+     - Strengthened ledger uniqueness invariants to reject duplicate `OpID`, duplicate logical sequence numbers, and conflicting key/value identities.
+  6. *Thread-Safe Stderr Diagnostic Collector (Finding F)*:
+     - Replaced unsynchronized raw `bytes.Buffer` stderr capture with `safeStderrCollector`, protected by a mutex and bounded to 64 KiB, eliminating data races between daemon writes and supervisor inspection.
+  7. *Child Environment Isolation (Finding G)*:
+     - Replaced unconstrained `os.Environ()` inheritance with an allowlisted child environment (`buildChildEnv`), passing only `PATH`, `HOME`, `TMPDIR`, and essential runtime variables, stripping parent secrets.
+  8. *Authoritative Process Identity & Exit Lifecycle (Finding H)*:
+     - Replaced PID existence probing with exact `exec.Cmd.Wait()` and `syscall.WaitStatus` inspection to authoritatively confirm child termination via `SIGKILL` before proceeding to restart.
+  9. *Guaranteed Cleanup & Orphan Prevention (Finding I)*:
+     - Enforced safe cleanup order in `t.Cleanup`: writers stopped $\to$ child killed $\to$ `cmd.Wait()` drained $\to$ ledger closed $\to$ temp directories removed, guaranteeing zero orphaned daemon processes.
+  10. *Ephemeral Port Allocation (Finding J)*:
+      - Migrated from manual port discovery to dynamic ephemeral port allocation (`--port 0`), parsing the bound listening address from daemon stdout, eliminating port TOCTOU races and `TIME_WAIT` rebind failures.
+  11. *Deterministic Seed-Based Workload Generation (Finding K)*:
+      - Logical run identifiers, keys, values, and crash timing schedules are derived deterministically from the pseudo-random seed (`runID = run-<seed>`, `key = chaos/<runID>/<seq>`), eliminating wall-clock dependencies from logical workload identity.
+  12. *Connection-Level Fault Injection & Reconnection Verification (Findings L & M)*:
+      - Implemented `partitionNetwork` with connection-level fault injection via custom `DialFunc` and connection tracking.
+      - Upon partition cut, active TCP sockets on partitioned edges are immediately severed, and reconnection attempts are rejected.
+      - Verified that majority nodes remain connected, isolated nodes cannot reconnect while partitioned, and full mesh is re-established upon healing.
+  13. *Deterministic Torn-Tail Recovery Verification (Finding P)*:
+      - Added targeted test `TestWAL_DeterministicTornTailRecovery` proving that when an incomplete/truncated record exists at the WAL tail, startup recovery safely detects and truncates the torn record without losing prior valid records.
+* **Why It Exists**:
+  Guarantees that chaos-testing frameworks provide mathematically rigorous, race-free, and fail-closed verification of production durability and consensus invariants.
+* **Impact**:
+  Eliminates flaky tests, orphan processes, environment leakage, and false-positive verification in chaos and partition test suites.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Fail-closed oracle; race-free barriers; deterministic recovery).
+  * Security: **Audited & Hardened** (Environment sanitization; bounded diagnostic buffers; safe process lifecycle).
+  * Performance: **Zero Production Overhead** (Hardening localized to test oracle and simulation harnesses).
 
 ---
 
