@@ -9,40 +9,73 @@
 
 ## Table of Contents
 
-1. [Foundations, Binary Encodings & Memory Management](#1-foundations-binary-encodings--memory-management)
-2. [Write-Ahead Log (WAL) & Durability Subsystem](#2-write-ahead-log-wal--durability-subsystem)
-3. [In-Memory MemTable & Concurrent SkipList](#3-in-memory-memtable--concurrent-skiplist)
-4. [Persistent SSTable File Formats & Block Layout](#4-persistent-sstable-file-formats--block-layout)
+1. [Foundations, Binary Encodings & Memory Management](#1-foundations-binary-encodings-memory-management)
+2. [Write-Ahead Log (WAL) & Durability Subsystem](#2-write-ahead-log-wal-durability-subsystem)
+3. [In-Memory MemTable & Concurrent SkipList](#3-in-memory-memtable-concurrent-skiplist)
+4. [Persistent SSTable File Formats & Block Layout](#4-persistent-sstable-file-formats-block-layout)
 5. [Probabilistic Bloom Filter Subsystem](#5-probabilistic-bloom-filter-subsystem)
-6. [Manifest Log & VersionSet Concurrency](#6-manifest-log--versionset-concurrency)
-7. [Crash Recovery, Torn Writes & Startup Replay](#7-crash-recovery-torn-writes--startup-replay)
-8. [Leveled Compaction & K-Way Merge Sort](#8-leveled-compaction--k-way-merge-sort)
+6. [Manifest Log & VersionSet Concurrency](#6-manifest-log-versionset-concurrency)
+7. [Crash Recovery, Torn Writes & Startup Replay](#7-crash-recovery-torn-writes-startup-replay)
+8. [Leveled Compaction & K-Way Merge Sort](#8-leveled-compaction-k-way-merge-sort)
 9. [Sharded LRU Read Block Cache](#9-sharded-lru-read-block-cache)
-10. [Single-Node Engine Integration & Backpressure](#10-single-node-engine-integration--backpressure)
-11. [TCP Binary Wire Protocol & Networking](#11-tcp-binary-wire-protocol--networking)
-12. [Distributed Foundations & Node Topology](#12-distributed-foundations--node-topology)
+10. [Single-Node Engine Integration & Backpressure](#10-single-node-engine-integration-backpressure)
+11. [TCP Binary Wire Protocol & Networking](#11-tcp-binary-wire-protocol-networking)
+12. [Distributed Foundations & Node Topology](#12-distributed-foundations-node-topology)
 13. [Raft Consensus Engine (V1.1)](#13-raft-consensus-engine-v11)
 14. [Distributed State Machine Replication](#14-distributed-state-machine-replication)
-15. [Linearizable Reads & the ReadIndex Protocol](#15-linearizable-reads--the-readindex-protocol)
-16. [Fault Injection & Chaos Engineering](#16-fault-injection--chaos-engineering)
-17. [System-Wide Security & Threat Modeling](#17-system-wide-security--threat-modeling)
+15. [Linearizable Reads & the ReadIndex Protocol](#15-linearizable-reads-the-readindex-protocol)
+16. [Fault Injection & Chaos Engineering](#16-fault-injection-chaos-engineering)
+17. [System-Wide Security & Threat Modeling](#17-system-wide-security-threat-modeling)
 18. [Master Checklist: 30 "Did You Actually Build This?" Exposure Questions](#18-master-checklist-30-did-you-actually-build-this-exposure-questions)
 19. [Implementation Learning Log](#19-implementation-learning-log)
-20. [Deep Systems Interview Questions & Answers: WAL Recovery & Multi-Segment Replay](#20-deep-systems-interview-questions--answers-wal-recovery--multi-segment-replay)
-21. [Deep Systems Interview Questions & Answers: Group Commit Queue & Write Task Types](#21-deep-systems-interview-questions--answers-group-commit-queue--write-task-types)
-22. [Deep Systems Interview Questions & Answers: Group Commit Batch Runner & Cooperative fsync](#22-deep-systems-interview-questions--answers-group-commit-batch-runner--cooperative-fsync)
-23. [Deep Systems Interview Questions & Answers: Security Architecture & Static Security Audit](#23-deep-systems-interview-questions--answers-security-architecture--static-security-audit)
-24. [Deep Systems Interview Questions & Answers: Storage, Filesystem & Persistence Dynamic Auditing](#24-deep-systems-interview-questions--answers-storage-filesystem--persistence-dynamic-auditing)
-25. [Twelve Deep Systems Security Questions on In-Memory Concurrent Engine & SkipList Subsystems](#25-twelve-deep-systems-security-questions-on-in-memory-concurrent-engine--skiplist-subsystems)
-26. [Questions I Personally Failed & Corrected Understandings](#26-questions-i-personally-failed--corrected-understandings)
-27. [Deep Systems Interview Questions & Answers: SkipList Node Memory Representation & Geometric Randomizer (P03-S01-M01)](#27-deep-systems-interview-questions--answers-skiplist-node-memory-representation--geometric-randomizer-p03-s01-m01)
-28. [Deep Systems Interview Questions & Answers: Forward Iterator, Express-Lane Seek, & Weak Consistency (P03-S03-M01)](#28-deep-systems-interview-questions--answers-forward-iterator-express-lane-seek--weak-consistency-p03-s03-m01)
-29. [Deep Systems Interview Questions & Answers: Atomic MemTable Freeze, Linearization Points, & In-Place Immutability (P03-S03-M02)](#29-deep-systems-interview-questions--answers-atomic-memtable-freeze-linearization-points--in-place-immutability-p03-s03-m02)
-41. [Deep Systems Interview Questions & Answers: Node Identity & Cluster Configuration Model (P14-S01-M01)](#41-deep-systems-interview-questions--answers-node-identity--cluster-configuration-model-p14-s01-m01)
-42. [Deep Systems Interview Questions & Answers: Peer-to-Peer RPC Framing Protocol (P14-S01-M02)](#42-deep-systems-interview-questions--answers-peer-to-peer-rpc-framing-protocol-p14-s01-m02)
-43. [Deep Systems Interview Questions & Answers: Liveness, Readiness, & Disk Health Probes (P20-S01-M02)](#43-deep-systems-interview-questions--answers-liveness-readiness--disk-health-probes-p20-s01-m02)
+20. [Deep Systems Interview Questions & Answers: WAL Recovery & Multi-Segment Replay](#20-deep-systems-interview-questions-answers-wal-recovery-multi-segment-replay)
+21. [Deep Systems Interview Questions & Answers: Group Commit Queue & Write Task Types](#21-deep-systems-interview-questions-answers-group-commit-queue-write-task-types)
+22. [Deep Systems Interview Questions & Answers: Group Commit Batch Runner & Cooperative fsync](#22-deep-systems-interview-questions-answers-group-commit-batch-runner-cooperative-fsync)
+23. [Deep Systems Interview Questions & Answers: Security Architecture & Static Security Audit](#23-deep-systems-interview-questions-answers-security-architecture-static-security-audit)
+24. [Deep Systems Interview Questions & Answers: Storage, Filesystem & Persistence Dynamic Auditing](#24-deep-systems-interview-questions-answers-storage-filesystem-persistence-dynamic-auditing)
+25. [Twelve Deep Systems Security Questions on In-Memory Concurrent Engine & SkipList Subsystems](#25-twelve-deep-systems-security-questions-on-in-memory-concurrent-engine-skiplist-subsystems)
+26. [Deep Systems Interview Questions & Answers: SkipList Node Memory Representation & Geometric Randomizer (P03-S01-M01)](#26-deep-systems-interview-questions-answers-skiplist-node-memory-representation-geometric-randomizer-p03-s01-m01)
+27. [Deep Systems Interview Questions & Answers: Single-Threaded SkipList Insertion & Lookup (P03-S01-M02)](#27-deep-systems-interview-questions-answers-single-threaded-skiplist-insertion-lookup-p03-s01-m02)
+28. [Deep Systems Interview Questions & Answers: Lock-Free Read Traversal & Atomic Publication (P03-S02-M01)](#28-deep-systems-interview-questions-answers-lock-free-read-traversal-atomic-publication-p03-s02-m01)
+29. [Questions I Personally Failed & Corrected Understandings](#29-questions-i-personally-failed-corrected-understandings)
+30. [Deep Systems Interview Questions & Answers: Forward Iterator, Express-Lane Seek, & Weak Consistency (P03-S03-M01)](#30-deep-systems-interview-questions-answers-forward-iterator-express-lane-seek-weak-consistency-p03-s03-m01)
+31. [Deep Systems Interview Questions & Answers: Atomic MemTable Freeze, Linearization Points, & In-Place Immutability (P03-S03-M02)](#31-deep-systems-interview-questions-answers-atomic-memtable-freeze-linearization-points-in-place-immutability-p03-s03-m02)
+32. [Deep Systems Interview Questions & Answers: SSTable Data Block Architecture, Prefix Compression & Restart Points (P04-S01-M01)](#32-deep-systems-interview-questions-answers-sstable-data-block-architecture-prefix-compression-restart-points-p04-s01-m01)
+33. [Deep Systems Interview Questions & Answers: SSTable Block Trailer, Restart Array Serialization & CRC32 Integrity (P04-S01-M02)](#33-deep-systems-interview-questions-answers-sstable-block-trailer-restart-array-serialization-crc32-integrity-p04-s01-m02)
+34. [Deep Systems Interview Questions & Answers: SSTable Sparse Two-Level Block Index Architecture & Block Handles (P04-S02-M01)](#34-deep-systems-interview-questions-answers-sstable-sparse-two-level-block-index-architecture-block-handles-p04-s02-m01)
+35. [Deep Systems Interview Questions & Answers: SSTable Fixed 48-Byte Footer Architecture (P04-S02-M02)](#35-deep-systems-interview-questions-answers-sstable-fixed-48-byte-footer-architecture-p04-s02-m02)
+36. [Deep Systems Interview Questions & Answers: SSTable Sequential File Writer Architecture (P04-S03-M01)](#36-deep-systems-interview-questions-answers-sstable-sequential-file-writer-architecture-p04-s03-m01)
+37. [Deep Systems Interview Questions & Answers: SSTable Block Reader & Sparse Index Point Lookup (P04-S03-M02)](#37-deep-systems-interview-questions-answers-sstable-block-reader-sparse-index-point-lookup-p04-s03-m02)
+38. [Systems Questions on Append-Only MANIFEST Log Persistence & CRC32 Framing (P06-S01-M02)](#38-systems-questions-on-append-only-manifest-log-persistence-crc32-framing-p06-s01-m02)
+39. [Systems Questions on Atomic CURRENT Pointer Swapping & Directory Durability (P06-S02-M01)](#39-systems-questions-on-atomic-current-pointer-swapping-directory-durability-p06-s02-m01)
+40. [Deep Systems Interview Questions & Answers: CURRENT Pointer Reader & Validation (P06-S02-M02)](#40-deep-systems-interview-questions-answers-current-pointer-reader-validation-p06-s02-m02)
+41. [Deep Systems Interview Questions & Answers: VersionSet & Version-Pinned Reference Counting (P06-S02-M03)](#41-deep-systems-interview-questions-answers-versionset-version-pinned-reference-counting-p06-s02-m03)
+42. [Deep Systems Security: Parser Integer-Overflow, Unsigned Wraparound & Safe Deserialization (SEC-001)](#42-deep-systems-security-parser-integer-overflow-unsigned-wraparound-safe-deserialization-sec-001)
+43. [Manifest Integrity, Deserialization Boundaries & SSTable Metadata Validation (SEC-004)](#43-manifest-integrity-deserialization-boundaries-sstable-metadata-validation-sec-004)
+44. [Atomic Reference Counting: Integer Overflow, Upper-Bound Proving & Arithmetic Safety (SEC-005)](#44-atomic-reference-counting-integer-overflow-upper-bound-proving-arithmetic-safety-sec-005)
+45. [Parent Directory TOCTOU: Why Pathnames Are Not Filesystem Identities (SEC-006)](#45-parent-directory-toctou-why-pathnames-are-not-filesystem-identities-sec-006)
+46. [TableReader Path & Symlink TOCTOU: Why the Opened File Descriptor Is Authoritative (SEC-007)](#46-tablereader-path-symlink-toctou-why-the-opened-file-descriptor-is-authoritative-sec-007)
+47. [Recovery Lifecycle Isolation, Version Ownership, and Filesystem TOCTOU Hardening (P07-SEC-REMED)](#47-recovery-lifecycle-isolation-version-ownership-and-filesystem-toctou-hardening-p07-sec-remed)
+48. [Sharded Read Block Cache & SSTable Read Path Integration (P09-S01-M01, M02, M03)](#48-sharded-read-block-cache-sstable-read-path-integration-p09-s01-m01-m02-m03)
+49. [Deep Systems Interview Questions & Answers: Production Diagnostics & `pprof` Profiling Subsystem (P13-S01-M04)](#49-deep-systems-interview-questions-answers-production-diagnostics-pprof-profiling-subsystem-p13-s01-m04)
+50. [Deep Systems Interview Questions & Answers: Node Identity & Cluster Configuration Model (P14-S01-M01)](#50-deep-systems-interview-questions-answers-node-identity-cluster-configuration-model-p14-s01-m01)
+51. [Deep Systems Interview Questions & Answers: Peer-to-Peer RPC Framing Protocol (P14-S01-M02)](#51-deep-systems-interview-questions-answers-peer-to-peer-rpc-framing-protocol-p14-s01-m02)
+52. [Deep Systems Interview Questions & Answers: Outbound Peer Connection Manager & Concurrency Safety (P14-S01-M03)](#52-deep-systems-interview-questions-answers-outbound-peer-connection-manager-concurrency-safety-p14-s01-m03)
+53. [Deep Systems Interview Questions & Answers: Phase 14 Adversarial Security Audit & Transport Hardening (SEC-P14-FULL)](#53-deep-systems-interview-questions-answers-phase-14-adversarial-security-audit-transport-hardening-sec-p14-full)
+54. [Deep Systems Interview Questions & Answers: Jepsen Network Partition Simulation & Split-Brain Commit Prevention (P18-S01-M01)](#54-deep-systems-interview-questions-answers-jepsen-network-partition-simulation-split-brain-commit-prevention-p18-s01-m01)
+55. [Deep Systems Interview Questions & Answers: Abrupt SIGKILL Crash Recovery & Durability Boundaries (P18-S01-M02)](#55-deep-systems-interview-questions-answers-abrupt-sigkill-crash-recovery-durability-boundaries-p18-s01-m02)
+56. [Deep Systems Interview Questions & Answers: Phase 18 Security Remediation & Chaos Verification Hardening (P18-SEC)](#56-deep-systems-interview-questions-answers-phase-18-security-remediation-chaos-verification-hardening-p18-sec)
+57. [Deep Systems Interview Questions & Answers: Strict Path Traversal Sanitization & Filesystem Containment (P19-S01-M01)](#57-deep-systems-interview-questions-answers-strict-path-traversal-sanitization-filesystem-containment-p19-s01-m01)
+58. [Deep Systems Interview Questions & Answers: Network Connection Limits & Slowloris Defense Architecture (P19-S01-M02)](#58-deep-systems-interview-questions-answers-network-connection-limits-slowloris-defense-architecture-p19-s01-m02)
+59. [Deep Systems Interview Questions & Answers: Production Observability, Lock-Free Prometheus Metrics & Cardinality Defense (P20-S01-M01)](#59-deep-systems-interview-questions-answers-production-observability-lock-free-prometheus-metrics-cardinality-defense-p20-s01-m01)
+60. [Deep Systems Interview Questions & Answers: Liveness, Readiness, & Disk Health Probes (P20-S01-M02)](#60-deep-systems-interview-questions-answers-liveness-readiness-disk-health-probes-p20-s01-m02)
+61. [Deep Systems Interview Questions & Answers: Benchmark Methodology, Tail Latency Measurement & Empirical Evidence (P21-S01-M01)](#61-deep-systems-interview-questions-answers-benchmark-methodology-tail-latency-measurement-empirical-evidence-p21-s01-m01)
+62. [Final Interview Defense Matrix](#62-final-interview-defense-matrix)
+63. [Personal Defense Checklist](#63-personal-defense-checklist)
+64. [Top 50 Final Defense Questions](#64-top-50-final-defense-questions)
 
 ---
+
 
 # 1. Foundations, Binary Encodings & Memory Management
 
@@ -1804,7 +1837,7 @@ Conversely, historical sealed segments ($S_1 \dots S_{N-1}$) were closed and syn
     3. The corresponding WAL segment(s) spanning the un-flushed sequence range must *not* be deleted or recycled.
     4. The engine halts new mutations (entering a fail-closed write stall or returning `ErrStorageDegraded`), protecting against memory exhaustion while preserving committed data in RAM and WAL until administrative recovery or disk remediation occurs.
 
-# 27. Deep Systems Interview Questions & Answers: SkipList Node Memory Representation & Geometric Randomizer (P03-S01-M01)
+# 26. Deep Systems Interview Questions & Answers: SkipList Node Memory Representation & Geometric Randomizer (P03-S01-M01)
 
 ### 1. Why do SkipLists use a geometric height distribution rather than a uniform distribution?
 * **Question**: In your SkipList implementation, why is node height governed by a geometric distribution ($p = 0.25$) rather than a uniform random distribution over $[1, L_{max}]$?
@@ -1900,7 +1933,7 @@ Conversely, historical sealed segments ($S_1 \dots S_{N-1}$) were closed and syn
 
 ---
 
-# 28. Deep Systems Interview Questions & Answers: Single-Threaded SkipList Insertion & Lookup (P03-S01-M02)
+# 27. Deep Systems Interview Questions & Answers: Single-Threaded SkipList Insertion & Lookup (P03-S01-M02)
 
 ### 1. How did you locate the predecessor of an inserted SkipList node?
 * **Question**: In your SkipList implementation, walk me through the exact algorithm for locating the predecessor nodes when inserting a new key.
@@ -2036,7 +2069,7 @@ Conversely, historical sealed segments ($S_1 \dots S_{N-1}$) were closed and syn
 
 ---
 
-# 29. Deep Systems Interview Questions & Answers: Lock-Free Read Traversal & Atomic Publication (P03-S02-M01)
+# 28. Deep Systems Interview Questions & Answers: Lock-Free Read Traversal & Atomic Publication (P03-S02-M01)
 
 ### 1. Why can SkipList readers be lock-free while writers remain serialized?
 * **Question**: Why is a SkipList uniquely suited for lock-free reader traversal with a serialized writer, whereas balanced search trees (AVL, Red-Black, B-Trees) require reader locking?
@@ -2166,11 +2199,11 @@ Conversely, historical sealed segments ($S_1 \dots S_{N-1}$) were closed and syn
 
 ---
 
-# 26. Questions I Personally Failed & Corrected Understandings
+# 29. Questions I Personally Failed & Corrected Understandings
 
 *(Entries will be appended whenever knowledge gaps are discovered)*
 
-# 28. Deep Systems Interview Questions & Answers: Forward Iterator, Express-Lane Seek, & Weak Consistency (P03-S03-M01)
+# 30. Deep Systems Interview Questions & Answers: Forward Iterator, Express-Lane Seek, & Weak Consistency (P03-S03-M01)
 
 ### 1. How does the SkipList forward iterator navigate through records?
 * **Question**: How does `Iterator.Next()` traverse records, and what synchronization is required?
@@ -2240,7 +2273,7 @@ Conversely, historical sealed segments ($S_1 \dots S_{N-1}$) were closed and syn
     4. Seek operations must not just land on `UserKey >= target`, but must find the latest version $\le S_{\text{snap}}$, requiring complex multi-version lookahead.
   - Freezing the MemTable (`P03-S03-M02`) freezes the entire list, converting it into a static immutable structure where snapshot isolation is trivial.
 
-# 29. Deep Systems Interview Questions & Answers: Atomic MemTable Freeze, Linearization Points, & In-Place Immutability (P03-S03-M02)
+# 31. Deep Systems Interview Questions & Answers: Atomic MemTable Freeze, Linearization Points, & In-Place Immutability (P03-S03-M02)
 
 ### 1. Why do LSM-tree storage engines require an atomic freeze transition?
 * **Question**: Why does an LSM engine transition active MemTables to immutable/frozen tables rather than flushing directly from the active MemTable?
@@ -2287,7 +2320,7 @@ Conversely, historical sealed segments ($S_1 \dots S_{N-1}$) were closed and syn
     - If `it.sl` were retained, the entire MemTable (potentially 64MB of nodes) cannot be garbage collected even after the table has been flushed to disk and dereferenced by the engine!
     - Setting `it.sl = nil` in `Close()` severs the reference to the SkipList, allowing the entire MemTable heap to be promptly reclaimed by the Go runtime GC.
 
-# 30. Deep Systems Interview Questions & Answers: SSTable Data Block Architecture, Prefix Compression & Restart Points (P04-S01-M01)
+# 32. Deep Systems Interview Questions & Answers: SSTable Data Block Architecture, Prefix Compression & Restart Points (P04-S01-M01)
 
 ### 1. Why do LSM-tree storage engines use prefix compression inside data blocks?
 * **Question**: Why do SSTable data blocks store keys using prefix compression instead of writing raw keys?
@@ -2417,7 +2450,7 @@ Restart Offsets: [0]
 
 ---
 
-# 31. Deep Systems Interview Questions & Answers: SSTable Block Trailer, Restart Array Serialization & CRC32 Integrity (P04-S01-M02)
+# 33. Deep Systems Interview Questions & Answers: SSTable Block Trailer, Restart Array Serialization & CRC32 Integrity (P04-S01-M02)
 
 ### 1. Why is the restart array placed at the tail of the block rather than the header?
 * **Question**: Why do SSTable data blocks store restart offsets and restart counts at the end of the block instead of at the beginning like typical file or network packet headers?
@@ -2547,7 +2580,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 32. Deep Systems Interview Questions & Answers: SSTable Sparse Two-Level Block Index Architecture & Block Handles (P04-S02-M01)
+# 34. Deep Systems Interview Questions & Answers: SSTable Sparse Two-Level Block Index Architecture & Block Handles (P04-S02-M01)
 
 ### 1. What is a sparse two-level block index, and how does it differ fundamentally from a dense index?
 * **Question**: Why does an LSM storage engine like Lattice utilize a sparse two-level block index instead of a dense index?
@@ -2619,7 +2652,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 33. Deep Systems Interview Questions & Answers: SSTable Fixed 48-Byte Footer Architecture (P04-S02-M02)
+# 35. Deep Systems Interview Questions & Answers: SSTable Fixed 48-Byte Footer Architecture (P04-S02-M02)
 
 ### 1. Why is the SSTable footer designed with a fixed size rather than variable-length encoding?
 * **Question**: In many storage formats, variable-length integers (varints) are used to save disk space. Why does Lattice SSTable use a strictly fixed 48-byte footer with fixed 64-bit Big-Endian integers instead of varints?
@@ -2698,7 +2731,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 34. Deep Systems Interview Questions & Answers: SSTable Sequential File Writer Architecture (P04-S03-M01)
+# 36. Deep Systems Interview Questions & Answers: SSTable Sequential File Writer Architecture (P04-S03-M01)
 
 ### 1. How does `TableWriter` guarantee crash consistency and atomicity during SSTable file construction?
 * **Question**: In an LSM-tree storage engine, an SSTable file may take hundreds of milliseconds to stream to disk. If a process crash (`SIGKILL`) or power failure occurs midway through writing, how does Lattice ensure that partial, torn, or corrupt SSTables never become visible to readers or corrupt database state?
@@ -2762,7 +2795,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 35. Deep Systems Interview Questions & Answers: SSTable Block Reader & Sparse Index Point Lookup (P04-S03-M02)
+# 37. Deep Systems Interview Questions & Answers: SSTable Block Reader & Sparse Index Point Lookup (P04-S03-M02)
 
 ### 1. How does `TableReader` bootstrap an SSTable without scanning data blocks?
 * **Question**: In an LSM-tree storage engine, why does `TableReader` read the footer from `file_size - 48`, and why is loading the sparse index block into RAM sufficient for point lookups?
@@ -2829,7 +2862,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 29. Systems Questions on Append-Only MANIFEST Log Persistence & CRC32 Framing (P06-S01-M02)
+# 38. Systems Questions on Append-Only MANIFEST Log Persistence & CRC32 Framing (P06-S01-M02)
 
 ### 1. Why is VersionEdit serialization separate from MANIFEST record framing?
 * **Question**: In Lattice's manifest subsystem, why is `VersionEdit.Encode()` completely decoupled from the physical `MANIFEST` record framing header?
@@ -2906,7 +2939,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 30. Systems Questions on Atomic CURRENT Pointer Swapping & Directory Durability (P06-S02-M01)
+# 39. Systems Questions on Atomic CURRENT Pointer Swapping & Directory Durability (P06-S02-M01)
 
 ### 1. Why must CURRENT be written through a temporary file (`CURRENT.tmp`) rather than modified in place?
 * **Question**: Why does Lattice stage updates to `CURRENT.tmp` before renaming, instead of opening `CURRENT` with `O_TRUNC` and writing the new manifest filename directly?
@@ -2988,7 +3021,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 31. Deep Systems Interview Questions & Answers: CURRENT Pointer Reader & Validation (P06-S02-M02)
+# 40. Deep Systems Interview Questions & Answers: CURRENT Pointer Reader & Validation (P06-S02-M02)
 
 ### 1. Why must `ReadCurrentManifest` enforce strict canonical parsing rather than tolerant normalization?
 * **Question**: Why does `ParseCurrentManifest` reject trailing spaces, CRLF (`\r\n`), missing newlines, lowercase prefixes, or superfluous leading zeros (e.g. `MANIFEST-0000001\n`) instead of silently trimming and normalizing?
@@ -3027,7 +3060,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 32. Deep Systems Interview Questions & Answers: VersionSet & Version-Pinned Reference Counting (P06-S02-M03)
+# 41. Deep Systems Interview Questions & Answers: VersionSet & Version-Pinned Reference Counting (P06-S02-M03)
 
 ### 1. Why must a published `Version` be strictly immutable in an LSM-tree?
 * **Question**: Why does `NewVersion` defensively copy all level slices and byte keys, and why are there no mutation methods (e.g. `AddFile` or `DeleteFile`) on `Version` itself?
@@ -3095,7 +3128,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 33. Deep Systems Security: Parser Integer-Overflow, Unsigned Wraparound & Safe Deserialization (SEC-001)
+# 42. Deep Systems Security: Parser Integer-Overflow, Unsigned Wraparound & Safe Deserialization (SEC-001)
 
 ### 1. Why is unsigned integer arithmetic in length calculations prone to exploitable overflow?
 * **Question**: In Go and other systems languages, unsigned integers wrap around modulo $2^N$ on overflow without triggering compiler warnings or runtime panics. How does this create security vulnerabilities in binary deserializers?
@@ -3124,7 +3157,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 34. Manifest Integrity, Deserialization Boundaries & SSTable Metadata Validation (SEC-004)
+# 43. Manifest Integrity, Deserialization Boundaries & SSTable Metadata Validation (SEC-004)
 
 ### 1. Why must VersionEdit validate semantic SSTable metadata rather than merely validate the binary TLV structure? (SEC-004 / F-004)
 * **Question**: In an LSM-tree storage engine, why is structural/syntactic validation of manifest TLV records (e.g. valid varints, matching payload lengths) insufficient on its own, and why must `VersionEdit` enforce semantic SSTable metadata invariants at the admission boundary?
@@ -3149,7 +3182,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 35. Atomic Reference Counting: Integer Overflow, Upper-Bound Proving & Arithmetic Safety (SEC-005)
+# 44. Atomic Reference Counting: Integer Overflow, Upper-Bound Proving & Arithmetic Safety (SEC-005)
 
 ### 1. How can an atomic reference counter still overflow, and why must the maximum-value check occur before the CAS increment? (SEC-005 / F-005)
 * **Question**: In systems programming, developers often assume that using atomic primitives like Go's `atomic.Int32` or C++'s `std::atomic<int32_t>` guarantees full safety. How can an atomic reference counter still overflow, why is saturation counter-productive, and why must the maximum-value bound check occur *before* evaluating `cur + 1` in the compare-and-swap loop?
@@ -3177,7 +3210,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 36. Parent Directory TOCTOU: Why Pathnames Are Not Filesystem Identities (SEC-006)
+# 45. Parent Directory TOCTOU: Why Pathnames Are Not Filesystem Identities (SEC-006)
 
 ### 1. Why is `filepath.Dir(dstPath)` insufficient to identify a parent directory across time, and how does this create a TOCTOU race in SSTable publication? (SEC-006 / F-006)
 * **Question**: In database storage engines, SSTable files are written to temporary staging paths and then atomically published to their final destination path. If the parent directory is referenced by `filepath.Dir(dstPath)` — a string — why is this unsafe for a multi-step publication pipeline (create temp, write data, close, link, fsync directory)?
@@ -3199,7 +3232,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 37. TableReader Path & Symlink TOCTOU: Why the Opened File Descriptor Is Authoritative (SEC-007)
+# 46. TableReader Path & Symlink TOCTOU: Why the Opened File Descriptor Is Authoritative (SEC-007)
 
 ### 1. Why is `os.Open(path)` followed by pathname-based validation vulnerable to TOCTOU, and why is the opened file descriptor the authoritative object? (SEC-007 / F-007)
 * **Question**: In database storage engines, a common pattern for opening an SSTable or database file is:
@@ -3229,7 +3262,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 38. Recovery Lifecycle Isolation, Version Ownership, and Filesystem TOCTOU Hardening (P07-SEC-REMED)
+# 47. Recovery Lifecycle Isolation, Version Ownership, and Filesystem TOCTOU Hardening (P07-SEC-REMED)
 
 ### 1. Why must crash recovery be lifecycle-isolated from concurrent mutations, and why can recovery not run after live writes have begun? (SEC-P07-01)
 * **Question**: In many storage engine implementations, `RecoverWAL()` is implemented as an independent method that reads logs from disk and populates an active MemTable. Why is allowing concurrent `Put`/`Delete` operations during recovery, or invoking recovery after live writes have occurred, a fatal architectural defect?
@@ -3313,7 +3346,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 39. Sharded Read Block Cache & SSTable Read Path Integration (P09-S01-M01, M02, M03)
+# 48. Sharded Read Block Cache & SSTable Read Path Integration (P09-S01-M01, M02, M03)
 
 ### 1. Why must `validateBlockHandle` be evaluated strictly BEFORE consulting the `BlockCache`?
 * **Question**: In `TableReader.ReadBlock(handle)`, why is it dangerous to perform the cache lookup `r.blockCache.Get(key)` before verifying that `handle.Offset + handle.Size <= FileSize - FooterSize` and `handle.Size <= MaxDataBlockSize`?
@@ -3349,7 +3382,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 40. Deep Systems Interview Questions & Answers: Production Diagnostics & `pprof` Profiling Subsystem (P13-S01-M04)
+# 49. Deep Systems Interview Questions & Answers: Production Diagnostics & `pprof` Profiling Subsystem (P13-S01-M04)
 
 ### 1. Transport Separation vs. Protocol Multiplexing: Why use a dedicated HTTP server rather than multiplexing pprof over Lattice's binary TCP storage protocol?
 * **Question**: Lattice implements a custom binary framing protocol (`transport.OpGet`, `transport.OpPut`, 5-byte fixed headers). Why didn't you add a `transport.OpPprof` opcode to the existing TCP storage listener instead of spinning up an independent HTTP listener?
@@ -3416,7 +3449,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 41. Deep Systems Interview Questions & Answers: Node Identity & Cluster Configuration Model (P14-S01-M01)
+# 50. Deep Systems Interview Questions & Answers: Node Identity & Cluster Configuration Model (P14-S01-M01)
 
 ### 1. Why does a distributed database need stable node identity?
 * **Question**: Why can't cluster nodes identify themselves dynamically via ephemeral addresses, hostnames, or randomly generated UUIDs on each process restart?
@@ -3465,7 +3498,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 42. Deep Systems Interview Questions & Answers: Peer-to-Peer RPC Framing Protocol (P14-S01-M02)
+# 51. Deep Systems Interview Questions & Answers: Peer-to-Peer RPC Framing Protocol (P14-S01-M02)
 
 ### 1. Why should a distributed system use explicit binary wire formats?
 * **Question**: Why did you build a custom binary framing protocol for Lattice peer communication instead of using JSON, YAML, or Go's standard `encoding/gob`?
@@ -3536,7 +3569,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 43. Deep Systems Interview Questions & Answers: Outbound Peer Connection Manager & Concurrency Safety (P14-S01-M03)
+# 52. Deep Systems Interview Questions & Answers: Outbound Peer Connection Manager & Concurrency Safety (P14-S01-M03)
 
 ### 1. Why must outbound peer connections use a per-peer supervisor rather than an ad-hoc connection pool?
 * **Question**: In your peer connection manager, why is communication to each remote peer owned by a dedicated, long-lived `peerSupervisor` loop rather than using a general-purpose dynamic connection pool (like `database/sql` or an HTTP transport pool)?
@@ -3601,7 +3634,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 44. Deep Systems Interview Questions & Answers: Phase 14 Adversarial Security Audit & Transport Hardening (SEC-P14-FULL)
+# 53. Deep Systems Interview Questions & Answers: Phase 14 Adversarial Security Audit & Transport Hardening (SEC-P14-FULL)
 
 ### 1. How does a race between `sync.WaitGroup.Add` and `Wait` crash a Go process, and how did Lattice eliminate it?
 * **Question**: In concurrent Go networking systems, what happens if `Start()` calls `wg.Add(1)` while `Close()` is executing `wg.Wait()`, and how does Lattice ensure lifecycle synchronization?
@@ -3681,7 +3714,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 43. Deep Systems Interview Questions & Answers: Jepsen Network Partition Simulation & Split-Brain Commit Prevention (P18-S01-M01)
+# 54. Deep Systems Interview Questions & Answers: Jepsen Network Partition Simulation & Split-Brain Commit Prevention (P18-S01-M01)
 
 ### 1. In a Raft cluster, how do you mathematically and programmatically prove zero split-brain writes can commit during a network partition?
 * **Question**: When a 3-node Raft cluster splits into an isolated leader $\{N_1\}$ and a surviving majority $\{N_2, N_3\}$, what exact code path prevents $N_1$ from committing a concurrent write?
@@ -3706,7 +3739,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 44. Deep Systems Interview Questions & Answers: Abrupt SIGKILL Crash Recovery & Durability Boundaries (P18-S01-M02)
+# 55. Deep Systems Interview Questions & Answers: Abrupt SIGKILL Crash Recovery & Durability Boundaries (P18-S01-M02)
 
 ### 1. Why is testing with abrupt `SIGKILL` fundamentally stronger than testing with graceful shutdown (`SIGTERM`, `SIGINT`, or `Close()`)?
 * **Question**: In storage engine durability testing, why is invoking graceful shutdown (`SIGTERM`, `SIGINT`, or programmatic `Close()`) insufficient, and what unique failure modes does `SIGKILL` expose?
@@ -3763,7 +3796,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 45. Deep Systems Interview Questions & Answers: Phase 18 Security Remediation & Chaos Verification Hardening (P18-SEC)
+# 56. Deep Systems Interview Questions & Answers: Phase 18 Security Remediation & Chaos Verification Hardening (P18-SEC)
 
 ### 1. Why is background worker goroutine `panic` considered an anti-pattern in chaos testing, and how does fail-closed supervisor signaling fix it?
 * **Question**: In concurrent testing, what catastrophic side-effects happen when a worker goroutine panics upon an unexpected error (like an ACK ledger write failure), and how should supervisor signaling be structured?
@@ -3897,7 +3930,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 24. Deep Systems Interview Questions & Answers: Strict Path Traversal Sanitization & Filesystem Containment (P19-S01-M01)
+# 57. Deep Systems Interview Questions & Answers: Strict Path Traversal Sanitization & Filesystem Containment (P19-S01-M01)
 
 ### 1. Why are `filepath.Clean` and `filepath.Join` insufficient on their own as security boundaries?
 * **Question**: Why is relying solely on `filepath.Join(rootDir, userInput)` or `filepath.Clean(userInput)` a classic directory traversal vulnerability in Go?
@@ -3980,7 +4013,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 25. Deep Systems Interview Questions & Answers: Network Connection Limits & Slowloris Defense Architecture (P19-S01-M02)
+# 58. Deep Systems Interview Questions & Answers: Network Connection Limits & Slowloris Defense Architecture (P19-S01-M02)
 
 ### 1. Why are connection limits alone insufficient to protect a server without socket deadlines (Slowloris mechanics)?
 * **Question**: Why does an application with `MaxConnections = 4,096` remain completely vulnerable to denial-of-service if read and write socket deadlines are not strictly enforced?
@@ -4076,7 +4109,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 46. Deep Systems Interview Questions & Answers: Production Observability, Lock-Free Prometheus Metrics & Cardinality Defense (P20-S01-M01)
+# 59. Deep Systems Interview Questions & Answers: Production Observability, Lock-Free Prometheus Metrics & Cardinality Defense (P20-S01-M01)
 
 ### 1. Lock-Free Histogram Architecture & Zero Allocation on Hot Storage Paths
 * **Question**: Why does placing a `sync.Mutex` inside a high-throughput histogram degrade performance in concurrent storage engines (100k ops/sec), and how does Lattice achieve 0 allocations and lock-free recording?
@@ -4173,7 +4206,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 43. Deep Systems Interview Questions & Answers: Liveness, Readiness, & Disk Health Probes (P20-S01-M02)
+# 60. Deep Systems Interview Questions & Answers: Liveness, Readiness, & Disk Health Probes (P20-S01-M02)
 
 ### 1. Liveness vs. Readiness Decoupling in Distributed Storage
 * **Question**: Why is equating liveness (`/live`) and readiness (`/ready`) a fatal architectural anti-pattern in a distributed database managed by container orchestrators (Kubernetes, Nomad, Borg)?
@@ -4268,7 +4301,7 @@ Offset 68..71 (4B, CRC32-IEEE):
 
 ---
 
-# 37. Deep Systems Interview Questions & Answers: Benchmark Methodology, Tail Latency Measurement & Empirical Evidence (P21-S01-M01)
+# 61. Deep Systems Interview Questions & Answers: Benchmark Methodology, Tail Latency Measurement & Empirical Evidence (P21-S01-M01)
 
 ### 1. Client-Observed vs Server-Side Latency Measurement Boundaries
 * **Question**: Why is measuring latency at the client network boundary fundamentally different from measuring execution time inside the storage engine, and which one should be reported in public benchmark evidence?
@@ -4353,6 +4386,677 @@ Offset 68..71 (4B, CRC32-IEEE):
     3. *Measured Result*: Empirically benchmarked on specific hardware (Apple M4, 16GB RAM, APFS NVMe, 64 workers, 1,266.36 ops/sec, 4.05ms GET P50, 232.78ms PUT P50).
     4. *Observed Limitation*: Empirical bottlenecks (e.g. sync write queueing under lock serialization).
   - Interviewers value an engineer who accurately explains *why* physical disk sync latency and lock contention produced 232ms PUT P50 over someone who quotes unverified theoretical numbers.
+
+---
+
+---
+
+# 62. Final Interview Defense Matrix
+
+| Subsystem | Core Concept | Where Implemented | Primary Invariant | Key Test | Known Limitation | Interview Risk |
+| :--- | :--- | :--- | :--- | :--- | :--- | :---: |
+| **WAL** | Append-only write-ahead log with Big-Endian framing, CRC32-IEEE checksums, and size-based rotation | `internal/wal/writer.go`, `internal/wal/rotating_writer.go`, `internal/wal/reader.go`, `internal/wal/coordinator.go` | Sync before ACK; record boundary checksum verification; active segment atomic pointer isolation | `internal/wal/writer_test.go`, `internal/wal/rotating_writer_test.go`, `internal/wal/recovery_test.go` | Standalone engine write path serializes `wal.AppendSync` per write under `Engine.mu.Lock()`, queuing concurrent writes behind the single-threaded NVMe sync barrier (~3.6ms per flush). Group commit coordinator (`wal.Coordinator`) exists in `internal/wal/` but is not enabled on standalone unbatched PUTs | **HIGH** |
+| **MemTable** | In-memory ordered key-value indexing backed by a concurrent probabilistic SkipList with lock-free readers | `internal/memtable/memtable.go`, `internal/memtable/skiplist.go`, `internal/memtable/iterator.go` | Single-writer exclusive mutation with lock-free concurrent readers; forward links updated with atomic pointer stores; memory monotonic expansion during life | `internal/memtable/skiplist_test.go`, `internal/memtable/memtable_test.go`, `internal/memtable/iterator_test.go` | Memory bounded by fixed active capacity (default 64 MiB); memory reclamation occurs only upon flush and table retirement; backward iteration not supported | **MEDIUM** |
+| **SSTable** | Immutable on-disk sorted string tables with 4KB data blocks, prefix compression, restart arrays, two-level sparse index, and fixed 48-byte trailer footer | `internal/sstable/table_writer.go`, `internal/sstable/table_reader.go`, `internal/sstable/block_writer.go`, `internal/sstable/block_reader.go`, `internal/sstable/footer.go` | Keys strictly ascending by `InternalKey` (user key asc, seqnum desc, optype desc); restart points every $K=16$ keys; CRC32-IEEE verification per block | `internal/sstable/table_test.go`, `internal/sstable/block_test.go`, `internal/sstable/footer_test.go` | Immutable once written; block decompression and variable-prefix decoding incur CPU overhead; range scans require merging multi-table iterators | **MEDIUM** |
+| **Bloom** | Probabilistic bitset filter utilizing double-hashing per data block to eliminate unnecessary disk I/O on missing keys | `internal/filter/bloom.go`, `internal/filter/filter_block.go` | Zero false negatives; bitset size and hash function count ($k = \lceil \ln 2 \cdot m/n \rceil$) mathematically optimized for target false positive probability ($\approx 1\%$) | `internal/filter/bloom_test.go`, `internal/filter/filter_block_test.go` | Sized for point lookups; cannot filter range scans; false positive rate degrades if key density exceeds initial sizing estimates | **LOW** |
+| **VersionSet** | Multi-version concurrency control (MVCC) tracking active LSM levels and SSTables across generational changes via atomic version installation and reference counting | `internal/version/version_set.go`, `internal/version/version.go`, `internal/version/manifest_writer.go`, `internal/version/manifest_reader.go` | Pinned version immutability; reference counts determine SSTable physical lifecycle; manifest log records delta edits (`VersionEdit`); CURRENT pointer atomically updated via temporary file swap and directory sync | `internal/version/version_set_test.go`, `internal/version/manifest_test.go` | In-memory doubly-linked version chain can hold older versions in RAM if a reader goroutine pins a version indefinitely without calling `Unref()` | **HIGH** |
+| **Recovery** | Deterministic database state reconstruction upon restart via manifest replay followed by active and uncompacted WAL segment replay | `internal/engine/recovery.go`, `internal/wal/reader.go`, `internal/version/manifest_reader.go` | Acknowledged writes are 100% recovered; torn tail on active segment is safely truncated to last valid CRC32 boundary; older segments with corruption trigger fail-closed panic | `internal/engine/recovery_test.go`, `internal/wal/recovery_test.go`, `tests/chaos/` | Cold restart replay time is proportional to total uncompacted WAL size; requires scanning logs from oldest uncheckpointed sequence | **HIGH** |
+| **Compaction** | Background leveling compaction merging overlapping $L_i$ and $L_{i+1}$ SSTables to enforce geometric size limits, garbage-collect tombstones, and minimize read amplification | `internal/compaction/compaction.go`, `internal/compaction/planner.go`, `internal/compaction/merger.go` | Non-overlapping key ranges in $L_1 \dots L_6$; tombstones dropped only when key cannot exist in deeper levels; atomic installation via Manifest `VersionEdit` | `internal/compaction/compaction_test.go`, `internal/compaction/planner_test.go` | Write amplification increases with depth; single background compaction thread in V1; large compactions can induce transient I/O spikes | **HIGH** |
+| **Cache** | Sharded LRU read cache for decompressed SSTable data blocks, reducing disk reads and lock contention across multicore processors | `internal/cache/sharded_cache.go`, `internal/cache/lru.go` | $2^k$ independent shards indexed by hash of `(fileNum, offset)`; fixed byte capacity per shard; $O(1)$ eviction and lookup under per-shard mutex | `internal/cache/sharded_cache_test.go`, `internal/cache/lru_test.go` | Cache stores uncompressed blocks, trading heap memory footprint for zero decompression latency on hit; dynamic cache resizing requires re-sharding | **LOW** |
+| **Engine** | Top-level single-node LSM orchestrator coordinating active MemTable, immutable MemTable queue, WAL writer, VersionSet, and shared block cache | `internal/engine/engine.go`, `internal/engine/options.go` | Strict write ordering: sequence number allocation -> WAL append -> WAL fsync -> MemTable insertion -> client ACK; read path: active MemTable -> immutable MemTable -> VersionSet Level 0 -> VersionSet Level 1..6 | `internal/engine/engine_test.go`, `internal/engine/integration_test.go` | Global `Engine.mu` write lock coordinates WAL appends and MemTable insertions in standalone mode; no multi-version transaction snapshot isolation (single-key operations only) | **HIGH** |
+| **Transport** | Custom binary TCP wire protocol with fixed 18-byte headers, Big-Endian encoding, CRC32 payload checksums, connection admission limits, and Slowloris deadlines | `internal/transport/server.go`, `internal/transport/client.go`, `internal/transport/frame.go`, `internal/transport/binary.go` | Framed protocol isolation; 5 MiB payload ceiling; 4,096 client connection limit; Slowloris deadlines (`HeaderTimeout`, `PayloadTimeout`, `WriteTimeout`, `IdleTimeout`) | `internal/transport/server_test.go`, `internal/transport/security_test.go` | Custom binary wire protocol requires Lattice-specific client driver; no TLS/mTLS on the external client port (:9099) in standalone mode | **MEDIUM** |
+| **Cluster** | Immutable cluster topology model establishing bijective mappings between numeric `NodeID` and canonical TCP endpoint strings (`host:port`) | `internal/cluster/topology.go`, `internal/cluster/node.go` | Stable numeric node identity (`uint64 > 0`); one-to-one bijection between `NodeID` and endpoint; immutable topology after startup validation; zero runtime mutations | `internal/cluster/topology_test.go` | Static cluster membership; dynamic membership changes (Raft Joint Consensus) not supported in V1; topology changes require coordinated rolling configuration updates | **LOW** |
+| **Raft** | Leader election, log replication, safety invariants, and persistent state management adhering to the Raft consensus specification | `internal/raft/node.go`, `internal/raft/log.go`, `internal/raft/storage.go`, `internal/raft/state.go` | At most one leader per term; election safety; leader log append-only; log matching property; leader completeness; commit index monotonicity | `internal/raft/election_test.go`, `internal/raft/replication_test.go`, `internal/raft/safety_test.go` | Log compaction and Raft snapshots not implemented in V1; log entries persist in `raft.log` indefinitely until node restart or truncation | **HIGH** |
+| **State Machine** | Replicated deterministic finite state machine applying committed Raft log entries sequentially to the local storage engine | `internal/raft/apply.go`, `internal/raft/command.go` | Entries applied strictly in ascending `commitIndex` order; apply loop decoupled from consensus replication; idempotent application of committed mutations | `internal/raft/apply_test.go`, `internal/raft/command_test.go` | Single-threaded apply loop per node; state machine lag can occur if heavy engine writes queue behind slow disk flushes | **MEDIUM** |
+| **ReadIndex** | Linearizable read protocol allowing the Raft leader to serve reads without writing proposals to the consensus log, using heartbeat round-trip confirmation | `internal/raft/read_index.go`, `internal/raft/router.go` | Leader must confirm leadership by sending heartbeat to majority and observing success; must wait for local `appliedIndex >= readIndex`; re-validates leadership before reading state machine | `internal/raft/read_index_test.go`, `internal/raft/read_barrier_tcp_integration_test.go` | Reads route exclusively through the leader; follower linearizable reads require proxying through leader or LeaseRead (deferred) | **HIGH** |
+| **Chaos** | Deterministic fault injection framework verifying consensus and persistence invariants under network partitions (Jepsen-style) and abrupt process terminations (`SIGKILL`) | `tests/chaos/`, `internal/raft/partition_integration_test.go` | Zero split-brain commits during partitions; zero acknowledged write loss across abrupt `SIGKILL` cycles; test oracle resides in independent process domain | `tests/chaos/sigkill_durability_test.go`, `internal/raft/partition_integration_test.go` | Tests simulate OS-level process crashes and TCP partitions; raw power-loss with volatile disk write caching not simulated; assumes kernel `fsync` integrity | **HIGH** |
+| **Security** | Defense-in-depth security hardening including strict path containment, symlink breakout defense, integer overflow protection, frame allocation bounds, and connection limits | `internal/security/containment.go`, `internal/security/validation.go`, `docs/threat-model.md` | Deepest existing ancestor canonicalization for pre-creation path checks; whitelist regex for database filenames; safe subtractive length validation before allocation; allowlisted test environments | `internal/security/containment_test.go`, `internal/transport/security_test.go` | Mutual TLS (mTLS) for peer connections deferred; consensus traffic in cluster mode uses loopback plaintext by default unless `--insecure-transport` is passed | **HIGH** |
+| **Metrics** | High-throughput Prometheus text exposition HTTP server (:9100/metrics) backed by atomic discrete-bucket histograms with pre-allocated Cartesian label sets | `internal/metrics/registry.go`, `internal/metrics/histogram.go`, `internal/metrics/server.go` | Lock-free, zero-allocation latency recording on hot storage paths; discrete bucket storage with scrape-time cumulative accumulation; strictly bounded label cardinality ($O(1)$ series) | `internal/metrics/histogram_test.go`, `internal/metrics/registry_test.go`, `internal/metrics/server_test.go` | Label values must be pre-registered during initialization; dynamic ad-hoc labels are dropped to prevent memory exhaustion; metric format supports Prometheus 0.0.4 text exposition only | **MEDIUM** |
+| **Health** | Non-blocking HTTP health probes (:9100/live, :9100/ready) decoupling process event-loop vitality from cluster/storage readiness, with 5-second singleflight cached disk monitoring | `internal/metrics/health.go`, `internal/metrics/disk.go`, `cmd/lattice/health_test.go` | Wait-free health queries (no storage write locks or network RPCs); fail-closed disk threshold precedence (Critical > Warning > Healthy); follower readiness verified via live TCP connection to leader; zero information disclosure | `internal/metrics/health_test.go`, `internal/metrics/disk_test.go`, `cmd/lattice/health_test.go` | Health probes observe and report status; they do not automatically trigger compaction, failover, or disk cleanup; disk metrics reflect 5s cached state | **MEDIUM** |
+| **Benchmarking** | High-precision client-side performance benchmark harness measuring client-observed request/response latencies and throughput under deterministic Zipfian workloads | `internal/benchmark/histogram.go`, `internal/benchmark/zipf.go`, `cmd/lattice-bench/` | Client-observed latency boundary; logarithmic octave buckets with $\le 0.78125\%$ relative error; discrete nearest-rank percentiles; strict pre-population isolation; bounded duration context cancellation | `internal/benchmark/histogram_test.go`, `internal/benchmark/statistical_test.go`, `cmd/lattice-bench/runner_test.go` | Co-located client and daemon over local loopback; single-node standalone durability exhibits write queuing (~232ms PUT P50 under 64 workers); empirical numbers are hardware-specific (Apple M4) | **HIGH** |
+
+
+---
+
+# 63. Personal Defense Checklist
+
+- [x] **I can explain the exact write path**: Client TCP frame -> `transport.Server` decode -> `Engine.mu.Lock()` -> sequence number allocation -> WAL frame encode (`wal_%012d.log`) -> `wal.AppendSync` (`write` + `fdatasync`) -> `MemTable.Put` (SkipList atomic link insertion) -> release `Engine.mu` -> send `StatusOk` binary response.
+- [x] **I can explain the exact read path**: Client TCP frame -> `transport.Server` decode -> `Engine.Get`: (1) check active `MemTable` (lock-free SkipList search); if found, return value or `ErrKeyNotFound` if tombstone; (2) check immutable `MemTables` (newest to oldest); (3) pin `VersionSet.Current()` with `Ref()`; check Level 0 SSTables (newest to oldest by `FileNum`, Bloom filter check -> index binary search -> block cache / disk read); check Levels 1..6 (binary search SSTable metadata by key range -> Bloom filter check -> block seek); unpin `Version.Unref()`.
+- [x] **I can explain WAL durability semantics**: Single-segment `AppendSync` issues `fdatasync()` per write. `RotatingWriter` flushes, syncs, and seals historical segments before allocating new segments. Active segment pointer is managed via `atomic.Pointer[WALWriter]`.
+- [x] **I can explain crash recovery**: Step 1: Replay `MANIFEST` to reconstruct levels and file metadata in an isolated in-memory builder without touching live versions. Step 2: Open active/uncompacted WAL segments sequentially; replay records into MemTable. If the active segment has an incomplete torn tail at EOF, `wal.RecoverSegment` physically truncates the file in place to the last valid CRC32 boundary and fsyncs; older segments with corruption fail closed.
+- [x] **I can explain compaction**: Size-tiered leveled compaction ($L_1 \dots L_6$). When $L_i$ size exceeds $10^i \times 10\text{ MiB}$, select candidate file, expand overlapping key range in $L_{i+1}$, run multi-way merge iterator, write new $L_{i+1}$ SSTables (clamped to 2 MiB), atomically install via Manifest `VersionEdit`, and delete obsolete input files after unpinning.
+- [x] **I can explain cache concurrency**: `ShardedLRUCache` partitions keyspace into $2^k$ shards using FNV-1a hash of `(fileNum, offset)`. Each shard maintains a doubly-linked LRU list and hash table protected by its own `sync.Mutex`. Point lookups lock only the single target shard, eliminating global contention.
+- [x] **I can explain transport framing**: Fixed 18-byte header: `Magic` (0x4C54), `Version` (0x01), `OpCode` (1 byte), `Flags` (1 byte), `SeqID` (8 bytes Big-Endian), `PayloadLength` (4 bytes Big-Endian). Payload followed by 4-byte CRC32-IEEE checksum. Header bounds checked before payload buffer allocation.
+- [x] **I can explain Raft state transitions**: Nodes start as `RoleFollower`. If election timer (randomized 150-300ms) expires without heartbeat, transition to `RoleCandidate`, increment `currentTerm`, vote for self, persist state, and broadcast `RequestVote`. If majority votes granted, transition to `RoleLeader`, initialize `nextIndex`/`matchIndex`, and broadcast initial empty `AppendEntries` heartbeats. If higher term observed, immediately step down to `RoleFollower`.
+- [x] **I can explain log replication**: Leader receives proposal, appends to local `raft.log`, and issues `AppendEntries` to followers carrying `PrevLogIndex` and `PrevLogTerm`. Follower verifies previous log matching invariant. If match, appends entries and returns `Success=true`. If mismatch, returns `Success=false`, and leader decrements `nextIndex` and retries.
+- [x] **I can explain commit advancement**: Leader updates `matchIndex[peer]`. `advanceCommitIndexLocked` identifies index $N > \text{commitIndex}$ where majority of `matchIndex[i] >= N` and `log[N].Term == currentTerm`. Advances `commitIndex = N` and signals background `applyLoop`.
+- [x] **I can explain ReadIndex**: Leader receives read request. Step 1: Records `readIndex = commitIndex`. Step 2: Sends heartbeat to majority of peers and waits for quorum confirmation to prove it is still the authoritative leader. Step 3: Waits for local `appliedIndex >= readIndex`. Step 4: Revalidates leadership term and epoch (`ValidateLeadership`). Step 5: Executes local storage engine `Get` and returns result to client.
+- [x] **I can explain network partitions**: In a 3-node cluster split $\{N_1\} \mid \{N_2, N_3\}$, isolated leader $N_1$ cannot achieve quorum ($1 < 2$). Its proposals remain uncommitted and never reach the state machine. Surviving majority $\{N_2, N_3\}$ elects a new leader in higher term and commits writes. Upon healing, $N_1$ steps down upon observing higher term, truncates its divergent uncommitted suffix, and catches up.
+- [x] **I can explain the Phase 19 security model**: Directory traversal prevented via canonical containment (`ValidateContainment` with deepest existing ancestor resolution); database filenames validated via strict regex whitelist (`^[a-zA-Z0-9_.-]+$`); transport connections limited to 4,096; Slowloris mitigated via absolute socket deadlines; consensus peer connections limited to 64; diagnostic inspection tools verify regular file modes and inode identity (`os.SameFile`).
+- [x] **I can explain Prometheus instrumentation**: High-throughput telemetry using lock-free, zero-allocation discrete bucket histograms. Cumulative values computed at scrape time. Pre-allocated Cartesian product label vectors eliminate runtime allocations and prevent cardinality bomb attacks. Text exposition strictly escapes newlines and quotes.
+- [x] **I can explain liveness vs readiness**: `/live` indicates process event-loop vitality (HTTP 200 while running, 503 during termination). `/ready` indicates query serving capability (HTTP 503 during engine recovery, storage poison, disk exhaustion, or follower isolation). Follower readiness requires an active TCP connection to the leader. Disk health queries use singleflight 5-second cached `statfs` sampling with fail-closed precedence.
+- [x] **I can explain the benchmark methodology**: Canonical 60-second mixed workload (80% GET / 20% PUT) with 64 concurrent workers over TCP against standalone daemon. 10,000 keys pre-populated in unmeasured setup phase. Keys sampled using deterministic Zipfian distribution ($\theta = 0.99$, seed 42).
+- [x] **I can explain P50/P99 semantics**: Logarithmic octave buckets sub-divided into 128 sub-buckets guarantee relative quantization error $\le 0.78125\%$. Percentiles computed using discrete nearest-rank ordering ($rank = \lceil p \times N \rceil$), returning conservative bucket upper bounds.
+- [x] **I can explain every published benchmark number**: Median 60-second trial on Apple M4: 1,266.36 ops/sec throughput, 4.05ms GET P50, 15.99ms GET P99, 232.78ms PUT P50, 254.80ms PUT P99. High PUT latency is mathematically explained by 64 concurrent workers serializing behind physical NVMe `fdatasync()` flushes (~3.6ms per flush).
+- [x] **I can state what Lattice does NOT implement**: Mutual TLS (mTLS) for peer connections; dynamic cluster membership changes (Raft Joint Consensus); multi-version transaction snapshot isolation (single-key operations only); Raft log compaction / snapshots; distributed sharding across multi-group Raft; direct I/O (`O_DIRECT`).
+
+
+---
+
+# 64. Top 50 Final Defense Questions
+
+## Category 1: Foundations (Q01 – Q03)
+
+### Q01: How does Lattice structure its Go package layout, and how does the compiler enforce internal boundaries?
+* **Question**: Why are packages divided into `cmd/`, `internal/`, and `pkg/`, and what happens if an external project attempts to import code from `internal/wal` or `internal/engine`?
+* **Answer**: Lattice strictly adheres to standard Go enterprise layout principles. `cmd/` contains entrypoint binaries (`cmd/lattice`, `cmd/lattice-cli`, `cmd/lattice-bench`), each functioning as a minimal harness responsible only for CLI flag parsing, signal handling, and runtime dependency wiring. `internal/` houses the private storage engine, consensus, and networking libraries. Under Go compiler rules (introduced in Go 1.4), code in `internal/` can only be imported by packages rooted in the parent directory tree. Any external project attempting to import `github.com/silent-knight19/lattice/internal/wal` fails at compile time with `use of internal package not allowed`. This guarantees that internal data structures, disk formats, and locking invariants cannot be externally depended upon (Hyrum's Law).
+* **Relevant Implementation Location**: `cmd/lattice/main.go`, `internal/wal/`, `internal/engine/`
+* **Relevant Test / Evidence**: Verified via Go compiler build tree; `go build ./...` passes while external modules cannot reference `internal/`.
+* **Known Caveat**: Embedded usage of Lattice in other Go applications requires placing caller code within the same repository or providing an explicit public wrapper under `pkg/client`.
+
+### Q02: Why did Lattice choose fixed-width Big-Endian binary encoding for disk and network headers instead of Protocol Buffers or JSON?
+* **Question**: What are the performance and architectural tradeoffs between custom binary serialization and general-purpose IDLs like Protobuf or JSON in high-throughput storage engines?
+* **Answer**: In high-throughput storage engines handling tens of thousands of operations per second, serialization efficiency is critical for tail latency. Text formats like JSON require continuous string allocations, ASCII-to-integer conversions, and runtime reflection, introducing heavy heap churn and GC pauses. While Protocol Buffers provides binary serialization, generated Protobuf code incurs interface indirection and object allocations. Lattice implements explicit Big-Endian binary encodings (`internal/binary`). Headers are fixed-width (e.g. 18-byte transport header, 48-byte SSTable footer), allowing $O(1)$ stack-allocated decoding without heap allocations. Big-Endian provides canonical cross-platform network byte order, ensuring that records serialized on ARM64 are bit-identical when read on x86-64.
+* **Relevant Implementation Location**: `internal/binary/binary.go`, `internal/transport/frame.go`, `internal/sstable/footer.go`
+* **Relevant Test / Evidence**: `internal/binary/binary_test.go`, `internal/transport/frame_test.go`
+* **Known Caveat**: Custom binary protocols require custom client drivers and manual backward/forward compatibility schema management when altering field structures.
+
+### Q03: Why does Lattice compute CRC32-IEEE checksums at the application layer when filesystems and network layers already provide checksums?
+* **Question**: In modern systems with TCP checksums, TLS MACs, and filesystem integrity checks (e.g. ZFS/Btrfs or NVMe CRC), why does Lattice still compute and verify CRC32-IEEE checksums on every WAL record, SSTable block, and transport frame?
+* **Answer**: The Saltzer-Kaashoek End-to-End Principle dictates that reliability and integrity cannot be fully delegated to lower-level subsystems. TCP checksums (16-bit 1's complement) have a known error rate where bit-flips can slip through; furthermore, TCP checksums only protect transit over the wire, not data corrupted in OS kernel socket buffers, DMA controllers, or RAM bit-rot before socket transmission. Similarly, standard filesystems (ext4, APFS) do not checksum user data blocks, and even on checksummed filesystems, data can be corrupted in userland memory buffers before the `write()` system call. Computing CRC32-IEEE at the application layer establishes a true end-to-end verification boundary: if a byte is corrupted anywhere along the path from serialization to memory to disk, Lattice detects it and fails closed.
+* **Relevant Implementation Location**: `internal/binary/crc.go`, `internal/wal/writer.go`, `internal/sstable/block_writer.go`
+* **Relevant Test / Evidence**: `internal/binary/crc_test.go`, `internal/wal/reader_test.go` (verifying torn write and corruption detection)
+* **Known Caveat**: Computing CRC32 consumes CPU cycles on every append and read; mitigated in Lattice by utilizing Go's hardware-accelerated CRC32-IEEE SIMD instructions (`hash/crc32.ChecksumIEEE`).
+
+---
+
+## Category 2: Storage Architecture (Q04 – Q07)
+
+### Q04: Why does Lattice use a Log-Structured Merge-Tree (LSM-Tree) instead of a B+Tree for its storage core?
+* **Question**: What are the trade-offs between LSM-trees and B+trees regarding Write Amplification (WA), Read Amplification (RA), and Space Amplification (SA)?
+* **Answer**: B+trees update data in place on 4KB or 8KB pages. On flash/SSD storage, small random writes require rewriting entire pages, leading to high write amplification ($WA \approx 20-50\times$), heavy flash wear, and random I/O stalls during dirty page writeback. An LSM-tree converts all incoming mutations into sequential in-memory updates (MemTable) backed by an append-only log (WAL). In-memory tables are periodically flushed to disk as immutable SSTables, and background compactions perform sequential k-way merge sorts. This yields near-optimal sequential write performance ($WA \approx 5-10\times$). The trade-off is higher read amplification ($RA$), because a point lookup must search multiple levels of SSTables if the key is not in memory; Lattice mitigates this with Bloom filters (reducing $RA$ to $\sim 1$ disk read on misses) and a sharded block cache.
+* **Relevant Implementation Location**: `internal/engine/engine.go`, `internal/memtable/`, `internal/sstable/`
+* **Relevant Test / Evidence**: `internal/engine/integration_test.go`, `internal/engine/engine_test.go`
+* **Known Caveat**: Background leveled compactions consume disk I/O bandwidth and temporary storage space, requiring careful tuning of level thresholds to avoid write stalls.
+
+### Q05: How does prefix compression work in SSTable data blocks, and why are restart points critical for point lookups?
+* **Question**: How does Lattice compress sorted keys inside a 4KB data block, and why would point lookups degrade to $O(N)$ without restart points?
+* **Answer**: Inside an SSTable data block, keys are sorted. Consecutive keys share common prefixes (e.g. `user:1001:email`, `user:1001:profile`). Prefix compression stores only the common prefix length (`shared_len`), suffix length (`unshared_len`), value length, unshared key bytes, and value bytes. While this achieves high compression ratios, a reader cannot decode a key in the middle of a block without scanning and reconstructing all preceding keys from byte zero ($O(N)$ scan). To restore fast random access, Lattice introduces **Restart Points** every $K=16$ keys. At each restart point, `shared_len` is forced to 0 (the full key is stored). The offsets of all restart points are written as a 32-bit integer array at the tail of the block. A point lookup performs a binary search over the restart points ($O(\log(N/16))$) to locate the enclosing 16-key range, and then scans at most 16 keys linearly, bounding search latency.
+* **Relevant Implementation Location**: `internal/sstable/block_writer.go`, `internal/sstable/block_reader.go`
+* **Relevant Test / Evidence**: `internal/sstable/block_test.go`
+* **Known Caveat**: Suffix keys within a restart interval still require sequential delta decoding; restart intervals must balance compression density ($K$ large) against lookup CPU cycles ($K$ small).
+
+### Q06: Walk through the two-level sparse block index in an SSTable. How does a reader navigate from the 48-byte footer to the target data block?
+* **Question**: Describe the exact block-navigation sequence executed by `TableReader.Seek(key)` when querying an SSTable on disk.
+* **Answer**:
+  1. **Footer Bootstrap**: When `TableReader` opens an SSTable, it reads the fixed 48-byte trailer from `file_size - 48`. It verifies `Magic` (0x4C545353) and extracts `IndexHandle` (offset and size of the two-level index block) and `MetaIndexHandle`.
+  2. **Index Block Lookup**: `TableReader` loads the Index Block. The index block contains one entry per data block: `(separator_key, block_handle)`, where `separator_key` is a key $\ge$ the largest key in that data block and $<$ the smallest key in the subsequent block.
+  3. **Binary Search on Index**: `TableReader` binary-searches the index block to identify the single candidate data block whose range covers the target key.
+  4. **Data Block Fetch**: Using `block_handle.Offset` and `block_handle.Size`, `TableReader` checks the sharded block cache. If a cache miss occurs, it reads the block from disk via positional `os.File.ReadAt`, verifies the 4-byte CRC32 trailer, and populates the cache.
+  5. **Restart Point Seek**: Within the data block, it binary-searches the restart array and scans linearly to locate the target key.
+* **Relevant Implementation Location**: `internal/sstable/table_reader.go`, `internal/sstable/footer.go`, `internal/sstable/block_reader.go`
+* **Relevant Test / Evidence**: `internal/sstable/table_test.go`
+* **Known Caveat**: If an SSTable's index block exceeds 4KB, loading large index blocks into memory incurs initial open latency; mitigated by keeping index entries sparse.
+
+### Q07: How is the read block cache sharded, and how does it prevent lock contention on multicore architectures?
+* **Question**: Why is a single global LRU cache an anti-pattern in concurrent database systems, and how does `ShardedLRUCache` eliminate mutex bottlenecks?
+* **Answer**: A traditional LRU cache protected by a single `sync.Mutex` requires every cache lookup (even read hits) to acquire the lock to update the LRU linked list pointers. Under 64 concurrent reader threads, this global mutex becomes a severe serialization bottleneck, causing thread descheduling and cache-line bouncing across CPU sockets. Lattice implements `ShardedLRUCache` (`internal/cache/sharded_cache.go`), which partitions the cache into $2^k$ independent cache shards (default 16 or 32 shards). The target shard is computed via an FNV-1a hash of the composite key `(fileNum uint64, blockOffset uint64)`. Each shard maintains its own doubly-linked LRU list, hash table, byte-capacity tracking, and dedicated `sync.Mutex`. Point lookups lock only the single target shard, reducing lock contention probability by a factor of 16 or 32 and enabling linear multicore read scaling.
+* **Relevant Implementation Location**: `internal/cache/sharded_cache.go`, `internal/cache/lru.go`
+* **Relevant Test / Evidence**: `internal/cache/sharded_cache_test.go`, `internal/cache/lru_test.go`
+* **Known Caveat**: Sharding divides total cache capacity evenly across shards; skewed access patterns to a single SSTable file could fill one shard while other shards have unused capacity.
+
+---
+
+## Category 3: Durability & Logging (Q08 – Q11)
+
+### Q08: What is the exact difference between `fsync()` and `fdatasync()`, and why does Lattice use `fdatasync()` on Linux?
+* **Question**: What operating system system call is used to commit WAL records to physical flash storage, and what performance advantage does `fdatasync()` provide over `fsync()`?
+* **Answer**: Both system calls flush dirty userland and OS page cache buffers to the storage controller. However, `fsync()` flushes both file data blocks *and* file metadata (inode modification time, access time, file size). In filesystems like ext4 or XFS, writing metadata requires an extra synchronous write to the filesystem journal log, resulting in two physical disk I/O operations per sync. `fdatasync()` flushes file data blocks and only flushes metadata if the metadata change is required to read the data (e.g. file size extension), omitting pure timestamp updates. On Linux, Lattice uses `fdatasync()` to eliminate redundant journal syncs, cutting I/O latency in half. On macOS/Darwin (where `fdatasync` is aliased to `fsync` or `fcntl(F_FULLFSYNC)`), the OS barrier is applied accordingly.
+* **Relevant Implementation Location**: `internal/wal/writer.go`, `internal/wal/sync_unix.go`
+* **Relevant Test / Evidence**: `internal/wal/writer_test.go`
+* **Known Caveat**: On macOS, standard `fsync` does not flush the drive's volatile hardware write cache unless `F_FULLFSYNC` is used; macOS NVMe flushes average ~3.6ms due to write cache barrier overhead.
+
+### Q09: In the standalone daemon, why does PUT exhibit high latency under 64 concurrent workers, and what is the role of `wal.Coordinator`?
+* **Question**: Under 64 concurrent benchmark workers, PUT latency P50 was measured at ~232ms in standalone mode. Why did this occur, and how does the group commit coordinator resolve it?
+* **Answer**: In standalone mode (`Engine.Put`), durable write-ahead logging executes `wal.AppendSync()` under `Engine.mu.Lock()` to ensure that physical WAL records, sequence allocations, and MemTable entries remain strictly sequentially ordered. Single-operation NVMe `fsync` latency on Apple Silicon internal SSD averages $\approx 3.6\text{ms}$. When 64 concurrent workers concurrently issue unbatched PUT requests, they queue up behind the single-threaded disk sync barrier. With a queue depth of 64, the expected queueing latency is $64 \times 3.64\text{ms} \approx 232.8\text{ms}$. To scale beyond physical disk sync limits, Lattice implements a cooperative group commit coordinator (`wal.Coordinator` in `internal/wal/coordinator.go`), where a leader thread coalesces up to 1,024 enqueued writes into a single shared `fdatasync()` barrier. While `wal.Coordinator` is verified in unit tests, the standalone engine default currently runs synchronous single-write persistence to ensure straightforward crash determinism.
+* **Relevant Implementation Location**: `internal/engine/engine.go`, `internal/wal/coordinator.go`, `internal/wal/runner.go`
+* **Relevant Test / Evidence**: `internal/wal/runner_test.go`, `internal/wal/coordinator_test.go`
+* **Known Caveat**: Group commit amortizes flush latency across concurrent writers but introduces queue wait latency for single-threaded callers.
+
+### Q10: How does `RotatingWriter` ensure multi-segment durability during high-volume logging?
+* **Question**: When a WAL segment exceeds its size threshold (e.g. 64 MiB), how does Lattice rotate segments without dropping in-flight writes or exposing un-flushed data?
+* **Answer**: `RotatingWriter` exclusively owns the active `*WALWriter`. All write requests are synchronized through an internal mutex. When an append causes the active segment to cross the byte ceiling:
+  1. The active record finishes writing to the current segment file.
+  2. The segment buffer is flushed to kernel space.
+  3. `fdatasync()` is executed on the file descriptor, sealing segment $N-1$ at an exact, checksum-verified record boundary.
+  4. The old file descriptor is closed.
+  5. The new segment file `wal_%012d.log` is created and synced.
+  6. The active segment pointer is atomically updated via `atomic.Pointer[WALWriter]`.
+  Because historical segments $1 \dots N-1$ are sealed and synced prior to opening segment $N$, historical segments are immutable and immune to crash corruption.
+* **Relevant Implementation Location**: `internal/wal/rotating_writer.go`
+* **Relevant Test / Evidence**: `internal/wal/rotating_writer_test.go`
+* **Known Caveat**: Segment rotation requires opening a new file descriptor and syncing directory metadata, which can introduce a transient latency blip on the write path.
+
+### Q11: How does VersionSet reference counting prevent active SSTables from being deleted from disk while a long-running reader is querying them?
+* **Question**: In an LSM-tree, when a compaction completes and replaces files $F_1, F_2$ with $F_3$, why doesn't Lattice immediately unlink $F_1$ and $F_2$ from disk?
+* **Answer**: In a concurrent database, an analytical query or point lookup might be actively reading from $F_1$ via positional `ReadAt`. If the background compaction thread unlinked $F_1$ immediately upon publishing the new version, the reader's subsequent block reads would fail with `file already closed` or `no such file or directory`. Lattice implements MVCC version pinning (`internal/version/version_set.go`):
+  1. When a reader begins a query, it pins the current version: `v := vset.Current()`, which increments `v.refCount`.
+  2. Compaction produces $V_{new}$ and installs it via `vset.AppendVersion()`.
+  3. `AppendVersion` decrements the VersionSet's reference on $V_{old}$.
+  4. However, because the reader still holds a reference, $V_{old}.\text{refCount} \ge 1$. $V_{old}$ remains alive in the active versions list, and its referenced SSTables are protected from deletion.
+  5. Only when the reader query completes and calls `v.Unref()` does $V_{old}.\text{refCount}$ reach zero, triggering resource finalization and safely unlinking obsolete physical files.
+* **Relevant Implementation Location**: `internal/version/version_set.go`, `internal/version/version.go`
+* **Relevant Test / Evidence**: `internal/version/version_set_test.go`
+* **Known Caveat**: A leaked version pin (a caller that forgets to call `v.Unref()`) will permanently prevent obsolete SSTables from being unlinked, leading to disk space leakage.
+
+---
+
+## Category 4: Crash Recovery & Integrity (Q12 – Q15)
+
+### Q12: Explain the exact two-phase startup recovery sequence executed by `Engine.Open()`.
+* **Question**: When a crashed Lattice instance restarts, in what order are files inspected and replayed, and how does the engine ensure no partial recovery state is exposed?
+* **Answer**:
+  1. **Phase 1: Manifest Replay**: `Engine.Open()` reads the `CURRENT` file to locate the authoritative `MANIFEST-%06d` log. It executes `ReplayManifest()`, which sequentially replays all `VersionEdit` records into an isolated in-memory builder (`versionBuilder`). It validates file numbers, level ranges, and SSTable physical presence using `os.Lstat`. If valid, it constructs the initial `Version` and installs it in `VersionSet`.
+  2. **Phase 2: WAL Replay**: The engine scans the data directory for `wal_%012d.log` segments, sorting them numerically. It iterates from oldest uncompacted segment to the newest active segment. For each segment, it uses `wal.OpenReader` to decode records sequentially, verifying CRC32 checksums, sequence numbers, and operation types, and re-inserts them into the active `MemTable`.
+  3. **Phase 3: Quiescent State Publication**: Only after both Manifest and WAL replay succeed with zero errors does `Engine.Open()` mark its lifecycle state as `engineStateRecovered` and bind the client transport listener, guaranteeing zero partial-state exposure.
+* **Relevant Implementation Location**: `internal/engine/recovery.go`, `internal/engine/engine.go`
+* **Relevant Test / Evidence**: `internal/engine/recovery_test.go`
+* **Known Caveat**: If the database was shut down uncleanly with large uncompacted WAL segments, replay time scales with WAL size, delaying readiness.
+
+### Q13: Why are torn tails permitted on the active WAL segment during crash recovery, but older historical segments with corruption fail closed?
+* **Question**: If a crash occurs mid-write, how does Lattice distinguish between a benign torn tail and malicious/accidental bit-rot in older log files?
+* **Answer**: When a power cut or `SIGKILL` occurs, the process is terminated mid-syscall. If the write was interrupted halfway through serializing a record onto the active segment, the file contains an incomplete fragment at EOF with a missing or invalid CRC32 checksum. This is an expected crash artifact. `wal.RecoverSegment` physically truncates the active segment in place back to the last valid record boundary and issues `fsync`. However, historical segments ($1 \dots N-1$) were explicitly sealed, flushed, fsynced, and closed by `RotatingWriter` during normal operation prior to the crash. Therefore, a torn or corrupted record in an older segment cannot be a crash artifact; it signifies physical media decay, sector corruption, or offline tampering. Automatically truncating an older segment would silently destroy committed historical transactions; thus, recovery fails closed immediately with `ErrCorruptedSegment`.
+* **Relevant Implementation Location**: `internal/wal/reader.go`, `internal/wal/recovery.go`
+* **Relevant Test / Evidence**: `internal/wal/recovery_test.go`
+* **Known Caveat**: Recovering from corrupted historical segments requires manual operator intervention using backup manifests and offline repair tools.
+
+### Q14: How does the isolated Version Builder pattern prevent state poisoning during corrupted Manifest recovery?
+* **Question**: If a Manifest file contains a corrupted `VersionEdit` record at offset 50,000, why doesn't recovery leave the database half-initialized?
+* **Answer**: Naive recovery code modifies the live `VersionSet` incrementally as it reads each record from disk. If record $K$ fails validation or has a CRC mismatch, the `VersionSet` is left holding state transitions $1 \dots K-1$, leaving the database in an undefined, corrupted state. Lattice enforces the **Isolated Version Builder Pattern** (`versionBuilder` in `internal/version/version_set.go`). Manifest replay operates purely on a private heap struct without publishing versions to the `VersionSet`. All physical disk inspections (`os.Lstat` on SSTable files) are strictly read-only. If any record fails checksum or schema validation, `ReplayManifest` halts immediately, returns `*ReplayError`, and discards the private builder. The live `VersionSet`, `CURRENT` pointer, and SSTables remain 100% pristine and unmodified.
+* **Relevant Implementation Location**: `internal/version/version_set.go`, `internal/version/manifest_reader.go`
+* **Relevant Test / Evidence**: `internal/version/manifest_test.go`
+* **Known Caveat**: Manifest replay requires memory proportional to the number of active SSTables in the database.
+
+### Q15: Walk through the exact atomic protocol used to update the `CURRENT` file pointer.
+* **Question**: Why can't a storage engine update the `CURRENT` pointer by simply calling `os.WriteFile("CURRENT", []byte(manifestName), 0644)`?
+* **Answer**: Calling `os.WriteFile` directly on `CURRENT` truncates and writes the file in place. If an abrupt power loss or OS crash occurs while the write is in progress, `CURRENT` is left with 0 bytes or a truncated manifest filename. Upon reboot, the engine cannot locate its Manifest file and fails to start, resulting in catastrophic downtime. Lattice implements the **Atomic Rename & Directory Sync Protocol**:
+  1. Write the new manifest filename into a temporary file in the same filesystem: `CURRENT.tmp`.
+  2. Issue `file.Sync()` on `CURRENT.tmp` to ensure the bytes are durable on physical flash.
+  3. Close `CURRENT.tmp`.
+  4. Execute atomic replacement: `os.Rename("CURRENT.tmp", "CURRENT")`. Under POSIX and Windows filesystem semantics, `rename` is an atomic directory metadata swap; the file pointer transitions instantaneously from old to new with zero window of empty or partial content.
+  5. Open the parent directory descriptor and execute `dir.Sync()` to ensure the directory entry update itself is durably committed to physical disk.
+* **Relevant Implementation Location**: `internal/version/manifest_writer.go`
+* **Relevant Test / Evidence**: `internal/version/manifest_test.go`
+* **Known Caveat**: Directory fsync (`dir.Sync()`) requires specific OS file descriptor handling that differs between Unix (`os.Open(dir)`) and Windows.
+
+---
+
+## Category 5: Compaction & LSM Dynamics (Q16 – Q19)
+
+### Q16: How does leveled compaction enforce geometric size ratios, and what are the specific level size limits in Lattice?
+* **Question**: What triggers compaction between levels, and why does Lattice scale level capacities by a factor of 10?
+* **Answer**: In leveled compaction, Level 0 ($L_0$) consists of directly flushed MemTables; files in $L_0$ have overlapping key ranges. Levels $1 \dots 6$ have strictly partitioned, non-overlapping key ranges. Each level $L_i$ has a maximum byte capacity:
+  - $L_1$: 10 MiB
+  - $L_2$: 100 MiB ($10 \times L_1$)
+  - $L_3$: 1,000 MiB (1 GiB)
+  - $L_i$: $10^i \times 10\text{ MiB}$
+  The compaction planner scores each level: $\text{score}(L_0) = \text{fileCount} / 4$, and $\text{score}(L_i) = \text{totalBytes}(L_i) / \text{maxBytes}(L_i)$. The level with the highest score $> 1.0$ is chosen for compaction. Scaling levels by a factor of 10 bounds overall space amplification to $\approx 1.11\times$ (the deepest level holds $\sim 90\%$ of all database data) and guarantees that a key appears at most once per level $L_1 \dots L_6$.
+* **Relevant Implementation Location**: `internal/compaction/planner.go`, `internal/compaction/compaction.go`
+* **Relevant Test / Evidence**: `internal/compaction/planner_test.go`
+* **Known Caveat**: When $L_0$ accumulates many files (e.g. during heavy write bursts), compaction backpressure must throttle incoming writes to prevent read amplification from degrading.
+
+### Q17: Under what exact mathematical conditions is it safe to permanently drop a delete tombstone during compaction?
+* **Question**: If an SSTable in Level 2 contains a tombstone for key `"user:42"`, why can't the compaction worker drop the tombstone when compacting from $L_2$ to $L_3$?
+* **Answer**: If a tombstone were dropped prematurely while an older revision of that key (`OpTypePut`) still existed in a deeper level ($L_4$ or $L_5$), the deletion would vanish! Subsequent queries for `"user:42"` would miss in $L_0 \dots L_3$ and discover the resurrected stale PUT in $L_4$—a critical data resurrection bug. Lattice enforces the **Tombstone Dropping Invariant**: A tombstone in level $L_i$ being compacted to $L_{i+1}$ can be permanently dropped if and only if:
+  1. The compaction output level is the maximum existing level in the database containing data for this range, OR
+  2. The compaction planner proves that **no level deeper than $L_{i+1}$ ($L_{i+2} \dots L_6$) contains key `"user:42"`**.
+  The planner verifies this by inspecting the key range metadata (`SmallestKey`, `LargestKey`) and Bloom filter summaries of all SSTables in levels $L_{i+2} \dots L_6$. If any deeper SSTable could contain the key, the tombstone must be preserved in the compaction output file.
+* **Relevant Implementation Location**: `internal/compaction/compaction.go`
+* **Relevant Test / Evidence**: `internal/compaction/compaction_test.go`
+* **Known Caveat**: Verifying key overlap across deeper levels requires checking metadata slices; conservative approximations keep tombstones until they reach the bottom level.
+
+### Q18: How does the K-Way merge sort iterator resolve duplicate keys and sequence numbers during compaction?
+* **Question**: When merging multiple SSTables that contain different versions of the same user key, how does the merger guarantee that the client observes the newest value?
+* **Answer**: Compaction uses a priority queue (min-heap) over the iterators of all participating SSTables (`internal/compaction/merger.go`). Keys are compared using `InternalKeyComparator`:
+  1. User Key: ascending order (`bytes.Compare(a.UserKey, b.UserKey)`).
+  2. Sequence Number: **descending order** (higher sequence number comes first).
+  3. Operation Type: descending order (`OpPut` vs `OpDelete`).
+  When multiple entries share the exact same user key, the iterator encounters the highest sequence number first (the newest write). The merger preserves this newest entry. If the newest entry is an `OpPut`, any older entries for that key encountered subsequently in the same compaction run are discarded as obsolete versions. If the newest entry is an `OpDelete`, it is evaluated against the tombstone dropping rule (Q17).
+* **Relevant Implementation Location**: `internal/compaction/merger.go`, `internal/binary/internalkey.go`
+* **Relevant Test / Evidence**: `internal/compaction/merger_test.go`
+* **Known Caveat**: Sequence numbers must be strictly 64-bit monotonically increasing to prevent timestamp collision.
+
+### Q19: How does atomic compaction installation prevent race conditions with concurrent write flushes?
+* **Question**: When a compaction finishes writing new SSTables, how is the new state published without racing against MemTable flushes happening concurrently?
+* **Answer**: Compaction workers do not modify the active `Version` in place. Instead, when compaction finishes generating new SSTable files on disk, it creates a `VersionEdit` describing the exact delta:
+  - `DeletedFiles`: list of input files `(level, fileNum)`.
+  - `AddedFiles`: list of newly generated output files `(level, FileMetadata)`.
+  The worker passes `VersionEdit` to `VersionSet.LogAndApply()`:
+  1. `LogAndApply` acquires `VersionSet.mu.Lock()`.
+  2. It writes and syncs the `VersionEdit` record to the append-only `MANIFEST` file.
+  3. It applies the delta to construct a new `Version` struct $V_{new}$.
+  4. It atomically installs $V_{new}$ as `vset.current` and appends it to the version list.
+  5. It releases `VersionSet.mu.Unlock()`.
+  Because concurrent MemTable flushes also serialize through `VersionSet.mu.Lock()` when publishing their $L_0$ edits, the Manifest acts as a serialized write-ahead log for metadata transitions. Neither worker can corrupt or overwrite the other's additions.
+* **Relevant Implementation Location**: `internal/version/version_set.go`, `internal/compaction/compaction.go`
+* **Relevant Test / Evidence**: `internal/version/version_set_test.go`, `internal/compaction/compaction_test.go`
+* **Known Caveat**: Holding `VersionSet.mu` during Manifest `fdatasync()` introduces a brief synchronization barrier for other publishing workers.
+
+---
+
+## Category 6: Networking & Wire Protocol (Q20 – Q23)
+
+### Q20: Explain the exact structure of the Lattice 18-byte binary wire header.
+* **Question**: What are the fields, byte offsets, and endianness of the Lattice client and peer transport header?
+* **Answer**:
+  The wire frame begins with a fixed 18-byte Big-Endian binary header:
+  - `Offset 0..1` (2 bytes): `Magic = 0x4C54` (`"LT"` in ASCII). Rejects non-Lattice packets immediately.
+  - `Offset 2` (1 byte): `Version = 0x01`. Protocol version indicator.
+  - `Offset 3` (1 byte): `OpCode`. Identifies operation type (Client: `0x01` PUT, `0x02` GET, `0x03` DELETE, `0x04` STATS; Peer: `0x81` RequestVote, `0x82` AppendEntries, etc.).
+  - `Offset 4` (1 byte): `Flags`. Bitfield for compression, heartbeat, or error flags.
+  - `Offset 5` (1 byte): `Reserved = 0x00`. Padded for 8-byte boundary alignment.
+  - `Offset 6..13` (8 bytes): `SeqID uint64`. Big-Endian sequence identifier used by clients to correlate request-response pairs.
+  - `Offset 14..17` (4 bytes): `PayloadLength uint32`. Big-Endian length of the subsequent payload body.
+  Immediately following the header is the `Payload` ($0 \dots \text{PayloadLength}$ bytes), terminated by a 4-byte Big-Endian CRC32-IEEE checksum of header + payload.
+* **Relevant Implementation Location**: `internal/transport/frame.go`, `internal/transport/binary.go`
+* **Relevant Test / Evidence**: `internal/transport/frame_test.go`
+* **Known Caveat**: Header fields are fixed-width to ensure $O(1)$ decoding, requiring protocol upgrades if fields need expansion.
+
+### Q21: How does Lattice prevent "Memory Bombs" / "Allocation Bombs" when decoding length-prefixed binary frames from untrusted network connections?
+* **Question**: If an adversary sends an 18-byte header claiming `PayloadLength = 4,000,000,000`, how does Lattice avoid crashing with an Out-Of-Memory (OOM) panic?
+* **Answer**: A naive decoder reads `PayloadLength` and immediately executes `make([]byte, payloadLength)` before reading the payload bytes from the socket. An attacker can open 50 connections and send 50 tiny 18-byte packets claiming 4 GB each, tricking the Go runtime into allocating 200 GB of heap and triggering the OS kernel OOM killer. Lattice enforces **Multi-Tier Subtractive Length Validation**:
+  1. *Global Payload Ceiling*: `PayloadLength` is checked against `transport.MaxPayloadLength` (5 MiB = 5,242,880 bytes). Any frame exceeding 5 MiB is rejected immediately with `ErrPayloadTooLarge` before any allocation occurs.
+  2. *Subtractive Arithmetic*: When parsing sub-fields within the payload (e.g. key length, value length), decoders never add lengths (`if offset + len > totalLen`). Instead, they use safe subtraction: `if uint64(len) > uint64(totalLen - offset)`, eliminating integer overflow wraparound bugs.
+  3. *Socket Severing*: Malformed frames trigger immediate socket closure (`conn.Close()`), terminating the connection and freeing all buffers.
+* **Relevant Implementation Location**: `internal/transport/frame.go`, `internal/transport/binary.go`, `internal/security/validation.go`
+* **Relevant Test / Evidence**: `internal/transport/security_test.go`
+* **Known Caveat**: Payloads larger than 5 MiB cannot be transmitted in a single frame; multi-part chunking is required for very large values.
+
+### Q22: Why does Slowloris defense require absolute point-in-time socket deadlines rather than sliding inactivity timers?
+* **Question**: Why does an application that resets its read timeout after every byte received remain completely vulnerable to Slowloris attacks?
+* **Answer**: In Go's `net` package, `SetReadDeadline(t)` sets an absolute point in wall-clock time (`time.Time`). If an application uses a "sliding inactivity timer" by resetting the deadline whenever bytes arrive, an attacker trickling 1 byte every 4.9 seconds on a 5-second timeout can keep a connection open indefinitely. By holding 4,096 connections open this way, the attacker exhausts all server connection slots without ever timing out. Lattice implements **Absolute Stage Deadlines**:
+  - `HeaderTimeout = 5s`: When a connection becomes active, `SetReadDeadline(time.Now().Add(HeaderTimeout))` is set once. All 18 bytes of the header must arrive before this deadline, regardless of trickle pacing.
+  - `PayloadTimeout = 10s`: Once the header is verified, a fresh absolute deadline is set for the payload.
+  - `WriteTimeout = 10s`: Ensures clients that stop reading responses cannot block server handler goroutines.
+  - `IdleTimeout = 60s`: Applied only when a keep-alive connection is legitimately waiting between requests.
+* **Relevant Implementation Location**: `internal/transport/server.go`, `internal/transport/conn.go`
+* **Relevant Test / Evidence**: `internal/transport/server_test.go`
+* **Known Caveat**: Clients experiencing extreme network latency or packet loss over slow cellular links may be severed if their header transfer exceeds 5 seconds.
+
+### Q23: How does `Server.trackConn` eliminate oversubscription races during connection admission?
+* **Question**: Why is checking an atomic connection counter in the accept loop vulnerable to exceeding `MaxConnections = 4,096`, and how is it made atomic?
+* **Answer**: If the accept loop checks `if activeConns.Load() >= 4096` before taking a lock, a burst of 100 concurrent incoming connections can all pass the check simultaneously before any of them increments the counter, temporarily oversubscribing the server to 4,196 connections. Lattice implements an **Atomic Admission Gate** (`trackConn` in `internal/transport/server.go`):
+  1. The accept loop uses `activeConns.Load() >= MaxConnections` as a non-blocking fast-path filter.
+  2. Authoritative admission is executed strictly under `Server.mu.Lock()`:
+     ```go
+     if s.cfg.MaxConnections > 0 && len(s.conns) >= s.cfg.MaxConnections {
+         return false
+     }
+     s.conns[conn] = struct{}{}
+     s.activeConns.Add(1)
+     s.wg.Add(1)
+     return true
+     ```
+  3. If at capacity, `trackConn` returns `false`, and the accept loop immediately calls `conn.Close()` without spawning a goroutine or allocating buffers.
+* **Relevant Implementation Location**: `internal/transport/server.go`
+* **Relevant Test / Evidence**: `internal/transport/security_test.go`, `internal/transport/server_test.go`
+* **Known Caveat**: Acquiring `Server.mu` on connection accept introduces a small serialization point during extreme connection storms; mitigated by connection reuse (keep-alive).
+
+---
+
+## Category 7: Concurrency & Invariants (Q24 – Q27)
+
+### Q24: How does the concurrent SkipList achieve lock-free reads while supporting concurrent single-writer mutations?
+* **Question**: Why can readers traverse the SkipList without acquiring a read lock (`RWMutex`), and how does the writer prevent readers from observing partially linked nodes?
+* **Answer**: Lattice's SkipList (`internal/memtable/skiplist.go`) uses a single-writer, lock-free reader architecture. Nodes are allocated with a flexible forward pointer array (`atomic.Pointer[Node]`).
+  - **Bottom-Up Atomic Linking**: When inserting a new node of height $H$, the writer initializes the node's key, value, and height completely in memory. It then splices the node into the linked lists from Level 0 upward to Level $H-1$. For each level, it executes an atomic store: `prevNode.next[level].Store(newNode)`.
+  - **Memory Ordering**: In Go's memory model, `atomic.Pointer.Store` provides release semantics, and `atomic.Pointer.Load` provides acquire semantics. When a reader loads the non-nil pointer at Level 0, it is guaranteed to observe the fully initialized key and value data.
+  - **Lock-Free Traversal**: Readers traverse from the top level down using `atomic.Pointer.Load()`. Readers never block writers, and writers never block readers.
+* **Relevant Implementation Location**: `internal/memtable/skiplist.go`, `internal/memtable/memtable.go`
+* **Relevant Test / Evidence**: `internal/memtable/skiplist_test.go` (stress-tested with 100 concurrent readers and 1 writer)
+* **Known Caveat**: Multiple concurrent writers cannot write directly to the SkipList without external serialization; writes are serialized via `Engine.mu`.
+
+### Q25: What is the exact linearization point when an active MemTable is frozen into an immutable MemTable?
+* **Question**: When the active MemTable reaches its 64 MiB capacity threshold, walk through the exact steps of freezing, and identify the point where subsequent writes observe the new MemTable.
+* **Answer**:
+  1. The writer thread holding `Engine.mu.Lock()` detects `activeMem.ByteSize() >= 64 MiB`.
+  2. The thread allocates a brand-new, empty `MemTable` instance ($M_{new}$).
+  3. **Linearization Point**: The thread updates the engine's active pointer:
+     ```go
+     e.immMems = append([]*MemTable{e.activeMem}, e.immMems...)
+     e.activeMem = mNew
+     ```
+  4. At this exact moment, all subsequent `Engine.Put` operations allocate sequence numbers against $M_{new}$.
+  5. The frozen MemTable $M_{old}$ is now immutable. Because SkipList nodes are never mutated or deleted in place, concurrent readers traversing $M_{old}$ can continue uninterrupted without locks.
+  6. A background goroutine is signaled to flush $M_{old}$ to an $L_0$ SSTable on disk.
+* **Relevant Implementation Location**: `internal/engine/engine.go`
+* **Relevant Test / Evidence**: `internal/engine/engine_test.go`
+* **Known Caveat**: If background flushes are slower than incoming write rates, immutable MemTables accumulate; when the queue limit (default 4) is reached, write stalls are triggered.
+
+### Q26: Explain the "Pin-Before-Unlock" pattern in VersionSet and why `TryRef()` is required when iterating active versions.
+* **Question**: Why is returning a raw `*Version` pointer from `VersionSet.ActiveVersions()` a use-after-free race, and how does `TryRef()` solve it?
+* **Answer**: In a concurrent engine, a `Version` struct is kept alive by reference counts. When `VersionSet.ActiveVersions()` traverses the linked list of active versions under `vs.mu.RLock()`, an older superseded version $V_{old}$ might be held alive only by a single analytical reader. If that reader finishes and calls `V_{old}.Unref()` concurrently, $V_{old}.\text{refCount}$ drops to 0. If `ActiveVersions()` simply returned `*Version` pointers without incrementing their reference counts, the caller would receive a pointer to a dead struct whose resources are being finalized (use-after-free).
+  - **Pin-Before-Unlock**: Under `vs.mu.RLock()`, `ActiveVersions()` attempts to increment each version's reference count via `v.TryRef()`.
+  - `TryRef()` uses CAS: if `refCount == 0`, the version is already dying and cannot be resurrected; `TryRef()` returns `false`, and the version is skipped. If `refCount > 0`, it atomically increments `refCount` to at least 2.
+  - The caller is guaranteed exclusive ownership of its pinned reference even after `vs.mu.RUnlock()` is called.
+* **Relevant Implementation Location**: `internal/version/version.go`, `internal/version/version_set.go`
+* **Relevant Test / Evidence**: `internal/version/version_set_test.go`
+* **Known Caveat**: Every successful `Ref()` or `TryRef()` must be paired with an eventual `Unref()` call, typically via Go's `defer v.Unref()`.
+
+### Q27: How does `Server.Shutdown(ctx)` guarantee deterministic termination without leaking goroutines or hanging indefinitely?
+* **Question**: Walk through the graceful shutdown sequence of the transport server. How does it handle idle keep-alive connections vs slow in-flight requests?
+* **Answer**:
+  1. `Server.closed.CompareAndSwap(false, true)`: Single-gate idempotency; subsequent connection attempts fail immediately.
+  2. `Server.listener.Close()`: Closes the TCP listening socket, terminating the accept loop.
+  3. Forced Deadline Expiration: Under `s.mu.Lock()`, the server iterates over all active sockets in `s.conns` and sets `conn.SetDeadline(time.Now())`.
+  4. Any worker blocked in `Read()` or `Write()` awakens immediately with an I/O timeout error.
+  5. Sockets are closed: `conn.Close()`. Handlers unwind, execute `defer s.untrackConn()`, and decrement `s.wg.Done()`.
+  6. Context-Bounded Join: The server waits for `s.wg.Wait()` in a goroutine while selecting on `ctx.Done()`. If the shutdown context expires before all goroutines finish, it returns `ctx.Err()`, preventing an indefinite hang.
+* **Relevant Implementation Location**: `internal/transport/server.go`
+* **Relevant Test / Evidence**: `internal/transport/server_test.go`
+* **Known Caveat**: Forcing socket deadlines abruptly aborts in-flight client requests; clients receive connection reset/timeout and must retry against another node.
+
+---
+
+## Category 8: Raft Consensus Engine (Q28 – Q31)
+
+### Q28: How do Raft role transitions work in Lattice, and how are randomized election timers implemented without goroutine leaks?
+* **Question**: Describe the state transitions between Follower, Candidate, and Leader, and explain how election timers avoid split-vote synchronization.
+* **Answer**: Nodes start in `RoleFollower`. Each follower runs an election timer ticker reset upon receiving valid heartbeats (`AppendEntries`) from the leader. If the timer expires without heartbeats:
+  1. Follower transitions to `RoleCandidate`.
+  2. Increments `currentTerm`, votes for self (`votedFor = localID`), persists term/vote to durable storage, and resets election timer.
+  3. Broadcasts `RequestVote` RPCs to all peers in the topology.
+  4. If it receives votes from a majority ($\lfloor N/2 \rfloor + 1$), it transitions to `RoleLeader`.
+  5. The new leader initializes `nextIndex` and `matchIndex` for all peers, and immediately broadcasts empty `AppendEntries` heartbeats.
+  6. If at any time a Candidate or Leader observes an incoming RPC with $\text{Term} > \text{currentTerm}$, it immediately updates its term, persists it, steps down to `RoleFollower`, and cancels its heartbeat scheduler.
+  Election timeouts are randomized between 150ms and 300ms using a thread-safe PRNG, ensuring that candidate elections are staggered, drastically reducing split-vote probabilities.
+* **Relevant Implementation Location**: `internal/raft/node.go`, `internal/raft/state.go`
+* **Relevant Test / Evidence**: `internal/raft/election_test.go`
+* **Known Caveat**: If network latency between nodes exceeds 150ms, election timers can expire prematurely, inducing election churn.
+
+### Q29: What is the Candidate Log Up-to-Date Rule in Raft, and why is it essential for Leader Completeness?
+* **Question**: In `HandleRequestVote`, when can a follower reject a candidate's vote request even if the candidate has a higher term?
+* **Answer**: Raft guarantees the **Leader Completeness Property**: if a log entry is committed in a given term, that entry will be present in the logs of the leaders for all higher terms. To enforce this without log transfer during elections, Raft requires that a voter grant its vote only if the candidate's log is **at least as up-to-date as the voter's own log** (`internal/raft/node.go`):
+  $$\text{Candidate Up-to-Date} \iff (\text{candLastTerm} > \text{localLastTerm}) \lor (\text{candLastTerm} == \text{localLastTerm} \land \text{candLastIndex} \ge \text{localLastIndex})$$
+  If the candidate's last log entry has a lower term than the voter's, or if terms match but the candidate has fewer entries, the voter rejects the vote (`VoteGranted = false`). This prevents a partitioned node with an obsolete log from winning an election and overwriting committed data.
+* **Relevant Implementation Location**: `internal/raft/node.go`
+* **Relevant Test / Evidence**: `internal/raft/election_test.go`
+* **Known Caveat**: Clock skew does not affect log comparison because terms and log indices are logical sequence numbers.
+
+### Q30: How does `advanceCommitIndexLocked` mathematically prove majority replication before advancing `commitIndex`?
+* **Question**: In a 5-node cluster, how does the leader determine that an entry has been replicated to a quorum, and why can a leader never commit an entry from a previous term by counting replicas alone?
+* **Answer**: In `advanceCommitIndexLocked` (`internal/raft/node.go`):
+  1. The leader iterates over candidate log indices $N$ from `commitIndex + 1` up to `lastLogIndex`.
+  2. For each index $N$, it counts the number of cluster nodes that have acknowledged replication:
+     $$\text{count} = 1 \text{ (self)} + \sum_{p \in \text{peers}, p \ne \text{self}} \mathbf{1}_{(\text{matchIndex}[p] \ge N)}$$
+  3. If $\text{count} \ge \lfloor 5/2 \rfloor + 1 = 3$ (quorum), index $N$ has achieved majority replication.
+  4. **The Term Invariant (Raft Section 5.4.2)**: A leader is only allowed to advance `commitIndex` to $N$ if **the entry at index $N$ was created in the leader's current term** (`log[N].Term == currentTerm`). Leaders cannot commit log entries from older terms merely by counting replicas, because an older entry replicated to a majority could still be overwritten by a future leader under subtle partition edge cases. Once an entry from the *current* term commits, all prior entries are committed indirectly.
+* **Relevant Implementation Location**: `internal/raft/node.go`
+* **Relevant Test / Evidence**: `internal/raft/replication_test.go`, `internal/raft/safety_test.go`
+* **Known Caveat**: A newly elected leader cannot commit older uncommitted entries until it commits at least one entry in its own term; Lattice commits a no-op or initial command upon election.
+
+### Q31: How does `storage.TruncateSuffix` reconcile divergent follower logs when a network partition heals?
+* **Question**: If a partitioned leader appends uncommitted entries locally and is subsequently deposed, what happens when the new leader replicates conflicting entries to it?
+* **Answer**: When the healed node receives an `AppendEntries` RPC with $\text{PrevLogIndex} = P, \text{PrevLogTerm} = T$:
+  1. It checks its local log at index $P$. If the terms match, the preceding logs are identical (Log Matching Invariant).
+  2. If an existing entry at index $P+1$ conflicts with the incoming entry (different term), the follower must purge the conflicting entry and all subsequent entries.
+  3. It calls `storage.TruncateSuffix(P+1)`:
+     - The storage engine stages the truncated log into `raft.log.tmp`.
+     - Issues `fdatasync()` to commit the truncation to disk.
+     - Atomically swaps the file via `os.Rename("raft.log.tmp", "raft.log")`.
+     - Flushes the parent directory.
+  4. The uncommitted divergent suffix is physically erased from both disk and memory.
+  5. The follower appends the leader's new entries, ensuring all cluster nodes converge on identical log sequences.
+* **Relevant Implementation Location**: `internal/raft/storage.go`, `internal/raft/node.go`
+* **Relevant Test / Evidence**: `internal/raft/replication_test.go`, `internal/raft/partition_integration_test.go`
+* **Known Caveat**: Truncation rewrites the log tail, requiring temporary disk space for `raft.log.tmp`.
+
+---
+
+## Category 9: Linearizability & ReadIndex (Q32 – Q35)
+
+### Q32: What is the formal difference between Serializability, Sequential Consistency, and Linearizability?
+* **Question**: Why does an infrastructure engineer say that a system can be serializable without being linearizable?
+* **Answer**:
+  - **Serializability**: A multi-operation transaction property. It guarantees that the execution schedule of concurrent transactions is equivalent to *some* serial execution of those transactions in time. However, serializability places *zero constraints on real-time ordering*. A serializable system can return data from 10 minutes ago, as long as transactions appear ordered.
+  - **Sequential Consistency**: An operation-level property (Lamport). Operations take effect in some sequential order that respects the program order of each individual process. However, it does not respect real-time wall-clock bounds across processes.
+  - **Linearizability**: A real-time, single-operation composability property (Herlihy & Wing). If operation $B$ starts in real time after operation $A$ completes (receives an ACK on the wire), $B$ must observe the outcome of $A$ or a newer write. It eliminates stale reads and guarantees that the system behaves as a single atomic copy of state in real time.
+* **Relevant Implementation Location**: `internal/raft/read_index.go`, `internal/raft/router.go`
+* **Relevant Test / Evidence**: `internal/raft/read_barrier_tcp_integration_test.go`
+* **Known Caveat**: Linearizability requires cross-node communication or synchronized physical clocks, increasing read latency compared to stale local reads.
+
+### Q33: Why does the ReadIndex protocol require majority heartbeat round-trip confirmation before serving a read?
+* **Question**: Why can't a Raft leader serve a linearizable read immediately from its local memory using `commitIndex` without contacting any other nodes?
+* **Answer**: In asynchronous distributed networks, a leader can be partitioned off from the rest of the cluster without realizing it (the "Deposed Leader" or "Ghost Leader" scenario). While the isolated leader is unaware, the surviving majority may have already elected a new leader in a higher term and committed new writes. If the old leader served reads locally without contacting peers, it would return stale data, violating linearizability. ReadIndex solves this:
+  1. The leader records `readIndex = commitIndex`.
+  2. The leader broadcasts heartbeat messages (`AppendEntries`) to all peers and waits for acknowledgements from a majority.
+  3. Achieving majority confirmation proves that the leader was still the legitimate leader at the moment the read request arrived, because no other leader could have been elected in that term without intersecting the majority.
+* **Relevant Implementation Location**: `internal/raft/read_index.go`, `internal/raft/node.go`
+* **Relevant Test / Evidence**: `internal/raft/read_index_test.go`
+* **Known Caveat**: Round-trip heartbeat confirmation adds network latency to read requests; mitigated by coalescing multiple concurrent read requests into a single heartbeat round.
+
+### Q34: What is the "Apply Barrier" in ReadIndex, and what bug occurs if a leader reads the state machine immediately after quorum confirmation?
+* **Question**: After receiving heartbeat confirmation from a majority, why must the leader wait for `appliedIndex >= readIndex` before reading from the local storage engine?
+* **Answer**: In Raft, consensus commit (`commitIndex`) and state machine application (`appliedIndex`) are decoupled asynchronous stages. When an entry reaches majority replication, `commitIndex` advances, but the background `applyLoop` may still be in the process of applying that entry to the local storage engine (`Engine.Put`). If the leader served the read from the storage engine immediately after quorum confirmation without waiting, the local engine might not have applied the committed write yet. The client would observe stale data for a write that was already committed—violating linearizability! The **Apply Barrier** (`WaitForApplied` in `internal/raft/apply.go`) forces the read handler to block on a notification condition until the apply loop signals that `appliedIndex >= readIndex`.
+* **Relevant Implementation Location**: `internal/raft/apply.go`, `internal/raft/router.go`
+* **Relevant Test / Evidence**: `internal/raft/read_barrier_tcp_integration_test.go`
+* **Known Caveat**: If the local state machine apply loop is stalled by disk I/O, read queries queue at the apply barrier until disk writes complete.
+
+### Q35: Why is `ValidateLeadership(term, epoch)` necessary after the apply barrier wait?
+* **Question**: In `RouteRead`, why does Lattice re-validate leadership authority *after* waiting for the state machine to apply?
+* **Answer**: Waiting for the state machine barrier (`WaitForApplied(ctx, readIndex)`) involves an asynchronous wait that can take several milliseconds. During that wait interval:
+  1. The node could have lost network connectivity.
+  2. Another node could have timed out, initiated an election, and become the leader in term $T+1$.
+  3. The local node could have stepped down to Follower.
+  If the node did not revalidate leadership after unblocking from the barrier, it would proceed to read its local storage engine and respond to the client as if it were still the leader. `ValidateLeadership(readRes.Term, readRes.Epoch)` checks that the node's current role is still `RoleLeader`, that its term has not changed, and that its `leaderEpoch` is identical to when the ReadIndex sequence began. If leadership was lost, it aborts the read and returns a redirect to the client.
+* **Relevant Implementation Location**: `internal/raft/router.go`, `internal/raft/node.go`
+* **Relevant Test / Evidence**: `internal/raft/router_test.go`
+* **Known Caveat**: Checking local term and epoch is a wait-free memory check ($O(1)$) that does not require additional network round-trips.
+
+---
+
+## Category 10: Security & Containment (Q36 – Q39)
+
+### Q36: Why are `filepath.Clean` and `filepath.Join` insufficient on their own as security boundaries against directory traversal?
+* **Question**: Why does `filepath.Join(rootDir, userInput)` fail to prevent directory escaping when `userInput` contains `../../etc/passwd`?
+* **Answer**: `filepath.Clean` and `filepath.Join` operate purely through lexical string manipulation without inspecting physical filesystem inodes. If `rootDir` is `/var/lib/lattice` and `userInput` is `../../etc/passwd`, `filepath.Join` lexically cancels out the path components, returning `/etc/passwd`. The resulting path completely escapes the intended directory root. Furthermore, lexical checks have zero awareness of symbolic links: a path like `/var/lib/lattice/data/file` appears lexically contained, but if `data` is a symlink pointing to `/root`, the physical write escapes to `/root/file`. Lattice enforces **Canonical Containment** (`internal/security/containment.go`), which resolves canonical physical paths via `filepath.EvalSymlinks`, computes the relative path via `filepath.Rel`, and asserts that the target physically resides within the canonical root.
+* **Relevant Implementation Location**: `internal/security/containment.go`
+* **Relevant Test / Evidence**: `internal/security/containment_test.go`
+* **Known Caveat**: Evaluating symlinks requires filesystem syscalls (`lstat`), adding microsecond overhead; mitigated by performing containment validation during file open/create boundaries rather than on every block read.
+
+### Q37: How does "Deepest Existing Ancestor Resolution" solve the pre-creation symlink breakout dilemma?
+* **Question**: When creating a new file (e.g. `000042.sst`), calling `filepath.EvalSymlinks` on the target path fails with `os.ErrNotExist`. How does Lattice prevent symlink breakouts on files that do not yet exist?
+* **Answer**: If a security validator skips symlink evaluation because a file does not exist yet, an attacker can create an ancestor directory that is a symlink pointing outside the root (e.g. `/db/symlink_dir -> /etc`), and then request the creation of `/db/symlink_dir/shadow`. To solve this, Lattice implements `evalDeepestExistingAncestor` (`internal/security/containment.go`):
+  1. It walks upward directory by directory until it finds the deepest ancestor that actually exists on disk.
+  2. It evaluates `filepath.EvalSymlinks` on that existing ancestor directory.
+  3. It verifies that the resolved ancestor directory remains strictly contained within the canonical database root (`filepath.Rel`).
+  4. It reassembles the remaining non-existent path components onto the resolved ancestor and verifies lexical containment.
+  This ensures that even if an intermediate directory is a malicious symlink, the escape is detected and rejected before `os.Create` or `os.Mkdir` is ever invoked.
+* **Relevant Implementation Location**: `internal/security/containment.go`
+* **Relevant Test / Evidence**: `internal/security/containment_test.go`
+* **Known Caveat**: Path traversal checks assume the host operating system kernel enforces standard POSIX symlink semantics.
+
+### Q38: What is "Sibling-Prefix Boundary Confusion", and how does `filepath.Rel` eliminate it?
+* **Question**: Why is testing `strings.HasPrefix(targetPath, rootDir)` vulnerable to directory traversal, and what is the correct implementation?
+* **Answer**: Suppose an authorized database root is `/var/lib/lattice`. An attacker requests a path resolving to `/var/lib/lattice-evil/malicious.sst`. Calling `strings.HasPrefix("/var/lib/lattice-evil/malicious.sst", "/var/lib/lattice")` returns `true` because the character string `/var/lib/lattice-evil` begins with the exact prefix substring `/var/lib/lattice`! The attacker escapes containment and accesses an unauthorized sibling directory. Lattice eliminates this vulnerability by using `filepath.Rel(cleanRoot, cleanTarget)`:
+  ```go
+  rel, err := filepath.Rel(cleanRoot, cleanTarget)
+  if err != nil || rel == ".." || strings.HasPrefix(rel, ".." + string(filepath.Separator)) {
+      return errors.ErrInvalidPath
+  }
+  ```
+  `filepath.Rel` operates on path components rather than raw characters. For `/var/lib/lattice-evil`, `filepath.Rel` returns `../lattice-evil`, which immediately triggers the `..` prefix guard and is rejected.
+* **Relevant Implementation Location**: `internal/security/containment.go`
+* **Relevant Test / Evidence**: `internal/security/containment_test.go`
+* **Known Caveat**: Both root and target paths must be made absolute and cleaned before passing to `filepath.Rel`.
+
+### Q39: What subtle vulnerability did differential fuzzing uncover in Lattice's address canonicalization logic?
+* **Question**: What vulnerability did `go test -fuzz` discover in `ValidateAndCanonicalizeAddress`, and how was it remediated?
+* **Answer**: During fuzz testing with adversarial inputs, the fuzzer supplied the input `"0.0.0.0.:9098"`. In Go's standard library, `net.ParseIP("0.0.0.0.")` returned `nil` because of the trailing period. The address bypassed the initial wildcard IP check and was routed to the hostname parsing branch. The hostname parser stripped the trailing period (standard RFC DNS normalization), producing `"0.0.0.0"`, which was accepted as a valid hostname! Upon subsequent resolution, it bound as wildcard `0.0.0.0`, defeating the security policy that prohibits wildcard listeners. The vulnerability was remediated by moving trailing-dot normalization and lowercasing *before* any IP parsing and wildcard checks, enforcing RFC 1123 label grammar checks, and rejecting all-numeric top-level domains.
+* **Relevant Implementation Location**: `internal/security/validation.go`
+* **Relevant Test / Evidence**: `internal/security/fuzz_test.go`, `internal/security/validation_test.go`
+* **Known Caveat**: Fuzz testing detects edge-case parsing anomalies but requires seed corpora representing complex real-world network addresses.
+
+---
+
+## Category 11: Observability & Telemetry (Q40 – Q43)
+
+### Q40: How does Lattice achieve lock-free, zero-allocation Prometheus metric recording on hot storage paths?
+* **Question**: Why does recording a latency sample into a Prometheus histogram in Lattice incur 0 heap allocations and 0 mutex contention?
+* **Answer**: In high-throughput storage engines (100k ops/sec), acquiring a mutex to record latency samples creates severe CPU cache-line bouncing and thread descheduling. Lattice implements a lock-free histogram (`internal/metrics/histogram.go`):
+  - Buckets are pre-allocated slices of `atomic.Uint64`.
+  - Boundaries are pre-sorted `[]float64`.
+  - When observing a duration $t$, a binary search (`sort.SearchFloats`) identifies the discrete bucket index on the stack.
+  - Exactly **one** atomic addition is executed on the target bucket (`h.buckets[idx].Add(1)`), one on total count (`h.count.Add(1)`), and one on sum (`h.sumNanos.Add(...)`).
+  - Zero heap allocations occur (`testing.AllocsPerRun == 0`).
+  - Cumulative Prometheus bucket counts are computed only at scrape time when `Snapshot()` is invoked, decoupling high-frequency recording from Prometheus exposition semantics.
+* **Relevant Implementation Location**: `internal/metrics/histogram.go`, `internal/metrics/registry.go`
+* **Relevant Test / Evidence**: `internal/metrics/histogram_test.go`
+* **Known Caveat**: Binary search over bucket boundaries takes $O(\log B)$ comparisons; with $B \le 20$, this requires at most 5 floating-point comparisons on the stack.
+
+### Q41: What is a Prometheus "Cardinality Bomb", and how does Lattice mathematically guarantee bounded memory overhead?
+* **Question**: How can remote clients weaponize metrics labels to crash a database daemon via Out-Of-Memory (OOM), and how does Lattice defend against it?
+* **Answer**: In Prometheus, every unique combination of key-value label pairs creates an independent time-series object in memory. If an application allows user-supplied data (such as user keys, request UUIDs, or IP addresses) to be used as metric labels, an attacker sending $1,000,000$ unique keys generates $1,000,000$ new histogram series (each with 18 buckets), consuming gigabytes of RAM until the process crashes from OOM. Lattice defends against this via **Pre-Allocated Cartesian Product Maps** (`internal/metrics/registry.go`):
+  1. Callers declare the strict set of permitted label names and discrete enum values during package initialization (e.g. `op: {"put", "get", "delete"}`).
+  2. The constructor pre-computes the complete Cartesian product and registers them in a static lookup map.
+  3. If `WithLabelValues(...)` is called with an unrecognized or dynamic string, it falls back to a shared `noopHistogram` and **never** expands internal maps. Total time-series cardinality is mathematically bounded to $O(1)$.
+* **Relevant Implementation Location**: `internal/metrics/registry.go`
+* **Relevant Test / Evidence**: `internal/metrics/registry_test.go`
+* **Known Caveat**: Adding a new metric label requires adding the enum value to the pre-allocated map and recompiling the code.
+
+### Q42: Why is equating `/live` and `/ready` a catastrophic failure mode in containerized distributed databases?
+* **Question**: What happens if a container orchestrator (Kubernetes) restarts a database pod because `/live` failed during a heavy compaction or temporary disk exhaustion?
+* **Answer**: Liveness and readiness have fundamentally distinct operational semantics:
+  - **Liveness (`/live`)**: Answers "Is the process event loop running?" Liveness failure triggers a destructive action: the orchestrator sends `SIGKILL` and restarts the container. If `/live` fails because disk is low or the node lost its Raft leader connection, restarting triggers crash loops. During disk pressure, restarting creates new WAL segments and dump logs, worsening disk exhaustion. During partitions, restarting triggers unnecessary leader elections. `/live` must represent purely process vitality.
+  - **Readiness (`/ready`)**: Answers "Is this node currently capable of serving client requests?" Readiness failure triggers a non-destructive routing action: the service mesh / load balancer stops routing traffic to the pod. If a node is recovering its WAL, if storage is poisoned, or if an isolated follower has lost connectivity to the Raft leader, `/ready` returns HTTP 503. The pod remains running to catch up or await partition healing without serving corrupted or stale data to clients.
+* **Relevant Implementation Location**: `internal/metrics/health.go`, `cmd/lattice/main.go`
+* **Relevant Test / Evidence**: `internal/metrics/health_test.go`, `cmd/lattice/health_test.go`
+* **Known Caveat**: Orchestrators must be configured with appropriate `initialDelaySeconds` and `periodSeconds` to give nodes time to recover.
+
+### Q43: Why is checking `node.LeaderID() != nil` alone fundamentally flawed when determining if a Raft follower is ready to serve traffic?
+* **Question**: If a network partition isolates a Raft follower from the leader, why does checking only local Raft state falsely report readiness?
+* **Answer**: In Raft, when a follower participates in an election or receives an `AppendEntries` heartbeat, it caches the leader's identity (`r.leaderID = leader`). If a network partition occurs and severs this follower from the rest of the cluster, its local `r.leaderID` remains populated with the old leader's ID indefinitely until an election timeout ticks and it becomes a Candidate (or if election timers are paused during linearizable read evaluations). If the node only checked `LeaderID() != nil`, an isolated follower would falsely report HTTP 200 `READY`. Clients routing queries to this follower would receive stale reads or fail on proxied writes. Lattice implements **Authoritative Transport Verification** (`internal/metrics/health.go`):
+  ```go
+  if !peerMgr.IsConnected(leaderID) {
+      return false, "isolated_from_cluster"
+  }
+  ```
+  Because the transport manager maintains active TCP connection state and severs connections upon heartbeat timeout or socket reset, `IsConnected(leaderID)` guarantees a live bidirectional channel to the authoritative leader. If partitioned, `/ready` immediately returns HTTP 503 (`isolated_from_cluster`).
+* **Relevant Implementation Location**: `internal/metrics/health.go`
+* **Relevant Test / Evidence**: `internal/metrics/health_test.go`, `cmd/lattice/health_test.go`
+* **Known Caveat**: Transport connection checks reflect TCP socket state; transient TCP keepalive delays can briefly delay partition detection.
+
+---
+
+## Category 12: Benchmarking & Performance (Q44 – Q47)
+
+### Q44: Why must storage benchmarks measure latency at the client network boundary rather than inside the storage engine?
+* **Question**: Why is reporting engine-internal function execution time (`t_engine`) an incomplete representation of system performance in architectural benchmarks?
+* **Answer**: Measuring execution time inside `Engine.Put` or `Engine.Get` captures only internal memory lookup or disk append time. It completely excludes:
+  1. TCP frame serialization and deserialization.
+  2. OS kernel TCP socket buffer queueing and flow control.
+  3. Context switches and thread scheduling delays in worker pools.
+  4. Network transport latency across the wire.
+  If an engine processes a query in $50\,\mu\text{s}$ but client requests queue in socket backlogs for $4\,\text{ms}$, the experienced user latency is $4\,\text{ms}$. Reporting internal engine time conceals system queuing bottlenecks and creates a misleading illusion of performance. Lattice measures **Client-Observed End-to-End Latency**: the timer starts immediately before `transport.WriteRequest` (`t0 = time.Now()`) and stops immediately after reading and verifying the complete response frame (`time.Since(t0)`).
+* **Relevant Implementation Location**: `cmd/lattice-bench/client.go`, `cmd/lattice-bench/runner.go`
+* **Relevant Test / Evidence**: `cmd/lattice-bench/runner_test.go`
+* **Known Caveat**: Client-observed latency includes loopback network stack overhead and local client scheduling delays.
+
+### Q45: How does the logarithmic sub-bucket histogram achieve a provable relative quantization error $\le 0.78125\%$ without heap allocations?
+* **Question**: How does `internal/benchmark/LatencyHistogram` bound quantile error across latencies ranging from 1 nanosecond to 4.88 hours?
+* **Answer**: A linear histogram with fine buckets across hours of latency would require gigabytes of RAM. A purely logarithmic histogram with base 2 doubles bucket widths with each power of two, resulting in a coarse $50\%$ relative error. Lattice combines logarithmic octaves with linear sub-bucketing:
+  - Latencies in $[0, 127]\,\text{ns}$ map 1:1 to 128 linear buckets (exact nanosecond precision).
+  - Latencies from $128\,\text{ns}$ to $2^{44}-1\,\text{ns}$ (~4.88 hours) are partitioned into logarithmic octaves $[2^k, 2^{k+1}-1]$.
+  - Each octave is sub-divided into $2^7 = 128$ equal-width linear sub-buckets.
+  - In octave $k$, the bucket width is $\Delta = 2^{k-7}\,\text{ns}$.
+  - For any observation $V$ in that octave, $V \ge 2^k$.
+  - The maximum relative quantization error is strictly bounded by:
+    $$\frac{\Delta}{V} \le \frac{2^{k-7}}{2^k} = \frac{1}{128} = 0.0078125 \text{ (0.78125%) } < 1.0\%$$
+  The entire histogram is backed by a fixed array of 4,865 `uint64` counters (4,864 sub-buckets + 1 overflow bucket) indexed via hardware bitwise intrinsics (`bits.LeadingZeros64`), executing in $O(1)$ lock-free CPU instructions with 0 heap allocations.
+* **Relevant Implementation Location**: `internal/benchmark/histogram.go`
+* **Relevant Test / Evidence**: `internal/benchmark/histogram_test.go`, `internal/benchmark/statistical_test.go`
+* **Known Caveat**: Observations exceeding $2^{44}-1\,\text{ns}$ (~4.88 hours) accumulate in the single overflow bucket.
+
+### Q46: Why does Lattice use discrete nearest-rank percentiles returning bucket upper bounds instead of linear interpolation?
+* **Question**: How are P50, P90, and P99 computed from histogram buckets, and why is returning the bucket upper bound preferred for SLA compliance?
+* **Answer**: For quantile $p \in [0.0, 1.0]$ and total observation count $N$, the target discrete rank is $\text{rank} = \lceil p \times N \rceil$. The histogram accumulates bucket counts from bucket 0 upward until $\sum_{i=0}^B \text{count}_i \ge \text{rank}$.
+  - **The Danger of Linear Interpolation**: In bucket quantization, observations in bucket $[L_B, U_B]$ could theoretically have fallen anywhere between $L_B$ and $U_B$. Linear interpolation assumes a uniform distribution within the bucket. If observations clustered near $U_B$, interpolation understates true latency, reporting overly optimistic numbers.
+  - **Conservative Upper-Bound SLA Guarantee**: By returning $U_B$ (clamped to exact observed `maxNs`), Lattice guarantees the formal SLA/SLO contract: **at least $p \times 100\%$ of recorded operations completed in $\le \text{returned\_latency}$**. An infrastructure SLA must never under-report tail latency.
+* **Relevant Implementation Location**: `internal/benchmark/histogram.go`
+* **Relevant Test / Evidence**: `internal/benchmark/histogram_test.go`
+* **Known Caveat**: Coarse bucket widths would overstate latency; mitigated in Lattice by the $\le 0.78125\%$ relative error bound.
+
+### Q47: In the 60-second benchmark summary, why did 64 "Network Drops" occur at the end of the run, and why is this correct behavior?
+* **Question**: Does the occurrence of 64 dropped requests at the end of the 60-second benchmark indicate a networking bug or connection leak?
+* **Answer**: No; it represents correct, strict duration enforcement. With 64 concurrent workers continuously submitting requests over TCP, at the exact moment the 60.000s duration expires ($T = 60\text{s}$), all 64 workers have an in-flight request pending across their TCP sockets. If the harness waited for these 64 requests to complete, a slow physical disk sync or network delay could extend the benchmark run to 65s or 70s, corrupting the 60-second duration invariant. To prevent duration overruns, client socket contexts are bound to the 60.000s deadline (`client.effectiveDeadline(ctx)`). At $t = 60.001\text{s}$, the context deadline cancels the 64 in-flight sockets. The harness catches the `i/o timeout` error and increments `netErrors`, while strictly excluding incomplete operations from latency histograms and throughput calculations. Transparently documenting these 64 boundary drops ($64 / 76,047 \approx 0.08\%$) proves that zero operations were fabricated or allowed to breach the measurement boundary.
+* **Relevant Implementation Location**: `cmd/lattice-bench/client.go`, `cmd/lattice-bench/runner.go`
+* **Relevant Test / Evidence**: `cmd/lattice-bench/runner_test.go`
+* **Known Caveat**: In-flight requests cancelled at the boundary may have already been written to the server's WAL before the socket severed.
+
+---
+
+## Category 13: End-to-End System Design (Q48 – Q50)
+
+### Q48: Trace the complete path of a `PUT key=foo, value=bar` operation through the entire Lattice system in both standalone and cluster modes.
+* **Question**: Describe every subsystem, lock, file operation, and network frame involved in executing a `PUT` mutation.
+* **Answer**:
+  - **Standalone Mode**:
+    1. Client frames request: 18-byte header (`OpPut`, `SeqID=1`, `PayloadLength=15`), key `"foo"`, value `"bar"`, CRC32 checksum. Transmits over TCP to `:9099`.
+    2. `transport.Server` validates connection limits, enforces Slowloris deadlines, verifies CRC32, and extracts payload.
+    3. `Engine.Put` acquires `Engine.mu.Lock()`.
+    4. Sequence number allocated: `seq := e.nextSeqNum; e.nextSeqNum++`.
+    5. WAL record encoded with Big-Endian headers and CRC32-IEEE checksum.
+    6. `wal.AppendSync` writes bytes to active segment `wal_%012d.log` and executes `fdatasync()` on the file descriptor.
+    7. `MemTable.Put` inserts `InternalKey(foo, seq, OpTypePut)` into the SkipList using lock-free atomic pointer stores.
+    8. `Engine.mu.Unlock()` released.
+    9. `transport.Server` encodes 18-byte response frame with `StatusOk` and sends it back to the client.
+  - **Cluster Mode (Raft)**:
+    1. Request arrives at `transport.Server` on `:9099`. `ProposalRouter.RouteWrite` intercepts the request.
+    2. If the node is a Follower or Candidate, it returns `StatusNotLeader` with the leader's address.
+    3. If Leader: Encodes command into canonical bytes `Command{OpPut, foo, bar}`.
+    4. Submits proposal to `Node.ProposeWithContext(ctx, cmdBytes)`: appends entry to local `raft.log` and flushes disk.
+    5. Transmits `AppendEntries` RPC to peers over `:9098` via `PeerConnectionManager`.
+    6. Follower nodes append entries to their `raft.log` and return success.
+    7. Upon receiving majority acks, leader advances `commitIndex`.
+    8. Background `applyLoop` unblocks, reads committed entry, and calls local `Engine.Put` (steps 3-7 above).
+    9. Client response sent with `StatusOk`.
+* **Relevant Implementation Location**: `internal/transport/`, `internal/engine/`, `internal/raft/`, `internal/wal/`
+* **Relevant Test / Evidence**: `internal/raft/read_barrier_tcp_integration_test.go`, `internal/engine/integration_test.go`
+* **Known Caveat**: In cluster mode, client writes are durably acknowledged once committed in the Raft consensus log, prior to asynchronous state machine application.
+
+### Q49: Trace the complete path of a `GET key=foo` operation across all memory and storage tiers.
+* **Question**: Describe the exact order of tiers searched during a point lookup, and how Lattice minimizes disk I/O on misses.
+* **Answer**:
+  1. Client sends 18-byte request frame (`OpGet`, key `"foo"`).
+  2. In cluster mode on the leader, `RouteRead` executes the linearizable ReadIndex sequence: quorum heartbeat round-trip confirmation -> wait for state machine apply barrier (`appliedIndex >= readIndex`) -> revalidate leadership (`ValidateLeadership`).
+  3. `Engine.Get("foo")` executes:
+     - **Tier 1: Active MemTable**: Searches the concurrent SkipList lock-free. If key found: if `OpTypePut`, return value; if `OpTypeDelete` (tombstone), return `ErrKeyNotFound`.
+     - **Tier 2: Immutable MemTables**: If not in active MemTable, searches the queue of immutable MemTables from newest to oldest. If found, returns value or tombstone.
+     - **Tier 3: Level 0 SSTables**: If not in memory, pins the current version: `v := vset.Current()`. Traverses $L_0$ SSTables from newest to oldest by `FileNum`:
+       - Checks the SSTable's Bloom filter. If Bloom filter returns false, skips file immediately without disk I/O!
+       - If Bloom returns true: checks the sparse index block to find candidate data block.
+       - Checks `ShardedLRUCache` for the data block. If miss, reads block from disk via `os.File.ReadAt`.
+       - Binary-searches restart array and scans block entries. If matching `InternalKey` found: if `OpPut`, return value; if `OpDelete`, return `ErrKeyNotFound`.
+     - **Tier 4: Levels 1..6 SSTables**: In each level $L_1 \dots L_6$, files are non-overlapping. Performs binary search over SSTable metadata key ranges to identify the *single* candidate file covering `"foo"`. Checks Bloom filter -> index block -> block cache -> disk read.
+     - **Tier 5: Key Not Found**: If all levels are exhausted without finding the key, unpins `v.Unref()` and returns `ErrKeyNotFound` (`StatusKeyNotFound`).
+* **Relevant Implementation Location**: `internal/engine/engine.go`, `internal/sstable/table_reader.go`, `internal/cache/sharded_cache.go`
+* **Relevant Test / Evidence**: `internal/engine/engine_test.go`, `internal/sstable/table_test.go`
+* **Known Caveat**: An un-cached $L_0$ search without Bloom filters would require reading every $L_0$ SSTable; Bloom filters are essential to prevent read amplification.
+
+### Q50: What architectural capabilities does Lattice explicitly NOT implement, and what would be the scope of future engineering phases?
+* **Question**: If an interviewer asks: "What are the major limitations of Lattice today, and what would you build next?", how do you answer with technical precision?
+* **Answer**:
+  Lattice is an engineered, verified single-node LSM storage engine with Raft consensus, linearizable reads, and comprehensive security hardening. However, Lattice explicitly does NOT implement:
+  1. **Dynamic Cluster Membership (Raft Joint Consensus)**: Cluster topology in V1 is immutable after startup; adding or removing nodes requires rolling configuration restarts rather than consensus-managed member transitions.
+  2. **Raft Log Compaction / Snapshots**: Raft log entries persist in `raft.log` indefinitely without snapshotting into SSTables, meaning log replay time grows over long lifespans.
+  3. **Multi-Version Snapshot Isolation (Transactions)**: Operations are single-key atomic; multi-key ACID transactions, snapshot isolation, and two-phase commit (2PC) are not supported.
+  4. **Mutual TLS (mTLS) for Consensus**: Peer consensus traffic uses loopback plaintext by default; mTLS certificate verification and automated PKI rotation are scheduled for future phases.
+  5. **Distributed Sharding across Multi-Raft**: The database runs as a single Raft consensus group (replicated state machine). Scaling beyond a single node's storage capacity requires horizontal range sharding (Multi-Raft like CockroachDB or TiKV).
+  6. **Direct I/O (`O_DIRECT`)**: Storage writes use standard kernel page caching and `fdatasync()`; user-space page cache bypass via direct I/O is not implemented.
+* **Relevant Implementation Location**: `docs/known-limitations.md`, `internal/raft/`, `internal/engine/`
+* **Relevant Test / Evidence**: Documented in `docs/known-limitations.md` (Items 1 through 91).
+* **Known Caveat**: Acknowledging explicit boundaries demonstrates engineering maturity and integrity in senior systems interviews.
+
 
 ---
 
