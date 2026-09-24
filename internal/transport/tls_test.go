@@ -1246,6 +1246,54 @@ func TestValidatePeerDialerTLSConfig_Unit(t *testing.T) {
 	}
 }
 
+func TestValidateClientServerTLSConfig_Unit(t *testing.T) {
+	ca := NewTestCA(t, "Lattice Client Unit CA")
+	serverCert, serverKey := ca.IssueServerCert(t, "localhost")
+	kp, err := tls.LoadX509KeyPair(serverCert, serverKey)
+	if err != nil {
+		t.Fatalf("LoadX509KeyPair failed: %v", err)
+	}
+	pool, err := LoadCertPool(ca.CertPath)
+	if err != nil {
+		t.Fatalf("LoadCertPool failed: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		cfg     *tls.Config
+		wantErr bool
+	}{
+		{"nil config", nil, true},
+		{"TLS 1.2 min", &tls.Config{MinVersion: tls.VersionTLS12, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool, Certificates: []tls.Certificate{kp}}, true},
+		{"TLS 1.2 max", &tls.Config{MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS12, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool, Certificates: []tls.Certificate{kp}}, true},
+		{"InsecureSkipVerify", &tls.Config{MinVersion: tls.VersionTLS13, InsecureSkipVerify: true, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool, Certificates: []tls.Certificate{kp}}, true},
+		{"NoClientCert", &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.NoClientCert, ClientCAs: pool, Certificates: []tls.Certificate{kp}}, true},
+		{"RequestClientCert", &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequestClientCert, ClientCAs: pool, Certificates: []tls.Certificate{kp}}, true},
+		{"VerifyClientCertIfGiven", &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.VerifyClientCertIfGiven, ClientCAs: pool, Certificates: []tls.Certificate{kp}}, true},
+		{"RequireAnyClientCert", &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAnyClientCert, ClientCAs: pool, Certificates: []tls.Certificate{kp}}, true},
+		{"nil ClientCAs", &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: nil, Certificates: []tls.Certificate{kp}}, true},
+		{"empty certificates", &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool}, true},
+		{"valid client server mTLS", &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool, Certificates: []tls.Certificate{kp}}, false},
+		{"valid client server mTLS with GetConfigForClient", &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool, GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) { return nil, nil }}, false},
+		{"valid client server mTLS with GetCertificate", &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool, GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return nil, nil }}, false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateClientServerTLSConfig(tc.cfg)
+			if tc.wantErr && err == nil {
+				t.Errorf("expected error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if tc.wantErr && !stdErrors.Is(err, errors.ErrInsecureTransport) {
+				t.Errorf("expected ErrInsecureTransport, got: %v", err)
+			}
+		})
+	}
+}
+
 func TestSecurityPolicy_ClientMTLS_PeerCertRejection(t *testing.T) {
 	ca := NewTestCA(t, "Lattice Separation CA")
 	serverCert, serverKey := ca.IssueServerCert(t, "localhost")

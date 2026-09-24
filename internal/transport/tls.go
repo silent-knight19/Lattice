@@ -115,7 +115,149 @@ func ServerTLSConfig(certFile, keyFile, clientCAFile string, requireClientCert b
 		return nil, fmt.Errorf("cannot require client certificates without configuring a trusted Client CA file")
 	}
 
-	return cfg, nil
+	if requireClientCert {
+		return WrapClientServerTLSConfig(cfg, false), nil
+	}
+	return WrapClientServerTLSConfig(cfg, true), nil
+}
+
+// WrapClientServerTLSConfig clones cfg and installs/chains the mandatory Lattice client transport
+// verification callback, preserving any caller-provided VerifyConnection.
+//
+// Invariants enforced for non-loopback endpoints:
+//   - Mandatory TLS 1.3+ (MinVersion >= VersionTLS13, MaxVersion == 0 || MaxVersion >= VersionTLS13).
+//   - Mandatory mutual client authentication (ClientAuth == RequireAndVerifyClientCert).
+//   - InsecureSkipVerify must not be enabled.
+//   - Trusted ClientCAs pool cannot be replaced or bypassed (dynCfg.ClientCAs.Equal(trustedClientCAs)).
+//   - Lattice PKI separation (Raft peer certificates rejected on client transport).
+//
+// If cfg specifies GetConfigForClient, it is wrapped with a Lattice-owned validator ensuring that
+// any dynamically returned configuration cannot bypass or weaken these invariants.
+func WrapClientServerTLSConfig(cfg *tls.Config, isLoopback bool) *tls.Config {
+	if cfg == nil {
+		return nil
+	}
+	wrapped := cfg.Clone()
+	callerVerify := cfg.VerifyConnection
+
+	// Snapshot trusted ClientCAs from the base configuration to prevent dynamic substitution.
+	var trustedClientCAs *x509.CertPool
+	if cfg.ClientCAs != nil {
+		trustedClientCAs = cfg.ClientCAs.Clone()
+		wrapped.ClientCAs = trustedClientCAs
+	}
+
+	requireMTLS := !isLoopback || (wrapped.ClientAuth == tls.RequireAndVerifyClientCert)
+
+	wrapped.VerifyConnection = func(cs tls.ConnectionState) error {
+		// 1. Caller-provided verification must succeed first if present
+		if callerVerify != nil {
+			if err := callerVerify(cs); err != nil {
+				return fmt.Errorf("caller TLS verification rejected connection: %w", err)
+			}
+		}
+
+		// 2. Client certificate verification
+		if len(cs.PeerCertificates) == 0 {
+			if requireMTLS {
+				return stdErrors.New("no client certificate presented during TLS handshake")
+			}
+			return nil
+		}
+
+		leaf := cs.PeerCertificates[0]
+		// Defense-in-depth: Raft peer certificate cannot authenticate as a client certificate (PKI separation)
+		if IsPeerCertificate(leaf) && !IsClientCertificate(leaf) {
+			return stdErrors.New("certificate rejected: Raft peer certificate cannot be used as client certificate (PKI separation violation)")
+		}
+
+		return nil
+	}
+
+	callerGetConfig := cfg.GetConfigForClient
+	if callerGetConfig != nil {
+		wrapped.GetConfigForClient = func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+			dynCfg, err := callerGetConfig(chi)
+			if err != nil {
+				return nil, fmt.Errorf("caller GetConfigForClient rejected client hello: %w", err)
+			}
+			if dynCfg == nil {
+				return wrapped, nil
+			}
+
+			// If mTLS is required (always on non-loopback, or if configured on loopback), enforce strict invariants:
+			if requireMTLS {
+				// Invariant 1: Dynamic config must not downgrade TLS below TLS 1.3
+				if dynCfg.MinVersion < tls.VersionTLS13 || (dynCfg.MaxVersion != 0 && dynCfg.MaxVersion < tls.VersionTLS13) {
+					return nil, fmt.Errorf("GetConfigForClient returned TLS config with invalid TLS version (min=0x%04x, max=0x%04x); TLS 1.3 required",
+						dynCfg.MinVersion, dynCfg.MaxVersion)
+				}
+
+				// Invariant 2: Dynamic config must not enable InsecureSkipVerify
+				if dynCfg.InsecureSkipVerify {
+					return nil, stdErrors.New("GetConfigForClient returned TLS config with InsecureSkipVerify enabled")
+				}
+
+				// Invariant 3: Dynamic config must enforce RequireAndVerifyClientCert
+				if dynCfg.ClientAuth != tls.RequireAndVerifyClientCert {
+					return nil, fmt.Errorf("GetConfigForClient returned TLS config with invalid ClientAuth %v; RequireAndVerifyClientCert required",
+						dynCfg.ClientAuth)
+				}
+
+				// Invariant 4: Dynamic config MUST NOT substitute or alter the trusted ClientCAs pool
+				if trustedClientCAs == nil {
+					return nil, stdErrors.New("GetConfigForClient returned dynamic config but base server configuration has nil ClientCAs")
+				}
+				if dynCfg.ClientCAs == nil || !dynCfg.ClientCAs.Equal(trustedClientCAs) {
+					return nil, stdErrors.New("GetConfigForClient returned TLS config replacing or omitting trusted ClientCAs pool")
+				}
+			}
+
+			// Invariant 5: Deep-wrap the dynamic config with Lattice client identity & PKI separation verification
+			dynCopy := dynCfg.Clone()
+			dynCopy.GetConfigForClient = nil // Prevent recursive GetConfigForClient loops
+
+			// Preserve any caller-provided VerifyConnection from the base configuration:
+			// A dynamic configuration MUST NOT be able to remove verification callbacks established on the base configuration.
+			dynCallerVerify := dynCfg.VerifyConnection
+			if callerVerify != nil {
+				if dynCallerVerify != nil {
+					dynCopy.VerifyConnection = func(cs tls.ConnectionState) error {
+						if err := callerVerify(cs); err != nil {
+							return fmt.Errorf("base TLS verification rejected connection: %w", err)
+						}
+						if err := dynCallerVerify(cs); err != nil {
+							return fmt.Errorf("dynamic TLS verification rejected connection: %w", err)
+						}
+						return nil
+					}
+				} else {
+					dynCopy.VerifyConnection = callerVerify
+				}
+			}
+
+			dynWrapped := WrapClientServerTLSConfig(dynCopy, isLoopback)
+			if requireMTLS {
+				dynWrapped.ClientCAs = trustedClientCAs
+				dynWrapped.ClientAuth = tls.RequireAndVerifyClientCert
+				dynWrapped.MinVersion = tls.VersionTLS13
+				if dynCfg.MaxVersion != 0 {
+					dynWrapped.MaxVersion = dynCfg.MaxVersion
+				} else {
+					dynWrapped.MaxVersion = tls.VersionTLS13
+				}
+			}
+
+			return dynWrapped, nil
+		}
+	}
+
+	return wrapped
+}
+
+// WrapServerTLSConfig is an alias for WrapClientServerTLSConfig.
+func WrapServerTLSConfig(cfg *tls.Config, isLoopback bool) *tls.Config {
+	return WrapClientServerTLSConfig(cfg, isLoopback)
 }
 
 // ClientTLSConfig constructs a hardened TLS 1.3 client configuration for SDK and CLI connections.
@@ -392,6 +534,26 @@ func WrapPeerServerTLSConfig(cfg *tls.Config, topology *cluster.Topology) *tls.C
 			// Invariant 5: Deep-wrap the dynamic config with Lattice peer identity verification
 			dynCopy := dynCfg.Clone()
 			dynCopy.GetConfigForClient = nil // Prevent recursive GetConfigForClient loops
+
+			// Preserve any caller-provided VerifyConnection from the base configuration:
+			// A dynamic configuration MUST NOT be able to remove verification callbacks established on the base configuration.
+			dynCallerVerify := dynCfg.VerifyConnection
+			if callerVerify != nil {
+				if dynCallerVerify != nil {
+					dynCopy.VerifyConnection = func(cs tls.ConnectionState) error {
+						if err := callerVerify(cs); err != nil {
+							return fmt.Errorf("base TLS verification rejected connection: %w", err)
+						}
+						if err := dynCallerVerify(cs); err != nil {
+							return fmt.Errorf("dynamic TLS verification rejected connection: %w", err)
+						}
+						return nil
+					}
+				} else {
+					dynCopy.VerifyConnection = callerVerify
+				}
+			}
+
 			dynWrapped := WrapPeerServerTLSConfig(dynCopy, topology)
 			dynWrapped.ClientCAs = trustedClientCAs
 			dynWrapped.ClientAuth = tls.RequireAndVerifyClientCert
@@ -649,4 +811,73 @@ func ValidatePeerDialerTLSConfig(cfg *tls.Config) error {
 	}
 
 	return nil
+}
+
+// ValidateClientServerTLSConfig verifies that cfg satisfies the mandatory mutual TLS 1.3
+// invariants for client-facing server endpoints on non-loopback network interfaces.
+//
+// Enforces:
+//   - cfg must be non-nil.
+//   - MinVersion must be tls.VersionTLS13.
+//   - MaxVersion, if set, must be >= tls.VersionTLS13.
+//   - InsecureSkipVerify must not be true.
+//   - ClientAuth must be tls.RequireAndVerifyClientCert (mutual TLS).
+//   - ClientCAs must be non-nil.
+//   - Certificates must not be empty (or GetCertificate / GetConfigForClient configured).
+//
+// Rejects:
+//   - nil TLS config
+//   - TLS < 1.3
+//   - TLS 1.3 with NoClientCert
+//   - TLS 1.3 with RequestClientCert
+//   - TLS 1.3 with VerifyClientCertIfGiven
+//   - TLS 1.3 with RequireAnyClientCert
+//   - TLS 1.3 with RequireAndVerifyClientCert but nil ClientCAs
+//   - missing certificate/key
+//
+// Accepts:
+//   - correctly constructed client server mTLS configuration
+func ValidateClientServerTLSConfig(cfg *tls.Config) error {
+	if cfg == nil {
+		return fmt.Errorf("%w: client server TLS configuration is nil; mutual TLS 1.3 required", errors.ErrInsecureTransport)
+	}
+
+	if cfg.MinVersion < tls.VersionTLS13 || (cfg.MaxVersion != 0 && cfg.MaxVersion < tls.VersionTLS13) {
+		return fmt.Errorf("%w: client server TLS configuration mandates TLS 1.3 (min=%x, max=%x)",
+			errors.ErrInsecureTransport, cfg.MinVersion, cfg.MaxVersion)
+	}
+
+	if cfg.InsecureSkipVerify {
+		return fmt.Errorf("%w: client server TLS InsecureSkipVerify must not be enabled", errors.ErrInsecureTransport)
+	}
+
+	switch cfg.ClientAuth {
+	case tls.RequireAndVerifyClientCert:
+		// Required mutual TLS invariant
+	case tls.NoClientCert:
+		return fmt.Errorf("%w: client server TLS requires mutual client certificate verification (got NoClientCert)", errors.ErrInsecureTransport)
+	case tls.RequestClientCert:
+		return fmt.Errorf("%w: client server TLS requires mandatory client certificate verification (got RequestClientCert)", errors.ErrInsecureTransport)
+	case tls.VerifyClientCertIfGiven:
+		return fmt.Errorf("%w: client server TLS requires mandatory client certificate verification (got VerifyClientCertIfGiven)", errors.ErrInsecureTransport)
+	case tls.RequireAnyClientCert:
+		return fmt.Errorf("%w: client server TLS requires verified client certificate against trusted CA (got RequireAnyClientCert)", errors.ErrInsecureTransport)
+	default:
+		return fmt.Errorf("%w: client server TLS invalid ClientAuth mode (%v); RequireAndVerifyClientCert required", errors.ErrInsecureTransport, cfg.ClientAuth)
+	}
+
+	if cfg.ClientCAs == nil {
+		return fmt.Errorf("%w: client server TLS requires non-nil trusted ClientCAs pool for mutual authentication", errors.ErrInsecureTransport)
+	}
+
+	if len(cfg.Certificates) == 0 && cfg.GetCertificate == nil && cfg.GetConfigForClient == nil {
+		return fmt.Errorf("%w: client server TLS requires configured X.509 certificate and private key", errors.ErrInsecureTransport)
+	}
+
+	return nil
+}
+
+// ValidateServerTLSConfig is an alias for ValidateClientServerTLSConfig.
+func ValidateServerTLSConfig(cfg *tls.Config) error {
+	return ValidateClientServerTLSConfig(cfg)
 }
