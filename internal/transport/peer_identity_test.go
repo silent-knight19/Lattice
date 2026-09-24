@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -788,6 +789,380 @@ func TestExtractNodeIDFromCert_AmbiguityAudit(t *testing.T) {
 		}
 		if id != 1 {
 			t.Fatalf("expected NodeID 1, got %d", id)
+		}
+	})
+}
+
+func TestPeerIdentity_CustomDialerSecurity(t *testing.T) {
+	ca := NewTestCA(t, "Lattice Trusted Peer CA")
+	untrustedCA := NewTestCA(t, "Untrusted Rogue CA")
+
+	// Local node 1; Remote peer 2 has a NON-LOOPBACK address
+	topo := createTestTopology(t, 1, "192.0.2.1:19098", map[cluster.NodeID]string{
+		2: "192.0.2.2:19099",
+	})
+
+	node1Cert, node1Key := ca.IssuePeerCert(t, 1)
+	node2Cert, node2Key := ca.IssuePeerCert(t, 2)
+	node3Cert, node3Key := ca.IssuePeerCert(t, 3)
+
+	caPool, _ := LoadCertPool(ca.CertPath)
+
+	baseCfg := func() PeerConnectionConfig {
+		cfg := DefaultPeerConnectionConfig()
+		cfg.PeerTLSCertFile = node1Cert
+		cfg.PeerTLSKeyFile = node1Key
+		cfg.PeerCAFile = ca.CertPath
+		cfg.DialTimeout = 200 * time.Millisecond
+		cfg.ReconnectMin = 50 * time.Millisecond
+		cfg.ReconnectMax = 100 * time.Millisecond
+		return cfg
+	}
+
+	// Attack 1: Custom dialer returning tls.Conn with self-signed / rogue CA
+	t.Run("Attack 1: Custom dialer returning pre-secured tls.Conn with rogue CA => Rejected", func(t *testing.T) {
+		rogueCert, rogueKey := untrustedCA.IssuePeerCert(t, 2)
+		rogueKP, _ := tls.LoadX509KeyPair(rogueCert, rogueKey)
+
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to listen: %v", err)
+		}
+		defer ln.Close()
+
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				sTLS := tls.Server(conn, &tls.Config{
+					MinVersion:   tls.VersionTLS13,
+					Certificates: []tls.Certificate{rogueKP},
+				})
+				_ = sTLS.Handshake()
+			}
+		}()
+
+		cfg := baseCfg()
+		cfg.DialFunc = func(ctx context.Context, addr string) (net.Conn, error) {
+			return tls.Dial("tcp", ln.Addr().String(), &tls.Config{
+				MinVersion:         tls.VersionTLS13,
+				InsecureSkipVerify: true,
+			})
+		}
+
+		mgr, err := NewPeerConnectionManager(topo, cfg)
+		if err != nil {
+			t.Fatalf("NewPeerConnectionManager failed: %v", err)
+		}
+		defer mgr.Close()
+
+		if err := mgr.Start(); err != nil {
+			t.Fatalf("mgr.Start failed: %v", err)
+		}
+
+		time.Sleep(300 * time.Millisecond)
+
+		if mgr.IsConnected(2) {
+			t.Fatal("SECURITY VIOLATION: manager connected to rogue peer via custom dialer returning tls.Conn with untrusted CA")
+		}
+	})
+
+	// Attack 2: Custom dialer returning tls.Conn with InsecureSkipVerify=true
+	t.Run("Attack 2: Custom dialer returning tls.Conn with InsecureSkipVerify=true => Rejected", func(t *testing.T) {
+		rogueCert, rogueKey := untrustedCA.IssuePeerCert(t, 2)
+		rogueKP, _ := tls.LoadX509KeyPair(rogueCert, rogueKey)
+
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to listen: %v", err)
+		}
+		defer ln.Close()
+
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				sTLS := tls.Server(conn, &tls.Config{
+					MinVersion:   tls.VersionTLS13,
+					Certificates: []tls.Certificate{rogueKP},
+				})
+				_ = sTLS.Handshake()
+			}
+		}()
+
+		cfg := baseCfg()
+		cfg.RawDialFunc = func(ctx context.Context, addr string) (net.Conn, error) {
+			return tls.Dial("tcp", ln.Addr().String(), &tls.Config{
+				MinVersion:         tls.VersionTLS13,
+				InsecureSkipVerify: true,
+			})
+		}
+
+		mgr, err := NewPeerConnectionManager(topo, cfg)
+		if err != nil {
+			t.Fatalf("NewPeerConnectionManager failed: %v", err)
+		}
+		defer mgr.Close()
+
+		if err := mgr.Start(); err != nil {
+			t.Fatalf("mgr.Start failed: %v", err)
+		}
+
+		time.Sleep(300 * time.Millisecond)
+
+		if mgr.IsConnected(2) {
+			t.Fatal("SECURITY VIOLATION: manager connected via custom dialer with InsecureSkipVerify=true")
+		}
+	})
+
+	// Attack 3: Correct role, correct NodeID, but wrong CA (raw dialer to rogue server)
+	t.Run("Attack 3: Raw dialer to server with correct role and NodeID but wrong CA => Rejected", func(t *testing.T) {
+		rogueCert, rogueKey := untrustedCA.IssuePeerCert(t, 2)
+		rogueKP, _ := tls.LoadX509KeyPair(rogueCert, rogueKey)
+
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to listen: %v", err)
+		}
+		defer ln.Close()
+
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				sTLS := tls.Server(conn, &tls.Config{
+					MinVersion:   tls.VersionTLS13,
+					Certificates: []tls.Certificate{rogueKP},
+				})
+				_ = sTLS.Handshake()
+			}
+		}()
+
+		cfg := baseCfg()
+		// Raw dialer provides raw transport connection; Lattice must execute TLS handshake against manager TLSConfig
+		cfg.RawDialFunc = func(ctx context.Context, addr string) (net.Conn, error) {
+			return net.Dial("tcp", ln.Addr().String())
+		}
+
+		mgr, err := NewPeerConnectionManager(topo, cfg)
+		if err != nil {
+			t.Fatalf("NewPeerConnectionManager failed: %v", err)
+		}
+		defer mgr.Close()
+
+		if err := mgr.Start(); err != nil {
+			t.Fatalf("mgr.Start failed: %v", err)
+		}
+
+		time.Sleep(300 * time.Millisecond)
+
+		if mgr.IsConnected(2) {
+			t.Fatal("SECURITY VIOLATION: manager connected to server signed by unauthorized CA")
+		}
+	})
+
+	// Attack 4: Correct CA, wrong NodeID (server presents Node 3 cert while dialing Node 2)
+	t.Run("Attack 4: Raw dialer to server with correct CA but wrong NodeID (Node 3 != 2) => Rejected", func(t *testing.T) {
+		node3KP, _ := tls.LoadX509KeyPair(node3Cert, node3Key)
+
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to listen: %v", err)
+		}
+		defer ln.Close()
+
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				sTLS := tls.Server(conn, &tls.Config{
+					MinVersion:   tls.VersionTLS13,
+					Certificates: []tls.Certificate{node3KP},
+					ClientAuth:   tls.RequireAndVerifyClientCert,
+					ClientCAs:    caPool,
+				})
+				_ = sTLS.Handshake()
+			}
+		}()
+
+		cfg := baseCfg()
+		cfg.RawDialFunc = func(ctx context.Context, addr string) (net.Conn, error) {
+			return net.Dial("tcp", ln.Addr().String())
+		}
+
+		mgr, err := NewPeerConnectionManager(topo, cfg)
+		if err != nil {
+			t.Fatalf("NewPeerConnectionManager failed: %v", err)
+		}
+		defer mgr.Close()
+
+		if err := mgr.Start(); err != nil {
+			t.Fatalf("mgr.Start failed: %v", err)
+		}
+
+		time.Sleep(300 * time.Millisecond)
+
+		if mgr.IsConnected(2) {
+			t.Fatal("SECURITY VIOLATION: manager connected despite server presenting wrong NodeID (3 instead of 2)")
+		}
+	})
+
+	// Attack 5: Server presents ordinary client certificate
+	t.Run("Attack 5: Raw dialer to server presenting ordinary client cert => Rejected", func(t *testing.T) {
+		clientCert, clientKey := ca.IssueClientCert(t, "ordinary-client")
+		clientKP, _ := tls.LoadX509KeyPair(clientCert, clientKey)
+
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to listen: %v", err)
+		}
+		defer ln.Close()
+
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				sTLS := tls.Server(conn, &tls.Config{
+					MinVersion:   tls.VersionTLS13,
+					Certificates: []tls.Certificate{clientKP},
+					ClientAuth:   tls.RequireAndVerifyClientCert,
+					ClientCAs:    caPool,
+				})
+				_ = sTLS.Handshake()
+			}
+		}()
+
+		cfg := baseCfg()
+		cfg.RawDialFunc = func(ctx context.Context, addr string) (net.Conn, error) {
+			return net.Dial("tcp", ln.Addr().String())
+		}
+
+		mgr, err := NewPeerConnectionManager(topo, cfg)
+		if err != nil {
+			t.Fatalf("NewPeerConnectionManager failed: %v", err)
+		}
+		defer mgr.Close()
+
+		if err := mgr.Start(); err != nil {
+			t.Fatalf("mgr.Start failed: %v", err)
+		}
+
+		time.Sleep(300 * time.Millisecond)
+
+		if mgr.IsConnected(2) {
+			t.Fatal("SECURITY VIOLATION: manager connected to server presenting ordinary client certificate")
+		}
+	})
+
+	// Attack 6: Plain TCP connection returned by custom dialer for non-loopback peer
+	t.Run("Attack 6: Custom dialer returns plain TCP connection for non-loopback peer => Rejected", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to listen: %v", err)
+		}
+		defer ln.Close()
+
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				// Speaks plaintext, not TLS
+				_ = conn.Close()
+			}
+		}()
+
+		cfg := baseCfg()
+		cfg.RawDialFunc = func(ctx context.Context, addr string) (net.Conn, error) {
+			return net.Dial("tcp", ln.Addr().String())
+		}
+
+		mgr, err := NewPeerConnectionManager(topo, cfg)
+		if err != nil {
+			t.Fatalf("NewPeerConnectionManager failed: %v", err)
+		}
+		defer mgr.Close()
+
+		if err := mgr.Start(); err != nil {
+			t.Fatalf("mgr.Start failed: %v", err)
+		}
+
+		time.Sleep(300 * time.Millisecond)
+
+		if mgr.IsConnected(2) {
+			t.Fatal("SECURITY VIOLATION: manager connected to plain TCP endpoint on non-loopback peer")
+		}
+	})
+
+	// Legitimate Raw Dialer: Custom dialer returns raw net.Conn to legitimate peer server
+	t.Run("Legitimate Raw Dialer: Raw dialer to legitimate Node 2 peer server => Successfully Connected", func(t *testing.T) {
+		topo2 := createTestTopology(t, 2, "192.0.2.2:19099", map[cluster.NodeID]string{
+			1: "192.0.2.1:19098",
+		})
+		serverTLS, err := PeerServerTLSConfig(node2Cert, node2Key, ca.CertPath, topo2)
+		if err != nil {
+			t.Fatalf("PeerServerTLSConfig failed: %v", err)
+		}
+
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to listen: %v", err)
+		}
+		defer ln.Close()
+
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				sTLS := tls.Server(conn, serverTLS)
+				if err := sTLS.Handshake(); err == nil {
+					// Keep connection alive for supervisor
+					go func(c net.Conn) {
+						var buf [1024]byte
+						for {
+							if _, err := c.Read(buf[:]); err != nil {
+								_ = c.Close()
+								return
+							}
+						}
+					}(sTLS)
+				}
+			}
+		}()
+
+		cfg := baseCfg()
+		// Custom raw dialer that routes to the legitimate server listener
+		cfg.RawDialFunc = func(ctx context.Context, addr string) (net.Conn, error) {
+			return net.Dial("tcp", ln.Addr().String())
+		}
+
+		mgr, err := NewPeerConnectionManager(topo, cfg)
+		if err != nil {
+			t.Fatalf("NewPeerConnectionManager failed: %v", err)
+		}
+		defer mgr.Close()
+
+		if err := mgr.Start(); err != nil {
+			t.Fatalf("mgr.Start failed: %v", err)
+		}
+
+		time.Sleep(300 * time.Millisecond)
+
+		if !mgr.IsConnected(2) {
+			t.Fatal("expected manager to successfully connect to legitimate Node 2 peer via manager-owned TLS")
 		}
 	})
 }

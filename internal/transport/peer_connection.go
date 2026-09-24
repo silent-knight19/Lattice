@@ -49,7 +49,18 @@ func (s PeerState) String() string {
 	}
 }
 
-// DialFunc abstracts network dialing, allowing loopback, mocks, or future mTLS dialers.
+// RawDialFunc is a low-level network dialer function that establishes the underlying raw
+// network transport (e.g. TCP connection or in-memory socket).
+//
+// Security Invariant: For non-loopback Raft peers, Lattice strictly owns the TLS layer.
+// Lattice wraps the raw connection returned by RawDialFunc with its own manager-owned
+// TLS 1.3 mTLS configuration and executes the handshake and identity verification.
+// A RawDialFunc (or DialFunc) is never permitted to return an already-authenticated *tls.Conn
+// for non-loopback peers; attempting to supply a pre-authenticated TLS connection fails closed.
+type RawDialFunc func(ctx context.Context, addr string) (net.Conn, error)
+
+// DialFunc is the pluggable dialer type preserved for backward compatibility and treated
+// strictly as a raw transport dialer.
 type DialFunc func(ctx context.Context, addr string) (net.Conn, error)
 
 // PeerFrameHandler is invoked when a valid protocol frame is received from a peer.
@@ -72,17 +83,14 @@ type PeerConnectionConfig struct {
 	// WriteTimeout is the deadline applied to individual frame writes (default: 5s).
 	WriteTimeout time.Duration
 
-	// DialFunc is the pluggable dialer function (defaults to standard TLS 1.3 mTLS dialer for production).
-	// When nil, NewPeerConnectionManager automatically constructs a mutual TLS 1.3 dialer using the
-	// configured peer certificates or TLSConfig.
-	//
-	// Security Contract:
-	// DialFunc is a deterministic testing seam and transport extension point. For non-loopback peer
-	// topologies, the peer connection manager strictly mandates a valid peer mTLS configuration
-	// (satisfying TLS 1.3, mandatory client verification, and trusted peer CA); providing a custom
-	// DialFunc does NOT bypass this security invariant. When utilizing a custom DialFunc on non-loopback
-	// topologies, the dialer implementation is contractually required to negotiate mutual TLS 1.3
-	// conforming to the Lattice peer trust domain. Production daemon initialization never sets DialFunc.
+	// RawDialFunc is an optional raw network dialer seam (e.g. for connection tracking,
+	// partition simulation, or proxying). On non-loopback peers, Lattice always owns the
+	// TLS 1.3 mTLS handshake and upgrades the connection using its manager-owned peer TLS configuration.
+	RawDialFunc RawDialFunc
+
+	// DialFunc is an alias/fallback for RawDialFunc preserved for compatibility. It is treated
+	// strictly as a raw transport dialer. On non-loopback peers, returning an already-authenticated
+	// *tls.Conn is rejected fail-closed to prevent custom dialers from bypassing manager-owned TLS.
 	DialFunc DialFunc
 
 	// OnFrameReceived is invoked when a valid frame is received from a remote peer.
@@ -285,9 +293,10 @@ func (rf *peerReplayFilter) CheckAndRecord(f *Frame) error {
 
 // peerSupervisor manages the complete connection lifecycle for a single remote peer.
 type peerSupervisor struct {
-	peerID  cluster.NodeID
-	address string
-	cfg     PeerConnectionConfig
+	peerID   cluster.NodeID
+	address  string
+	cfg      PeerConnectionConfig
+	topology *cluster.Topology
 
 	mu           sync.RWMutex
 	state        PeerState
@@ -301,11 +310,12 @@ type peerSupervisor struct {
 	writeMu  sync.Mutex
 }
 
-func newPeerSupervisor(p cluster.Peer, cfg PeerConnectionConfig) *peerSupervisor {
+func newPeerSupervisor(p cluster.Peer, cfg PeerConnectionConfig, topology *cluster.Topology) *peerSupervisor {
 	return &peerSupervisor{
 		peerID:       p.ID,
 		address:      p.Address,
 		cfg:          cfg,
+		topology:     topology,
 		state:        PeerStateDisconnected,
 		failures:     0,
 		replayFilter: newPeerReplayFilter(p.ID),
@@ -435,12 +445,16 @@ func (s *peerSupervisor) run(ctx context.Context, wg *sync.WaitGroup) {
 		s.state = PeerStateConnecting
 		s.mu.Unlock()
 
-		// Attempt dial with timeout
+		// Attempt dial with timeout using raw transport dialer
 		dialCtx, dialCancel := context.WithTimeout(ctx, s.cfg.DialTimeout)
-		conn, err := s.cfg.DialFunc(dialCtx, s.address)
+		rawDialer := s.cfg.RawDialFunc
+		if rawDialer == nil && s.cfg.DialFunc != nil {
+			rawDialer = RawDialFunc(s.cfg.DialFunc)
+		}
+		rawConn, err := rawDialer(dialCtx, s.address)
 		dialCancel()
 
-		if err == nil && conn == nil {
+		if err == nil && rawConn == nil {
 			err = errors.ErrPeerUnavailable
 		}
 
@@ -473,59 +487,162 @@ func (s *peerSupervisor) run(ctx context.Context, wg *sync.WaitGroup) {
 		if s.state == PeerStateClosing || ctx.Err() != nil {
 			s.state = PeerStateClosing
 			s.mu.Unlock()
-			_ = conn.Close()
+			_ = rawConn.Close()
 			return
 		}
 		if s.state == PeerStateConnected && s.conn != nil {
 			s.mu.Unlock()
-			_ = conn.Close()
+			_ = rawConn.Close()
 			continue
 		}
+		s.mu.Unlock()
 
-		// Defense-in-depth: on non-loopback connections, verify TLS and peer identity
+		var activeConn net.Conn
 		if !isLoopbackAddress(s.address) {
-			if tc, ok := conn.(*tls.Conn); ok {
-				cs := tc.ConnectionState()
-				if !cs.HandshakeComplete {
-					if err := tc.HandshakeContext(dialCtx); err != nil {
+			// Invariant: On non-loopback peers, custom dialers must NOT return an already-authenticated *tls.Conn.
+			// Lattice mandates that the transport layer itself establishes and verifies the TLS 1.3 mTLS connection.
+			if _, isTLS := rawConn.(*tls.Conn); isTLS {
+				_ = rawConn.Close()
+				s.mu.Lock()
+				s.failures++
+				failures := s.failures
+				s.mu.Unlock()
+				delay := s.calculateBackoff(failures)
+				select {
+				case <-ctx.Done():
+					s.mu.Lock()
+					s.state = PeerStateClosing
+					s.mu.Unlock()
+					return
+				case <-time.After(delay):
+					continue
+				}
+			}
+
+			if s.cfg.TLSConfig == nil {
+				_ = rawConn.Close()
+				s.mu.Lock()
+				s.failures++
+				failures := s.failures
+				s.mu.Unlock()
+				delay := s.calculateBackoff(failures)
+				select {
+				case <-ctx.Done():
+					s.mu.Lock()
+					s.state = PeerStateClosing
+					s.mu.Unlock()
+					return
+				case <-time.After(delay):
+					continue
+				}
+			}
+
+			// Manager-owned TLS handshake over the raw transport connection
+			handshakeCtx, handshakeCancel := context.WithTimeout(ctx, s.cfg.DialTimeout)
+			tlsConn := tls.Client(rawConn, s.cfg.TLSConfig)
+			handshakeErr := tlsConn.HandshakeContext(handshakeCtx)
+			handshakeCancel()
+			if handshakeErr != nil {
+				_ = rawConn.Close()
+				s.mu.Lock()
+				s.failures++
+				failures := s.failures
+				s.mu.Unlock()
+				delay := s.calculateBackoff(failures)
+				select {
+				case <-ctx.Done():
+					s.mu.Lock()
+					s.state = PeerStateClosing
+					s.mu.Unlock()
+					return
+				case <-time.After(delay):
+					continue
+				}
+			}
+
+			// Verify connection admission requirements
+			if err := assertAdmissiblePeerConnection(tlsConn, s.peerID, s.address, s.topology); err != nil {
+				_ = tlsConn.Close()
+				s.mu.Lock()
+				s.failures++
+				failures := s.failures
+				s.mu.Unlock()
+				delay := s.calculateBackoff(failures)
+				select {
+				case <-ctx.Done():
+					s.mu.Lock()
+					s.state = PeerStateClosing
+					s.mu.Unlock()
+					return
+				case <-time.After(delay):
+					continue
+				}
+			}
+
+			activeConn = tlsConn
+		} else {
+			// Loopback peer:
+			if s.cfg.TLSConfig != nil {
+				if _, isTLS := rawConn.(*tls.Conn); !isTLS {
+					handshakeCtx, handshakeCancel := context.WithTimeout(ctx, s.cfg.DialTimeout)
+					tlsConn := tls.Client(rawConn, s.cfg.TLSConfig)
+					handshakeErr := tlsConn.HandshakeContext(handshakeCtx)
+					handshakeCancel()
+					if handshakeErr != nil {
+						_ = rawConn.Close()
+						s.mu.Lock()
+						s.failures++
+						failures := s.failures
 						s.mu.Unlock()
-						_ = conn.Close()
-						continue
+						delay := s.calculateBackoff(failures)
+						select {
+						case <-ctx.Done():
+							s.mu.Lock()
+							s.state = PeerStateClosing
+							s.mu.Unlock()
+							return
+						case <-time.After(delay):
+							continue
+						}
 					}
-					cs = tc.ConnectionState()
-				}
-				if len(cs.PeerCertificates) == 0 {
-					s.mu.Unlock()
-					_ = conn.Close()
-					continue
-				}
-				leaf := cs.PeerCertificates[0]
-				if !IsPeerCertificate(leaf) || IsClientCertificate(leaf) {
-					s.mu.Unlock()
-					_ = conn.Close()
-					continue
-				}
-				nodeID, err := ExtractNodeIDFromCert(leaf)
-				if err != nil || nodeID != s.peerID {
-					s.mu.Unlock()
-					_ = conn.Close()
-					continue
+					activeConn = tlsConn
+				} else {
+					activeConn = rawConn
 				}
 			} else {
-				// Non-loopback peer connections require TLS; raw plaintext conns from custom dialers rejected
-				s.mu.Unlock()
-				_ = conn.Close()
-				continue
+				// Unencrypted loopback (permitted exclusively for local development and unit tests)
+				activeConn = rawConn
 			}
 		}
 
 		// Configure TCP keep-alive
-		configureKeepAlive(conn, s.cfg.KeepAlivePeriod)
+		configureKeepAlive(activeConn, s.cfg.KeepAlivePeriod)
+
+		// Admission into active supervisor connection
+		s.mu.Lock()
+		if s.state == PeerStateClosing || ctx.Err() != nil {
+			s.state = PeerStateClosing
+			s.mu.Unlock()
+			_ = activeConn.Close()
+			return
+		}
+		if s.state == PeerStateConnected && s.conn != nil {
+			s.mu.Unlock()
+			_ = activeConn.Close()
+			continue
+		}
+
+		// Mandatory security assertion at connection admission
+		if err := assertAdmissiblePeerConnection(activeConn, s.peerID, s.address, s.topology); err != nil {
+			s.mu.Unlock()
+			_ = activeConn.Close()
+			continue
+		}
 
 		// Install new active connection with monotonic generation
 		s.generation++
 		curGen := s.generation
-		s.conn = conn
+		s.conn = activeConn
 		s.state = PeerStateConnected
 		s.failures = 0
 		doneCh := make(chan struct{})
@@ -535,7 +652,7 @@ func (s *peerSupervisor) run(ctx context.Context, wg *sync.WaitGroup) {
 
 		// Launch reader loop tracked by supervisor's readerWg
 		s.readerWg.Add(1)
-		go s.runReader(ctx, curGen, conn)
+		go s.runReader(ctx, curGen, activeConn)
 
 		// Await connection termination or manager shutdown
 		select {
@@ -589,10 +706,74 @@ func (s *peerSupervisor) run(ctx context.Context, wg *sync.WaitGroup) {
 	}
 }
 
+// assertAdmissiblePeerConnection performs strict cryptographic and identity verification before
+// any connection is admitted into a peer supervisor (s.conn = conn; s.state = PeerStateConnected).
+//
+// For non-loopback peers:
+// 1. Connection MUST be a *tls.Conn.
+// 2. TLS handshake MUST be complete.
+// 3. Negotiated protocol MUST be TLS 1.3 or higher.
+// 4. Remote peer MUST have presented at least one certificate.
+// 5. The certificate MUST have cryptographically chained to the configured peer CA (VerifiedChains > 0).
+// 6. The leaf certificate MUST assert the Lattice peer role (OU = Lattice Raft Peer) and NOT a client role.
+// 7. The leaf certificate MUST assert an unambiguous NodeID matching the expected target peer ID.
+// 8. The extracted NodeID MUST belong to the configured topology and MUST NOT be the local node (non-self).
+func assertAdmissiblePeerConnection(conn net.Conn, expectedPeerID cluster.NodeID, addr string, topo *cluster.Topology) error {
+	if conn == nil {
+		return errors.ErrNilReceiver
+	}
+	if isLoopbackAddress(addr) {
+		return nil
+	}
+	tc, ok := conn.(*tls.Conn)
+	if !ok {
+		return fmt.Errorf("security violation: non-loopback peer connection %q must be *tls.Conn", addr)
+	}
+	cs := tc.ConnectionState()
+	if !cs.HandshakeComplete {
+		return fmt.Errorf("security violation: non-loopback peer connection %q handshake incomplete", addr)
+	}
+	if cs.Version < tls.VersionTLS13 {
+		return fmt.Errorf("security violation: non-loopback peer connection %q requires TLS 1.3+, got 0x%04x", addr, cs.Version)
+	}
+	if len(cs.PeerCertificates) == 0 {
+		return fmt.Errorf("security violation: non-loopback peer connection %q missing remote certificate", addr)
+	}
+	if len(cs.VerifiedChains) == 0 {
+		return fmt.Errorf("security violation: non-loopback peer connection %q missing verified certificate chain to trusted peer CA", addr)
+	}
+	leaf := cs.PeerCertificates[0]
+	if !IsPeerCertificate(leaf) || IsClientCertificate(leaf) {
+		return fmt.Errorf("security violation: non-loopback peer connection %q certificate missing required peer role", addr)
+	}
+	nodeID, err := ExtractNodeIDFromCert(leaf)
+	if err != nil {
+		return fmt.Errorf("security violation: non-loopback peer connection %q NodeID extraction failed: %w", addr, err)
+	}
+	if nodeID != expectedPeerID {
+		return fmt.Errorf("security violation: non-loopback peer connection %q authenticated NodeID %d != expected %d", addr, nodeID, expectedPeerID)
+	}
+	if topo != nil {
+		if !topo.Contains(nodeID) {
+			return fmt.Errorf("security violation: non-loopback peer connection %q NodeID %d not in cluster topology", addr, nodeID)
+		}
+		if topo.IsSelf(nodeID) {
+			return fmt.Errorf("security violation: non-loopback peer connection %q NodeID %d is local node (self-connection prohibited)", addr, nodeID)
+		}
+	}
+	return nil
+}
+
 // adoptInboundConnection installs an accepted inbound TCP connection into the supervisor,
 // replacing any stale connection, and starts a reader loop.
 // Returns true if connection was adopted, false if rejected.
 func (s *peerSupervisor) adoptInboundConnection(ctx context.Context, conn net.Conn, firstFrame *Frame, localID cluster.NodeID) bool {
+	// Mandatory security assertion at inbound connection admission:
+	if err := assertAdmissiblePeerConnection(conn, s.peerID, s.address, s.topology); err != nil {
+		_ = conn.Close()
+		return false
+	}
+
 	s.mu.Lock()
 	if s.state == PeerStateClosing || ctx.Err() != nil {
 		s.mu.Unlock()
@@ -827,68 +1008,44 @@ func NewPeerConnectionManager(topology *cluster.Topology, cfg PeerConnectionConf
 			continue
 		}
 		peerCfg := cfg
-		if cfg.DialFunc == nil {
+
+		// Manager-owned outbound peer TLS configuration for remote peer p:
+		if cfg.PeerTLSCertFile != "" {
+			peerTLS, err := PeerClientTLSConfig(cfg.PeerTLSCertFile, cfg.PeerTLSKeyFile, cfg.PeerCAFile, p.ID, p.Address, topology)
+			if err != nil {
+				cancel()
+				return nil, fmt.Errorf("failed to configure peer TLS dialer for node %d: %w", p.ID, err)
+			}
+			peerCfg.TLSConfig = peerTLS
+		} else if cfg.TLSConfig != nil {
+			peerTLS := WrapPeerClientTLSConfig(cfg.TLSConfig, p.ID, p.Address, topology)
+			peerCfg.TLSConfig = peerTLS
+		} else if !isLoopbackAddress(p.Address) {
+			cancel()
+			return nil, fmt.Errorf("%w: remote peer %d address %q is non-loopback; Raft peer transport mandates mutual TLS 1.3",
+				errors.ErrInsecureTransport, p.ID, p.Address)
+		}
+
+		// Configure the raw transport dialer (seam for socket injection / test tracking):
+		rawDialer := cfg.RawDialFunc
+		if rawDialer == nil && cfg.DialFunc != nil {
+			rawDialer = RawDialFunc(cfg.DialFunc)
+		}
+		if rawDialer == nil {
 			dialTimeout := cfg.DialTimeout
 			keepAlivePeriod := cfg.KeepAlivePeriod
-
-			if cfg.PeerTLSCertFile != "" {
-				peerTLS, err := PeerClientTLSConfig(cfg.PeerTLSCertFile, cfg.PeerTLSKeyFile, cfg.PeerCAFile, p.ID, p.Address, topology)
-				if err != nil {
-					cancel()
-					return nil, fmt.Errorf("failed to configure peer TLS dialer for node %d: %w", p.ID, err)
+			rawDialer = func(ctx context.Context, addr string) (net.Conn, error) {
+				dialer := &net.Dialer{
+					Timeout:   dialTimeout,
+					KeepAlive: keepAlivePeriod,
 				}
-				peerCfg.TLSConfig = peerTLS
-				peerCfg.DialFunc = func(ctx context.Context, addr string) (net.Conn, error) {
-					dialer := &net.Dialer{
-						Timeout:   dialTimeout,
-						KeepAlive: keepAlivePeriod,
-					}
-					tlsDialer := &tls.Dialer{
-						NetDialer: dialer,
-						Config:    peerTLS,
-					}
-					conn, err := tlsDialer.DialContext(ctx, "tcp", addr)
-					if err != nil {
-						return nil, err
-					}
-					configureKeepAlive(conn, keepAlivePeriod)
-					return conn, nil
-				}
-			} else if cfg.TLSConfig != nil {
-				peerTLS := WrapPeerClientTLSConfig(cfg.TLSConfig, p.ID, p.Address, topology)
-				peerCfg.TLSConfig = peerTLS
-				peerCfg.DialFunc = func(ctx context.Context, addr string) (net.Conn, error) {
-					dialer := &net.Dialer{
-						Timeout:   dialTimeout,
-						KeepAlive: keepAlivePeriod,
-					}
-					tlsDialer := &tls.Dialer{
-						NetDialer: dialer,
-						Config:    peerTLS,
-					}
-					conn, err := tlsDialer.DialContext(ctx, "tcp", addr)
-					if err != nil {
-						return nil, err
-					}
-					configureKeepAlive(conn, keepAlivePeriod)
-					return conn, nil
-				}
-			} else {
-				peerCfg.DialFunc = func(ctx context.Context, addr string) (net.Conn, error) {
-					dialer := &net.Dialer{
-						Timeout:   dialTimeout,
-						KeepAlive: keepAlivePeriod,
-					}
-					conn, err := dialer.DialContext(ctx, "tcp", addr)
-					if err != nil {
-						return nil, err
-					}
-					configureKeepAlive(conn, keepAlivePeriod)
-					return conn, nil
-				}
+				return dialer.DialContext(ctx, "tcp", addr)
 			}
 		}
-		supervisors[p.ID] = newPeerSupervisor(p, peerCfg)
+		peerCfg.RawDialFunc = rawDialer
+		peerCfg.DialFunc = DialFunc(rawDialer)
+
+		supervisors[p.ID] = newPeerSupervisor(p, peerCfg, topology)
 	}
 
 	return &PeerConnectionManager{
