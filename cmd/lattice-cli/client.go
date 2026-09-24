@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net"
 	"sync/atomic"
@@ -42,6 +43,38 @@ func Dial(address string, timeout time.Duration) (*TCPClient, error) {
 		conn:    conn,
 		timeout: timeout,
 	}, nil
+}
+
+// DialConfig establishes a connection to the Lattice server respecting Config's TLS and timeout options.
+func DialConfig(cfg *Config) (*TCPClient, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("config cannot be nil")
+	}
+
+	if cfg.TLS {
+		tlsConfig, err := transport.ClientTLSConfig(cfg.CACert, cfg.Cert, cfg.Key, cfg.ServerName, cfg.InsecureSkipVerify)
+		if err != nil {
+			return nil, fmt.Errorf("tls configuration error: %w", err)
+		}
+		if cfg.ServerName != "" && tlsConfig.ServerName == "" {
+			tlsConfig = tlsConfig.Clone()
+			tlsConfig.ServerName = cfg.ServerName
+		}
+		dialer := &net.Dialer{
+			Timeout:   cfg.Timeout,
+			KeepAlive: 30 * time.Second,
+		}
+		conn, err := tls.DialWithDialer(dialer, "tcp", cfg.Address, tlsConfig)
+		if err != nil {
+			return nil, fmt.Errorf("dial tls %s: %w", cfg.Address, err)
+		}
+		return &TCPClient{
+			conn:    conn,
+			timeout: cfg.Timeout,
+		}, nil
+	}
+
+	return Dial(cfg.Address, cfg.Timeout)
 }
 
 // Execute assigns a monotonic sequence ID to req, writes it over TCP, reads

@@ -402,7 +402,7 @@ func runWithContext(ctx context.Context, args []string, in io.Reader, out, errOu
 	}()
 
 	// Connect to running Lattice node
-	client, err := Dial(cfg.Address, cfg.Timeout)
+	client, err := DialConfig(cfg)
 	if err != nil {
 		fmt.Fprintf(errOut, "error: connection to %s failed: %v\n", cfg.Address, err)
 		return ExitNetworkError

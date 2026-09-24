@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	stdErrors "errors"
 	"fmt"
@@ -51,8 +52,23 @@ type ServerConfig struct {
 	Address string
 
 	// InsecureTransport explicitly permits unencrypted plaintext TCP on non-loopback network interfaces.
-	// When false (default), binding to any non-loopback address (e.g. 0.0.0.0, public IP) is rejected with ErrInsecureTransport.
+	// When false (default), binding to any non-loopback address (e.g. 0.0.0.0, public IP) without TLS is rejected with ErrInsecureTransport.
 	InsecureTransport bool
+
+	// TLSConfig provides full TLS 1.3 configuration. If non-nil, Server runs over TLS.
+	TLSConfig *tls.Config
+
+	// TLSCertFile and TLSKeyFile provide paths to X.509 certificate and private key files.
+	// If set and TLSConfig is nil, Server automatically builds a hardened TLS 1.3 configuration.
+	TLSCertFile string
+	TLSKeyFile  string
+
+	// ClientCAFile provides the path to a trusted CA certificate bundle for client mTLS.
+	// When provided, client certificates are verified against this CA bundle.
+	ClientCAFile string
+
+	// RequireClientCert enforces mandatory client certificate authentication (mTLS) when ClientCAFile is configured.
+	RequireClientCert bool
 
 	// MaxConnections is the maximum number of concurrent client connections (default: 4096).
 	MaxConnections int
@@ -186,11 +202,19 @@ func NewServer(cfg ServerConfig, eng Engine) (*Server, error) {
 		return nil, errors.ErrNilReceiver
 	}
 
+	if cfg.TLSConfig == nil && cfg.TLSCertFile != "" {
+		tlsCfg, err := ServerTLSConfig(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.ClientCAFile, cfg.RequireClientCert)
+		if err != nil {
+			return nil, err
+		}
+		cfg.TLSConfig = tlsCfg
+	}
+
 	defaults := DefaultServerConfig()
 	if cfg.Address == "" {
 		cfg.Address = defaults.Address
 	}
-	if !cfg.InsecureTransport && !isLoopbackAddress(cfg.Address) {
+	if cfg.TLSConfig == nil && !cfg.InsecureTransport && !isLoopbackAddress(cfg.Address) {
 		return nil, errors.ErrInsecureTransport
 	}
 	if cfg.MaxConnections <= 0 {
@@ -319,12 +343,18 @@ func (s *Server) Listen(addr string) error {
 	if bindAddr == "" {
 		bindAddr = s.cfg.Address
 	}
-	if !s.cfg.InsecureTransport && !isLoopbackAddress(bindAddr) {
+	if s.cfg.TLSConfig == nil && !s.cfg.InsecureTransport && !isLoopbackAddress(bindAddr) {
 		s.started.Store(false)
 		return errors.ErrInsecureTransport
 	}
 
-	l, err := net.Listen("tcp", bindAddr)
+	var l net.Listener
+	var err error
+	if s.cfg.TLSConfig != nil {
+		l, err = tls.Listen("tcp", bindAddr, s.cfg.TLSConfig)
+	} else {
+		l, err = net.Listen("tcp", bindAddr)
+	}
 	if err != nil {
 		s.started.Store(false)
 		return err
@@ -348,9 +378,13 @@ func (s *Server) Serve(l net.Listener) error {
 	}
 
 	addrStr := l.Addr().String()
-	if !s.cfg.InsecureTransport && !isLoopbackAddress(addrStr) {
+	if s.cfg.TLSConfig == nil && !s.cfg.InsecureTransport && !isLoopbackAddress(addrStr) {
 		s.started.Store(false)
 		return errors.ErrInsecureTransport
+	}
+
+	if s.cfg.TLSConfig != nil {
+		l = tls.NewListener(l, s.cfg.TLSConfig)
 	}
 
 	s.listener = l
@@ -458,6 +492,19 @@ func (s *Server) handleConn(conn net.Conn) {
 		_ = conn.Close()
 		s.untrackConn(conn)
 	}()
+
+	if tc, ok := conn.(*tls.Conn); ok {
+		handshakeTimeout := s.cfg.HeaderTimeout
+		if handshakeTimeout <= 0 {
+			handshakeTimeout = 5 * time.Second
+		}
+		handshakeCtx, handshakeCancel := context.WithTimeout(connCtx, handshakeTimeout)
+		err := tc.HandshakeContext(handshakeCtx)
+		handshakeCancel()
+		if err != nil {
+			return
+		}
+	}
 
 	maxInFlight := s.cfg.MaxInFlightPerConn
 	if maxInFlight <= 0 {

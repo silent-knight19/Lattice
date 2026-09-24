@@ -1121,3 +1121,97 @@ func TestBinarySubprocess_PipedScriptExecution(t *testing.T) {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, stdout.String())
 	}
 }
+
+func TestE2E_CLI_TLS_And_mTLS(t *testing.T) {
+	ca := newCLITestCA(t, "cli-ca")
+	serverCert, serverKey := ca.issueCert(t, "server", false, true)
+	clientCert, clientKey := ca.issueCert(t, "client", true, false)
+
+	tempDir := t.TempDir()
+	eng := engine.NewEngineWithOptions(engine.EngineOptions{DBPath: tempDir})
+	if err := eng.Open(); err != nil {
+		t.Fatalf("failed to open engine: %v", err)
+	}
+	defer func() {
+		_ = eng.Close()
+	}()
+
+	srvCfg := transport.DefaultServerConfig()
+	srvCfg.Address = "127.0.0.1:0"
+	srvCfg.TLSCertFile = serverCert
+	srvCfg.TLSKeyFile = serverKey
+	srvCfg.ClientCAFile = ca.CertPath
+	srvCfg.RequireClientCert = true // Enforce client mTLS
+
+	srv, err := transport.NewServer(srvCfg, eng)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+	defer func() {
+		_ = srv.Shutdown(context.Background())
+	}()
+
+	serverAddr := ln.Addr().String()
+
+	binPath := filepath.Join(tempDir, "lattice-cli")
+	buildCmd := exec.Command("go", "build", "-o", binPath, ".")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build binary: %v\nOutput: %s", err, string(out))
+	}
+
+	t.Run("Valid mTLS CLI Commands", func(t *testing.T) {
+		cliCmd := exec.Command(binPath,
+			"--address", serverAddr,
+			"--tls",
+			"--ca-cert", ca.CertPath,
+			"--cert", clientCert,
+			"--key", clientKey,
+			"--server-name", "localhost",
+		)
+		input := "PUT secure_k 'secure_v'\nGET secure_k\nEXISTS secure_k\nDELETE secure_k\nEXISTS secure_k\nSTATS\nQUIT\n"
+		cliCmd.Stdin = strings.NewReader(input)
+
+		var stdout, stderr bytes.Buffer
+		cliCmd.Stdout = &stdout
+		cliCmd.Stderr = &stderr
+
+		if err := cliCmd.Run(); err != nil {
+			t.Fatalf("CLI command failed: %v, stderr: %s", err, stderr.String())
+		}
+
+		outStr := stdout.String()
+		if !strings.Contains(outStr, "secure_v") || !strings.Contains(outStr, "true") || !strings.Contains(outStr, "active_memtable_entries") {
+			t.Fatalf("unexpected stdout: %s", outStr)
+		}
+	})
+
+	t.Run("Missing Client Certificate Rejected", func(t *testing.T) {
+		cliCmd := exec.Command(binPath,
+			"--address", serverAddr,
+			"--tls",
+			"--ca-cert", ca.CertPath,
+			"--server-name", "localhost",
+			// No --cert or --key
+		)
+		cliCmd.Stdin = strings.NewReader("GET secure_k\nQUIT\n")
+
+		var stdout, stderr bytes.Buffer
+		cliCmd.Stdout = &stdout
+		cliCmd.Stderr = &stderr
+
+		err := cliCmd.Run()
+		if err == nil {
+			t.Fatalf("expected CLI to fail when server requires client mTLS but no cert was provided")
+		}
+	})
+}

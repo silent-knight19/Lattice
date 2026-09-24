@@ -25,9 +25,15 @@ const (
 
 // Config holds configuration parameters for the lattice-cli REPL.
 type Config struct {
-	Address string
-	Timeout time.Duration
-	NoColor bool
+	Address            string
+	Timeout            time.Duration
+	NoColor            bool
+	TLS                bool
+	CACert             string
+	Cert               string
+	Key                string
+	ServerName         string
+	InsecureSkipVerify bool
 }
 
 // DefaultConfig returns default client configuration connecting to loopback.
@@ -52,6 +58,12 @@ func ParseCLIFlags(args []string, stdout, stderr io.Writer) (*Config, bool, erro
 		flagPort         int
 		flagTimeout      time.Duration
 		flagNoColor      bool
+		flagTLS          bool
+		flagCACert       string
+		flagCert         string
+		flagKey          string
+		flagServerName   string
+		flagInsecure     bool
 		flagHelp         bool
 		flagHelpShort    bool
 		flagVersion      bool
@@ -62,6 +74,12 @@ func ParseCLIFlags(args []string, stdout, stderr io.Writer) (*Config, bool, erro
 	fs.IntVar(&flagPort, "port", -1, "Lattice server port override (1..65535)")
 	fs.DurationVar(&flagTimeout, "timeout", cfg.Timeout, "Request timeout duration")
 	fs.BoolVar(&flagNoColor, "no-color", false, "Disable colored ANSI output")
+	fs.BoolVar(&flagTLS, "tls", false, "Connect using TLS 1.3 encryption")
+	fs.StringVar(&flagCACert, "ca-cert", "", "Path to trusted CA certificate for server verification")
+	fs.StringVar(&flagCert, "cert", "", "Path to client certificate for mutual TLS (mTLS)")
+	fs.StringVar(&flagKey, "key", "", "Path to client private key for mutual TLS (mTLS)")
+	fs.StringVar(&flagServerName, "server-name", "", "Expected TLS server name (SNI/hostname verification)")
+	fs.BoolVar(&flagInsecure, "insecure", false, "Skip TLS server certificate verification (testing only)")
 	fs.BoolVar(&flagHelp, "help", false, "Display usage instructions and exit")
 	fs.BoolVar(&flagHelpShort, "h", false, "Display usage instructions and exit")
 	fs.BoolVar(&flagVersion, "version", false, "Display version information and exit")
@@ -75,6 +93,12 @@ func ParseCLIFlags(args []string, stdout, stderr io.Writer) (*Config, bool, erro
 		fmt.Fprintf(stdout, "  --address string     Server address to connect to (default %q)\n", cfg.Address)
 		fmt.Fprintf(stdout, "  --port int           Server port override (1..65535)\n")
 		fmt.Fprintf(stdout, "  --timeout duration   Request timeout (default %s)\n", DefaultTimeout)
+		fmt.Fprintf(stdout, "  --tls                Connect using TLS 1.3\n")
+		fmt.Fprintf(stdout, "  --ca-cert string     Path to trusted CA certificate\n")
+		fmt.Fprintf(stdout, "  --cert string        Path to client certificate for mTLS\n")
+		fmt.Fprintf(stdout, "  --key string         Path to client private key for mTLS\n")
+		fmt.Fprintf(stdout, "  --server-name string Expected TLS server name\n")
+		fmt.Fprintf(stdout, "  --insecure           Skip TLS certificate verification (testing only)\n")
 		fmt.Fprintf(stdout, "  --no-color           Disable ANSI color formatting\n")
 		fmt.Fprintf(stdout, "  -h, --help           Show help documentation\n")
 		fmt.Fprintf(stdout, "  -v, --version        Show version information\n\n")
@@ -141,6 +165,16 @@ func ParseCLIFlags(args []string, stdout, stderr io.Writer) (*Config, bool, erro
 	cfg.Timeout = flagTimeout
 
 	cfg.NoColor = flagNoColor
+	cfg.TLS = flagTLS || flagCACert != "" || flagCert != ""
+	cfg.CACert = flagCACert
+	cfg.Cert = flagCert
+	cfg.Key = flagKey
+	cfg.ServerName = flagServerName
+	cfg.InsecureSkipVerify = flagInsecure
+
+	if (cfg.Cert != "" && cfg.Key == "") || (cfg.Cert == "" && cfg.Key != "") {
+		return nil, false, fmt.Errorf("both --cert and --key must be provided for client mTLS")
+	}
 
 	return &cfg, false, nil
 }

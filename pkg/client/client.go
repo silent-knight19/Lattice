@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,6 +40,28 @@ var (
 // Options configures the Lattice client connection.
 type Options struct {
 	Timeout time.Duration
+
+	// TLSConfig explicitly provides custom crypto/tls configuration.
+	// When non-nil, connection uses TLS 1.3 with this configuration.
+	TLSConfig *tls.Config
+
+	// EnableTLS enables TLS 1.3 encryption. If CAFile is not specified,
+	// standard system root CAs are used to verify the server certificate.
+	EnableTLS bool
+
+	// CAFile is the path to a trusted CA certificate file (PEM) to verify the server certificate.
+	CAFile string
+
+	// CertFile and KeyFile provide the paths to the client X.509 certificate and private key for mTLS.
+	CertFile string
+	KeyFile  string
+
+	// ServerName specifies the expected TLS server name (SNI and hostname verification).
+	ServerName string
+
+	// InsecureSkipVerify explicitly bypasses server certificate verification (for testing only).
+	// Default is false.
+	InsecureSkipVerify bool
 }
 
 // DefaultOptions returns production default client options.
@@ -68,14 +91,39 @@ func DialWithOptions(address string, opts Options) (*Client, error) {
 		opts.Timeout = 5 * time.Second
 	}
 
-	conn, err := net.DialTimeout("tcp", address, opts.Timeout)
-	if err != nil {
-		return nil, fmt.Errorf("dial tcp %s: %w", address, err)
-	}
+	var conn net.Conn
+	var err error
 
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		_ = tcpConn.SetKeepAlive(true)
-		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	useTLS := opts.EnableTLS || opts.TLSConfig != nil || opts.CAFile != "" || opts.CertFile != ""
+	if useTLS {
+		tlsConfig := opts.TLSConfig
+		if tlsConfig == nil {
+			tlsConfig, err = transport.ClientTLSConfig(opts.CAFile, opts.CertFile, opts.KeyFile, opts.ServerName, opts.InsecureSkipVerify)
+			if err != nil {
+				return nil, fmt.Errorf("tls config: %w", err)
+			}
+		}
+		if opts.ServerName != "" && tlsConfig.ServerName == "" {
+			tlsConfig = tlsConfig.Clone()
+			tlsConfig.ServerName = opts.ServerName
+		}
+		dialer := &net.Dialer{
+			Timeout:   opts.Timeout,
+			KeepAlive: 30 * time.Second,
+		}
+		conn, err = tls.DialWithDialer(dialer, "tcp", address, tlsConfig)
+		if err != nil {
+			return nil, fmt.Errorf("dial tls %s: %w", address, err)
+		}
+	} else {
+		conn, err = net.DialTimeout("tcp", address, opts.Timeout)
+		if err != nil {
+			return nil, fmt.Errorf("dial tcp %s: %w", address, err)
+		}
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			_ = tcpConn.SetKeepAlive(true)
+			_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		}
 	}
 
 	return &Client{

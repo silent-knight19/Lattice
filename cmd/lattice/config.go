@@ -16,6 +16,7 @@ import (
 	"github.com/silent-knight19/lattice/internal/cluster"
 	"github.com/silent-knight19/lattice/internal/errors"
 	"github.com/silent-knight19/lattice/internal/security"
+	"github.com/silent-knight19/lattice/internal/transport"
 )
 
 const (
@@ -79,6 +80,17 @@ type Config struct {
 	PeerAddress       string            `json:"peer_address"`
 	ClusterPeers      ClusterPeersList  `json:"cluster_peers"`
 	Topology          *cluster.Topology `json:"-"`
+
+	// Client TLS
+	TLSCertFile       string `json:"tls_cert_file"`
+	TLSKeyFile        string `json:"tls_key_file"`
+	ClientCAFile      string `json:"client_ca_file"`
+	RequireClientCert bool   `json:"require_client_cert"`
+
+	// Peer mTLS
+	PeerTLSCertFile string `json:"peer_tls_cert_file"`
+	PeerTLSKeyFile  string `json:"peer_tls_key_file"`
+	PeerCAFile      string `json:"peer_ca_file"`
 }
 
 // IsClusterEnabled reports whether clustering configuration is active.
@@ -133,6 +145,13 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 		flagNodeID            uint64
 		flagPeerAddress       string
 		flagClusterPeers      string
+		flagTLSCert           string
+		flagTLSKey            string
+		flagClientCA          string
+		flagRequireClientCert bool
+		flagPeerTLSCert       string
+		flagPeerTLSKey        string
+		flagPeerCA            string
 		flagHelp              bool
 		flagHelpShort         bool
 		flagVersion           bool
@@ -149,6 +168,13 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 	fs.Uint64Var(&flagNodeID, "node-id", 0, "Cluster node ID (> 0 in cluster mode; 0 for single-node)")
 	fs.StringVar(&flagPeerAddress, "peer-address", "", "TCP bind address for Raft peer transport (e.g. 127.0.0.1:9098)")
 	fs.StringVar(&flagClusterPeers, "cluster-peers", "", "Comma-separated list of cluster peers (format: id=host:port, e.g. 1=10.0.0.1:9098,2=10.0.0.2:9098)")
+	fs.StringVar(&flagTLSCert, "tls-cert", "", "Path to X.509 certificate file for client TLS transport")
+	fs.StringVar(&flagTLSKey, "tls-key", "", "Path to private key file for client TLS transport")
+	fs.StringVar(&flagClientCA, "client-ca", "", "Path to trusted CA certificate bundle for client mutual TLS (mTLS)")
+	fs.BoolVar(&flagRequireClientCert, "require-client-cert", false, "Enforce mandatory client certificate authentication (mTLS)")
+	fs.StringVar(&flagPeerTLSCert, "peer-tls-cert", "", "Path to X.509 certificate file for Raft peer mTLS transport")
+	fs.StringVar(&flagPeerTLSKey, "peer-tls-key", "", "Path to private key file for Raft peer mTLS transport")
+	fs.StringVar(&flagPeerCA, "peer-ca", "", "Path to trusted CA certificate bundle for Raft peer mutual authentication")
 	fs.BoolVar(&flagHelp, "help", false, "Display usage instructions and exit")
 	fs.BoolVar(&flagHelpShort, "h", false, "Display usage instructions and exit")
 	fs.BoolVar(&flagVersion, "version", false, "Display version information and exit")
@@ -234,6 +260,27 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 			return nil, false, fmt.Errorf("config error: invalid --cluster-peers: %w", err)
 		}
 		cfg.ClusterPeers = peers
+	}
+	if provided["tls-cert"] {
+		cfg.TLSCertFile = flagTLSCert
+	}
+	if provided["tls-key"] {
+		cfg.TLSKeyFile = flagTLSKey
+	}
+	if provided["client-ca"] {
+		cfg.ClientCAFile = flagClientCA
+	}
+	if provided["require-client-cert"] {
+		cfg.RequireClientCert = flagRequireClientCert
+	}
+	if provided["peer-tls-cert"] {
+		cfg.PeerTLSCertFile = flagPeerTLSCert
+	}
+	if provided["peer-tls-key"] {
+		cfg.PeerTLSKeyFile = flagPeerTLSKey
+	}
+	if provided["peer-ca"] {
+		cfg.PeerCAFile = flagPeerCA
 	}
 
 	// Step 3: Normalize Address and Port
@@ -345,8 +392,46 @@ func (c *Config) Validate() error {
 
 	// Phase 11 Loopback Security Policy (SEC-P11-001):
 	// Unencrypted plaintext TCP is prohibited on non-loopback addresses without explicit opt-in.
-	if !c.InsecureTransport && !isLoopback(host) {
+	hasTLS := c.TLSCertFile != ""
+	if !hasTLS && !c.InsecureTransport && !isLoopback(host) {
 		return errors.ErrInsecureTransport
+	}
+
+	// Client TLS validation
+	if c.TLSCertFile != "" || c.TLSKeyFile != "" {
+		if c.TLSCertFile == "" || c.TLSKeyFile == "" {
+			return fmt.Errorf("config error: both --tls-cert and --tls-key must be specified for TLS")
+		}
+		if err := transport.ValidateCertificateFile(c.TLSCertFile); err != nil {
+			return fmt.Errorf("config error: --tls-cert: %w", err)
+		}
+		if err := transport.ValidateCertificateFile(c.TLSKeyFile); err != nil {
+			return fmt.Errorf("config error: --tls-key: %w", err)
+		}
+	}
+	if c.ClientCAFile != "" {
+		if err := transport.ValidateCertificateFile(c.ClientCAFile); err != nil {
+			return fmt.Errorf("config error: --client-ca: %w", err)
+		}
+	}
+	if c.RequireClientCert && c.ClientCAFile == "" {
+		return fmt.Errorf("config error: --require-client-cert requires --client-ca to be configured")
+	}
+
+	// Peer mTLS validation
+	if c.PeerTLSCertFile != "" || c.PeerTLSKeyFile != "" || c.PeerCAFile != "" {
+		if c.PeerTLSCertFile == "" || c.PeerTLSKeyFile == "" || c.PeerCAFile == "" {
+			return fmt.Errorf("config error: all of --peer-tls-cert, --peer-tls-key, and --peer-ca must be specified for peer mTLS")
+		}
+		if err := transport.ValidateCertificateFile(c.PeerTLSCertFile); err != nil {
+			return fmt.Errorf("config error: --peer-tls-cert: %w", err)
+		}
+		if err := transport.ValidateCertificateFile(c.PeerTLSKeyFile); err != nil {
+			return fmt.Errorf("config error: --peer-tls-key: %w", err)
+		}
+		if err := transport.ValidateCertificateFile(c.PeerCAFile); err != nil {
+			return fmt.Errorf("config error: --peer-ca: %w", err)
+		}
 	}
 
 	// Phase 13 M04 Pprof Security Policy:
@@ -546,6 +631,31 @@ func loadConfigFile(path string) (*Config, error) {
 				return nil, fmt.Errorf("invalid cluster_peers on line %d: %w", lineNum, err)
 			}
 			cfg.ClusterPeers = peers
+		case "tls_cert", "tls_cert_file", "tls-cert", "server.tls_cert", "server.tls_cert_file":
+			canonicalKey = "tls_cert"
+			cfg.TLSCertFile = val
+		case "tls_key", "tls_key_file", "tls-key", "server.tls_key", "server.tls_key_file":
+			canonicalKey = "tls_key"
+			cfg.TLSKeyFile = val
+		case "client_ca", "client_ca_file", "client-ca", "server.client_ca", "server.client_ca_file":
+			canonicalKey = "client_ca"
+			cfg.ClientCAFile = val
+		case "require_client_cert", "require-client-cert", "server.require_client_cert":
+			canonicalKey = "require_client_cert"
+			b, err := strconv.ParseBool(val)
+			if err != nil {
+				return nil, fmt.Errorf("invalid boolean value on line %d: %q", lineNum, val)
+			}
+			cfg.RequireClientCert = b
+		case "peer_tls_cert", "peer_tls_cert_file", "peer-tls-cert", "raft.peer_tls_cert", "raft.peer_tls_cert_file":
+			canonicalKey = "peer_tls_cert"
+			cfg.PeerTLSCertFile = val
+		case "peer_tls_key", "peer_tls_key_file", "peer-tls-key", "raft.peer_tls_key", "raft.peer_tls_key_file":
+			canonicalKey = "peer_tls_key"
+			cfg.PeerTLSKeyFile = val
+		case "peer_ca", "peer_ca_file", "peer-ca", "raft.peer_ca", "raft.peer_ca_file":
+			canonicalKey = "peer_ca"
+			cfg.PeerCAFile = val
 		default:
 			// Allow structural section headers without values (e.g. "server:", "storage:", "cluster:", "raft:")
 			if val == "" {

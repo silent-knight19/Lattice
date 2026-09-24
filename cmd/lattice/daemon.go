@@ -393,6 +393,10 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 	srvCfg := transport.DefaultServerConfig()
 	srvCfg.Address = cfg.Address
 	srvCfg.InsecureTransport = cfg.InsecureTransport
+	srvCfg.TLSCertFile = cfg.TLSCertFile
+	srvCfg.TLSKeyFile = cfg.TLSKeyFile
+	srvCfg.ClientCAFile = cfg.ClientCAFile
+	srvCfg.RequireClientCert = cfg.RequireClientCert
 
 	// In cluster mode: wire persistent Raft storage, Node, ProposalRouter, and apply loop
 	if cfg.IsClusterEnabled() {
@@ -415,6 +419,9 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 
 		peerCfg := transport.DefaultPeerConnectionConfig()
 		peerCfg.InsecureTransport = cfg.InsecureTransport
+		peerCfg.PeerTLSCertFile = cfg.PeerTLSCertFile
+		peerCfg.PeerTLSKeyFile = cfg.PeerTLSKeyFile
+		peerCfg.PeerCAFile = cfg.PeerCAFile
 		peerCfg.OnFrameReceived = func(peerID cluster.NodeID, frame *transport.Frame) {
 			if raftNode != nil {
 				_ = raftNode.HandlePeerFrame(peerID, frame)
