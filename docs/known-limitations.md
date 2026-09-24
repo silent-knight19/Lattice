@@ -1025,12 +1025,11 @@ This document tracks all **genuine architectural and operational limitations** o
   1. *Pure Framing Codec*: Implements the length-prefixed binary wire protocol foundation (`internal/transport`), 18-byte fixed header (`0x4C415454`), 4-byte CRC32-IEEE checksum trailer, and typed Request/Response codec without network listeners or socket management (scheduled for `P11-S01-M02`).
   2. *Pre-Allocation Frame Bounding*: Strict $5\text{MB}$ payload ceiling enforced upon header decode *before* memory allocation. Claims $>5\text{MB}$ fail closed with `ErrFrameTooLarge` and zero payload allocation.
   3. *Unspecified Wire Contract Resolution*:
-     - `OP_PUT`: Encoded as `[ KeyLen (2B uint16 Big-Endian) | Key (KeyLen B) | Value (remainder B) ]`. Eliminates redundant value length headers and guarantees consistency with total payload length.
      - `OP_GET`, `OP_DELETE`, `OP_EXISTS`: Encoded as `[ Key (PayloadLength B) ]` directly utilizing the frame payload length.
-     - `OP_BATCH`: Encoded as `[ Count (4B uint32) | Entries... ]` with entries storing `[ OpType (1B) | KeyLen (2B) | Key | ValLen (4B) | Val ]`. Bounded to $\le 1024$ ops and $\le 5\text{MB}$. Storage-level atomic multi-operation execution remains dependent on a future Engine `WriteBatch` API.
+     - `OP_BATCH`: Encoded as `[ Count (4B uint32) | Entries... ]` with entries storing `[ OpType (1B) | KeyLen (2B) | Key | ValLen (4B) | Val ]`. Bounded to $\le 1024$ ops and $\le 5\text{MB}$. Atomic multi-operation execution is fully implemented end-to-end via the Engine `Batch` API, WAL `BATCH_START`/`BATCH_COMMIT` markers with monotonic sequence numbers, Raft single-command consensus replication, CLI `BATCH` command, and the official Go SDK `pkg/client.WriteBatch`.
      - `OP_STATS`: Validated with zero payload; unexpected bytes rejected.
      - `Response`: Symmetrically framed with 18-byte header where byte 5 is `StatusCode` (`StatusOk=0x00`, `StatusKeyNotFound=0x01`, `StatusError=0x02`, `StatusInvalidRequest=0x03`, `StatusThrottled=0x04`, `StatusServerClosed=0x05`), echoing `SeqID` and `OpCode` with a 4-byte CRC32 trailer. Success GET carries raw value; EXISTS carries 1-byte boolean; failures carry diagnostic message string.
-  4. *Buffer Ownership*: `DecodeRequest` and `DecodeResponse` strictly return independent, defensive slice copies of keys, values, and batches. Source frame buffers may be safely recycled without corrupting decoded structs.
+   4. *Buffer Ownership*: `DecodeRequest` and `DecodeResponse` strictly return independent, defensive slice copies of keys, values, and batches. Source frame buffers may be safely recycled without corrupting decoded structs.
 * **Why It Exists**:
   Separates transport serialization and adversarial framing defense from socket lifecycle and storage engine mechanics.
 * **Impact**:
@@ -1048,9 +1047,14 @@ This document tracks all **genuine architectural and operational limitations** o
   3. *Synchronized Multi-Caller Graceful Shutdown (SEC-P11-003)*: Concurrent invocations of `Server.Shutdown(ctx)` are coordinated via a dedicated `shutdownDone` channel. While the single-winner caller triggers listener close and waits for active connections to drain, all concurrent callers wait on `shutdownDone` (or context cancellation). No caller returns success before all connection goroutines have exited and all sockets are closed.
   4. *Listener Backoff on Temporary Network Errors (GAP-P11-001)*: The accept loop detects transient network errors (`net.Error.Temporary()`, such as `EMFILE`/`ENFILE` file descriptor exhaustion) and applies exponential backoff (5ms to 1s) rather than tightly spinning CPU cycles.
   5. *Supported vs Unsupported Engine Operations*:
-     - `OP_PUT`, `OP_GET`, `OP_DELETE` dispatch directly to Phase 10 `Engine.Put`, `Engine.Get`, and `Engine.Delete`.
-     - `OP_EXISTS`, `OP_BATCH`, `OP_STATS` are rejected deterministically with `StatusInvalidRequest` and explanatory diagnostics, adhering strictly to the principle of not fabricating unexposed storage engine functionality.
-  6. *Slowloris & Resource Defense*:
+     - `OP_PUT`, `OP_GET`, `OP_DELETE`, `OP_BATCH` dispatch directly to `Engine.Put`, `Engine.Get`, `Engine.Delete`, and `Engine.Batch` in standalone mode, or through consensus `ProposalRouter` in cluster mode.
+     - `OP_EXISTS`, `OP_STATS` are rejected deterministically with `StatusInvalidRequest` and explanatory diagnostics, adhering strictly to the principle of not fabricating unexposed storage engine functionality.
+  6. *Batch Atomicity vs Group Commit vs Raft Replication Distinction*:
+     - *User-Level BATCH Atomicity*: An ordered, heterogeneous sequence of `PUT` and `DELETE` mutations (`BATCH(WriteBatch) -> Status`) executing as a single logical database state transition. Visibility is all-or-nothing (readers holding `RLock` over in-memory memtable structures never observe intermediate states). WAL persistence is bracketed by `BATCH_START` and `BATCH_COMMIT` markers with contiguous sequence numbers and `Sync()` durability before returning success. Crash recovery buffers open batches and discards torn batches at EOF.
+     - *Group Commit Coalescing*: An internal I/O durability optimization (`wal.Coordinator` / `GroupCommitRunner`) that amortizes physical `fdatasync()` calls across concurrent unbatched client writes. Group Commit does *not* provide multi-key transactional atomicity between unrelated client operations; each independent write has independent visibility.
+     - *Raft Batch Replication*: In clustered mode, a user-level `BATCH` is packaged into a single Raft log entry (`Command` with `OpTypeBatch`). It is replicated, quorum-committed, and applied to the state machine as one atomic state transition.
+  7. *Slowloris & Resource Defense*:
+
      - Reading frames enforces separate deadlines: `IdleTimeout` (default 60s) for inactivity between requests, `HeaderTimeout` (default 5s) for frame header completion, and `PayloadTimeout` (default 10s) for payload completion.
      - `WriteTimeout` (default 5s) prevents stalled clients from holding server goroutines blocked indefinitely during response transmission.
      - `MaxConnections` (default 1024) caps simultaneous accepted connections to mitigate OS file descriptor and goroutine exhaustion.

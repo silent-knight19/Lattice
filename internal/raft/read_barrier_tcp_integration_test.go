@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/cluster"
 	"github.com/silent-knight19/lattice/internal/errors"
 	"github.com/silent-knight19/lattice/internal/raft"
@@ -87,6 +88,45 @@ func (c *controllableEngineSM) Delete(ctx context.Context, key []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.data, string(key))
+	return nil
+}
+
+func (c *controllableEngineSM) Batch(ctx context.Context, ops []binary.BatchOp) error {
+	c.mu.Lock()
+	pause := false
+	if c.pauseOnKey != "" {
+		for _, op := range ops {
+			if string(op.Key) == c.pauseOnKey {
+				pause = true
+				break
+			}
+		}
+	}
+	c.mu.Unlock()
+
+	if pause {
+		select {
+		case c.applyEntered <- struct{}{}:
+		default:
+		}
+		select {
+		case <-c.applyRelease:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, op := range ops {
+		if op.Type == binary.OpTypePut {
+			cp := make([]byte, len(op.Value))
+			copy(cp, op.Value)
+			c.data[string(op.Key)] = cp
+		} else {
+			delete(c.data, string(op.Key))
+		}
+	}
 	return nil
 }
 

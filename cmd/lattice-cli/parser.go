@@ -24,6 +24,7 @@ const (
 	CmdGet
 	CmdDelete
 	CmdExists
+	CmdBatch
 	CmdStats
 	CmdHelp
 	CmdExit
@@ -40,6 +41,8 @@ func (k CommandKind) String() string {
 		return "DELETE"
 	case CmdExists:
 		return "EXISTS"
+	case CmdBatch:
+		return "BATCH"
 	case CmdStats:
 		return "STATS"
 	case CmdHelp:
@@ -58,6 +61,7 @@ type Command struct {
 	Kind  CommandKind
 	Key   []byte
 	Value []byte
+	Batch []transport.BatchOp
 	Args  []string
 }
 
@@ -272,6 +276,64 @@ func ParseCommand(line string) (*Command, error) {
 		return &Command{
 			Kind: CmdExists,
 			Key:  key,
+		}, nil
+
+	case "BATCH":
+		if len(tokens) < 2 {
+			return nil, errors.New("BATCH requires at least one operation: BATCH [PUT <key> <val> | DELETE <key>]...")
+		}
+		var batchOps []transport.BatchOp
+		idx := 1
+		for idx < len(tokens) {
+			opStr := strings.ToUpper(string(tokens[idx]))
+			switch opStr {
+			case "PUT":
+				if idx+2 >= len(tokens) {
+					return nil, errors.New("BATCH PUT requires key and value: PUT <key> <value>")
+				}
+				key := tokens[idx+1]
+				val := tokens[idx+2]
+				if len(key) == 0 {
+					return nil, errors.New("BATCH PUT key cannot be empty")
+				}
+				if len(key) > transport.MaxKeyLength {
+					return nil, fmt.Errorf("BATCH PUT key length %d exceeds maximum %d", len(key), transport.MaxKeyLength)
+				}
+				if len(val) > transport.MaxValueLength {
+					return nil, fmt.Errorf("BATCH PUT value length %d exceeds maximum %d", len(val), transport.MaxValueLength)
+				}
+				batchOps = append(batchOps, transport.BatchOp{
+					Type:  transport.BatchOpPut,
+					Key:   key,
+					Value: val,
+				})
+				idx += 3
+			case "DELETE":
+				if idx+1 >= len(tokens) {
+					return nil, errors.New("BATCH DELETE requires key: DELETE <key>")
+				}
+				key := tokens[idx+1]
+				if len(key) == 0 {
+					return nil, errors.New("BATCH DELETE key cannot be empty")
+				}
+				if len(key) > transport.MaxKeyLength {
+					return nil, fmt.Errorf("BATCH DELETE key length %d exceeds maximum %d", len(key), transport.MaxKeyLength)
+				}
+				batchOps = append(batchOps, transport.BatchOp{
+					Type: transport.BatchOpDelete,
+					Key:  key,
+				})
+				idx += 2
+			default:
+				return nil, fmt.Errorf("unexpected operation %q in BATCH: expected PUT or DELETE", string(tokens[idx]))
+			}
+		}
+		if len(batchOps) > transport.MaxBatchOps {
+			return nil, fmt.Errorf("BATCH operation count %d exceeds maximum %d", len(batchOps), transport.MaxBatchOps)
+		}
+		return &Command{
+			Kind:  CmdBatch,
+			Batch: batchOps,
 		}, nil
 
 	case "STATS":

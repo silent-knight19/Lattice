@@ -66,6 +66,29 @@ func (m *secMockStateMachine) Delete(ctx context.Context, key []byte) error {
 	return nil
 }
 
+func (m *secMockStateMachine) Batch(ctx context.Context, ops []binary.BatchOp) error {
+	if m.blockCh != nil {
+		select {
+		case <-m.blockCh:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if m.failErr != nil {
+		return m.failErr
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, op := range ops {
+		if op.Type == binary.OpTypePut {
+			m.puts = append(m.puts, secMockPut{Key: append([]byte{}, op.Key...), Value: append([]byte{}, op.Value...)})
+		} else {
+			m.deletes = append(m.deletes, secMockDelete{Key: append([]byte{}, op.Key...)})
+		}
+	}
+	return nil
+}
+
 func (m *secMockStateMachine) putCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1037,11 +1060,15 @@ type noopEngine struct{}
 func (e *noopEngine) Put(ctx context.Context, key, val []byte) error { return nil }
 func (e *noopEngine) Get(key []byte) ([]byte, error)                 { return nil, errors.ErrKeyNotFound }
 func (e *noopEngine) Delete(ctx context.Context, key []byte) error   { return nil }
+func (e *noopEngine) Batch(ctx context.Context, batch []binary.BatchOp) error {
+	return nil
+}
 
 // countingEngine counts direct Engine.Put/Delete calls.
 type countingEngine struct {
 	putCount    atomic.Int64
 	deleteCount atomic.Int64
+	batchCount  atomic.Int64
 }
 
 func (e *countingEngine) Put(ctx context.Context, key, val []byte) error {
@@ -1051,6 +1078,10 @@ func (e *countingEngine) Put(ctx context.Context, key, val []byte) error {
 func (e *countingEngine) Get(key []byte) ([]byte, error) { return nil, errors.ErrKeyNotFound }
 func (e *countingEngine) Delete(ctx context.Context, key []byte) error {
 	e.deleteCount.Add(1)
+	return nil
+}
+func (e *countingEngine) Batch(ctx context.Context, batch []binary.BatchOp) error {
+	e.batchCount.Add(1)
 	return nil
 }
 

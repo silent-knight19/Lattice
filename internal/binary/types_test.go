@@ -89,6 +89,7 @@ func TestOpTypeString(t *testing.T) {
 		{binary.OpTypePut, "PUT"},
 		{binary.OpTypeDelete, "DELETE"},
 		{binary.OpTypeTombstone, "DELETE"},
+		{binary.OpTypeBatch, "BATCH"},
 		{binary.OpTypeInvalid, "UNKNOWN(0x00)"},
 		{binary.OpType(0x03), "UNKNOWN(0x03)"},
 		{binary.OpType(0x7F), "UNKNOWN(0x7f)"},
@@ -116,9 +117,9 @@ func TestParseOpType(t *testing.T) {
 	}
 
 	// Invalid cases
-	invalidBytes := []byte{0x00, 0x03, 0x04, 0x10, 0x7F, 0xFF}
+	invalidBytes := []byte{0x00, 0x03, 0x04, byte(binary.OpTypeBatch), 0x10, 0x7F, 0xFF}
 	for _, b := range invalidBytes {
-		op, err = binary.ParseOpType(b)
+		op, err := binary.ParseOpType(b)
 		if err == nil {
 			t.Fatalf("ParseOpType(0x%02x) expected error, got op=%v", b, op)
 		}
@@ -133,6 +134,46 @@ func TestParseOpType(t *testing.T) {
 		if !stdErrors.As(err, &typedErr) || typedErr.Op != b {
 			t.Fatalf("ParseOpType(0x%02x) failed to extract typed error or Op mismatch: %+v", b, typedErr)
 		}
+	}
+}
+
+func TestOpTypeBatch_ForbiddenInStorageKey(t *testing.T) {
+	// OpTypeBatch is a logical/container opcode, not a valid physical storage mutation type.
+	if binary.OpTypeBatch.Valid() {
+		t.Fatal("OpTypeBatch must not be valid for storage keys")
+	}
+
+	// 1. NewInternalKey rejects OpTypeBatch
+	_, err := binary.NewInternalKey([]byte("user_key"), 100, binary.OpTypeBatch)
+	if !stdErrors.Is(err, errors.ErrInvalidOpType) {
+		t.Fatalf("expected ErrInvalidOpType from NewInternalKey with OpTypeBatch, got %v", err)
+	}
+
+	// 2. ParseOpType rejects OpTypeBatch
+	_, err = binary.ParseOpType(byte(binary.OpTypeBatch))
+	if !stdErrors.Is(err, errors.ErrInvalidOpType) {
+		t.Fatalf("expected ErrInvalidOpType from ParseOpType(OpTypeBatch), got %v", err)
+	}
+
+	// 3. DecodeInternalKey with OpTypeBatch in trailer rejects with ErrInvalidOpType
+	rawKey := binary.AppendInternalKey(nil, binary.InternalKey{
+		UserKey: []byte("user_key"),
+		SeqNum:  100,
+		OpType:  binary.OpTypeBatch,
+	})
+	_, err = binary.DecodeInternalKey(rawKey)
+	if !stdErrors.Is(err, errors.ErrInvalidOpType) {
+		t.Fatalf("expected ErrInvalidOpType from DecodeInternalKey with OpTypeBatch, got %v", err)
+	}
+
+	// 4. BatchOp.Validate() rejects OpTypeBatch within a batch
+	batchOp := binary.BatchOp{
+		Type:  binary.OpTypeBatch,
+		Key:   []byte("user_key"),
+		Value: []byte("value"),
+	}
+	if err := batchOp.Validate(); !stdErrors.Is(err, errors.ErrInvalidOpType) {
+		t.Fatalf("expected ErrInvalidOpType from BatchOp with OpTypeBatch, got %v", err)
 	}
 }
 

@@ -913,6 +913,19 @@ func (e *testEngine) Delete(ctx context.Context, key []byte) error {
 	return nil
 }
 
+func (e *testEngine) Batch(ctx context.Context, ops []binary.BatchOp) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, op := range ops {
+		if op.Type == binary.OpTypePut {
+			e.store[string(op.Key)] = op.Value
+		} else {
+			delete(e.store, string(op.Key))
+		}
+	}
+	return nil
+}
+
 func (e *testEngine) Get(key []byte) ([]byte, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()

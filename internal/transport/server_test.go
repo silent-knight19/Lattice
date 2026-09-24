@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/engine"
 	"github.com/silent-knight19/lattice/internal/errors"
 	"github.com/silent-knight19/lattice/internal/transport"
@@ -20,11 +21,12 @@ import (
 
 // mockEngine satisfies transport.Engine with injectable hooks for error testing.
 type mockEngine struct {
-	mu    sync.RWMutex
-	store map[string][]byte
-	putFn func(ctx context.Context, key, val []byte) error
-	getFn func(key []byte) ([]byte, error)
-	delFn func(ctx context.Context, key []byte) error
+	mu      sync.RWMutex
+	store   map[string][]byte
+	putFn   func(ctx context.Context, key, val []byte) error
+	getFn   func(key []byte) ([]byte, error)
+	delFn   func(ctx context.Context, key []byte) error
+	batchFn func(ctx context.Context, batch []binary.BatchOp) error
 }
 
 func newMockEngine() *mockEngine {
@@ -67,6 +69,24 @@ func (m *mockEngine) Delete(ctx context.Context, key []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.store, string(key))
+	return nil
+}
+
+func (m *mockEngine) Batch(ctx context.Context, batch []binary.BatchOp) error {
+	if m.batchFn != nil {
+		return m.batchFn(ctx, batch)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, op := range batch {
+		if op.Type == binary.OpTypePut {
+			cp := make([]byte, len(op.Value))
+			copy(cp, op.Value)
+			m.store[string(op.Key)] = cp
+		} else if op.Type == binary.OpTypeDelete {
+			delete(m.store, string(op.Key))
+		}
+	}
 	return nil
 }
 
@@ -232,17 +252,6 @@ func TestServer_UnsupportedOpcodes_DoNotFake(t *testing.T) {
 				Key:    []byte("any_key"),
 			},
 			wantMsg: "EXISTS is not implemented",
-		},
-		{
-			name: "OpBatch",
-			req: &transport.Request{
-				OpCode: transport.OpBatch,
-				SeqID:  202,
-				Batch: []transport.BatchOp{
-					{Type: transport.BatchOpPut, Key: []byte("k"), Value: []byte("v")},
-				},
-			},
-			wantMsg: "BATCH is not implemented",
 		},
 		{
 			name: "OpStats",
@@ -637,6 +646,38 @@ func TestServer_RealEngine_Integration(t *testing.T) {
 	}
 	if len(resp.Value) != 0 {
 		t.Fatalf("expected 0-length value, got len %d", len(resp.Value))
+	}
+
+	// 5. BATCH execution over TCP against real Engine
+	batchReq := &transport.Request{
+		OpCode: transport.OpBatch,
+		SeqID:  805,
+		Batch: []transport.BatchOp{
+			{Type: transport.BatchOpPut, Key: []byte("b_k1"), Value: []byte("b_v1")},
+			{Type: transport.BatchOpPut, Key: []byte("b_k2"), Value: []byte("b_v2")},
+			{Type: transport.BatchOpDelete, Key: binaryKey},
+		},
+	}
+	if err := transport.WriteRequest(conn, batchReq); err != nil {
+		t.Fatalf("write BATCH request failed: %v", err)
+	}
+	resp, err = transport.ReadResponse(conn)
+	if err != nil || resp.Status != transport.StatusOk {
+		t.Fatalf("BATCH failed: err=%v, status=%v, msg=%s", err, resp.Status, resp.Message)
+	}
+
+	// Verify batch mutations directly on engine
+	v1, err := eng.Get([]byte("b_k1"))
+	if err != nil || !bytes.Equal(v1, []byte("b_v1")) {
+		t.Fatalf("b_k1 get failed: %v, val=%s", err, string(v1))
+	}
+	v2, err := eng.Get([]byte("b_k2"))
+	if err != nil || !bytes.Equal(v2, []byte("b_v2")) {
+		t.Fatalf("b_k2 get failed: %v, val=%s", err, string(v2))
+	}
+	_, err = eng.Get(binaryKey)
+	if !stdErrors.Is(err, errors.ErrKeyNotFound) {
+		t.Fatalf("expected binaryKey to be deleted, got err=%v", err)
 	}
 }
 

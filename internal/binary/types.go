@@ -24,6 +24,9 @@ const (
 
 	// OpTypeTombstone is an alias for OpTypeDelete, matching storage engine terminology.
 	OpTypeTombstone OpType = OpTypeDelete
+
+	// OpTypeBatch represents an atomic multi-operation batch.
+	OpTypeBatch OpType = 0x05
 )
 
 // Valid reports whether the operation type is one of the recognized operations (PUT or DELETE/TOMBSTONE).
@@ -47,9 +50,36 @@ func (op OpType) String() string {
 		return "PUT"
 	case OpTypeDelete:
 		return "DELETE"
+	case OpTypeBatch:
+		return "BATCH"
 	default:
 		return fmt.Sprintf("UNKNOWN(0x%02x)", byte(op))
 	}
+}
+
+// BatchOp represents a single mutation operation within a multi-operation WriteBatch.
+type BatchOp struct {
+	Type  OpType
+	Key   []byte
+	Value []byte
+}
+
+// Validate verifies that the batch operation satisfies key and value constraints.
+func (b BatchOp) Validate() error {
+	if b.Type != OpTypePut && b.Type != OpTypeDelete {
+		return fmt.Errorf("%w: invalid batch op type 0x%02x", errors.ErrInvalidOpType, byte(b.Type))
+	}
+	if err := ValidateKey(b.Key); err != nil {
+		return err
+	}
+	if b.Type == OpTypePut {
+		if err := ValidateValue(b.Value); err != nil {
+			return err
+		}
+	} else if len(b.Value) != 0 {
+		return fmt.Errorf("%w: DELETE batch op cannot contain non-empty value", errors.ErrInvalidOpType)
+	}
+	return nil
 }
 
 // ParseOpType parses a raw byte into an OpType, validating that it matches a known operation.

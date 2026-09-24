@@ -136,30 +136,66 @@ func (n *Node) routeWriteWithTopology(ctx context.Context, req *transport.Reques
 	}
 
 	// 1. Validate operation code
-	if req.OpCode != transport.OpPut && req.OpCode != transport.OpDelete {
+	if req.OpCode != transport.OpPut && req.OpCode != transport.OpDelete && req.OpCode != transport.OpBatch {
 		resp.Status = transport.StatusInvalidRequest
 		resp.Message = fmt.Sprintf("unsupported operation for write router: 0x%02x", byte(req.OpCode))
 		return resp, nil
 	}
 
 	// 2. Validate request bounds
-	if err := binary.ValidateKey(req.Key); err != nil {
-		resp.Status = transport.StatusInvalidRequest
-		resp.Message = err.Error()
-		return resp, nil
-	}
-	switch req.OpCode {
-	case transport.OpPut:
-		if err := binary.ValidateValue(req.Value); err != nil {
+	if req.OpCode == transport.OpBatch {
+		if len(req.Batch) == 0 {
+			resp.Status = transport.StatusInvalidRequest
+			resp.Message = "BATCH must contain at least one operation"
+			return resp, nil
+		}
+		if len(req.Batch) > transport.MaxBatchOps {
+			resp.Status = transport.StatusInvalidRequest
+			resp.Message = fmt.Sprintf("BATCH operation count %d exceeds maximum %d", len(req.Batch), transport.MaxBatchOps)
+			return resp, nil
+		}
+		for i, bOp := range req.Batch {
+			if !bOp.Type.Valid() {
+				resp.Status = transport.StatusInvalidRequest
+				resp.Message = fmt.Sprintf("batch op %d has invalid type: 0x%02x", i, byte(bOp.Type))
+				return resp, nil
+			}
+			if err := binary.ValidateKey(bOp.Key); err != nil {
+				resp.Status = transport.StatusInvalidRequest
+				resp.Message = fmt.Sprintf("batch op %d key: %v", i, err)
+				return resp, nil
+			}
+			if bOp.Type == transport.BatchOpPut {
+				if err := binary.ValidateValue(bOp.Value); err != nil {
+					resp.Status = transport.StatusInvalidRequest
+					resp.Message = fmt.Sprintf("batch op %d value: %v", i, err)
+					return resp, nil
+				}
+			} else if len(bOp.Value) != 0 {
+				resp.Status = transport.StatusInvalidRequest
+				resp.Message = fmt.Sprintf("batch op %d: DELETE cannot contain non-empty value", i)
+				return resp, nil
+			}
+		}
+	} else {
+		if err := binary.ValidateKey(req.Key); err != nil {
 			resp.Status = transport.StatusInvalidRequest
 			resp.Message = err.Error()
 			return resp, nil
 		}
-	case transport.OpDelete:
-		if len(req.Value) != 0 {
-			resp.Status = transport.StatusInvalidRequest
-			resp.Message = "DELETE command cannot contain non-empty value"
-			return resp, nil
+		switch req.OpCode {
+		case transport.OpPut:
+			if err := binary.ValidateValue(req.Value); err != nil {
+				resp.Status = transport.StatusInvalidRequest
+				resp.Message = err.Error()
+				return resp, nil
+			}
+		case transport.OpDelete:
+			if len(req.Value) != 0 {
+				resp.Status = transport.StatusInvalidRequest
+				resp.Message = "DELETE command cannot contain non-empty value"
+				return resp, nil
+			}
 		}
 	}
 
@@ -186,18 +222,38 @@ func (n *Node) routeWriteWithTopology(ctx context.Context, req *transport.Reques
 	}
 
 	// 6. Case: Leader -> Encode to canonical Raft command
-	var op binary.OpType
-	if req.OpCode == transport.OpPut {
-		op = binary.OpTypePut
+	var cmd Command
+	if req.OpCode == transport.OpBatch {
+		cmdOps := make([]CommandOp, len(req.Batch))
+		for i, op := range req.Batch {
+			opType := binary.OpTypePut
+			if op.Type == transport.BatchOpDelete {
+				opType = binary.OpTypeDelete
+			}
+			cmdOps[i] = CommandOp{
+				Op:    opType,
+				Key:   op.Key,
+				Value: op.Value,
+			}
+		}
+		cmd = Command{
+			Op:    binary.OpTypeBatch,
+			Batch: cmdOps,
+		}
 	} else {
-		op = binary.OpTypeDelete
+		var op binary.OpType
+		if req.OpCode == transport.OpPut {
+			op = binary.OpTypePut
+		} else {
+			op = binary.OpTypeDelete
+		}
+		cmd = Command{
+			Op:    op,
+			Key:   req.Key,
+			Value: req.Value,
+		}
 	}
 
-	cmd := Command{
-		Op:    op,
-		Key:   req.Key,
-		Value: req.Value,
-	}
 	cmdBytes, err := EncodeCommand(cmd)
 	if err != nil {
 		resp.Status = transport.StatusInvalidRequest
@@ -213,6 +269,8 @@ func (n *Node) routeWriteWithTopology(ctx context.Context, req *transport.Reques
 		opStr := "put"
 		if req.OpCode == transport.OpDelete {
 			opStr = "delete"
+		} else if req.OpCode == transport.OpBatch {
+			opStr = "batch"
 		}
 		metrics.RaftProposalLatency.WithLabelValues(opStr).ObserveDuration(time.Since(start))
 		resp.Status = transport.StatusOk

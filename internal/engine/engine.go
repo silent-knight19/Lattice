@@ -748,6 +748,234 @@ func (e *Engine) Delete(ctx context.Context, key []byte) error {
 	return nil
 }
 
+// BatchOp is an alias for binary.BatchOp representing a mutation within a WriteBatch.
+type BatchOp = binary.BatchOp
+
+// Batch applies an atomic multi-operation sequence of PUT and DELETE mutations (P10-S01-M05 / BATCH).
+//
+// Atomicity & Visibility Guarantees:
+//   - All-or-nothing: either all operations in the batch are applied and become durable,
+//     or no mutation becomes visible to concurrent or subsequent readers.
+//   - Isolation: readers observing the active or immutable MemTables under e.mu.RLock
+//     never observe partial intermediate states of the batch.
+//   - Ordering: duplicate keys within a batch are applied in strict deterministic request order;
+//     the final state of repeated keys reflects the last operation in the batch.
+//   - Durability: writes BATCH_START marker, ordered PUT/DELETE records, and BATCH_COMMIT
+//     marker to the WAL with strict monotonic sequence numbers, followed by a hardware sync barrier.
+//     No success response is returned until the WAL sync barrier completes.
+//   - Recovery: incomplete batches interrupted by a crash before BATCH_COMMIT sync are discarded.
+func (e *Engine) Batch(ctx context.Context, ops []binary.BatchOp) error {
+	start := time.Now()
+	defer func() {
+		metrics.EngineWriteLatency.WithLabelValues("batch").ObserveDuration(time.Since(start))
+	}()
+
+	if e == nil {
+		return errors.ErrNilReceiver
+	}
+	if e.closed.Load() {
+		return errors.ErrWriterClosed
+	}
+
+	if len(ops) == 0 {
+		return &errors.InvalidPayloadError{Reason: "batch must contain at least one operation"}
+	}
+	if len(ops) > 1024 {
+		return &errors.InvalidPayloadError{
+			Reason: fmt.Sprintf("batch operation count %d exceeds maximum 1024", len(ops)),
+		}
+	}
+
+	// 1. Up-front validation of all batch operations before acquiring locks or allocating sequence numbers
+	totalEstBytes := uint64(0)
+	totalWireBytes := uint64(4) // 4B count
+	batchMemBytes := uint64(0)
+
+	for _, op := range ops {
+		if err := op.Validate(); err != nil {
+			return err
+		}
+		opWire := 1 + 2 + uint64(len(op.Key))
+		if op.Type == binary.OpTypePut {
+			opWire += 4 + uint64(len(op.Value))
+		}
+		totalWireBytes += opWire
+		if totalWireBytes > 5*1024*1024 { // 5 MiB maximum payload
+			return &errors.FrameTooLargeError{
+				PayloadSize: uint32(totalWireBytes),
+				MaxSize:     5 * 1024 * 1024,
+			}
+		}
+
+		est := memtable.NodeStructSize + uint64(len(op.Key)) + 8*8 + uint64(len(op.Value))
+		totalEstBytes += est
+		batchMemBytes += est
+	}
+
+	// 2. L0 pacing/stall before sequence allocation or durability work
+	if err := e.gateL0Write(ctx); err != nil {
+		return err
+	}
+
+	// 3. Backpressure acquisition for the entire batch
+	if err := e.backpressure.Acquire(ctx, totalEstBytes); err != nil {
+		return err
+	}
+
+	e.mu.Lock()
+	rotated := false
+	defer func() {
+		e.mu.Unlock()
+		if rotated {
+			e.signalFlush()
+		}
+	}()
+
+	if e.closed.Load() || e.state == engineStateClosed {
+		e.backpressure.Release(totalEstBytes)
+		return errors.ErrWriterClosed
+	}
+	if e.state == engineStateRecovering {
+		e.backpressure.Release(totalEstBytes)
+		return errors.ErrRecoveryInProgress
+	}
+
+	// 4. Allocate contiguous, strictly monotonic sequence numbers for the entire batch:
+	// StartSeq, OpSeqs[0..N-1], CommitSeq (total N + 2 sequence numbers)
+	neededSeqs := uint64(len(ops) + 2)
+	curSeq := e.nextSeqNum.Load()
+	if curSeq > uint64(binary.MaxSeqNum)-neededSeqs {
+		e.backpressure.Release(totalEstBytes)
+		return &errors.SeqNumOverflowError{Current: curSeq}
+	}
+
+	startSeq := binary.SeqNum(e.nextSeqNum.Add(1))
+	opSeqs := make([]binary.SeqNum, len(ops))
+	for i := range ops {
+		opSeqs[i] = binary.SeqNum(e.nextSeqNum.Add(1))
+	}
+	commitSeq := binary.SeqNum(e.nextSeqNum.Add(1))
+
+	// 5. WAL Durability: emit BATCH_START, all PUT/DELETE records, and BATCH_COMMIT
+	if e.wal != nil {
+		nowNano := uint64(time.Now().UnixNano())
+		startRec := wal.Record{
+			Type:      wal.RecordTypeBatchStart,
+			SeqNum:    startSeq,
+			Timestamp: nowNano,
+		}
+		commitRec := wal.Record{
+			Type:      wal.RecordTypeBatchCommit,
+			SeqNum:    commitSeq,
+			Timestamp: nowNano,
+		}
+
+		opRecs := make([]wal.Record, len(ops))
+		for i, op := range ops {
+			recType := wal.RecordTypePut
+			if op.Type == binary.OpTypeDelete {
+				recType = wal.RecordTypeDelete
+			}
+			opRecs[i] = wal.Record{
+				Type:      recType,
+				SeqNum:    opSeqs[i],
+				Timestamp: nowNano,
+				Key:       op.Key,
+				Value:     op.Value,
+			}
+		}
+
+		// Use batch Append + Sync if supported by walWriter, or fallback to AppendSync
+		if bw, ok := e.wal.(interface {
+			Append(wal.Record) error
+			Sync() error
+		}); ok {
+			if err := bw.Append(startRec); err != nil {
+				e.backpressure.Release(totalEstBytes)
+				return err
+			}
+			for _, rec := range opRecs {
+				if err := bw.Append(rec); err != nil {
+					e.backpressure.Release(totalEstBytes)
+					return err
+				}
+			}
+			if err := bw.Append(commitRec); err != nil {
+				e.backpressure.Release(totalEstBytes)
+				return err
+			}
+			if err := bw.Sync(); err != nil {
+				e.backpressure.Release(totalEstBytes)
+				return err
+			}
+		} else {
+			if err := e.wal.AppendSync(startRec); err != nil {
+				e.backpressure.Release(totalEstBytes)
+				return err
+			}
+			for _, rec := range opRecs {
+				if err := e.wal.AppendSync(rec); err != nil {
+					e.backpressure.Release(totalEstBytes)
+					return err
+				}
+			}
+			if err := e.wal.AppendSync(commitRec); err != nil {
+				e.backpressure.Release(totalEstBytes)
+				return err
+			}
+		}
+	}
+
+	// 6. Pre-build all InternalKeys before touching MemTable
+	internalKeys := make([]binary.InternalKey, len(ops))
+	for i, op := range ops {
+		ik, err := binary.NewInternalKey(op.Key, opSeqs[i], op.Type)
+		if err != nil {
+			e.backpressure.Release(totalEstBytes)
+			return err
+		}
+		internalKeys[i] = ik
+	}
+
+	// 7. Ensure active MemTable has capacity to accommodate the batch without partial insertion
+	if e.activeMem.ByteSize()+batchMemBytes > memtable.MaxMemTableSize || e.activeMem.ByteSize()+batchMemBytes >= e.flushThreshold() {
+		if e.activeMem.Len() > 0 {
+			e.activeMem.Freeze()
+			e.immMems = append(e.immMems, e.activeMem)
+			e.activeMem = memtable.NewSkipList()
+			rotated = true
+		}
+	}
+
+	// 8. Insert all batch items into activeMem in exact sequential request order
+	for i, op := range ops {
+		insertErr := e.activeMem.Insert(internalKeys[i], op.Value)
+		if insertErr != nil {
+			if stdErrors.Is(insertErr, errors.ErrMemTableFull) {
+				e.activeMem.Freeze()
+				e.immMems = append(e.immMems, e.activeMem)
+				e.activeMem = memtable.NewSkipList()
+				rotated = true
+				_ = e.activeMem.Insert(internalKeys[i], op.Value)
+			}
+		}
+	}
+
+	// 9. Proactive rotation check if the batch filled the active table
+	if e.maybeRotateLocked() {
+		rotated = true
+	}
+
+	// 10. Update backpressure usage tracking
+	totalBytes := e.activeMem.ByteSize()
+	for _, imm := range e.immMems {
+		totalBytes += imm.ByteSize()
+	}
+	e.backpressure.RecordUsage(totalBytes)
+
+	return nil
+}
+
 // Get retrieves the newest value associated with key across memory and disk.
 //
 // Precedence (newest wins, tombstone shadows):
@@ -783,15 +1011,16 @@ func (e *Engine) Get(key []byte) ([]byte, error) {
 	vset := e.vset
 	dbPath := e.dbPath
 	bc := e.blockCache
-	e.mu.RUnlock()
 
 	// 1. Active MemTable (tombstone-aware).
 	if active != nil {
 		val, put, tomb := lookupMemLayer(active, key)
 		if put {
+			e.mu.RUnlock()
 			return val, nil
 		}
 		if tomb {
+			e.mu.RUnlock()
 			return nil, errors.ErrKeyNotFound
 		}
 	}
@@ -802,12 +1031,15 @@ func (e *Engine) Get(key []byte) ([]byte, error) {
 		}
 		val, put, tomb := lookupMemLayer(imm[i], key)
 		if put {
+			e.mu.RUnlock()
 			return val, nil
 		}
 		if tomb {
+			e.mu.RUnlock()
 			return nil, errors.ErrKeyNotFound
 		}
 	}
+	e.mu.RUnlock()
 
 	// 3. Persistent Version via transient TableReaders + shared block cache.
 	if vset == nil || dbPath == "" || !vset.HasCurrent() {

@@ -154,6 +154,7 @@ func printHelp(out io.Writer, style *Style) {
 	fmt.Fprintf(out, "  %s  %s\n", style.Cyan("PUT <key> <value>"), "- Store a key-value pair (supports quotes and \\xHH escapes)")
 	fmt.Fprintf(out, "  %s        %s\n", style.Cyan("GET <key>"), "- Retrieve a value by key")
 	fmt.Fprintf(out, "  %s     %s\n", style.Cyan("DELETE <key>"), "- Delete a key")
+	fmt.Fprintf(out, "  %s      %s\n", style.Cyan("BATCH <ops>"), "- Atomic write batch (e.g. BATCH PUT k1 v1 DELETE k2)")
 	fmt.Fprintf(out, "  %s     %s\n", style.Cyan("EXISTS <key>"), "- Check if key exists (sent to server; currently unsupported)")
 	fmt.Fprintf(out, "  %s            %s\n", style.Cyan("STATS"), "- Query server statistics (sent to server; currently unsupported)")
 	fmt.Fprintf(out, "  %s             %s\n", style.Cyan("HELP"), "- Display this help documentation")
@@ -164,6 +165,7 @@ func printHelp(out io.Writer, style *Style) {
 	fmt.Fprintf(out, "  PUT bin \"\\x00\\x01\\x02\\xff\"\n")
 	fmt.Fprintf(out, "  PUT empty \"\"\n")
 	fmt.Fprintf(out, "  DELETE user:1001\n")
+	fmt.Fprintf(out, "  BATCH PUT k1 v1 PUT k2 v2 DELETE user:1001\n")
 }
 
 // readLineBounded reads up to maxBytes from r until newline, preventing memory exhaustion DoS.
@@ -260,6 +262,21 @@ func executeCommand(client LatticeClient, cmd *Command, out io.Writer, style *St
 			} else {
 				fmt.Fprintln(out, "false")
 			}
+		} else {
+			fmt.Fprintf(out, "%s\n", style.Red(fmt.Sprintf("(error) %s", resp.Message)))
+		}
+
+	case CmdBatch:
+		req := &transport.Request{
+			OpCode: transport.OpBatch,
+			Batch:  cmd.Batch,
+		}
+		resp, err := client.Execute(req)
+		if err != nil {
+			return err
+		}
+		if resp.Status == transport.StatusOk {
+			fmt.Fprintln(out, style.Green("OK"))
 		} else {
 			fmt.Fprintf(out, "%s\n", style.Red(fmt.Sprintf("(error) %s", resp.Message)))
 		}

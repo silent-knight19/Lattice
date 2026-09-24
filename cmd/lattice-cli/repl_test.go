@@ -329,6 +329,41 @@ func TestParseCommand_Validation(t *testing.T) {
 		t.Errorf("expected valid EXISTS, got cmd=%v, err=%v", cmd, err)
 	}
 
+	// BATCH validation
+	_, err = ParseCommand("BATCH")
+	if err == nil || !strings.Contains(err.Error(), "requires at least one operation") {
+		t.Errorf("expected error for empty BATCH, got: %v", err)
+	}
+	_, err = ParseCommand("BATCH PUT")
+	if err == nil || !strings.Contains(err.Error(), "requires key and value") {
+		t.Errorf("expected error for incomplete BATCH PUT, got: %v", err)
+	}
+	_, err = ParseCommand("BATCH PUT k")
+	if err == nil || !strings.Contains(err.Error(), "requires key and value") {
+		t.Errorf("expected error for incomplete BATCH PUT, got: %v", err)
+	}
+	_, err = ParseCommand("BATCH DELETE")
+	if err == nil || !strings.Contains(err.Error(), "requires key") {
+		t.Errorf("expected error for incomplete BATCH DELETE, got: %v", err)
+	}
+	_, err = ParseCommand("BATCH FOOBAR k")
+	if err == nil || !strings.Contains(err.Error(), "unexpected operation") {
+		t.Errorf("expected error for unknown op in BATCH, got: %v", err)
+	}
+	cmd, err = ParseCommand("batch put k1 v1 delete k2 put k3 v3")
+	if err != nil || cmd.Kind != CmdBatch || len(cmd.Batch) != 3 {
+		t.Fatalf("expected valid BATCH with 3 ops, got cmd=%v, err=%v", cmd, err)
+	}
+	if cmd.Batch[0].Type != transport.BatchOpPut || string(cmd.Batch[0].Key) != "k1" || string(cmd.Batch[0].Value) != "v1" {
+		t.Errorf("unexpected batch op 0: %v", cmd.Batch[0])
+	}
+	if cmd.Batch[1].Type != transport.BatchOpDelete || string(cmd.Batch[1].Key) != "k2" {
+		t.Errorf("unexpected batch op 1: %v", cmd.Batch[1])
+	}
+	if cmd.Batch[2].Type != transport.BatchOpPut || string(cmd.Batch[2].Key) != "k3" || string(cmd.Batch[2].Value) != "v3" {
+		t.Errorf("unexpected batch op 2: %v", cmd.Batch[2])
+	}
+
 	// STATS validation
 	_, err = ParseCommand("STATS extra")
 	if err == nil || !strings.Contains(err.Error(), "takes no arguments") {
@@ -555,7 +590,30 @@ func TestExecuteCommand_MockCases(t *testing.T) {
 		t.Errorf("expected %q, got %q", expectedStatsErr, out.String())
 	}
 
-	// 8. Network Error during Execution
+	// 8. BATCH Success
+	out.Reset()
+	client.executeFn = func(req *transport.Request) (*transport.Response, error) {
+		if req.OpCode != transport.OpBatch {
+			t.Fatalf("expected OpBatch, got %s", req.OpCode)
+		}
+		if len(req.Batch) != 2 {
+			t.Fatalf("expected 2 batch ops, got %d", len(req.Batch))
+		}
+		return &transport.Response{
+			OpCode: transport.OpBatch,
+			Status: transport.StatusOk,
+			SeqID:  req.SeqID,
+		}, nil
+	}
+	cmd, _ = ParseCommand("BATCH PUT k1 v1 DELETE k2")
+	if err := executeCommand(client, cmd, &out, style); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.TrimSpace(out.String()) != "OK" {
+		t.Errorf("expected OK, got %q", out.String())
+	}
+
+	// 9. Network Error during Execution
 	client.executeFn = func(req *transport.Request) (*transport.Response, error) {
 		return nil, errors.New("connection reset by peer")
 	}
@@ -850,13 +908,19 @@ func TestRealTCPIntegration(t *testing.T) {
 		"DELETE user:1001",
 		"GET user:1001",
 
-		// 5. EXISTS (Unsupported operation from server)
+		// 5. BATCH atomic mutations
+		"BATCH PUT b1 v1 PUT b2 v2 DELETE empty:key",
+		"GET b1",
+		"GET b2",
+		"GET empty:key",
+
+		// 6. EXISTS (Unsupported operation from server)
 		"EXISTS anykey",
 
-		// 6. STATS (Unsupported operation from server)
+		// 7. STATS (Unsupported operation from server)
 		"STATS",
 
-		// 7. Clean Exit
+		// 8. Clean Exit
 		"EXIT",
 	}
 
@@ -878,6 +942,10 @@ func TestRealTCPIntegration(t *testing.T) {
 		"OK",
 		`"\x00\x01\x02\xff"`,
 		"OK",
+		"NOT FOUND",
+		"OK",
+		"v1",
+		"v2",
 		"NOT FOUND",
 		"(error) unsupported operation: EXISTS is not implemented by storage engine",
 		"(error) unsupported operation: STATS is not implemented by storage engine",

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/transport"
 )
 
@@ -313,11 +314,27 @@ func TestDaemon_ClusterMode_MissingRouterFailsClosed(t *testing.T) {
 	if eng.delCalls != 0 {
 		t.Fatalf("Engine.Delete was called directly (%d times) — bypass violation!", eng.delCalls)
 	}
+
+	// BATCH must also be rejected fail-closed
+	batchResp := srv.TestDispatch(&transport.Request{
+		OpCode: transport.OpBatch,
+		Batch: []transport.BatchOp{
+			{Type: transport.BatchOpPut, Key: []byte("k"), Value: []byte("v")},
+		},
+		SeqID: 3,
+	})
+	if batchResp.Status != transport.StatusError {
+		t.Fatalf("expected StatusError for BATCH when router is nil in cluster mode, got %v", batchResp.Status)
+	}
+	if eng.batchCalls != 0 {
+		t.Fatalf("Engine.Batch was called directly (%d times) — bypass violation!", eng.batchCalls)
+	}
 }
 
 type testCountingEngine struct {
-	putCalls int
-	delCalls int
+	putCalls   int
+	delCalls   int
+	batchCalls int
 }
 
 func (e *testCountingEngine) Put(ctx context.Context, key, val []byte) error {
@@ -331,5 +348,10 @@ func (e *testCountingEngine) Get(key []byte) ([]byte, error) {
 
 func (e *testCountingEngine) Delete(ctx context.Context, key []byte) error {
 	e.delCalls++
+	return nil
+}
+
+func (e *testCountingEngine) Batch(ctx context.Context, batch []binary.BatchOp) error {
+	e.batchCalls++
 	return nil
 }

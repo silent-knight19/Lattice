@@ -148,6 +148,14 @@ The engine exposes five canonical operations over TCP:
 * `DELETE(Key) -> Status`: Atomically record a tombstone, rendering the key nonexistent.
 * `EXISTS(Key) -> (Bool, Status)`: Low-overhead metadata existence check.
 * `BATCH(WriteBatch) -> Status`: Atomic application of a heterogeneous sequence of `PUT` and `DELETE` operations.
+  - **Batch Ordering Semantics**: Operations in a batch are applied in strict sequential request order. If a batch contains duplicate keys, subsequent operations deterministically overwrite or delete previous ones (e.g. `PUT A=1`, `DELETE A`, `PUT A=2` results in `A=2`).
+  - **Atomic Visibility**: Concurrent reads never observe an intermediate state of an executing batch. The entire batch is either completely visible or not visible at all.
+  - **Durability Guarantee**: Live writes emit `BATCH_START` followed by ordered `PUT`/`DELETE` records, concluded with `BATCH_COMMIT` under contiguous sequence numbers, and explicitly execute `Sync()` to disk before client acknowledgment.
+  - **Recovery Contract**: Open batches torn at log tail without a matching `BATCH_COMMIT` are discarded during recovery; fully committed batches are recovered in totality.
+  - **Architectural Distinction**:
+    - *User-Level BATCH Atomicity*: Transactional all-or-nothing semantic contract for a user's multi-key mutation.
+    - *Group Commit Batching*: Storage engine physical I/O optimization amortizing `fdatasync()` across concurrent independent writes without merging logical transactions.
+    - *Raft Batch Replication*: Clustered consensus replication where an entire user batch is packaged into a single Raft log entry (`OpTypeBatch`) and applied atomically across the replicated state machine.
 
 ### 5.2 Service-Level Performance Targets (Single-Node Baseline on Modern NVMe SSD)
 * **Write Throughput**: $\ge 80,000 \text{ ops/sec}$ with Group Commit enabled.

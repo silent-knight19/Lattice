@@ -36,6 +36,7 @@ const (
 type StateMachine interface {
 	Put(ctx context.Context, key, val []byte) error
 	Delete(ctx context.Context, key []byte) error
+	Batch(ctx context.Context, ops []binary.BatchOp) error
 }
 
 // StartApplyLoop initializes and starts the authoritative state machine apply loop.
@@ -350,6 +351,20 @@ func (n *Node) applySingleEntry(entry LogEntry) error {
 		case binary.OpTypeDelete:
 			if err := n.stateMachine.Delete(ctx, cmd.Key); err != nil {
 				return fmt.Errorf("%w: state machine Delete failed at index %d: %v", errors.ErrRaftApplyFailed, entry.Index, err)
+			}
+			return nil
+
+		case binary.OpTypeBatch:
+			ops := make([]binary.BatchOp, len(cmd.Batch))
+			for i, op := range cmd.Batch {
+				ops[i] = binary.BatchOp{
+					Type:  op.Op,
+					Key:   op.Key,
+					Value: op.Value,
+				}
+			}
+			if err := n.stateMachine.Batch(ctx, ops); err != nil {
+				return fmt.Errorf("%w: state machine Batch failed at index %d: %v", errors.ErrRaftApplyFailed, entry.Index, err)
 			}
 			return nil
 

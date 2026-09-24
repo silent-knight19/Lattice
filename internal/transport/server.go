@@ -22,6 +22,7 @@ type Engine interface {
 	Put(ctx context.Context, key, val []byte) error
 	Get(key []byte) ([]byte, error)
 	Delete(ctx context.Context, key []byte) error
+	Batch(ctx context.Context, batch []binary.BatchOp) error
 }
 
 // ProposalRouter defines the interface for routing client write mutations in replicated mode (P16-S01-M02).
@@ -562,6 +563,8 @@ func (s *Server) dispatch(req *Request) (finalResp *Response) {
 				opStr = "get"
 			case OpDelete:
 				opStr = "delete"
+			case OpBatch:
+				opStr = "batch"
 			default:
 				return
 			}
@@ -672,8 +675,31 @@ func (s *Server) dispatch(req *Request) (finalResp *Response) {
 		resp.Message = "unsupported operation: EXISTS is not implemented by storage engine"
 
 	case OpBatch:
-		resp.Status = StatusInvalidRequest
-		resp.Message = "unsupported operation: BATCH is not implemented by storage engine"
+		if router != nil {
+			r, err := router.RouteWrite(ctx, req)
+			if err != nil {
+				resp.Status = StatusError
+				resp.Message = "internal routing error"
+				return resp
+			}
+			return r
+		}
+		// In cluster mode, NEVER fall through to direct Engine writes.
+		if s.clusterMode {
+			resp.Status = StatusError
+			resp.Message = "cluster mode active but consensus router unavailable"
+			return resp
+		}
+		bOps := make([]binary.BatchOp, len(req.Batch))
+		for i, op := range req.Batch {
+			bOps[i] = binary.BatchOp{
+				Type:  binary.OpType(op.Type),
+				Key:   op.Key,
+				Value: op.Value,
+			}
+		}
+		err := s.engine.Batch(ctx, bOps)
+		s.mapEngineError(err, resp)
 
 	case OpStats:
 		resp.Status = StatusInvalidRequest
@@ -725,6 +751,11 @@ func (s *Server) mapEngineError(err error, resp *Response) {
 	if stdErrors.Is(err, errors.ErrInvalidPayload) {
 		resp.Status = StatusInvalidRequest
 		resp.Message = errors.ErrInvalidPayload.Error()
+		return
+	}
+	if stdErrors.Is(err, errors.ErrInvalidOpType) {
+		resp.Status = StatusInvalidRequest
+		resp.Message = errors.ErrInvalidOpType.Error()
 		return
 	}
 	// Sanitize general storage errors to avoid disclosing filesystem paths or internal diagnostics

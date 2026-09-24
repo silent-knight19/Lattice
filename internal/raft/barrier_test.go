@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/cluster"
 	"github.com/silent-knight19/lattice/internal/errors"
 	"github.com/silent-knight19/lattice/internal/raft"
@@ -46,6 +47,24 @@ func (m *mockStateMachine) Delete(ctx context.Context, key []byte) error {
 	}
 	m.deletes[string(key)] = struct{}{}
 	delete(m.puts, string(key))
+	return nil
+}
+
+func (m *mockStateMachine) Batch(ctx context.Context, ops []binary.BatchOp) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.err != nil {
+		return m.err
+	}
+	for _, op := range ops {
+		if op.Type == binary.OpTypePut {
+			m.puts[string(op.Key)] = string(op.Value)
+			delete(m.deletes, string(op.Key))
+		} else {
+			m.deletes[string(op.Key)] = struct{}{}
+			delete(m.puts, string(op.Key))
+		}
+	}
 	return nil
 }
 

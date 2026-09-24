@@ -85,6 +85,36 @@ func (m *mockStateMachine) Delete(ctx context.Context, key []byte) error {
 	return nil
 }
 
+func (m *mockStateMachine) Batch(ctx context.Context, ops []binary.BatchOp) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.currentCalls++
+	if m.failOnCount > 0 && m.currentCalls == m.failOnCount {
+		err := m.failErr
+		if err == nil {
+			err = errors.New("mock state machine batch failure")
+		}
+		return err
+	}
+	for _, op := range ops {
+		if err, ok := m.failOnKey[string(op.Key)]; ok {
+			return err
+		}
+	}
+
+	for _, op := range ops {
+		cmd := Command{
+			Op:    op.Type,
+			Key:   append([]byte(nil), op.Key...),
+			Value: append([]byte(nil), op.Value...),
+		}
+		m.appliedOps = append(m.appliedOps, cmd)
+		m.appliedKeys = append(m.appliedKeys, string(op.Key))
+	}
+	return nil
+}
+
 func (m *mockStateMachine) opsCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
