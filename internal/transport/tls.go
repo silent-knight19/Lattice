@@ -157,9 +157,32 @@ func ClientTLSConfig(caFile, certFile, keyFile, serverName string, insecureSkipV
 
 // ExtractNodeIDFromCert inspects X.509 Subject Alternative Names and CommonName
 // to extract the authoritative cluster NodeID identity asserted by the certificate.
+//
+// Invariants enforced:
+//   - cert must be non-nil.
+//   - At least one valid NodeID candidate must be asserted.
+//   - If multiple NodeID candidates are present across SAN URIs, SAN DNS names, or CN,
+//     all extracted NodeIDs MUST be identical. Conflicting NodeID assertions cause fail-closed rejection.
 func ExtractNodeIDFromCert(cert *x509.Certificate) (cluster.NodeID, error) {
 	if cert == nil {
 		return cluster.NodeIDNil, errors.ErrNilReceiver
+	}
+
+	var foundID cluster.NodeID
+
+	checkID := func(id cluster.NodeID, source string) error {
+		if !id.IsValid() {
+			return nil
+		}
+		if foundID == cluster.NodeIDNil {
+			foundID = id
+			return nil
+		}
+		if foundID != id {
+			return fmt.Errorf("conflicting NodeID assertions in certificate (%s asserts %d, previous asserted %d)",
+				source, id, foundID)
+		}
+		return nil
 	}
 
 	// 1. Check SAN URIs: spiffe://lattice/node/<id> or lattice://node/<id>
@@ -168,7 +191,9 @@ func ExtractNodeIDFromCert(cert *x509.Certificate) (cluster.NodeID, error) {
 			parts := strings.Split(strings.Trim(uri.Path, "/"), "/")
 			if len(parts) >= 2 && parts[0] == "node" {
 				if id, err := cluster.ParseNodeID(parts[1]); err == nil && id.IsValid() {
-					return id, nil
+					if err := checkID(id, "SAN URI"); err != nil {
+						return cluster.NodeIDNil, err
+					}
 				}
 			}
 		}
@@ -177,17 +202,25 @@ func ExtractNodeIDFromCert(cert *x509.Certificate) (cluster.NodeID, error) {
 	// 2. Check SAN DNS Names: node-<id>, node<id>, peer-<id>, <id>
 	for _, dns := range cert.DNSNames {
 		if id, ok := parseNodeIDString(dns); ok {
-			return id, nil
+			if err := checkID(id, fmt.Sprintf("SAN DNS %q", dns)); err != nil {
+				return cluster.NodeIDNil, err
+			}
 		}
 	}
 
 	// 3. Check Subject CommonName
 	if id, ok := parseNodeIDString(cert.Subject.CommonName); ok {
-		return id, nil
+		if err := checkID(id, fmt.Sprintf("CN %q", cert.Subject.CommonName)); err != nil {
+			return cluster.NodeIDNil, err
+		}
 	}
 
-	return cluster.NodeIDNil, fmt.Errorf("no valid NodeID found in certificate (CN=%q, DNS=%v)",
-		cert.Subject.CommonName, cert.DNSNames)
+	if foundID == cluster.NodeIDNil {
+		return cluster.NodeIDNil, fmt.Errorf("no valid NodeID found in certificate (CN=%q, DNS=%v)",
+			cert.Subject.CommonName, cert.DNSNames)
+	}
+
+	return foundID, nil
 }
 
 // parseNodeIDString attempts to extract a valid NodeID from common naming patterns.
@@ -254,6 +287,149 @@ func IsClientCertificate(cert *x509.Certificate) bool {
 	return false
 }
 
+// WrapPeerServerTLSConfig clones cfg and installs/chains the mandatory Lattice inbound peer identity
+// verification callback, preserving any caller-provided VerifyConnection.
+//
+// Invariants enforced by the verification callback:
+//   - Normal TLS verification against ClientCAs succeeds.
+//   - Caller-provided VerifyConnection (if non-nil) must succeed.
+//   - At least one client certificate is presented.
+//   - Certificate asserts Lattice Raft peer role (OU='Lattice Raft Peer').
+//   - Certificate does NOT assert Lattice client role (PKI separation).
+//   - Certificate NodeID extracted via ExtractNodeIDFromCert is valid.
+//   - If topology is non-nil:
+//   - Asserted NodeID must not be the local node (self-connections prohibited).
+//   - Asserted NodeID must belong to the configured topology.
+func WrapPeerServerTLSConfig(cfg *tls.Config, topology *cluster.Topology) *tls.Config {
+	if cfg == nil {
+		return nil
+	}
+	wrapped := cfg.Clone()
+	callerVerify := cfg.VerifyConnection
+
+	wrapped.VerifyConnection = func(cs tls.ConnectionState) error {
+		// 1. Caller-provided verification must succeed first if present
+		if callerVerify != nil {
+			if err := callerVerify(cs); err != nil {
+				return fmt.Errorf("caller TLS verification rejected connection: %w", err)
+			}
+		}
+
+		// 2. Mandatory Lattice peer identity verification
+		if len(cs.PeerCertificates) == 0 {
+			return stdErrors.New("no client certificate presented during peer handshake")
+		}
+		leaf := cs.PeerCertificates[0]
+
+		if !IsPeerCertificate(leaf) {
+			return stdErrors.New("certificate rejected: missing required Raft peer role (OU='Lattice Raft Peer')")
+		}
+		if IsClientCertificate(leaf) {
+			return stdErrors.New("certificate rejected: client certificate cannot authenticate as Raft peer (PKI separation violation)")
+		}
+
+		nodeID, err := ExtractNodeIDFromCert(leaf)
+		if err != nil {
+			return fmt.Errorf("failed to extract peer NodeID from certificate: %w", err)
+		}
+
+		if topology != nil {
+			if topology.IsSelf(nodeID) {
+				return fmt.Errorf("inbound peer connection authenticated as local node ID %d; self-connections prohibited", nodeID)
+			}
+			if !topology.Contains(nodeID) {
+				return fmt.Errorf("peer authenticated as NodeID %d which is not a recognized member of cluster topology", nodeID)
+			}
+		}
+
+		return nil
+	}
+
+	return wrapped
+}
+
+// WrapPeerClientTLSConfig clones cfg and installs/chains the mandatory Lattice outbound peer identity
+// verification callback for targetPeerID, preserving any caller-provided VerifyConnection.
+//
+// Invariants enforced by the verification callback:
+//   - Normal TLS verification against RootCAs succeeds.
+//   - Caller-provided VerifyConnection (if non-nil) must succeed.
+//   - At least one server certificate is presented.
+//   - Certificate asserts Lattice Raft peer role (OU='Lattice Raft Peer').
+//   - Certificate does NOT assert Lattice client role (PKI separation).
+//   - Certificate NodeID extracted via ExtractNodeIDFromCert is valid.
+//   - Asserted NodeID must match targetPeerID exactly (expected peer binding).
+//   - If topology is non-nil:
+//   - Asserted NodeID must not be the local node (self-connections prohibited).
+//   - Asserted NodeID must belong to the configured topology.
+func WrapPeerClientTLSConfig(cfg *tls.Config, targetPeerID cluster.NodeID, targetAddr string, topology *cluster.Topology) *tls.Config {
+	if cfg == nil {
+		return nil
+	}
+	wrapped := cfg.Clone()
+	if wrapped.RootCAs == nil && wrapped.ClientCAs != nil {
+		wrapped.RootCAs = wrapped.ClientCAs
+	}
+
+	// Determine server name for TLS SNI if not already configured
+	if wrapped.ServerName == "" {
+		serverName := fmt.Sprintf("node-%d", targetPeerID)
+		if targetAddr != "" {
+			host, _, err := net.SplitHostPort(targetAddr)
+			if err == nil && net.ParseIP(host) == nil && host != "localhost" {
+				serverName = host
+			}
+		}
+		wrapped.ServerName = serverName
+	}
+
+	callerVerify := cfg.VerifyConnection
+
+	wrapped.VerifyConnection = func(cs tls.ConnectionState) error {
+		// 1. Caller-provided verification must succeed first if present
+		if callerVerify != nil {
+			if err := callerVerify(cs); err != nil {
+				return fmt.Errorf("caller TLS verification rejected connection: %w", err)
+			}
+		}
+
+		// 2. Mandatory Lattice peer identity verification
+		if len(cs.PeerCertificates) == 0 {
+			return stdErrors.New("no server certificate presented by remote peer")
+		}
+		leaf := cs.PeerCertificates[0]
+
+		if !IsPeerCertificate(leaf) {
+			return stdErrors.New("remote certificate rejected: missing required Raft peer role (OU='Lattice Raft Peer')")
+		}
+		if IsClientCertificate(leaf) {
+			return stdErrors.New("remote certificate rejected: client certificate cannot authenticate as Raft peer (PKI separation violation)")
+		}
+
+		nodeID, err := ExtractNodeIDFromCert(leaf)
+		if err != nil {
+			return fmt.Errorf("failed to extract NodeID from remote peer certificate: %w", err)
+		}
+
+		if nodeID != targetPeerID {
+			return fmt.Errorf("peer certificate NodeID mismatch: expected %d, remote asserted %d", targetPeerID, nodeID)
+		}
+
+		if topology != nil {
+			if topology.IsSelf(nodeID) {
+				return fmt.Errorf("remote peer authenticated as local node ID %d; self-connections prohibited", nodeID)
+			}
+			if !topology.Contains(nodeID) {
+				return fmt.Errorf("remote peer NodeID %d is not in configured cluster topology", nodeID)
+			}
+		}
+
+		return nil
+	}
+
+	return wrapped
+}
+
 // PeerServerTLSConfig constructs a hardened TLS 1.3 listener configuration for inbound Raft peer connections.
 func PeerServerTLSConfig(certFile, keyFile, peerCAFile string, topology *cluster.Topology) (*tls.Config, error) {
 	if err := ValidateCertificateFile(certFile); err != nil {
@@ -284,34 +460,7 @@ func PeerServerTLSConfig(certFile, keyFile, peerCAFile string, topology *cluster
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 	}
 
-	cfg.VerifyConnection = func(cs tls.ConnectionState) error {
-		if len(cs.PeerCertificates) == 0 {
-			return stdErrors.New("no client certificate presented during peer handshake")
-		}
-		leaf := cs.PeerCertificates[0]
-
-		if !IsPeerCertificate(leaf) {
-			return stdErrors.New("certificate rejected: missing required Raft peer role (OU='Lattice Raft Peer')")
-		}
-
-		nodeID, err := ExtractNodeIDFromCert(leaf)
-		if err != nil {
-			return fmt.Errorf("failed to extract peer NodeID from certificate: %w", err)
-		}
-
-		if topology != nil {
-			if topology.IsSelf(nodeID) {
-				return fmt.Errorf("inbound peer connection authenticated as local node ID %d; self-connections prohibited", nodeID)
-			}
-			if !topology.Contains(nodeID) {
-				return fmt.Errorf("peer authenticated as NodeID %d which is not a recognized member of cluster topology", nodeID)
-			}
-		}
-
-		return nil
-	}
-
-	return cfg, nil
+	return WrapPeerServerTLSConfig(cfg, topology), nil
 }
 
 // PeerClientTLSConfig constructs a hardened TLS 1.3 dialer configuration for outbound Raft peer connections.
@@ -336,50 +485,14 @@ func PeerClientTLSConfig(certFile, keyFile, peerCAFile string, targetPeerID clus
 		return nil, fmt.Errorf("peer CA pool: %w", err)
 	}
 
-	// Determine server name for TLS SNI
-	serverName := fmt.Sprintf("node-%d", targetPeerID)
-	if targetAddr != "" {
-		host, _, err := net.SplitHostPort(targetAddr)
-		if err == nil && net.ParseIP(host) == nil && host != "localhost" {
-			serverName = host
-		}
-	}
-
 	cfg := &tls.Config{
 		MinVersion:   tls.VersionTLS13,
 		MaxVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{cert},
 		RootCAs:      caPool,
-		ServerName:   serverName,
 	}
 
-	cfg.VerifyConnection = func(cs tls.ConnectionState) error {
-		if len(cs.PeerCertificates) == 0 {
-			return stdErrors.New("no server certificate presented by remote peer")
-		}
-		leaf := cs.PeerCertificates[0]
-
-		if !IsPeerCertificate(leaf) {
-			return stdErrors.New("remote certificate rejected: missing required Raft peer role (OU='Lattice Raft Peer')")
-		}
-
-		nodeID, err := ExtractNodeIDFromCert(leaf)
-		if err != nil {
-			return fmt.Errorf("failed to extract NodeID from remote peer certificate: %w", err)
-		}
-
-		if nodeID != targetPeerID {
-			return fmt.Errorf("peer certificate NodeID mismatch: expected %d, remote asserted %d", targetPeerID, nodeID)
-		}
-
-		if topology != nil && !topology.Contains(nodeID) {
-			return fmt.Errorf("remote peer NodeID %d is not in configured cluster topology", nodeID)
-		}
-
-		return nil
-	}
-
-	return cfg, nil
+	return WrapPeerClientTLSConfig(cfg, targetPeerID, targetAddr, topology), nil
 }
 
 // ValidatePeerTLSConfig verifies that cfg satisfies the mandatory mutual TLS 1.3

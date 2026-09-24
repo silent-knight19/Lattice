@@ -482,6 +482,43 @@ func (s *peerSupervisor) run(ctx context.Context, wg *sync.WaitGroup) {
 			continue
 		}
 
+		// Defense-in-depth: on non-loopback connections, verify TLS and peer identity
+		if !isLoopbackAddress(s.address) {
+			if tc, ok := conn.(*tls.Conn); ok {
+				cs := tc.ConnectionState()
+				if !cs.HandshakeComplete {
+					if err := tc.HandshakeContext(dialCtx); err != nil {
+						s.mu.Unlock()
+						_ = conn.Close()
+						continue
+					}
+					cs = tc.ConnectionState()
+				}
+				if len(cs.PeerCertificates) == 0 {
+					s.mu.Unlock()
+					_ = conn.Close()
+					continue
+				}
+				leaf := cs.PeerCertificates[0]
+				if !IsPeerCertificate(leaf) || IsClientCertificate(leaf) {
+					s.mu.Unlock()
+					_ = conn.Close()
+					continue
+				}
+				nodeID, err := ExtractNodeIDFromCert(leaf)
+				if err != nil || nodeID != s.peerID {
+					s.mu.Unlock()
+					_ = conn.Close()
+					continue
+				}
+			} else {
+				// Non-loopback peer connections require TLS; raw plaintext conns from custom dialers rejected
+				s.mu.Unlock()
+				_ = conn.Close()
+				continue
+			}
+		}
+
 		// Configure TCP keep-alive
 		configureKeepAlive(conn, s.cfg.KeepAlivePeriod)
 
@@ -741,6 +778,10 @@ func NewPeerConnectionManager(topology *cluster.Topology, cfg PeerConnectionConf
 		cfg.TLSConfig = cfg.ListenerTLSConfig
 	}
 
+	if cfg.ListenerTLSConfig != nil {
+		cfg.ListenerTLSConfig = WrapPeerServerTLSConfig(cfg.ListenerTLSConfig, topology)
+	}
+
 	// Non-loopback peer endpoints strictly mandate mutual TLS 1.3.
 	// Plaintext and arbitrary one-way TLS configurations are prohibited on non-loopback peer destinations
 	// regardless of InsecureTransport setting.
@@ -814,10 +855,8 @@ func NewPeerConnectionManager(topology *cluster.Topology, cfg PeerConnectionConf
 					return conn, nil
 				}
 			} else if cfg.TLSConfig != nil {
-				tlsCfg := cfg.TLSConfig.Clone()
-				if tlsCfg.RootCAs == nil && tlsCfg.ClientCAs != nil {
-					tlsCfg.RootCAs = tlsCfg.ClientCAs
-				}
+				peerTLS := WrapPeerClientTLSConfig(cfg.TLSConfig, p.ID, p.Address, topology)
+				peerCfg.TLSConfig = peerTLS
 				peerCfg.DialFunc = func(ctx context.Context, addr string) (net.Conn, error) {
 					dialer := &net.Dialer{
 						Timeout:   dialTimeout,
@@ -825,7 +864,7 @@ func NewPeerConnectionManager(topology *cluster.Topology, cfg PeerConnectionConf
 					}
 					tlsDialer := &tls.Dialer{
 						NetDialer: dialer,
-						Config:    tlsCfg,
+						Config:    peerTLS,
 					}
 					conn, err := tlsDialer.DialContext(ctx, "tcp", addr)
 					if err != nil {
@@ -916,7 +955,8 @@ func (m *PeerConnectionManager) StartListener(addr string) error {
 	var ln net.Listener
 	var err error
 	if m.cfg.ListenerTLSConfig != nil {
-		ln, err = tls.Listen("tcp", addr, m.cfg.ListenerTLSConfig)
+		listenerTLS := WrapPeerServerTLSConfig(m.cfg.ListenerTLSConfig, m.topology)
+		ln, err = tls.Listen("tcp", addr, listenerTLS)
 	} else {
 		ln, err = net.Listen("tcp", addr)
 	}
@@ -951,7 +991,8 @@ func (m *PeerConnectionManager) ServeListener(ln net.Listener) error {
 	}
 
 	if m.cfg.ListenerTLSConfig != nil {
-		ln = tls.NewListener(ln, m.cfg.ListenerTLSConfig)
+		listenerTLS := WrapPeerServerTLSConfig(m.cfg.ListenerTLSConfig, m.topology)
+		ln = tls.NewListener(ln, listenerTLS)
 	}
 
 	m.listener = ln
@@ -1038,6 +1079,11 @@ func (m *PeerConnectionManager) handleInboundConn(conn net.Conn) {
 			return
 		}
 		authenticatedNodeID = nodeID
+	}
+
+	if !isLoopbackAddress(conn.RemoteAddr().String()) && authenticatedNodeID == 0 {
+		_ = conn.Close()
+		return
 	}
 
 	// Deadline for first request frame to defend against Slowloris

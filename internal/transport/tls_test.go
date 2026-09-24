@@ -370,6 +370,14 @@ func TestTLS_PeerTransport_Comprehensive(t *testing.T) {
 		t.Fatalf("failed to create topology: %v", err)
 	}
 
+	topo2, err := cluster.NewTopology(2, "127.0.0.1:19099", []cluster.PeerConfig{
+		{ID: 1, Address: "127.0.0.1:19098"},
+		{ID: 2, Address: "127.0.0.1:19099"},
+	})
+	if err != nil {
+		t.Fatalf("failed to create topology 2: %v", err)
+	}
+
 	node1Cert, node1Key := ca.IssuePeerCert(t, 1)
 	node2Cert, node2Key := ca.IssuePeerCert(t, 2)
 
@@ -394,7 +402,7 @@ func TestTLS_PeerTransport_Comprehensive(t *testing.T) {
 	listenAddr := mgr1.ListenerAddr().String()
 
 	t.Run("Valid Peer Handshake and Frame Exchange", func(t *testing.T) {
-		dialerTLS, err := PeerClientTLSConfig(node2Cert, node2Key, ca.CertPath, 1, listenAddr, topo)
+		dialerTLS, err := PeerClientTLSConfig(node2Cert, node2Key, ca.CertPath, 1, listenAddr, topo2)
 		if err != nil {
 			t.Fatalf("failed to create peer client TLS config: %v", err)
 		}
@@ -434,7 +442,7 @@ func TestTLS_PeerTransport_Comprehensive(t *testing.T) {
 
 	t.Run("Reject Peer Impersonation (Cert NodeID != Frame LeaderID)", func(t *testing.T) {
 		// Peer 2 authenticates with its own cert, but sends an AppendEntries claiming LeaderID = 3
-		dialerTLS, err := PeerClientTLSConfig(node2Cert, node2Key, ca.CertPath, 1, listenAddr, topo)
+		dialerTLS, err := PeerClientTLSConfig(node2Cert, node2Key, ca.CertPath, 1, listenAddr, topo2)
 		if err != nil {
 			t.Fatalf("failed to create peer client TLS config: %v", err)
 		}
