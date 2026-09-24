@@ -1183,11 +1183,56 @@ func TestValidatePeerTLSConfig_Unit(t *testing.T) {
 		{"nil ClientCAs", &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: nil, Certificates: []tls.Certificate{kp}}, true},
 		{"empty certificates", &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool}, true},
 		{"valid peer mTLS", &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool, Certificates: []tls.Certificate{kp}}, false},
+		{"valid peer mTLS with GetConfigForClient", &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool, GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) { return nil, nil }}, false},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			err := ValidatePeerTLSConfig(tc.cfg)
+			if tc.wantErr && err == nil {
+				t.Errorf("expected error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if tc.wantErr && !stdErrors.Is(err, errors.ErrInsecureTransport) {
+				t.Errorf("expected ErrInsecureTransport, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidatePeerDialerTLSConfig_Unit(t *testing.T) {
+	ca := NewTestCA(t, "Lattice Peer Dialer Unit CA")
+	nodeCert, nodeKey := ca.IssuePeerCert(t, 1)
+	kp, err := tls.LoadX509KeyPair(nodeCert, nodeKey)
+	if err != nil {
+		t.Fatalf("LoadX509KeyPair failed: %v", err)
+	}
+	pool, err := LoadCertPool(ca.CertPath)
+	if err != nil {
+		t.Fatalf("LoadCertPool failed: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		cfg     *tls.Config
+		wantErr bool
+	}{
+		{"nil config", nil, true},
+		{"TLS 1.2 min", &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool, Certificates: []tls.Certificate{kp}}, true},
+		{"InsecureSkipVerify", &tls.Config{MinVersion: tls.VersionTLS13, InsecureSkipVerify: true, RootCAs: pool, Certificates: []tls.Certificate{kp}}, true},
+		{"nil CA pools", &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{kp}}, true},
+		{"empty certificates", &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: pool}, true},
+		{"invalid ClientAuth", &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequestClientCert, RootCAs: pool, Certificates: []tls.Certificate{kp}}, true},
+		{"GetConfigForClient set on dialer", &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: pool, Certificates: []tls.Certificate{kp}, GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) { return nil, nil }}, true},
+		{"valid peer dialer with RootCAs", &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: pool, Certificates: []tls.Certificate{kp}}, false},
+		{"valid peer dialer with ClientCAs", &tls.Config{MinVersion: tls.VersionTLS13, ClientCAs: pool, Certificates: []tls.Certificate{kp}}, false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidatePeerDialerTLSConfig(tc.cfg)
 			if tc.wantErr && err == nil {
 				t.Errorf("expected error, got nil")
 			}

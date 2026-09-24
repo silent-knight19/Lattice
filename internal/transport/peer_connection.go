@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
@@ -561,7 +562,7 @@ func (s *peerSupervisor) run(ctx context.Context, wg *sync.WaitGroup) {
 			}
 
 			// Verify connection admission requirements
-			if err := assertAdmissiblePeerConnection(tlsConn, s.peerID, s.address, s.topology); err != nil {
+			if err := assertAdmissiblePeerConnection(tlsConn, s.peerID, s.address, s.topology, s.trustedRoots()); err != nil {
 				_ = tlsConn.Close()
 				s.mu.Lock()
 				s.failures++
@@ -633,7 +634,7 @@ func (s *peerSupervisor) run(ctx context.Context, wg *sync.WaitGroup) {
 		}
 
 		// Mandatory security assertion at connection admission
-		if err := assertAdmissiblePeerConnection(activeConn, s.peerID, s.address, s.topology); err != nil {
+		if err := assertAdmissiblePeerConnection(activeConn, s.peerID, s.address, s.topology, s.trustedRoots()); err != nil {
 			s.mu.Unlock()
 			_ = activeConn.Close()
 			continue
@@ -718,7 +719,8 @@ func (s *peerSupervisor) run(ctx context.Context, wg *sync.WaitGroup) {
 // 6. The leaf certificate MUST assert the Lattice peer role (OU = Lattice Raft Peer) and NOT a client role.
 // 7. The leaf certificate MUST assert an unambiguous NodeID matching the expected target peer ID.
 // 8. The extracted NodeID MUST belong to the configured topology and MUST NOT be the local node (non-self).
-func assertAdmissiblePeerConnection(conn net.Conn, expectedPeerID cluster.NodeID, addr string, topo *cluster.Topology) error {
+// 9. If trustedRoots is non-nil, the leaf certificate MUST cryptographically chain to trustedRoots.
+func assertAdmissiblePeerConnection(conn net.Conn, expectedPeerID cluster.NodeID, addr string, topo *cluster.Topology, trustedRoots *x509.CertPool) error {
 	if conn == nil {
 		return errors.ErrNilReceiver
 	}
@@ -761,6 +763,35 @@ func assertAdmissiblePeerConnection(conn net.Conn, expectedPeerID cluster.NodeID
 			return fmt.Errorf("security violation: non-loopback peer connection %q NodeID %d is local node (self-connection prohibited)", addr, nodeID)
 		}
 	}
+	if trustedRoots != nil {
+		intermediates := x509.NewCertPool()
+		for _, cert := range cs.PeerCertificates[1:] {
+			intermediates.AddCert(cert)
+		}
+		opts := x509.VerifyOptions{
+			Roots:         trustedRoots,
+			Intermediates: intermediates,
+			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+		}
+		if _, err := leaf.Verify(opts); err != nil {
+			return fmt.Errorf("security violation: non-loopback peer connection %q certificate chain not trusted by Lattice peer CA: %w", addr, err)
+		}
+	}
+	return nil
+}
+
+func (s *peerSupervisor) trustedRoots() *x509.CertPool {
+	if s.cfg.ListenerTLSConfig != nil && s.cfg.ListenerTLSConfig.ClientCAs != nil {
+		return s.cfg.ListenerTLSConfig.ClientCAs
+	}
+	if s.cfg.TLSConfig != nil {
+		if s.cfg.TLSConfig.RootCAs != nil {
+			return s.cfg.TLSConfig.RootCAs
+		}
+		if s.cfg.TLSConfig.ClientCAs != nil {
+			return s.cfg.TLSConfig.ClientCAs
+		}
+	}
 	return nil
 }
 
@@ -769,7 +800,7 @@ func assertAdmissiblePeerConnection(conn net.Conn, expectedPeerID cluster.NodeID
 // Returns true if connection was adopted, false if rejected.
 func (s *peerSupervisor) adoptInboundConnection(ctx context.Context, conn net.Conn, firstFrame *Frame, localID cluster.NodeID) bool {
 	// Mandatory security assertion at inbound connection admission:
-	if err := assertAdmissiblePeerConnection(conn, s.peerID, s.address, s.topology); err != nil {
+	if err := assertAdmissiblePeerConnection(conn, s.peerID, s.address, s.topology, s.trustedRoots()); err != nil {
 		_ = conn.Close()
 		return false
 	}

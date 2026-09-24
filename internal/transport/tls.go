@@ -307,6 +307,13 @@ func WrapPeerServerTLSConfig(cfg *tls.Config, topology *cluster.Topology) *tls.C
 	wrapped := cfg.Clone()
 	callerVerify := cfg.VerifyConnection
 
+	// Snapshot trusted ClientCAs from the base configuration to prevent dynamic substitution.
+	var trustedClientCAs *x509.CertPool
+	if cfg.ClientCAs != nil {
+		trustedClientCAs = cfg.ClientCAs.Clone()
+		wrapped.ClientCAs = trustedClientCAs
+	}
+
 	wrapped.VerifyConnection = func(cs tls.ConnectionState) error {
 		// 1. Caller-provided verification must succeed first if present
 		if callerVerify != nil {
@@ -343,6 +350,55 @@ func WrapPeerServerTLSConfig(cfg *tls.Config, topology *cluster.Topology) *tls.C
 		}
 
 		return nil
+	}
+
+	// Intercept and wrap GetConfigForClient to eliminate the TLS configuration escape hatch:
+	callerGetConfig := cfg.GetConfigForClient
+	if callerGetConfig != nil {
+		wrapped.GetConfigForClient = func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+			dynCfg, err := callerGetConfig(chi)
+			if err != nil {
+				return nil, fmt.Errorf("caller GetConfigForClient rejected client hello: %w", err)
+			}
+			if dynCfg == nil {
+				return wrapped, nil
+			}
+
+			// Invariant 1: Dynamic config must not downgrade TLS below TLS 1.3
+			if dynCfg.MinVersion < tls.VersionTLS13 || (dynCfg.MaxVersion != 0 && dynCfg.MaxVersion < tls.VersionTLS13) {
+				return nil, fmt.Errorf("GetConfigForClient returned TLS config with invalid TLS version (min=0x%04x, max=0x%04x); TLS 1.3 required",
+					dynCfg.MinVersion, dynCfg.MaxVersion)
+			}
+
+			// Invariant 2: Dynamic config must not enable InsecureSkipVerify
+			if dynCfg.InsecureSkipVerify {
+				return nil, stdErrors.New("GetConfigForClient returned TLS config with InsecureSkipVerify enabled")
+			}
+
+			// Invariant 3: Dynamic config must enforce RequireAndVerifyClientCert
+			if dynCfg.ClientAuth != tls.RequireAndVerifyClientCert {
+				return nil, fmt.Errorf("GetConfigForClient returned TLS config with invalid ClientAuth %v; RequireAndVerifyClientCert required",
+					dynCfg.ClientAuth)
+			}
+
+			// Invariant 4: Dynamic config MUST NOT substitute or alter the trusted peer ClientCAs pool
+			if trustedClientCAs == nil {
+				return nil, stdErrors.New("GetConfigForClient returned dynamic config but base peer configuration has nil ClientCAs")
+			}
+			if dynCfg.ClientCAs == nil || !dynCfg.ClientCAs.Equal(trustedClientCAs) {
+				return nil, stdErrors.New("GetConfigForClient returned TLS config replacing or omitting trusted peer ClientCAs pool")
+			}
+
+			// Invariant 5: Deep-wrap the dynamic config with Lattice peer identity verification
+			dynCopy := dynCfg.Clone()
+			dynCopy.GetConfigForClient = nil // Prevent recursive GetConfigForClient loops
+			dynWrapped := WrapPeerServerTLSConfig(dynCopy, topology)
+			dynWrapped.ClientCAs = trustedClientCAs
+			dynWrapped.ClientAuth = tls.RequireAndVerifyClientCert
+			dynWrapped.MinVersion = tls.VersionTLS13
+
+			return dynWrapped, nil
+		}
 	}
 
 	return wrapped
@@ -552,7 +608,7 @@ func ValidatePeerTLSConfig(cfg *tls.Config) error {
 		return fmt.Errorf("%w: peer TLS requires non-nil trusted ClientCAs pool for mutual authentication", errors.ErrInsecureTransport)
 	}
 
-	if len(cfg.Certificates) == 0 && cfg.GetCertificate == nil && cfg.GetClientCertificate == nil {
+	if len(cfg.Certificates) == 0 && cfg.GetCertificate == nil && cfg.GetClientCertificate == nil && cfg.GetConfigForClient == nil {
 		return fmt.Errorf("%w: peer TLS requires configured X.509 certificate and private key", errors.ErrInsecureTransport)
 	}
 
@@ -586,6 +642,10 @@ func ValidatePeerDialerTLSConfig(cfg *tls.Config) error {
 	if cfg.ClientAuth != 0 && cfg.ClientAuth != tls.RequireAndVerifyClientCert {
 		return fmt.Errorf("%w: peer dialer TLS ClientAuth must be RequireAndVerifyClientCert if specified (got %v)",
 			errors.ErrInsecureTransport, cfg.ClientAuth)
+	}
+
+	if cfg.GetConfigForClient != nil {
+		return fmt.Errorf("%w: peer dialer TLS configuration must not have GetConfigForClient set", errors.ErrInsecureTransport)
 	}
 
 	return nil

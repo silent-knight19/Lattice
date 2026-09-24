@@ -1166,3 +1166,408 @@ func TestPeerIdentity_CustomDialerSecurity(t *testing.T) {
 		}
 	})
 }
+
+func TestPeerIdentity_GetConfigForClientSecurity(t *testing.T) {
+	legitCA := NewTestCA(t, "Lattice Peer Legitimate CA")
+	attackerCA := NewTestCA(t, "Attacker Rogue CA")
+
+	legitPool, err := LoadCertPool(legitCA.CertPath)
+	if err != nil {
+		t.Fatalf("LoadCertPool legitCA failed: %v", err)
+	}
+	attackerPool, err := LoadCertPool(attackerCA.CertPath)
+	if err != nil {
+		t.Fatalf("LoadCertPool attackerCA failed: %v", err)
+	}
+
+	node1Cert, node1Key := legitCA.IssuePeerCert(t, 1)
+	node1KP, err := tls.LoadX509KeyPair(node1Cert, node1Key)
+	if err != nil {
+		t.Fatalf("LoadX509KeyPair node 1 failed: %v", err)
+	}
+
+	node2Cert, node2Key := legitCA.IssuePeerCert(t, 2)
+	node2KP, err := tls.LoadX509KeyPair(node2Cert, node2Key)
+	if err != nil {
+		t.Fatalf("LoadX509KeyPair node 2 failed: %v", err)
+	}
+
+	rogueCert2, rogueKey2 := attackerCA.IssuePeerCert(t, 2)
+	rogueKP2, err := tls.LoadX509KeyPair(rogueCert2, rogueKey2)
+	if err != nil {
+		t.Fatalf("LoadX509KeyPair rogue node 2 failed: %v", err)
+	}
+
+	// Topology: Node 1 is local (192.0.2.1:19098), Node 2 is remote (192.0.2.2:19099 - non-loopback)
+	topo := createTestTopology(t, 1, "192.0.2.1:19098", map[cluster.NodeID]string{
+		2: "192.0.2.2:19099",
+	})
+
+	baseCfg := func(listenerTLS *tls.Config) PeerConnectionConfig {
+		cfg := DefaultPeerConnectionConfig()
+		cfg.DialTimeout = 250 * time.Millisecond
+		cfg.ListenerTLSConfig = listenerTLS
+		cfg.TLSConfig = &tls.Config{
+			MinVersion:   tls.VersionTLS13,
+			Certificates: []tls.Certificate{node1KP},
+			RootCAs:      legitPool,
+			ClientCAs:    legitPool,
+			ClientAuth:   tls.RequireAndVerifyClientCert,
+		}
+		// Custom raw dialer that avoids dialing external network
+		cfg.RawDialFunc = func(ctx context.Context, addr string) (net.Conn, error) {
+			return nil, errors.New("outbound dialing disabled in this test")
+		}
+		return cfg
+	}
+
+	// Attack 1: GetConfigForClient replaces trust roots with attacker CA
+	t.Run("Attack 1: GetConfigForClient replaces trust roots => Rejected", func(t *testing.T) {
+		serverTLS := &tls.Config{
+			MinVersion:   tls.VersionTLS13,
+			Certificates: []tls.Certificate{node1KP},
+			ClientCAs:    legitPool,
+			ClientAuth:   tls.RequireAndVerifyClientCert,
+			GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+				return &tls.Config{
+					MinVersion:   tls.VersionTLS13,
+					Certificates: []tls.Certificate{node1KP},
+					ClientCAs:    attackerPool, // Rogue CA substitution
+					ClientAuth:   tls.RequireAndVerifyClientCert,
+				}, nil
+			},
+		}
+
+		mgr, err := NewPeerConnectionManager(topo, baseCfg(serverTLS))
+		if err != nil {
+			t.Fatalf("NewPeerConnectionManager failed: %v", err)
+		}
+		defer mgr.Close()
+
+		if err := mgr.StartListener("127.0.0.1:0"); err != nil {
+			t.Fatalf("StartListener failed: %v", err)
+		}
+
+		listenAddr := mgr.ListenerAddr().String()
+
+		// Attacker connects presenting rogue certificate signed by attacker CA
+		rogueClientTLS := &tls.Config{
+			MinVersion:   tls.VersionTLS13,
+			Certificates: []tls.Certificate{rogueKP2},
+			RootCAs:      legitPool,
+			ServerName:   "node-1",
+		}
+
+		conn, dErr := tls.Dial("tcp", listenAddr, rogueClientTLS)
+		if dErr == nil {
+			req := &AppendEntriesRequest{Term: 1, LeaderID: 2}
+			frame, _ := EncodeAppendEntries(req, 1)
+			_ = EncodeFrame(conn, frame)
+			_ = conn.Close()
+		}
+
+		time.Sleep(100 * time.Millisecond)
+
+		if mgr.IsConnected(2) {
+			t.Fatal("SECURITY VIOLATION: manager admitted peer connection signed by attacker CA via GetConfigForClient")
+		}
+		if mgr.ActiveInboundConnections() != 0 {
+			t.Fatalf("SECURITY VIOLATION: expected 0 active inbound connections, got %d", mgr.ActiveInboundConnections())
+		}
+	})
+
+	// Attack 2: Alternate config removes Lattice verification
+	t.Run("Attack 2: Alternate config removes Lattice verification => Rejected", func(t *testing.T) {
+		// Subcase 2a: attacker CA with nil VerifyConnection
+		serverTLS := &tls.Config{
+			MinVersion:   tls.VersionTLS13,
+			Certificates: []tls.Certificate{node1KP},
+			ClientCAs:    legitPool,
+			ClientAuth:   tls.RequireAndVerifyClientCert,
+			GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+				return &tls.Config{
+					MinVersion:       tls.VersionTLS13,
+					Certificates:     []tls.Certificate{node1KP},
+					ClientCAs:        attackerPool,
+					ClientAuth:       tls.RequireAndVerifyClientCert,
+					VerifyConnection: nil, // Caller attempted to omit Lattice verifier
+				}, nil
+			},
+		}
+
+		mgr, err := NewPeerConnectionManager(topo, baseCfg(serverTLS))
+		if err != nil {
+			t.Fatalf("NewPeerConnectionManager failed: %v", err)
+		}
+		defer mgr.Close()
+
+		if err := mgr.StartListener("127.0.0.1:0"); err != nil {
+			t.Fatalf("StartListener failed: %v", err)
+		}
+
+		listenAddr := mgr.ListenerAddr().String()
+
+		rogueClientTLS := &tls.Config{
+			MinVersion:   tls.VersionTLS13,
+			Certificates: []tls.Certificate{rogueKP2},
+			RootCAs:      legitPool,
+			ServerName:   "node-1",
+		}
+
+		conn, dErr := tls.Dial("tcp", listenAddr, rogueClientTLS)
+		if dErr == nil {
+			req := &AppendEntriesRequest{Term: 1, LeaderID: 2}
+			frame, _ := EncodeAppendEntries(req, 1)
+			_ = EncodeFrame(conn, frame)
+			_ = conn.Close()
+		}
+
+		time.Sleep(100 * time.Millisecond)
+
+		if mgr.IsConnected(2) {
+			t.Fatal("SECURITY VIOLATION: connection reached PeerStateConnected when alternate config removed verifier")
+		}
+
+		// Subcase 2b: legitimate CA, but caller omitted VerifyConnection and client presents ordinary client cert
+		ordinaryCert, ordinaryKey := legitCA.IssueClientCert(t, "ordinary-client")
+		ordinaryKP, _ := tls.LoadX509KeyPair(ordinaryCert, ordinaryKey)
+
+		ordinaryTLS := &tls.Config{
+			MinVersion:   tls.VersionTLS13,
+			Certificates: []tls.Certificate{ordinaryKP},
+			RootCAs:      legitPool,
+			ServerName:   "node-1",
+		}
+
+		// Server uses legitimate CA in GetConfigForClient but with VerifyConnection = nil
+		serverTLS2 := &tls.Config{
+			MinVersion:   tls.VersionTLS13,
+			Certificates: []tls.Certificate{node1KP},
+			ClientCAs:    legitPool,
+			ClientAuth:   tls.RequireAndVerifyClientCert,
+			GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+				return &tls.Config{
+					MinVersion:       tls.VersionTLS13,
+					Certificates:     []tls.Certificate{node1KP},
+					ClientCAs:        legitPool,
+					ClientAuth:       tls.RequireAndVerifyClientCert,
+					VerifyConnection: nil, // Omitting verifier
+				}, nil
+			},
+		}
+
+		mgr2, err := NewPeerConnectionManager(topo, baseCfg(serverTLS2))
+		if err != nil {
+			t.Fatalf("NewPeerConnectionManager failed: %v", err)
+		}
+		defer mgr2.Close()
+
+		if err := mgr2.StartListener("127.0.0.1:0"); err != nil {
+			t.Fatalf("StartListener failed: %v", err)
+		}
+
+		conn2, dErr2 := tls.Dial("tcp", mgr2.ListenerAddr().String(), ordinaryTLS)
+		if dErr2 == nil {
+			req := &AppendEntriesRequest{Term: 1, LeaderID: 2}
+			frame, _ := EncodeAppendEntries(req, 1)
+			_ = EncodeFrame(conn2, frame)
+			_ = conn2.Close()
+		}
+
+		time.Sleep(100 * time.Millisecond)
+
+		if mgr2.IsConnected(2) {
+			t.Fatal("SECURITY VIOLATION: manager admitted ordinary client certificate when GetConfigForClient omitted VerifyConnection")
+		}
+	})
+
+	// Attack 3: Alternate config weakens client authentication
+	t.Run("Attack 3: Alternate config weakens client authentication => Rejected", func(t *testing.T) {
+		weakModes := []struct {
+			name       string
+			clientAuth tls.ClientAuthType
+			minVersion uint16
+			skipVerify bool
+		}{
+			{"RequestClientCert", tls.RequestClientCert, tls.VersionTLS13, false},
+			{"RequireAnyClientCert", tls.RequireAnyClientCert, tls.VersionTLS13, false},
+			{"NoClientCert", tls.NoClientCert, tls.VersionTLS13, false},
+			{"VerifyClientCertIfGiven", tls.VerifyClientCertIfGiven, tls.VersionTLS13, false},
+			{"InsecureSkipVerify", tls.RequireAndVerifyClientCert, tls.VersionTLS13, true},
+			{"TLS 1.2", tls.RequireAndVerifyClientCert, tls.VersionTLS12, false},
+		}
+
+		for _, tc := range weakModes {
+			t.Run(tc.name, func(t *testing.T) {
+				serverTLS := &tls.Config{
+					MinVersion:   tls.VersionTLS13,
+					Certificates: []tls.Certificate{node1KP},
+					ClientCAs:    legitPool,
+					ClientAuth:   tls.RequireAndVerifyClientCert,
+					GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+						cfg := &tls.Config{
+							MinVersion:         tc.minVersion,
+							Certificates:       []tls.Certificate{node1KP},
+							ClientCAs:          legitPool,
+							ClientAuth:         tc.clientAuth,
+							InsecureSkipVerify: tc.skipVerify,
+						}
+						if tc.minVersion < tls.VersionTLS13 {
+							cfg.MaxVersion = tc.minVersion
+						}
+						return cfg, nil
+					},
+				}
+
+				mgr, err := NewPeerConnectionManager(topo, baseCfg(serverTLS))
+				if err != nil {
+					t.Fatalf("NewPeerConnectionManager failed: %v", err)
+				}
+				defer mgr.Close()
+
+				if err := mgr.StartListener("127.0.0.1:0"); err != nil {
+					t.Fatalf("StartListener failed: %v", err)
+				}
+
+				clientTLS := &tls.Config{
+					MinVersion:   tls.VersionTLS13,
+					Certificates: []tls.Certificate{node2KP},
+					RootCAs:      legitPool,
+					ServerName:   "node-1",
+				}
+
+				conn, dErr := tls.Dial("tcp", mgr.ListenerAddr().String(), clientTLS)
+				if dErr == nil {
+					req := &AppendEntriesRequest{Term: 1, LeaderID: 2}
+					frame, _ := EncodeAppendEntries(req, 1)
+					_ = EncodeFrame(conn, frame)
+					_ = conn.Close()
+				}
+
+				time.Sleep(100 * time.Millisecond)
+
+				if mgr.IsConnected(2) {
+					t.Fatalf("SECURITY VIOLATION: manager connected with weakened config %s", tc.name)
+				}
+				if mgr.ActiveInboundConnections() != 0 {
+					t.Fatalf("SECURITY VIOLATION: active inbound connection remains after weakened config %s", tc.name)
+				}
+			})
+		}
+	})
+
+	// Attack 4: Alternate config changes trust after initial validation
+	t.Run("Attack 4: Alternate config changes trust after initial validation => Rejected", func(t *testing.T) {
+		// Base config has legitimate CA pool; GetConfigForClient dynamically substitutes another CA
+		serverTLS := &tls.Config{
+			MinVersion:   tls.VersionTLS13,
+			Certificates: []tls.Certificate{node1KP},
+			ClientCAs:    legitPool,
+			ClientAuth:   tls.RequireAndVerifyClientCert,
+			GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+				return &tls.Config{
+					MinVersion:   tls.VersionTLS13,
+					Certificates: []tls.Certificate{node1KP},
+					ClientCAs:    attackerPool, // Substituted CA
+					ClientAuth:   tls.RequireAndVerifyClientCert,
+				}, nil
+			},
+		}
+
+		mgr, err := NewPeerConnectionManager(topo, baseCfg(serverTLS))
+		if err != nil {
+			t.Fatalf("NewPeerConnectionManager failed: %v", err)
+		}
+		defer mgr.Close()
+
+		if err := mgr.StartListener("127.0.0.1:0"); err != nil {
+			t.Fatalf("StartListener failed: %v", err)
+		}
+
+		rogueClientTLS := &tls.Config{
+			MinVersion:   tls.VersionTLS13,
+			Certificates: []tls.Certificate{rogueKP2},
+			RootCAs:      attackerPool,
+			ServerName:   "node-1",
+		}
+
+		conn, dErr := tls.Dial("tcp", mgr.ListenerAddr().String(), rogueClientTLS)
+		if dErr == nil {
+			req := &AppendEntriesRequest{Term: 1, LeaderID: 2}
+			frame, _ := EncodeAppendEntries(req, 1)
+			_ = EncodeFrame(conn, frame)
+			_ = conn.Close()
+		}
+
+		time.Sleep(100 * time.Millisecond)
+
+		if mgr.IsConnected(2) {
+			t.Fatal("SECURITY VIOLATION: manager connected via dynamically substituted CA pool")
+		}
+	})
+
+	// Attack 5: Normal legitimate peer with valid GetConfigForClient
+	t.Run("Attack 5: Normal legitimate peer with GetConfigForClient => Successfully Connected", func(t *testing.T) {
+		serverTLS := &tls.Config{
+			MinVersion:   tls.VersionTLS13,
+			Certificates: []tls.Certificate{node1KP},
+			ClientCAs:    legitPool,
+			ClientAuth:   tls.RequireAndVerifyClientCert,
+			GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+				return &tls.Config{
+					MinVersion:   tls.VersionTLS13,
+					Certificates: []tls.Certificate{node1KP},
+					ClientCAs:    legitPool,
+					ClientAuth:   tls.RequireAndVerifyClientCert,
+				}, nil
+			},
+		}
+
+		mgr, err := NewPeerConnectionManager(topo, baseCfg(serverTLS))
+		if err != nil {
+			t.Fatalf("NewPeerConnectionManager failed: %v", err)
+		}
+		defer mgr.Close()
+
+		if err := mgr.StartListener("127.0.0.1:0"); err != nil {
+			t.Fatalf("StartListener failed: %v", err)
+		}
+
+		legitClientTLS := &tls.Config{
+			MinVersion:   tls.VersionTLS13,
+			Certificates: []tls.Certificate{node2KP},
+			RootCAs:      legitPool,
+			ServerName:   "node-1",
+		}
+
+		conn, dErr := tls.Dial("tcp", mgr.ListenerAddr().String(), legitClientTLS)
+		if dErr != nil {
+			t.Fatalf("tls.Dial failed: %v", dErr)
+		}
+		defer conn.Close()
+
+		// Send valid AppendEntries frame claiming Node 2
+		req := &AppendEntriesRequest{Term: 1, LeaderID: 2}
+		frame, err := EncodeAppendEntries(req, 101)
+		if err != nil {
+			t.Fatalf("EncodeAppendEntries failed: %v", err)
+		}
+		if err := EncodeFrame(conn, frame); err != nil {
+			t.Fatalf("EncodeFrame failed: %v", err)
+		}
+
+		// Await connection adoption
+		var connected bool
+		for i := 0; i < 20; i++ {
+			if mgr.IsConnected(2) {
+				connected = true
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+
+		if !connected {
+			t.Fatal("expected manager to adopt legitimate inbound peer connection and transition to PeerStateConnected")
+		}
+	})
+}
