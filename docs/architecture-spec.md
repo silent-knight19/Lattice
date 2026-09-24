@@ -881,6 +881,77 @@ Lattice rejects slow text protocols and heavy RPC layers in favor of a lean, hig
 * **PayloadLength** (4 bytes, Big-Endian): Length of payload in bytes ($0 \le \text{len} \le 5\text{MB}$). Prevents memory allocation attacks.
 * **CRC32-IEEE** (4 bytes, Big-Endian): Checksum over the entire frame header and payload.
 
+### 26.2 Diagnostic Telemetry Snapshot Contract (OP_STATS)
+
+`OP_STATS` (`0x06`) provides a client-facing, point-in-time diagnostic snapshot over the TCP wire protocol.
+
+#### Request Format
+* **OpCode**: `0x06` (`OP_STATS`)
+* **PayloadLength**: `0` bytes (must be exactly 0; frames with non-zero payloads fail closed with `StatusInvalidRequest`).
+
+#### Response Format
+* **OpCode**: `0x06` (`OP_STATS`)
+* **Status**: `0x00` (`StatusOk`)
+* **Payload**: Canonical indented JSON representation of `StatsSnapshot` encoded in UTF-8. Maximum payload bounded to $\le 4\text{KB}$.
+
+#### JSON Schema & Field Semantics
+```json
+{
+  "engine": {
+    "state": "open",
+    "sequence_number": 42,
+    "next_file_number": 15
+  },
+  "memory": {
+    "active_memtable_entries": 100,
+    "active_memtable_bytes": 4096,
+    "immutable_memtable_count": 0,
+    "immutable_memtable_bytes": 0,
+    "backpressure_current_bytes": 4096,
+    "backpressure_max_bytes": 268435456,
+    "backpressure_utilization": 0.000015,
+    "backpressure_throttled_writes": 0,
+    "backpressure_rejected_writes": 0
+  },
+  "storage": {
+    "l0_files": 2,
+    "total_sstable_files": 5,
+    "total_sstable_bytes": 20480,
+    "flushes_completed": 2,
+    "flushes_pending": 0,
+    "wal_bytes_written": 8192
+  },
+  "cache": {
+    "capacity": 67108864,
+    "entries": 12,
+    "hits": 340,
+    "misses": 20,
+    "hit_ratio": 0.944444
+  },
+  "cluster": {
+    "enabled": false,
+    "role": "follower",
+    "term": 1,
+    "local_id": 1,
+    "leader_id": 1,
+    "commit_index": 50,
+    "last_applied": 50
+  },
+  "connections": {
+    "active": 3
+  }
+}
+```
+
+#### Node-Local vs Cluster Scope
+* `engine`, `memory`, `storage`, `cache`, and `connections` report node-local runtime state for the specific node answering the TCP request.
+* `cluster` explicitly reports node-local consensus state (`role`, `term`, `local_id`, `leader_id`, `commit_index`, `last_applied`) and is marked `enabled: false` when running in standalone mode. Node-local counters are never masqueraded as cluster-wide aggregations.
+
+#### Consistency & Performance Guarantees
+* **Zero Mutation**: Executing `OP_STATS` performs no database mutations: sequence numbers do not advance, MemTables are not flushed, WAL logs are not rotated, and files are not written.
+* **Bounded Runtime**: Values are extracted from existing atomic counters and in-memory VersionSet metadata under short read-locks. No filesystem scans or SSTable decodes are performed.
+* **Separation from Prometheus (`/metrics`)**: Prometheus `/metrics` provides an HTTP-based, multi-dimensional time-series scrape endpoint with histograms and quantile counters. `OP_STATS` provides a lightweight, human/CLI/SDK-parseable point-in-time snapshot over the binary client protocol.
+
 ---
 
 # 27. Distributed Cluster Architecture (V1.1 Blueprint)

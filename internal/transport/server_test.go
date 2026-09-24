@@ -101,6 +101,16 @@ func (m *mockEngine) Exists(key []byte) (bool, error) {
 	return ok, nil
 }
 
+func (m *mockEngine) Stats() (transport.EngineStats, transport.MemoryStats, transport.StorageStats, transport.CacheStats, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return transport.EngineStats{
+		State: "open",
+	}, transport.MemoryStats{
+		ActiveMemTableEntries: len(m.store),
+	}, transport.StorageStats{}, transport.CacheStats{}, nil
+}
+
 func startTestServer(t *testing.T, cfg transport.ServerConfig, eng transport.Engine) *transport.Server {
 	t.Helper()
 	srv, err := transport.NewServer(cfg, eng)
@@ -250,40 +260,29 @@ func TestServer_UnsupportedOpcodes_DoNotFake(t *testing.T) {
 	}
 	defer conn.Close()
 
-	unsupported := []struct {
-		name    string
-		req     *transport.Request
-		wantMsg string
-	}{
-		{
-			name: "OpStats",
-			req: &transport.Request{
-				OpCode: transport.OpStats,
-				SeqID:  203,
-			},
-			wantMsg: "STATS is not implemented",
+	frame := &transport.Frame{
+		Header: transport.Header{
+			Magic:         transport.Magic,
+			OpCode:        transport.OpCode(0x07),
+			SeqID:         203,
+			PayloadLength: 0,
 		},
 	}
-
-	for _, tc := range unsupported {
-		t.Run(tc.name, func(t *testing.T) {
-			if err := transport.WriteRequest(conn, tc.req); err != nil {
-				t.Fatalf("write request failed: %v", err)
-			}
-			resp, err := transport.ReadResponse(conn)
-			if err != nil {
-				t.Fatalf("read response failed: %v", err)
-			}
-			if resp.SeqID != tc.req.SeqID {
-				t.Errorf("seqID mismatch: got %d, want %d", resp.SeqID, tc.req.SeqID)
-			}
-			if resp.Status != transport.StatusInvalidRequest {
-				t.Errorf("expected StatusInvalidRequest, got: %v", resp.Status)
-			}
-			if !bytes.Contains([]byte(resp.Message), []byte(tc.wantMsg)) {
-				t.Errorf("message %q did not contain %q", resp.Message, tc.wantMsg)
-			}
-		})
+	if err := transport.EncodeFrame(conn, frame); err != nil {
+		t.Fatalf("write frame failed: %v", err)
+	}
+	resp, err := transport.ReadResponse(conn)
+	if err != nil {
+		t.Fatalf("read response failed: %v", err)
+	}
+	if resp.SeqID != 203 {
+		t.Errorf("seqID mismatch: got %d, want 203", resp.SeqID)
+	}
+	if resp.Status != transport.StatusInvalidRequest {
+		t.Errorf("expected StatusInvalidRequest, got: %v", resp.Status)
+	}
+	if !strings.Contains(resp.Message, "invalid operation code") {
+		t.Errorf("message %q did not contain 'invalid operation code'", resp.Message)
 	}
 }
 

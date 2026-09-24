@@ -149,6 +149,10 @@ func (c *controllableEngineSM) Exists(key []byte) (bool, error) {
 	return ok, nil
 }
 
+func (c *controllableEngineSM) Stats() (transport.EngineStats, transport.MemoryStats, transport.StorageStats, transport.CacheStats, error) {
+	return transport.EngineStats{State: "open"}, transport.MemoryStats{}, transport.StorageStats{}, transport.CacheStats{}, nil
+}
+
 type barrierTCPNode struct {
 	id      cluster.NodeID
 	addr    string

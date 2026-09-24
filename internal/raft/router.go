@@ -47,6 +47,38 @@ func (r *ProposalRouter) Engine() transport.Engine {
 	return r.engine
 }
 
+// ClusterStats satisfies transport.ClusterStatsProvider.
+func (r *ProposalRouter) ClusterStats() transport.ClusterStats {
+	if r == nil || r.node == nil {
+		return transport.ClusterStats{Enabled: true}
+	}
+	return r.node.ClusterStats()
+}
+
+// ClusterStats returns consensus and role telemetry for diagnostic snapshots.
+func (n *Node) ClusterStats() transport.ClusterStats {
+	if n == nil {
+		return transport.ClusterStats{Enabled: true}
+	}
+	n.mu.RLock()
+	role := n.role
+	leaderID := n.leaderID
+	commitIdx := n.commitIndex
+	n.mu.RUnlock()
+
+	term, _ := n.Term()
+
+	return transport.ClusterStats{
+		Enabled:     true,
+		Role:        role.String(),
+		Term:        uint64(term),
+		LocalID:     uint64(n.localID),
+		LeaderID:    uint64(leaderID),
+		CommitIndex: uint64(commitIdx),
+		LastApplied: uint64(n.LastApplied()),
+	}
+}
+
 // RouteWrite intercepts client mutations, routing to consensus on the leader or returning
 // leader redirection on followers and candidates (P16-S01-M02).
 func (r *ProposalRouter) RouteWrite(ctx context.Context, req *transport.Request) (*transport.Response, error) {

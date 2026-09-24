@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -311,5 +312,64 @@ func TestClient_Exists(t *testing.T) {
 	}
 	if _, err := c.Exists(ctx, make([]byte, 65536)); !errors.Is(err, client.ErrKeyTooLarge) {
 		t.Errorf("expected ErrKeyTooLarge, got %v", err)
+	}
+}
+
+func TestClient_Stats(t *testing.T) {
+	_, addr, cleanup := startServer(t)
+	defer cleanup()
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	defer c.Close()
+
+	ctx := context.Background()
+
+	// 1. Initial Stats
+	snap, err := c.Stats(ctx)
+	if err != nil {
+		t.Fatalf("Stats failed: %v", err)
+	}
+	if snap == nil {
+		t.Fatalf("expected non-nil StatsSnapshot")
+	}
+	if snap.Engine.State != "open" {
+		t.Errorf("expected engine state 'open', got %q", snap.Engine.State)
+	}
+	if snap.Connections.Active < 1 {
+		t.Errorf("expected active connections >= 1, got %d", snap.Connections.Active)
+	}
+
+	// 2. Put some keys and verify memory stats reflect
+	for i := 0; i < 5; i++ {
+		if err := c.Put(ctx, []byte(fmt.Sprintf("k%d", i)), []byte("val")); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+	}
+	snap2, err := c.Stats(ctx)
+	if err != nil {
+		t.Fatalf("Stats after Put failed: %v", err)
+	}
+	if snap2.Memory.ActiveMemTableEntries < 5 {
+		t.Errorf("expected >= 5 active entries, got %d", snap2.Memory.ActiveMemTableEntries)
+	}
+
+	// 3. Context cancelled
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := c.Stats(canceledCtx); err == nil {
+		t.Errorf("expected error with canceled context, got nil")
+	}
+
+	// 4. Closed client returns error
+	c2, err := client.Dial(addr)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	_ = c2.Close()
+	if _, err := c2.Stats(ctx); err == nil {
+		t.Errorf("expected error on closed client, got nil")
 	}
 }

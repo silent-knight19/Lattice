@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -252,6 +253,33 @@ func (c *Client) Batch(ctx context.Context, batch *WriteBatch) error {
 	return fmt.Errorf("batch failed (status 0x%02x): %s", resp.Status, resp.Message)
 }
 
+// Stats retrieves an authoritative point-in-time diagnostic telemetry snapshot from the server.
+func (c *Client) Stats(ctx context.Context) (*StatsSnapshot, error) {
+	req := &transport.Request{
+		OpCode: transport.OpStats,
+	}
+
+	resp, err := c.execute(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.Status != transport.StatusOk {
+		return nil, fmt.Errorf("stats failed (status 0x%02x): %s", resp.Status, resp.Message)
+	}
+
+	if len(resp.Value) == 0 {
+		return nil, errors.New("empty stats response payload")
+	}
+
+	var snap StatsSnapshot
+	if err := json.Unmarshal(resp.Value, &snap); err != nil {
+		return nil, fmt.Errorf("failed to decode stats JSON payload: %w", err)
+	}
+
+	return &snap, nil
+}
+
 // Close closes the underlying TCP connection.
 func (c *Client) Close() error {
 	if c.closed.CompareAndSwap(false, true) {
@@ -264,6 +292,9 @@ func (c *Client) Close() error {
 
 // execute serializes a Request onto the wire and parses the matching Response.
 func (c *Client) execute(ctx context.Context, req *transport.Request) (*transport.Response, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if c.closed.Load() {
 		return nil, ErrClientClosed
 	}
@@ -271,6 +302,9 @@ func (c *Client) execute(ctx context.Context, req *transport.Request) (*transpor
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if c.closed.Load() {
 		return nil, ErrClientClosed
 	}

@@ -300,13 +300,13 @@ func DecodeResponse(f *Frame) (*Response, error) {
 	if f == nil {
 		return nil, errors.ErrNilReceiver
 	}
-	if !f.Header.OpCode.Valid() {
-		return nil, &errors.InvalidOpCodeError{OpCode: byte(f.Header.OpCode)}
-	}
-
 	status := f.Header.Status
 	if !status.Valid() {
 		return nil, &errors.InvalidStatusError{Status: byte(status)}
+	}
+
+	if !f.Header.OpCode.Valid() && status == StatusOk {
+		return nil, &errors.InvalidOpCodeError{OpCode: byte(f.Header.OpCode)}
 	}
 
 	resp := &Response{
@@ -364,7 +364,7 @@ func EncodeResponse(resp *Response) (*Frame, error) {
 	if resp == nil {
 		return nil, errors.ErrNilReceiver
 	}
-	if !resp.OpCode.Valid() {
+	if !resp.OpCode.Valid() && resp.Status == StatusOk {
 		return nil, &errors.InvalidOpCodeError{OpCode: byte(resp.OpCode)}
 	}
 	if !resp.Status.Valid() {

@@ -1064,6 +1064,9 @@ func (e *noopEngine) Batch(ctx context.Context, batch []binary.BatchOp) error {
 	return nil
 }
 func (e *noopEngine) Exists(key []byte) (bool, error) { return false, nil }
+func (e *noopEngine) Stats() (transport.EngineStats, transport.MemoryStats, transport.StorageStats, transport.CacheStats, error) {
+	return transport.EngineStats{State: "open"}, transport.MemoryStats{}, transport.StorageStats{}, transport.CacheStats{}, nil
+}
 
 // countingEngine counts direct Engine.Put/Delete calls.
 type countingEngine struct {
@@ -1086,6 +1089,9 @@ func (e *countingEngine) Batch(ctx context.Context, batch []binary.BatchOp) erro
 	return nil
 }
 func (e *countingEngine) Exists(key []byte) (bool, error) { return false, nil }
+func (e *countingEngine) Stats() (transport.EngineStats, transport.MemoryStats, transport.StorageStats, transport.CacheStats, error) {
+	return transport.EngineStats{State: "open"}, transport.MemoryStats{}, transport.StorageStats{}, transport.CacheStats{}, nil
+}
 
 // mockRouter is a simple ProposalRouter for testing.
 type mockRouter struct{}

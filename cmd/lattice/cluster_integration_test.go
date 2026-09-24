@@ -359,3 +359,7 @@ func (e *testCountingEngine) Batch(ctx context.Context, batch []binary.BatchOp) 
 func (e *testCountingEngine) Exists(key []byte) (bool, error) {
 	return false, nil
 }
+
+func (e *testCountingEngine) Stats() (transport.EngineStats, transport.MemoryStats, transport.StorageStats, transport.CacheStats, error) {
+	return transport.EngineStats{State: "open"}, transport.MemoryStats{}, transport.StorageStats{}, transport.CacheStats{}, nil
+}

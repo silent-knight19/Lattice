@@ -942,6 +942,10 @@ func (e *testEngine) Exists(key []byte) (bool, error) {
 	return ok, nil
 }
 
+func (e *testEngine) Stats() (transport.EngineStats, transport.MemoryStats, transport.StorageStats, transport.CacheStats, error) {
+	return transport.EngineStats{State: "open"}, transport.MemoryStats{}, transport.StorageStats{}, transport.CacheStats{}, nil
+}
+
 func TestRouter_RouteRead(t *testing.T) {
 	peers := map[cluster.NodeID]string{
 		1: "127.0.0.1:9001",

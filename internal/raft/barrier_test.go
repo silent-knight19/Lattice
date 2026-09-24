@@ -90,6 +90,10 @@ func (m *mockStateMachine) Exists(key []byte) (bool, error) {
 	return ok, nil
 }
 
+func (m *mockStateMachine) Stats() (transport.EngineStats, transport.MemoryStats, transport.StorageStats, transport.CacheStats, error) {
+	return transport.EngineStats{State: "open"}, transport.MemoryStats{}, transport.StorageStats{}, transport.CacheStats{}, nil
+}
+
 func (m *mockStateMachine) SetError(err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

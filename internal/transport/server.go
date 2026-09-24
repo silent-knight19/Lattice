@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"encoding/json"
 	stdErrors "errors"
 	"fmt"
 	"hash/crc32"
@@ -24,6 +25,7 @@ type Engine interface {
 	Delete(ctx context.Context, key []byte) error
 	Batch(ctx context.Context, batch []binary.BatchOp) error
 	Exists(key []byte) (bool, error)
+	Stats() (EngineStats, MemoryStats, StorageStats, CacheStats, error)
 }
 
 // ProposalRouter defines the interface for routing client write mutations in replicated mode (P16-S01-M02).
@@ -724,8 +726,19 @@ func (s *Server) dispatch(req *Request) (finalResp *Response) {
 		s.mapEngineError(err, resp)
 
 	case OpStats:
-		resp.Status = StatusInvalidRequest
-		resp.Message = "unsupported operation: STATS is not implemented by storage engine"
+		snap, err := s.CollectStats()
+		if err != nil {
+			s.mapEngineError(err, resp)
+			return resp
+		}
+		data, err := json.MarshalIndent(snap, "", "  ")
+		if err != nil {
+			resp.Status = StatusError
+			resp.Message = "failed to serialize stats snapshot"
+			return resp
+		}
+		resp.Status = StatusOk
+		resp.Value = data
 
 	default:
 		resp.Status = StatusInvalidRequest
@@ -846,4 +859,39 @@ func (s *Server) ServeConnForTesting(conn net.Conn) {
 	} else {
 		_ = conn.Close()
 	}
+}
+
+// CollectStats gathers an authoritative point-in-time diagnostic snapshot across
+// the local engine, cluster consensus, and transport connection layers.
+func (s *Server) CollectStats() (*StatsSnapshot, error) {
+	engStats, memStats, storStats, cacheStats, err := s.engine.Stats()
+	if err != nil {
+		return nil, err
+	}
+
+	snap := &StatsSnapshot{
+		Engine:      engStats,
+		Memory:      memStats,
+		Storage:     storStats,
+		Cache:       cacheStats,
+		Connections: ConnStats{Active: s.activeConns.Load()},
+	}
+
+	if s.clusterMode {
+		snap.Cluster = ClusterStats{Enabled: true}
+		s.routerMu.RLock()
+		r := s.router
+		rr := s.readRouter
+		s.routerMu.RUnlock()
+
+		if cp, ok := r.(ClusterStatsProvider); ok {
+			snap.Cluster = cp.ClusterStats()
+		} else if cp, ok := rr.(ClusterStatsProvider); ok {
+			snap.Cluster = cp.ClusterStats()
+		}
+	} else {
+		snap.Cluster = ClusterStats{Enabled: false}
+	}
+
+	return snap, nil
 }

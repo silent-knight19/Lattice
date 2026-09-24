@@ -51,6 +51,10 @@ func (m *batchMockSM) Exists(key []byte) (bool, error) {
 	return ok, nil
 }
 
+func (m *batchMockSM) Stats() (transport.EngineStats, transport.MemoryStats, transport.StorageStats, transport.CacheStats, error) {
+	return transport.EngineStats{State: "open"}, transport.MemoryStats{}, transport.StorageStats{}, transport.CacheStats{}, nil
+}
+
 func (m *batchMockSM) Delete(ctx context.Context, key []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

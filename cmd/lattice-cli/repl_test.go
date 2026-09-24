@@ -587,23 +587,22 @@ func TestExecuteCommand_MockCases(t *testing.T) {
 		t.Errorf("expected %q, got %q", "false", out.String())
 	}
 
-	// 7. STATS Server Unsupported Response
+	// 7. STATS Server Success Response
 	out.Reset()
 	client.executeFn = func(req *transport.Request) (*transport.Response, error) {
 		return &transport.Response{
-			OpCode:  transport.OpStats,
-			Status:  transport.StatusInvalidRequest,
-			SeqID:   req.SeqID,
-			Message: "unsupported operation: STATS is not implemented by storage engine",
+			OpCode: transport.OpStats,
+			Status: transport.StatusOk,
+			SeqID:  req.SeqID,
+			Value:  []byte("{\n  \"engine\": {\"state\": \"open\"}\n}"),
 		}, nil
 	}
 	cmd, _ = ParseCommand("STATS")
 	if err := executeCommand(client, cmd, &out, style); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	expectedStatsErr := "(error) unsupported operation: STATS is not implemented by storage engine"
-	if strings.TrimSpace(out.String()) != expectedStatsErr {
-		t.Errorf("expected %q, got %q", expectedStatsErr, out.String())
+	if !strings.Contains(out.String(), `"state": "open"`) {
+		t.Errorf("expected stats JSON output, got %q", out.String())
 	}
 
 	// 8. BATCH Success
@@ -966,17 +965,21 @@ func TestRealTCPIntegration(t *testing.T) {
 		"NOT FOUND",
 		"true",
 		"false",
-		"(error) unsupported operation: STATS is not implemented by storage engine",
 	}
 
-	if len(outLines) != len(expectedOutputs) {
-		t.Fatalf("expected %d outputs, got %d:\n%v", len(expectedOutputs), len(outLines), outLines)
+	if len(outLines) < 14 {
+		t.Fatalf("expected at least 14 outputs, got %d:\n%v", len(outLines), outLines)
 	}
 
-	for i, expected := range expectedOutputs {
-		if outLines[i] != expected {
-			t.Errorf("output %d: expected %q, got %q", i, expected, outLines[i])
+	for i := 0; i < 14; i++ {
+		if outLines[i] != expectedOutputs[i] {
+			t.Errorf("output %d: expected %q, got %q", i, expectedOutputs[i], outLines[i])
 		}
+	}
+
+	statsJson := strings.Join(outLines[14:], "\n")
+	if !strings.Contains(statsJson, `"state": "open"`) {
+		t.Errorf("expected stats JSON containing '\"state\": \"open\"', got:\n%s", statsJson)
 	}
 }
 

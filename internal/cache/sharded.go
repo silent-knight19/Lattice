@@ -2,6 +2,7 @@ package cache
 
 import (
 	"encoding/binary"
+	"sync/atomic"
 
 	"github.com/silent-knight19/lattice/internal/errors"
 	"github.com/silent-knight19/lattice/internal/filter"
@@ -41,6 +42,8 @@ type paddedShard struct {
 // synchronization.
 type ShardedCache struct {
 	capacity int
+	hits     atomic.Uint64
+	misses   atomic.Uint64
 	shards   [NumShards]paddedShard
 }
 
@@ -120,11 +123,29 @@ func (c *ShardedCache) Get(key BlockKey) ([]byte, bool) {
 	idx := ShardIndex(key)
 	val, ok := c.shards[idx].Get(key)
 	if ok {
+		c.hits.Add(1)
 		metrics.BlockCacheHits.Inc()
 	} else {
+		c.misses.Add(1)
 		metrics.BlockCacheMisses.Inc()
 	}
 	return val, ok
+}
+
+// Hits returns the authoritative number of cache hits recorded by this cache instance.
+func (c *ShardedCache) Hits() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.hits.Load()
+}
+
+// Misses returns the authoritative number of cache misses recorded by this cache instance.
+func (c *ShardedCache) Misses() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.misses.Load()
 }
 
 // GetBlock is a convenience method for querying by raw SSTable file number and block byte offset.
