@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -582,6 +583,85 @@ func TestConfig_SecurityPolicy_ClientAndPeerMTLS(t *testing.T) {
 
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("expected success for loopback cluster peers without peer TLS, got: %v", err)
+		}
+	})
+}
+
+func TestConfig_ClientAuthzPolicy(t *testing.T) {
+	fp1 := "1111111111111111111111111111111111111111111111111111111111111111"
+	fp2 := "2222222222222222222222222222222222222222222222222222222222222222"
+
+	t.Run("Valid CLI flag policy string", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		args := []string{
+			"--client-authz-policy", fp1 + "=reader," + fp2 + "=writer",
+		}
+		cfg, _, err := ParseFlags(args, &stdout, &stderr)
+		if err != nil {
+			t.Fatalf("ParseFlags failed: %v", err)
+		}
+		if len(cfg.ClientAuthzPolicy) != 2 {
+			t.Fatalf("expected 2 policy entries, got %d", len(cfg.ClientAuthzPolicy))
+		}
+		if cfg.ClientAuthzPolicy[fp1] != "reader" || cfg.ClientAuthzPolicy[fp2] != "writer" {
+			t.Fatalf("unexpected policy map: %+v", cfg.ClientAuthzPolicy)
+		}
+	})
+
+	t.Run("Valid JSON policy file", func(t *testing.T) {
+		dir := t.TempDir()
+		policyPath := filepath.Join(dir, "policy.json")
+		data := fmt.Sprintf(`{"%s": "reader", "%s": "admin"}`, fp1, fp2)
+		if err := os.WriteFile(policyPath, []byte(data), 0600); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+
+		var stdout, stderr bytes.Buffer
+		args := []string{
+			"--client-authz-policy-file", policyPath,
+		}
+		cfg, _, err := ParseFlags(args, &stdout, &stderr)
+		if err != nil {
+			t.Fatalf("ParseFlags failed: %v", err)
+		}
+		if len(cfg.ClientAuthzPolicy) != 2 {
+			t.Fatalf("expected 2 entries, got %d", len(cfg.ClientAuthzPolicy))
+		}
+		if cfg.ClientAuthzPolicy[fp1] != "reader" || cfg.ClientAuthzPolicy[fp2] != "admin" {
+			t.Fatalf("unexpected policy entries: %+v", cfg.ClientAuthzPolicy)
+		}
+	})
+
+	t.Run("Invalid fingerprint in flag rejected", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		args := []string{
+			"--client-authz-policy", "invalid_fp=reader",
+		}
+		_, _, err := ParseFlags(args, &stdout, &stderr)
+		if err == nil {
+			t.Fatal("expected error for invalid fingerprint, got nil")
+		}
+	})
+
+	t.Run("Unsupported role in flag rejected", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		args := []string{
+			"--client-authz-policy", fp1 + "=superadmin",
+		}
+		_, _, err := ParseFlags(args, &stdout, &stderr)
+		if err == nil {
+			t.Fatal("expected error for unsupported role, got nil")
+		}
+	})
+
+	t.Run("Conflicting duplicate fingerprint rejected", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		args := []string{
+			"--client-authz-policy", fp1 + "=reader," + fp1 + "=writer",
+		}
+		_, _, err := ParseFlags(args, &stdout, &stderr)
+		if err == nil {
+			t.Fatal("expected error for conflicting duplicate fingerprint, got nil")
 		}
 	})
 }

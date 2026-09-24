@@ -1351,6 +1351,38 @@ Lattice is engineered as an enterprise-grade internal data tier with rigorous de
    - Key prefixes (`<tenant-id>:<namespace>:<user-key>`) are validated at the earliest ingestion point in the engine.
    - Storage abstractions enforce isolation barriers preventing cross-tenant key scans or unauthorized cross-namespace access.
 
+### 39.5 Client Authorization & Role-Based Access Control (RBAC)
+1. **Cryptographic Identity Derivation**:
+   - Client principal identities are derived deterministically from the authenticated X.509 client leaf certificate presented during TLS 1.3 mutual handshake:
+     $$\text{Principal Fingerprint} = \text{hex}(\text{SHA-256}(\text{cert.Raw}))$$
+   - The principal identity is represented canonically as a 64-character lowercase hexadecimal string.
+   - Self-asserted attributes (e.g. Common Name, SANs, Organizational Units) are non-authoritative for authorization; the SHA-256 digest of the DER-encoded leaf certificate forms the immutable cryptographic identity anchor.
+
+2. **Server-Owned RBAC Policy & Roles**:
+   - The server maintains an immutable, server-owned policy mapping certificate fingerprints to authorization roles:
+     - `reader`: Read-only access. Permitted: `OpGet` (`GET`), `OpExists` (`EXISTS`), `OpStats` (`STATS`). Denied: `OpPut` (`PUT`), `OpDelete` (`DELETE`), `OpBatch` (`BATCH`).
+     - `writer`: Read and write access. Permitted: `OpGet` (`GET`), `OpExists` (`EXISTS`), `OpStats` (`STATS`), `OpPut` (`PUT`), `OpDelete` (`DELETE`), `OpBatch` (`BATCH`).
+     - `admin`: Full administrative access. Permitted: all supported client operations (`GET`, `PUT`, `DELETE`, `EXISTS`, `BATCH`, `STATS`).
+   - Unknown roles or unconfigured roles fail closed.
+
+3. **Connection Identity Binding & Request Immutability**:
+   - Client identity resolution occurs once per connection during post-handshake connection initialization (`handleConn`).
+   - The authenticated `Principal` (containing certificate fingerprint and assigned `Role`) is bound directly to the connection context (`context.Context`).
+   - Pipelined requests, concurrent operations on the same connection, and individual request framing cannot override, spoof, or modify the authenticated principal or role. Inbound wire frames carry no authorization tokens or role claims; authorization is strictly derived from the underlying TLS connection state.
+
+4. **Pre-Storage & Pre-Consensus Enforcement Boundary**:
+   - Authorization decisions are enforced at the transport dispatch layer (`dispatchWithContext`) *prior* to invoking the storage engine (`engine.Engine`) in single-node mode, or routing writes/reads through the consensus proposal router (`ProposalRouter.RouteWrite`) and read router (`ReadRouter.RouteRead`) in cluster mode.
+   - Denied operations return immediately with `StatusPermissionDenied = 0x07` and payload `"permission denied"`.
+   - **Zero Side Effects**: Unauthorized write operations are rejected before entering the Raft log, generating proposals, acquiring engine locks, or modifying MemTables/WALs.
+
+5. **Fail-Closed Semantics & Information Disclosure Immunity**:
+   - Any client connection lacking an authenticated client certificate (such as unencrypted loopback development connections without mutual TLS) or presenting a certificate whose fingerprint is not present in the server's authorization policy is immediately denied when executing operations.
+   - Denied responses return `StatusPermissionDenied` (`0x07`) with the uniform error payload `"permission denied"`. Internal fingerprint hashes, policy rules, and internal configuration details are never disclosed to clients.
+
+6. **Cluster-Mode & Transport Domain Separation**:
+   - Client authorization governs the client transport data plane (`:9099`).
+   - Raft peer consensus transport (`:9098`) operates under a separate, dedicated peer security domain requiring peer mTLS with `OU = Lattice Raft Peer` and `NodeID` verification against cluster topology. Raft peers cannot issue client commands, and client certificates cannot participate in Raft consensus.
+
 ---
 
 # 40. Configuration Management

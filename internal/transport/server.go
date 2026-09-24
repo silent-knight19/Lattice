@@ -112,6 +112,14 @@ type ServerConfig struct {
 	// When true, all client write mutations (PUT, DELETE) MUST go through the ProposalRouter,
 	// and all client reads (GET) MUST go through the ReadRouter.
 	ClusterMode bool
+
+	// AuthzPolicy specifies the authoritative client RBAC policy mapping certificate fingerprints to roles.
+	// If nil and ClientAuthzPolicy is nil, client authorization is unconfigured (preserving loopback development defaults).
+	AuthzPolicy *AuthzPolicy
+
+	// ClientAuthzPolicy provides an optional mapping from certificate SHA-256 fingerprints to role names.
+	// Validated and compiled into AuthzPolicy during NewServer.
+	ClientAuthzPolicy map[string]string
 }
 
 const (
@@ -184,6 +192,8 @@ type Server struct {
 	router      ProposalRouter
 	readRouter  ReadRouter
 	clusterMode bool // immutable after construction (P16-SEC-F01)
+
+	authzPolicy *AuthzPolicy // immutable client authorization policy (Problem 6 RBAC)
 }
 
 // responseEnvelope packages a Response with its associated SeqID reservation metadata
@@ -281,12 +291,30 @@ func NewServer(cfg ServerConfig, eng Engine) (*Server, error) {
 		}
 	}
 
+	var authzPolicy *AuthzPolicy
+	if cfg.AuthzPolicy != nil && cfg.ClientAuthzPolicy != nil {
+		return nil, fmt.Errorf("%w: cannot specify both AuthzPolicy and ClientAuthzPolicy", errors.ErrInvalidAuthzPolicy)
+	}
+	if cfg.AuthzPolicy != nil {
+		if err := cfg.AuthzPolicy.Validate(); err != nil {
+			return nil, err
+		}
+		authzPolicy = cfg.AuthzPolicy
+	} else if cfg.ClientAuthzPolicy != nil {
+		p, err := NewAuthzPolicy(cfg.ClientAuthzPolicy)
+		if err != nil {
+			return nil, err
+		}
+		authzPolicy = p
+	}
+
 	return &Server{
 		cfg:               cfg,
 		engine:            eng,
 		router:            cfg.ProposalRouter,
 		readRouter:        readRouter,
 		clusterMode:       cfg.ClusterMode,
+		authzPolicy:       authzPolicy,
 		maxGlobalInFlight: int64(cfg.MaxGlobalInFlight),
 		conns:             make(map[net.Conn]struct{}),
 		shutdownCh:        make(chan struct{}),
@@ -550,6 +578,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		isLoopback = false
 	}
 
+	var principal *Principal
 	if tc, ok := conn.(*tls.Conn); ok {
 		handshakeTimeout := s.cfg.HeaderTimeout
 		if handshakeTimeout <= 0 {
@@ -595,9 +624,36 @@ func (s *Server) handleConn(conn net.Conn) {
 				}
 			}
 		}
+
+		// TLS handshake completed successfully. Bind connection principal from leaf certificate.
+		if len(cs.PeerCertificates) > 0 {
+			leaf := cs.PeerCertificates[0]
+			fp := CertificateFingerprintSHA256(leaf)
+			var role Role
+			if s.authzPolicy != nil {
+				if r, found := s.authzPolicy.Lookup(fp); found {
+					role = r
+				}
+			}
+			principal = &Principal{
+				Fingerprint:   fp,
+				Role:          role,
+				Authenticated: true,
+			}
+		}
 	} else if !isLoopback && !s.cfg.InsecureTransport {
 		return
 	}
+
+	if principal == nil {
+		principal = &Principal{
+			Fingerprint:   "",
+			Role:          "",
+			Authenticated: false,
+		}
+	}
+
+	connCtx = WithPrincipal(connCtx, principal)
 
 	maxInFlight := s.cfg.MaxInFlightPerConn
 	if maxInFlight <= 0 {
@@ -933,6 +989,8 @@ func (s *Server) dispatchWithContext(parentCtx context.Context, req *Request) (f
 				statusStr = "not_leader"
 			case StatusThrottled:
 				statusStr = "throttled"
+			case StatusPermissionDenied:
+				statusStr = "permission_denied"
 			default:
 				statusStr = "error"
 			}
@@ -949,6 +1007,17 @@ func (s *Server) dispatchWithContext(parentCtx context.Context, req *Request) (f
 		resp.Status = StatusServerClosed
 		resp.Message = "server is closed"
 		return resp
+	}
+
+	// Client Authorization Boundary (Problem 6 RBAC)
+	// Server-side explicit deny-by-default authorization evaluated before any storage or routing side effects.
+	if s.authzPolicy != nil {
+		principal := PrincipalFromContext(parentCtx)
+		if principal == nil || !principal.Authenticated || principal.Role == "" || !s.authzPolicy.AuthorizeRole(principal.Role, req.OpCode) {
+			resp.Status = StatusPermissionDenied
+			resp.Message = "permission denied"
+			return resp
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(parentCtx, s.cfg.RequestTimeout)
@@ -1204,9 +1273,22 @@ func (s *Server) Close() error {
 	return s.Shutdown(ctx)
 }
 
+// AuthzPolicy returns the authoritative client authorization policy configured on the server, or nil.
+func (s *Server) AuthzPolicy() *AuthzPolicy {
+	if s == nil {
+		return nil
+	}
+	return s.authzPolicy
+}
+
 // TestDispatch exposes dispatch for testing internal request routing without opening network connections.
 func (s *Server) TestDispatch(req *Request) *Response {
 	return s.dispatch(req)
+}
+
+// TestDispatchWithContext exposes dispatchWithContext for testing with explicit request contexts.
+func (s *Server) TestDispatchWithContext(ctx context.Context, req *Request) *Response {
+	return s.dispatchWithContext(ctx, req)
 }
 
 // ServeConnForTesting runs handleConn synchronously on conn for testing connection error paths.

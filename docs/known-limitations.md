@@ -1028,7 +1028,7 @@ This document tracks all **genuine architectural and operational limitations** o
      - `OP_GET`, `OP_DELETE`, `OP_EXISTS`: Encoded as `[ Key (PayloadLength B) ]` directly utilizing the frame payload length.
      - `OP_BATCH`: Encoded as `[ Count (4B uint32) | Entries... ]` with entries storing `[ OpType (1B) | KeyLen (2B) | Key | ValLen (4B) | Val ]`. Bounded to $\le 1024$ ops and $\le 5\text{MB}$. Atomic multi-operation execution is fully implemented end-to-end via the Engine `Batch` API, WAL `BATCH_START`/`BATCH_COMMIT` markers with monotonic sequence numbers, Raft single-command consensus replication, CLI `BATCH` command, and the official Go SDK `pkg/client.WriteBatch`.
      - `OP_STATS`: Validated with zero payload; unexpected bytes rejected. Success response carries a canonical, bounded point-in-time diagnostic JSON snapshot in `Response.Value`.
-     - `Response`: Symmetrically framed with 18-byte header where byte 5 is `StatusCode` (`StatusOk=0x00`, `StatusKeyNotFound=0x01`, `StatusError=0x02`, `StatusInvalidRequest=0x03`, `StatusThrottled=0x04`, `StatusServerClosed=0x05`), echoing `SeqID` and `OpCode` with a 4-byte CRC32 trailer. Success GET carries raw value; EXISTS carries 1-byte boolean; STATS carries JSON diagnostic snapshot; failures carry diagnostic message string.
+     - `Response`: Symmetrically framed with 18-byte header where byte 5 is `StatusCode` (`StatusOk=0x00`, `StatusKeyNotFound=0x01`, `StatusError=0x02`, `StatusInvalidRequest=0x03`, `StatusThrottled=0x04`, `StatusServerClosed=0x05`, `StatusNotLeader=0x06`, `StatusPermissionDenied=0x07`), echoing `SeqID` and `OpCode` with a 4-byte CRC32 trailer. Success GET carries raw value; EXISTS carries 1-byte boolean; STATS carries JSON diagnostic snapshot; failures carry diagnostic message string.
    4. *Buffer Ownership*: `DecodeRequest` and `DecodeResponse` strictly return independent, defensive slice copies of keys, values, and batches. Source frame buffers may be safely recycled without corrupting decoded structs.
 * **Why It Exists**:
   Separates transport serialization and adversarial framing defense from socket lifecycle and storage engine mechanics.
@@ -1758,6 +1758,30 @@ This document tracks all **genuine architectural and operational limitations** o
   * Correctness: **Optimal** (Exact accounting of physical disk flushes and boundary context expirations).
   * Security: **Audited & Hardened** (Bounded execution duration, strict resource containment).
   * Performance: **Empirically Bound by Physical Storage Sync Latency** (~4ms per NVMe flush).
+
+---
+
+### 92. Client Authorization (RBAC) Scope, Certificate Fingerprinting & Rotation Boundary (Problem 6)
+* **Limitation & Architectural Boundaries**:
+  1. *Certificate Fingerprint Identity & Certificate Rotation*:
+     - Client principals are identified exclusively by the SHA-256 digest of their DER-encoded leaf X.509 certificate (`sha256.Sum256(cert.Raw)`), formatted as a 64-character lowercase hex string.
+     - Rotating a client certificate (even with identical Subject CN/SANs or key material) produces a new certificate fingerprint. Operators must update the server authorization policy (`--client-authz-policy` or `--client-authz-policy-file`) with the new fingerprint before activating rotated certificates.
+     - Dynamic online policy reload (hot reloading without restart) is intentionally out of scope; policy changes take effect upon server restart or configuration reload.
+  2. *Strict Transport Security Domain Separation*:
+     - RBAC policies apply exclusively to client-facing transport (`:9099`).
+     - Raft consensus peer transport (`:9098`) uses dedicated mutual TLS with peer certificate verification (`OU = Lattice Raft Peer`) and NodeID matching against the canonical cluster topology. Raft peers cannot issue client data plane operations, and client certificates cannot participate in consensus RPCs.
+  3. *Pre-Consensus and Pre-Storage Enforcement Boundary*:
+     - Authorization checks execute at the connection dispatch layer before engine mutations or consensus proposal submission (`ProposalRouter.RouteWrite` / `ReadRouter.RouteRead`).
+     - Denied operations are rejected immediately with `StatusPermissionDenied` (`0x07`) and `"permission denied"`. Denied writes never enter the Raft replication log or state machine, ensuring zero side-effects.
+  4. *Fail-Closed Default & Zero Information Disclosure*:
+     - Unauthenticated connections (e.g. plaintext loopback in development) or client certificates whose fingerprints are absent from the authorization policy fail closed.
+     - Denied responses return bounded uniform payloads (`"permission denied"`) without disclosing internal configuration, registered fingerprints, or stack traces.
+* **Why It Exists**:
+  Provides a robust, zero-trust cryptographic role-based access control layer on top of TLS 1.3 mTLS client identities while preserving consensus isolation and avoiding information leaks.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Deterministic principal resolution, fail-closed authorization, request-context immutability).
+  * Security: **Audited & Hardened** (Fail-closed on missing/unknown certs, pre-consensus rejection, side-effect freedom, uniform error payload).
+  * Performance: **Optimal** (O(1) map lookup in memory post-handshake, zero heap allocations on authorization decision path).
 
 ---
 

@@ -405,6 +405,15 @@ var (
 	// ErrInsecureTransport indicates that cleartext TCP is prohibited on a non-loopback address without InsecureTransport opt-in.
 	ErrInsecureTransport = stdErrors.New("plaintext TCP forbidden on non-loopback address without InsecureTransport opt-in")
 
+	// ErrPermissionDenied indicates that an authenticated principal lacks permission to perform the requested operation.
+	ErrPermissionDenied = stdErrors.New("permission denied")
+
+	// ErrUnauthorized indicates that a connection or request lacks valid client authentication against the authorization policy.
+	ErrUnauthorized = stdErrors.New("unauthorized: missing or invalid authenticated identity")
+
+	// ErrInvalidAuthzPolicy indicates that an authorization policy is malformed, invalid, or contradictory.
+	ErrInvalidAuthzPolicy = stdErrors.New("invalid authorization policy")
+
 	// ErrInvalidNodeID indicates that a cluster node identifier is 0 or unparseable.
 	ErrInvalidNodeID = stdErrors.New("invalid node ID: must be greater than zero")
 

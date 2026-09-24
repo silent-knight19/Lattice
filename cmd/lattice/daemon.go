@@ -397,6 +397,7 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 	srvCfg.TLSKeyFile = cfg.TLSKeyFile
 	srvCfg.ClientCAFile = cfg.ClientCAFile
 	srvCfg.RequireClientCert = cfg.RequireClientCert
+	srvCfg.ClientAuthzPolicy = cfg.ClientAuthzPolicy
 
 	// In cluster mode: wire persistent Raft storage, Node, ProposalRouter, and apply loop
 	if cfg.IsClusterEnabled() {

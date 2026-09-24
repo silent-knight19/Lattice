@@ -35,6 +35,9 @@ var (
 
 	// ErrClientClosed indicates that an operation was attempted on a closed Client.
 	ErrClientClosed = errors.New("client is closed")
+
+	// ErrPermissionDenied indicates that the client principal is not authorized to execute the operation.
+	ErrPermissionDenied = errors.New("permission denied")
 )
 
 // Options configures the Lattice client connection.
@@ -158,6 +161,9 @@ func (c *Client) Put(ctx context.Context, key, value []byte) error {
 	if resp.Status == transport.StatusOk {
 		return nil
 	}
+	if resp.Status == transport.StatusPermissionDenied {
+		return ErrPermissionDenied
+	}
 	return fmt.Errorf("put failed (status 0x%02x): %s", resp.Status, resp.Message)
 }
 
@@ -189,6 +195,9 @@ func (c *Client) Get(ctx context.Context, key []byte) ([]byte, error) {
 	if resp.Status == transport.StatusKeyNotFound {
 		return nil, ErrKeyNotFound
 	}
+	if resp.Status == transport.StatusPermissionDenied {
+		return nil, ErrPermissionDenied
+	}
 	return nil, fmt.Errorf("get failed (status 0x%02x): %s", resp.Status, resp.Message)
 }
 
@@ -213,6 +222,9 @@ func (c *Client) Delete(ctx context.Context, key []byte) error {
 
 	if resp.Status == transport.StatusOk || resp.Status == transport.StatusKeyNotFound {
 		return nil
+	}
+	if resp.Status == transport.StatusPermissionDenied {
+		return ErrPermissionDenied
 	}
 	return fmt.Errorf("delete failed (status 0x%02x): %s", resp.Status, resp.Message)
 }
@@ -242,6 +254,9 @@ func (c *Client) Exists(ctx context.Context, key []byte) (bool, error) {
 	}
 	if resp.Status == transport.StatusKeyNotFound {
 		return false, nil
+	}
+	if resp.Status == transport.StatusPermissionDenied {
+		return false, ErrPermissionDenied
 	}
 	return false, fmt.Errorf("exists failed (status 0x%02x): %s", resp.Status, resp.Message)
 }
@@ -298,6 +313,9 @@ func (c *Client) Batch(ctx context.Context, batch *WriteBatch) error {
 	if resp.Status == transport.StatusOk {
 		return nil
 	}
+	if resp.Status == transport.StatusPermissionDenied {
+		return ErrPermissionDenied
+	}
 	return fmt.Errorf("batch failed (status 0x%02x): %s", resp.Status, resp.Message)
 }
 
@@ -312,6 +330,9 @@ func (c *Client) Stats(ctx context.Context) (*StatsSnapshot, error) {
 		return nil, err
 	}
 
+	if resp.Status == transport.StatusPermissionDenied {
+		return nil, ErrPermissionDenied
+	}
 	if resp.Status != transport.StatusOk {
 		return nil, fmt.Errorf("stats failed (status 0x%02x): %s", resp.Status, resp.Message)
 	}

@@ -74,6 +74,10 @@ func (f *PutFuture) fulfill(resp *transport.Response, err error) {
 	if resp.Status == transport.StatusOk {
 		return
 	}
+	if resp.Status == transport.StatusPermissionDenied {
+		f.err = ErrPermissionDenied
+		return
+	}
 	f.err = fmt.Errorf("put failed (status 0x%02x): %s", resp.Status, resp.Message)
 }
 
@@ -120,6 +124,10 @@ func (f *GetFuture) fulfill(resp *transport.Response, err error) {
 		f.err = ErrKeyNotFound
 		return
 	}
+	if resp.Status == transport.StatusPermissionDenied {
+		f.err = ErrPermissionDenied
+		return
+	}
 	f.err = fmt.Errorf("get failed (status 0x%02x): %s", resp.Status, resp.Message)
 }
 
@@ -156,6 +164,10 @@ func (f *DeleteFuture) fulfill(resp *transport.Response, err error) {
 		return
 	}
 	if resp.Status == transport.StatusOk || resp.Status == transport.StatusKeyNotFound {
+		return
+	}
+	if resp.Status == transport.StatusPermissionDenied {
+		f.err = ErrPermissionDenied
 		return
 	}
 	f.err = fmt.Errorf("delete failed (status 0x%02x): %s", resp.Status, resp.Message)
@@ -196,6 +208,14 @@ func (f *ExistsFuture) fulfill(resp *transport.Response, err error) {
 	}
 	if resp.Status == transport.StatusOk {
 		f.exists = resp.Exists
+		return
+	}
+	if resp.Status == transport.StatusKeyNotFound {
+		f.exists = false
+		return
+	}
+	if resp.Status == transport.StatusPermissionDenied {
+		f.err = ErrPermissionDenied
 		return
 	}
 	f.err = fmt.Errorf("exists failed (status 0x%02x): %s", resp.Status, resp.Message)
@@ -244,6 +264,10 @@ func (f *BatchFuture) fulfill(resp *transport.Response, err error) {
 	if resp.Status == transport.StatusOk {
 		return
 	}
+	if resp.Status == transport.StatusPermissionDenied {
+		f.err = ErrPermissionDenied
+		return
+	}
 	f.err = fmt.Errorf("batch failed (status 0x%02x): %s", resp.Status, resp.Message)
 }
 
@@ -270,6 +294,10 @@ func (f *StatsFuture) fulfill(resp *transport.Response, err error) {
 	defer close(f.done)
 	if err != nil {
 		f.err = err
+		return
+	}
+	if resp.Status == transport.StatusPermissionDenied {
+		f.err = ErrPermissionDenied
 		return
 	}
 	if resp.Status != transport.StatusOk {

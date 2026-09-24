@@ -87,6 +87,10 @@ type Config struct {
 	ClientCAFile      string `json:"client_ca_file"`
 	RequireClientCert bool   `json:"require_client_cert"`
 
+	// Client RBAC Authorization (Problem 6)
+	ClientAuthzPolicy     map[string]string `json:"client_authz_policy"`
+	ClientAuthzPolicyFile string            `json:"client_authz_policy_file"`
+
 	// Peer mTLS
 	PeerTLSCertFile string `json:"peer_tls_cert_file"`
 	PeerTLSKeyFile  string `json:"peer_tls_key_file"`
@@ -135,27 +139,29 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 	fs.SetOutput(stderr)
 
 	var (
-		flagDataDir           string
-		flagPort              int
-		flagAddress           string
-		flagConfig            string
-		flagInsecureTransport bool
-		flagPprofAddress      string
-		flagMetricsAddress    string
-		flagNodeID            uint64
-		flagPeerAddress       string
-		flagClusterPeers      string
-		flagTLSCert           string
-		flagTLSKey            string
-		flagClientCA          string
-		flagRequireClientCert bool
-		flagPeerTLSCert       string
-		flagPeerTLSKey        string
-		flagPeerCA            string
-		flagHelp              bool
-		flagHelpShort         bool
-		flagVersion           bool
-		flagVersionShort      bool
+		flagDataDir               string
+		flagPort                  int
+		flagAddress               string
+		flagConfig                string
+		flagInsecureTransport     bool
+		flagPprofAddress          string
+		flagMetricsAddress        string
+		flagNodeID                uint64
+		flagPeerAddress           string
+		flagClusterPeers          string
+		flagTLSCert               string
+		flagTLSKey                string
+		flagClientCA              string
+		flagRequireClientCert     bool
+		flagClientAuthzPolicy     string
+		flagClientAuthzPolicyFile string
+		flagPeerTLSCert           string
+		flagPeerTLSKey            string
+		flagPeerCA                string
+		flagHelp                  bool
+		flagHelpShort             bool
+		flagVersion               bool
+		flagVersionShort          bool
 	)
 
 	fs.StringVar(&flagDataDir, "data-dir", cfg.DataDir, "Directory path for database storage (WAL, SSTables, MANIFEST)")
@@ -172,6 +178,8 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 	fs.StringVar(&flagTLSKey, "tls-key", "", "Path to private key file for client TLS transport")
 	fs.StringVar(&flagClientCA, "client-ca", "", "Path to trusted CA certificate bundle for client mutual TLS (mTLS)")
 	fs.BoolVar(&flagRequireClientCert, "require-client-cert", false, "Enforce mandatory client certificate authentication (mTLS)")
+	fs.StringVar(&flagClientAuthzPolicy, "client-authz-policy", "", "Comma-separated client authorization policy mapping certificate fingerprints to roles (format: fp=role,fp=role)")
+	fs.StringVar(&flagClientAuthzPolicyFile, "client-authz-policy-file", "", "Path to JSON file containing client authorization policy mapping certificate fingerprints to roles")
 	fs.StringVar(&flagPeerTLSCert, "peer-tls-cert", "", "Path to X.509 certificate file for Raft peer mTLS transport")
 	fs.StringVar(&flagPeerTLSKey, "peer-tls-key", "", "Path to private key file for Raft peer mTLS transport")
 	fs.StringVar(&flagPeerCA, "peer-ca", "", "Path to trusted CA certificate bundle for Raft peer mutual authentication")
@@ -272,6 +280,20 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 	}
 	if provided["require-client-cert"] {
 		cfg.RequireClientCert = flagRequireClientCert
+	}
+	if provided["client-authz-policy"] {
+		policy, err := transport.ParseAuthzPolicyString(flagClientAuthzPolicy)
+		if err != nil {
+			return nil, false, fmt.Errorf("config error: invalid --client-authz-policy: %w", err)
+		}
+		entries := make(map[string]string)
+		for fp, role := range policy.Bindings() {
+			entries[fp] = string(role)
+		}
+		cfg.ClientAuthzPolicy = entries
+	}
+	if provided["client-authz-policy-file"] {
+		cfg.ClientAuthzPolicyFile = flagClientAuthzPolicyFile
 	}
 	if provided["peer-tls-cert"] {
 		cfg.PeerTLSCertFile = flagPeerTLSCert
@@ -425,6 +447,28 @@ func (c *Config) Validate() error {
 		}
 		if !c.RequireClientCert {
 			return fmt.Errorf("config error: external address %q with TLS requires mandatory client certificate authentication (--require-client-cert) for production mTLS", c.Address)
+		}
+	}
+
+	// Client RBAC Authorization Policy validation
+	if c.ClientAuthzPolicyFile != "" {
+		policy, err := transport.LoadAuthzPolicyFile(c.ClientAuthzPolicyFile)
+		if err != nil {
+			return fmt.Errorf("config error: --client-authz-policy-file: %w", err)
+		}
+		if c.ClientAuthzPolicy == nil {
+			c.ClientAuthzPolicy = make(map[string]string)
+		}
+		for fp, role := range policy.Bindings() {
+			if existingRole, exists := c.ClientAuthzPolicy[fp]; exists && existingRole != string(role) {
+				return fmt.Errorf("config error: conflicting duplicate role for fingerprint %s: %q vs %q", fp, existingRole, role)
+			}
+			c.ClientAuthzPolicy[fp] = string(role)
+		}
+	}
+	if len(c.ClientAuthzPolicy) > 0 {
+		if _, err := transport.NewAuthzPolicy(c.ClientAuthzPolicy); err != nil {
+			return fmt.Errorf("config error: invalid client authorization policy: %w", err)
 		}
 	}
 
@@ -676,6 +720,20 @@ func loadConfigFile(path string) (*Config, error) {
 				return nil, fmt.Errorf("invalid boolean value on line %d: %q", lineNum, val)
 			}
 			cfg.RequireClientCert = b
+		case "client_authz_policy_file", "client-authz-policy-file", "server.client_authz_policy_file":
+			canonicalKey = "client_authz_policy_file"
+			cfg.ClientAuthzPolicyFile = val
+		case "client_authz_policy", "client-authz-policy", "server.client_authz_policy":
+			canonicalKey = "client_authz_policy"
+			policy, err := transport.ParseAuthzPolicyString(val)
+			if err != nil {
+				return nil, fmt.Errorf("invalid client_authz_policy on line %d: %w", lineNum, err)
+			}
+			entries := make(map[string]string)
+			for fp, role := range policy.Bindings() {
+				entries[fp] = string(role)
+			}
+			cfg.ClientAuthzPolicy = entries
 		case "peer_tls_cert", "peer_tls_cert_file", "peer-tls-cert", "raft.peer_tls_cert", "raft.peer_tls_cert_file":
 			canonicalKey = "peer_tls_cert"
 			cfg.PeerTLSCertFile = val

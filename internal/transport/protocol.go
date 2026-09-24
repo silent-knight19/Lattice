@@ -115,11 +115,14 @@ const (
 
 	// StatusNotLeader indicates that the node is not the Raft leader and cannot process client writes (0x06).
 	StatusNotLeader StatusCode = 0x06
+
+	// StatusPermissionDenied indicates that the client principal is not authorized to execute the operation (0x07).
+	StatusPermissionDenied StatusCode = 0x07
 )
 
 // Valid reports whether the status code is a recognized StatusCode.
 func (sc StatusCode) Valid() bool {
-	return sc <= StatusNotLeader
+	return sc <= StatusPermissionDenied
 }
 
 // String returns the human-readable string representation of the status code.
@@ -139,6 +142,8 @@ func (sc StatusCode) String() string {
 		return "STATUS_SERVER_CLOSED"
 	case StatusNotLeader:
 		return "STATUS_NOT_LEADER"
+	case StatusPermissionDenied:
+		return "STATUS_PERMISSION_DENIED"
 	default:
 		return fmt.Sprintf("STATUS_UNKNOWN(0x%02x)", byte(sc))
 	}
