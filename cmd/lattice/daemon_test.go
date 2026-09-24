@@ -1208,3 +1208,90 @@ func TestDaemon_PprofStartupFailure_OccupiedPort(t *testing.T) {
 		t.Fatalf("expected ExitStartupError (%d), got %d (stderr: %s)", ExitStartupError, code, stderr.String())
 	}
 }
+
+func TestDaemon_SecurityPolicy_IntegrationWiring(t *testing.T) {
+	ca := newDaemonTestCA(t, "daemon-wiring-ca")
+	srvCert, srvKey := ca.issueServerCert(t, "server")
+	peerCert, peerKey := ca.issuePeerCert(t, 1)
+
+	t.Run("External client listener with TLS but no client CA fails startup", func(t *testing.T) {
+		tempDir := t.TempDir()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		stdout := &safeBuffer{}
+		stderr := &safeBuffer{}
+
+		args := []string{
+			"--data-dir", tempDir,
+			"--address", "192.168.1.10:9099",
+			"--tls-cert", srvCert,
+			"--tls-key", srvKey,
+		}
+
+		code := runWithContext(ctx, args, stdout, stderr, nil)
+		if code != ExitConfigError {
+			t.Fatalf("expected ExitConfigError (%d), got %d (stderr: %s)", ExitConfigError, code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "requires trusted client CA") {
+			t.Errorf("expected error message mentioning client CA, got: %s", stderr.String())
+		}
+	})
+
+	t.Run("--insecure-transport CANNOT downgrade peer transport security (Finding B)", func(t *testing.T) {
+		tempDir := t.TempDir()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		stdout := &safeBuffer{}
+		stderr := &safeBuffer{}
+
+		args := []string{
+			"--data-dir", tempDir,
+			"--insecure-transport", // client plaintext flag provided
+			"--node-id", "1",
+			"--peer-address", "127.0.0.1:9098",
+			"--cluster-peers", "1=127.0.0.1:9098,2=192.168.1.100:9098", // non-loopback peer
+		}
+
+		code := runWithContext(ctx, args, stdout, stderr, nil)
+		if code != ExitConfigError {
+			t.Fatalf("expected ExitConfigError (%d), got %d (stderr: %s)", ExitConfigError, code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "requires Raft peer mTLS") {
+			t.Errorf("expected error message mentioning Raft peer mTLS, got: %s", stderr.String())
+		}
+	})
+
+	t.Run("Valid mTLS on external client succeeds config validation", func(t *testing.T) {
+		tempDir := t.TempDir()
+		stdout := &safeBuffer{}
+		stderr := &safeBuffer{}
+
+		args := []string{
+			"--data-dir", tempDir,
+			"--address", "192.168.1.10:9099",
+			"--tls-cert", srvCert,
+			"--tls-key", srvKey,
+			"--client-ca", ca.CertPath,
+			"--require-client-cert",
+			"--node-id", "1",
+			"--peer-address", "127.0.0.1:9098",
+			"--cluster-peers", "1=127.0.0.1:9098,2=192.168.1.100:9098",
+			"--peer-tls-cert", peerCert,
+			"--peer-tls-key", peerKey,
+			"--peer-ca", ca.CertPath,
+		}
+
+		cfg, isHelp, err := ParseFlags(args, stdout, stderr)
+		if err != nil {
+			t.Fatalf("ParseFlags failed: %v", err)
+		}
+		if isHelp {
+			t.Fatal("unexpected isHelp=true")
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("expected Validate() to succeed for valid mTLS configuration, got: %v", err)
+		}
+	})
+}

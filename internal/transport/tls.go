@@ -97,6 +97,17 @@ func ServerTLSConfig(certFile, keyFile, clientCAFile string, requireClientCert b
 		cfg.ClientCAs = pool
 		if requireClientCert {
 			cfg.ClientAuth = tls.RequireAndVerifyClientCert
+			cfg.VerifyConnection = func(cs tls.ConnectionState) error {
+				if len(cs.PeerCertificates) == 0 {
+					return stdErrors.New("no client certificate presented during TLS handshake")
+				}
+				leaf := cs.PeerCertificates[0]
+				// Defense-in-depth: Raft peer certificate cannot authenticate as a client certificate
+				if IsPeerCertificate(leaf) && !IsClientCertificate(leaf) {
+					return stdErrors.New("certificate rejected: Raft peer certificate cannot be used as client certificate (PKI separation violation)")
+				}
+				return nil
+			}
 		} else {
 			cfg.ClientAuth = tls.VerifyClientCertIfGiven
 		}
@@ -219,6 +230,24 @@ func IsPeerCertificate(cert *x509.Certificate) bool {
 	// Also permit certificates whose Organization indicates Lattice Cluster
 	for _, org := range cert.Subject.Organization {
 		if strings.EqualFold(org, "Lattice Cluster") || strings.EqualFold(org, "Lattice Peer") {
+			return true
+		}
+	}
+	return false
+}
+
+// IsClientCertificate reports whether cert asserts client identity in the Lattice client trust domain.
+func IsClientCertificate(cert *x509.Certificate) bool {
+	if cert == nil {
+		return false
+	}
+	for _, ou := range cert.Subject.OrganizationalUnit {
+		if strings.EqualFold(ou, ClientCertRoleOU) || strings.EqualFold(ou, "Client") {
+			return true
+		}
+	}
+	for _, org := range cert.Subject.Organization {
+		if strings.EqualFold(org, "Lattice Client") {
 			return true
 		}
 	}

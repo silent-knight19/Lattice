@@ -202,20 +202,41 @@ func NewServer(cfg ServerConfig, eng Engine) (*Server, error) {
 		return nil, errors.ErrNilReceiver
 	}
 
+	defaults := DefaultServerConfig()
+	if cfg.Address == "" {
+		cfg.Address = defaults.Address
+	}
+
+	isLoopback := isLoopbackAddress(cfg.Address)
+	hasTLS := cfg.TLSConfig != nil || cfg.TLSCertFile != ""
+
+	// Finding A: Non-loopback client transport security policy enforcement
+	if !isLoopback {
+		if !hasTLS && !cfg.InsecureTransport {
+			return nil, errors.ErrInsecureTransport
+		}
+		if hasTLS {
+			// External production transport with TLS mandates client mutual TLS (mTLS)
+			if cfg.TLSConfig != nil {
+				if cfg.TLSConfig.ClientAuth != tls.RequireAndVerifyClientCert || cfg.TLSConfig.ClientCAs == nil {
+					return nil, fmt.Errorf("%w: non-loopback address %q with TLS requires mutual TLS with mandatory client certificate verification (tls.RequireAndVerifyClientCert)",
+						errors.ErrInsecureTransport, cfg.Address)
+				}
+			} else {
+				if cfg.ClientCAFile == "" || !cfg.RequireClientCert {
+					return nil, fmt.Errorf("%w: non-loopback address %q with TLS requires ClientCAFile and RequireClientCert=true for production mTLS",
+						errors.ErrInsecureTransport, cfg.Address)
+				}
+			}
+		}
+	}
+
 	if cfg.TLSConfig == nil && cfg.TLSCertFile != "" {
 		tlsCfg, err := ServerTLSConfig(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.ClientCAFile, cfg.RequireClientCert)
 		if err != nil {
 			return nil, err
 		}
 		cfg.TLSConfig = tlsCfg
-	}
-
-	defaults := DefaultServerConfig()
-	if cfg.Address == "" {
-		cfg.Address = defaults.Address
-	}
-	if cfg.TLSConfig == nil && !cfg.InsecureTransport && !isLoopbackAddress(cfg.Address) {
-		return nil, errors.ErrInsecureTransport
 	}
 	if cfg.MaxConnections <= 0 {
 		cfg.MaxConnections = defaults.MaxConnections
@@ -343,9 +364,15 @@ func (s *Server) Listen(addr string) error {
 	if bindAddr == "" {
 		bindAddr = s.cfg.Address
 	}
-	if s.cfg.TLSConfig == nil && !s.cfg.InsecureTransport && !isLoopbackAddress(bindAddr) {
-		s.started.Store(false)
-		return errors.ErrInsecureTransport
+	if !isLoopbackAddress(bindAddr) {
+		if s.cfg.TLSConfig == nil && !s.cfg.InsecureTransport {
+			s.started.Store(false)
+			return errors.ErrInsecureTransport
+		}
+		if s.cfg.TLSConfig != nil && (s.cfg.TLSConfig.ClientAuth != tls.RequireAndVerifyClientCert || s.cfg.TLSConfig.ClientCAs == nil) {
+			s.started.Store(false)
+			return fmt.Errorf("%w: non-loopback address %q requires mutual TLS with mandatory client certificate verification", errors.ErrInsecureTransport, bindAddr)
+		}
 	}
 
 	var l net.Listener
@@ -378,9 +405,15 @@ func (s *Server) Serve(l net.Listener) error {
 	}
 
 	addrStr := l.Addr().String()
-	if s.cfg.TLSConfig == nil && !s.cfg.InsecureTransport && !isLoopbackAddress(addrStr) {
-		s.started.Store(false)
-		return errors.ErrInsecureTransport
+	if !isLoopbackAddress(addrStr) {
+		if s.cfg.TLSConfig == nil && !s.cfg.InsecureTransport {
+			s.started.Store(false)
+			return errors.ErrInsecureTransport
+		}
+		if s.cfg.TLSConfig != nil && (s.cfg.TLSConfig.ClientAuth != tls.RequireAndVerifyClientCert || s.cfg.TLSConfig.ClientCAs == nil) {
+			s.started.Store(false)
+			return fmt.Errorf("%w: non-loopback address %q requires mutual TLS with mandatory client certificate verification", errors.ErrInsecureTransport, addrStr)
+		}
 	}
 
 	if s.cfg.TLSConfig != nil {

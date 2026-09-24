@@ -1311,13 +1311,14 @@ Lattice is engineered as an enterprise-grade internal data tier with rigorous de
 
 ### 39.1 Mandatory Transport Encryption & Authentication (mTLS)
 1. **Client Transport (`:9099`)**:
-   - **Production Standard**: Mandates TLS 1.3 with strong cipher suites (`TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`). Deprecated protocols (TLS 1.0, 1.1, 1.2) and insecure cipher suites are rejected fail-closed during handshake negotiation.
-   - **Mutual Authentication (mTLS)**: Supports client certificate authentication with root CA verification for zero-trust service mesh deployments.
-   - **Insecure Fallback Scoping**: Unencrypted plaintext TCP is strictly forbidden in production and permitted exclusively on loopback interfaces (`127.0.0.1`, `::1`) for local unit testing, requiring explicit `--insecure-transport` configuration flag.
+   - **Production Standard**: External/non-loopback production client transport mandates TLS 1.3 with mutual TLS (mTLS) client authentication (`TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`). Deprecated protocols (TLS 1.0, 1.1, 1.2) are rejected fail-closed during handshake negotiation.
+   - **Mandatory Mutual Authentication (mTLS)**: For any non-loopback external listener, configuring TLS requires both a trusted Client CA bundle (`--client-ca`) and mandatory client certificate enforcement (`--require-client-cert`). External listeners cannot run with ordinary one-way TLS. Client certificates asserting peer roles (`OU = Lattice Raft Peer`) are rejected on the client transport under PKI separation rules.
+   - **Insecure Flag Scoping & Development Exceptions**: Unencrypted plaintext TCP is strictly forbidden on non-loopback interfaces unless explicitly enabled via `--insecure-transport`. Plaintext transport and server-only TLS (without client certs) are permitted exclusively on loopback interfaces (`127.0.0.1`, `::1`, `localhost`) for local development and test automation.
 
 2. **Raft Consensus Transport (`:9098`)**:
-   - **Universal mTLS**: All peer-to-peer Raft cluster communication mandates mutual TLS 1.3 across *all* environments (including staging, development, and testing). Assuming unencrypted Raft is safe in development is prohibited.
-   - **Node Identity Pinning**: Each cluster node presents an X.509 certificate whose Subject Alternative Name (SAN) or Common Name (CN) is strictly matched against the authorized `cluster_peers` allowlist in configuration. Unregistered or forged certificates are dropped immediately before processing any consensus frames.
+   - **Mandatory Peer mTLS**: All peer-to-peer Raft cluster communication on non-loopback networks mandates mutual TLS 1.3 with peer certificate verification (`--peer-tls-cert`, `--peer-tls-key`, `--peer-ca`).
+   - **Independent Security Boundary**: The client-facing `--insecure-transport` flag applies strictly to the client data plane; it DOES NOT disable or downgrade Raft peer transport authentication. Non-loopback peer communication without peer mTLS fails closed at configuration validation and transport manager initialization.
+   - **Node Identity Pinning & PKI Separation**: Each cluster node presents an X.509 certificate with `OU = Lattice Raft Peer` whose asserted NodeID (SPIFFE URI `spiffe://lattice/node/<id>`, SAN DNS `node-<id>`, or CN `node-<id>`) is strictly validated against the canonical cluster topology. Untrusted, expired, mismatched, or ordinary client certificates are dropped immediately before processing any consensus frames. Loopback-only peer testing may utilize unencrypted transport exclusively in local/test topologies.
 
 ### 39.2 Pre-Allocation Frame Bounding & DoS Defenses
 1. **Zero-Allocation Length Header Validation**:

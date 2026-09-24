@@ -418,6 +418,16 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config error: --require-client-cert requires --client-ca to be configured")
 	}
 
+	// Finding A: Non-loopback external client transport with TLS requires mandatory mTLS (Client CA + RequireClientCert)
+	if !isLoopback(host) && hasTLS {
+		if c.ClientCAFile == "" {
+			return fmt.Errorf("config error: external address %q with TLS requires trusted client CA (--client-ca) for production mTLS", c.Address)
+		}
+		if !c.RequireClientCert {
+			return fmt.Errorf("config error: external address %q with TLS requires mandatory client certificate authentication (--require-client-cert) for production mTLS", c.Address)
+		}
+	}
+
 	// Peer mTLS validation
 	if c.PeerTLSCertFile != "" || c.PeerTLSKeyFile != "" || c.PeerCAFile != "" {
 		if c.PeerTLSCertFile == "" || c.PeerTLSKeyFile == "" || c.PeerCAFile == "" {
@@ -512,6 +522,25 @@ func (c *Config) Validate() error {
 				_, mPortStr, _ := net.SplitHostPort(c.MetricsAddress)
 				return fmt.Errorf("config error: peer address port %s conflicts with metrics address port %s", peerPortStr, mPortStr)
 			}
+		}
+
+		// Finding B: Check if any peer endpoint (local or remote) is non-loopback.
+		// Raft peer transport on non-loopback addresses strictly mandates mutual TLS 1.3 (--peer-tls-cert, --peer-tls-key, --peer-ca).
+		// The client-facing --insecure-transport flag DOES NOT permit unauthenticated peer transport.
+		hasNonLoopbackPeer := false
+		if c.Topology.LocalAddress() != "" && !isLoopback(c.Topology.LocalAddress()) {
+			hasNonLoopbackPeer = true
+		}
+		for _, p := range c.Topology.RemotePeers() {
+			if !isLoopback(p.Address) {
+				hasNonLoopbackPeer = true
+				break
+			}
+		}
+
+		hasPeerTLS := c.PeerTLSCertFile != "" && c.PeerTLSKeyFile != "" && c.PeerCAFile != ""
+		if hasNonLoopbackPeer && !hasPeerTLS {
+			return fmt.Errorf("config error: non-loopback cluster peer topology requires Raft peer mTLS (--peer-tls-cert, --peer-tls-key, --peer-ca); client --insecure-transport does not permit unauthenticated peer transport")
 		}
 	}
 

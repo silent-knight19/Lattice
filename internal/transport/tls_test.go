@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"crypto/tls"
+	stdErrors "errors"
 	"fmt"
 	"net"
 	"os"
@@ -664,4 +665,266 @@ func TestTLS_CertificateValidationFailures(t *testing.T) {
 			t.Fatalf("expected error parsing malformed PEM")
 		}
 	})
+}
+
+func TestSecurityPolicy_ClientTransport_Matrix(t *testing.T) {
+	ca := NewTestCA(t, "Lattice Policy CA")
+	serverCert, serverKey := ca.IssueServerCert(t, "localhost")
+	clientCert, clientKey := ca.IssueClientCert(t, "client")
+	_ = clientCert
+	_ = clientKey
+
+	handler := newMockEngine()
+	nonLoopback := "192.168.1.10:9099"
+	loopback := "127.0.0.1:9099"
+
+	t.Run("External + No TLS + InsecureTransport=false => Rejected", func(t *testing.T) {
+		cfg := DefaultServerConfig()
+		cfg.Address = nonLoopback
+		cfg.InsecureTransport = false
+		_, err := NewServer(cfg, handler)
+		if !stdErrors.Is(err, errors.ErrInsecureTransport) {
+			t.Fatalf("expected ErrInsecureTransport, got: %v", err)
+		}
+	})
+
+	t.Run("External + No TLS + InsecureTransport=true => Accepted", func(t *testing.T) {
+		cfg := DefaultServerConfig()
+		cfg.Address = nonLoopback
+		cfg.InsecureTransport = true
+		srv, err := NewServer(cfg, handler)
+		if err != nil {
+			t.Fatalf("expected success, got: %v", err)
+		}
+		if srv == nil {
+			t.Fatal("expected non-nil server")
+		}
+	})
+
+	t.Run("External + TLS + No Client CA => Rejected", func(t *testing.T) {
+		cfg := DefaultServerConfig()
+		cfg.Address = nonLoopback
+		cfg.TLSCertFile = serverCert
+		cfg.TLSKeyFile = serverKey
+		cfg.ClientCAFile = ""
+		cfg.RequireClientCert = false
+		_, err := NewServer(cfg, handler)
+		if err == nil {
+			t.Fatal("expected error for external listener with TLS but no Client CA, got nil")
+		}
+		if !stdErrors.Is(err, errors.ErrInsecureTransport) {
+			t.Fatalf("expected error wrapping ErrInsecureTransport, got: %v", err)
+		}
+	})
+
+	t.Run("External + TLS + Client CA + RequireClientCert=false => Rejected", func(t *testing.T) {
+		cfg := DefaultServerConfig()
+		cfg.Address = nonLoopback
+		cfg.TLSCertFile = serverCert
+		cfg.TLSKeyFile = serverKey
+		cfg.ClientCAFile = ca.CertPath
+		cfg.RequireClientCert = false
+		_, err := NewServer(cfg, handler)
+		if err == nil {
+			t.Fatal("expected error for external listener with TLS and ClientCA but RequireClientCert=false, got nil")
+		}
+		if !stdErrors.Is(err, errors.ErrInsecureTransport) {
+			t.Fatalf("expected error wrapping ErrInsecureTransport, got: %v", err)
+		}
+	})
+
+	t.Run("External + TLS + Client CA + RequireClientCert=true => Accepted", func(t *testing.T) {
+		cfg := DefaultServerConfig()
+		cfg.Address = nonLoopback
+		cfg.TLSCertFile = serverCert
+		cfg.TLSKeyFile = serverKey
+		cfg.ClientCAFile = ca.CertPath
+		cfg.RequireClientCert = true
+		srv, err := NewServer(cfg, handler)
+		if err != nil {
+			t.Fatalf("expected success for external listener with full mTLS, got: %v", err)
+		}
+		if srv == nil {
+			t.Fatal("expected non-nil server")
+		}
+	})
+
+	t.Run("Loopback + No TLS => Accepted (Local Dev)", func(t *testing.T) {
+		cfg := DefaultServerConfig()
+		cfg.Address = loopback
+		cfg.InsecureTransport = false
+		srv, err := NewServer(cfg, handler)
+		if err != nil {
+			t.Fatalf("expected success for loopback plaintext, got: %v", err)
+		}
+		if srv == nil {
+			t.Fatal("expected non-nil server")
+		}
+	})
+
+	t.Run("Loopback + TLS Server-Only => Accepted (Local Dev)", func(t *testing.T) {
+		cfg := DefaultServerConfig()
+		cfg.Address = loopback
+		cfg.TLSCertFile = serverCert
+		cfg.TLSKeyFile = serverKey
+		cfg.ClientCAFile = ""
+		cfg.RequireClientCert = false
+		srv, err := NewServer(cfg, handler)
+		if err != nil {
+			t.Fatalf("expected success for loopback server-only TLS, got: %v", err)
+		}
+		if srv == nil {
+			t.Fatal("expected non-nil server")
+		}
+	})
+
+	t.Run("Loopback + TLS + Client CA + RequireClientCert=true => Accepted", func(t *testing.T) {
+		cfg := DefaultServerConfig()
+		cfg.Address = loopback
+		cfg.TLSCertFile = serverCert
+		cfg.TLSKeyFile = serverKey
+		cfg.ClientCAFile = ca.CertPath
+		cfg.RequireClientCert = true
+		srv, err := NewServer(cfg, handler)
+		if err != nil {
+			t.Fatalf("expected success for loopback mTLS, got: %v", err)
+		}
+		if srv == nil {
+			t.Fatal("expected non-nil server")
+		}
+	})
+}
+
+func TestSecurityPolicy_PeerTransport_Matrix(t *testing.T) {
+	ca := NewTestCA(t, "Lattice Peer Policy CA")
+	node1Cert, node1Key := ca.IssuePeerCert(t, 1)
+	node2Cert, node2Key := ca.IssuePeerCert(t, 2)
+	_ = node2Cert
+	_ = node2Key
+
+	externalTopo := createTestTopology(t, 1, "127.0.0.1:9098", map[cluster.NodeID]string{
+		2: "192.168.1.100:9098",
+	})
+	loopbackTopo := createTestTopology(t, 1, "127.0.0.1:9098", map[cluster.NodeID]string{
+		2: "127.0.0.1:9097",
+	})
+
+	t.Run("External Peer + No TLS + InsecureTransport=false => Rejected", func(t *testing.T) {
+		cfg := DefaultPeerConnectionConfig()
+		cfg.InsecureTransport = false
+		_, err := NewPeerConnectionManager(externalTopo, cfg)
+		if !stdErrors.Is(err, errors.ErrInsecureTransport) {
+			t.Fatalf("expected ErrInsecureTransport, got: %v", err)
+		}
+	})
+
+	t.Run("External Peer + No TLS + InsecureTransport=true => Rejected (Finding B)", func(t *testing.T) {
+		cfg := DefaultPeerConnectionConfig()
+		cfg.InsecureTransport = true
+		_, err := NewPeerConnectionManager(externalTopo, cfg)
+		if !stdErrors.Is(err, errors.ErrInsecureTransport) {
+			t.Fatalf("expected ErrInsecureTransport for non-loopback peer even with InsecureTransport=true, got: %v", err)
+		}
+	})
+
+	t.Run("External Peer + Peer mTLS => Accepted", func(t *testing.T) {
+		cfg := DefaultPeerConnectionConfig()
+		cfg.PeerTLSCertFile = node1Cert
+		cfg.PeerTLSKeyFile = node1Key
+		cfg.PeerCAFile = ca.CertPath
+		mgr, err := NewPeerConnectionManager(externalTopo, cfg)
+		if err != nil {
+			t.Fatalf("expected success with peer mTLS, got: %v", err)
+		}
+		_ = mgr.Close()
+	})
+
+	t.Run("External Peer + Peer mTLS + InsecureTransport=true => Accepted (Secure)", func(t *testing.T) {
+		cfg := DefaultPeerConnectionConfig()
+		cfg.InsecureTransport = true
+		cfg.PeerTLSCertFile = node1Cert
+		cfg.PeerTLSKeyFile = node1Key
+		cfg.PeerCAFile = ca.CertPath
+		mgr, err := NewPeerConnectionManager(externalTopo, cfg)
+		if err != nil {
+			t.Fatalf("expected success with peer mTLS, got: %v", err)
+		}
+		_ = mgr.Close()
+	})
+
+	t.Run("Loopback Peer + No TLS + InsecureTransport=true => Accepted (Local Dev)", func(t *testing.T) {
+		cfg := DefaultPeerConnectionConfig()
+		cfg.InsecureTransport = true
+		mgr, err := NewPeerConnectionManager(loopbackTopo, cfg)
+		if err != nil {
+			t.Fatalf("expected success for loopback plaintext, got: %v", err)
+		}
+		_ = mgr.Close()
+	})
+
+	t.Run("External Peer Listener without TLS => Rejected", func(t *testing.T) {
+		cfg := DefaultPeerConnectionConfig()
+		cfg.InsecureTransport = true
+		mgr, err := NewPeerConnectionManager(loopbackTopo, cfg)
+		if err != nil {
+			t.Fatalf("setup failed: %v", err)
+		}
+		defer mgr.Close()
+
+		err = mgr.StartListener("192.168.1.10:9098")
+		if err == nil {
+			t.Fatal("expected error binding external peer listener without TLS, got nil")
+		}
+		if !stdErrors.Is(err, errors.ErrInsecureTransport) {
+			t.Fatalf("expected ErrInsecureTransport, got: %v", err)
+		}
+	})
+}
+
+func TestSecurityPolicy_ClientMTLS_PeerCertRejection(t *testing.T) {
+	ca := NewTestCA(t, "Lattice Separation CA")
+	serverCert, serverKey := ca.IssueServerCert(t, "localhost")
+	peerCert, peerKey := ca.IssuePeerCert(t, 1)
+
+	handler := newMockEngine()
+	srv, err := NewServer(ServerConfig{
+		Address:           "127.0.0.1:0",
+		TLSCertFile:       serverCert,
+		TLSKeyFile:        serverKey,
+		ClientCAFile:      ca.CertPath,
+		RequireClientCert: true,
+	}, handler)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer ln.Close()
+
+	go func() { _ = srv.Serve(ln) }()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+
+	// Connect presenting the Raft peer certificate as a client certificate
+	clientTLS, err := ClientTLSConfig(ca.CertPath, peerCert, peerKey, "localhost", false)
+	if err != nil {
+		t.Fatalf("ClientTLSConfig failed: %v", err)
+	}
+
+	conn, err := tls.Dial("tcp", ln.Addr().String(), clientTLS)
+	if err == nil {
+		// Handshake should fail either on dial or on first write/read
+		_ = WriteRequest(conn, &Request{OpCode: OpGet, SeqID: 1, Key: []byte("k")})
+		_, readErr := ReadResponse(conn)
+		if readErr == nil {
+			t.Fatal("expected peer cert to be rejected on client mTLS transport, but read succeeded")
+		}
+		_ = conn.Close()
+	}
 }

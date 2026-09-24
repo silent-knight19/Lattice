@@ -451,3 +451,137 @@ func TestConfig_SecurityPathSanitization(t *testing.T) {
 		}
 	})
 }
+
+func TestConfig_SecurityPolicy_ClientAndPeerMTLS(t *testing.T) {
+	ca := newDaemonTestCA(t, "daemon-policy-ca")
+	srvCert, srvKey := ca.issueServerCert(t, "server")
+	peerCert, peerKey := ca.issuePeerCert(t, 1)
+
+	t.Run("External client address + TLS + missing client CA => rejected", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Address = "192.168.1.10:9099"
+		cfg.TLSCertFile = srvCert
+		cfg.TLSKeyFile = srvKey
+		cfg.ClientCAFile = ""
+		cfg.RequireClientCert = false
+
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected error for external client listener with TLS but no client CA, got nil")
+		}
+		if !strings.Contains(err.Error(), "requires trusted client CA") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("External client address + TLS + client CA + RequireClientCert=false => rejected", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Address = "192.168.1.10:9099"
+		cfg.TLSCertFile = srvCert
+		cfg.TLSKeyFile = srvKey
+		cfg.ClientCAFile = ca.CertPath
+		cfg.RequireClientCert = false
+
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected error for external client listener with RequireClientCert=false, got nil")
+		}
+		if !strings.Contains(err.Error(), "requires mandatory client certificate authentication") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("External client address + TLS + client CA + RequireClientCert=true => succeeds", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Address = "192.168.1.10:9099"
+		cfg.TLSCertFile = srvCert
+		cfg.TLSKeyFile = srvKey
+		cfg.ClientCAFile = ca.CertPath
+		cfg.RequireClientCert = true
+
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("expected success for external client listener with full mTLS, got: %v", err)
+		}
+	})
+
+	t.Run("Loopback client address + TLS server-only => succeeds (local dev)", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Address = "127.0.0.1:9099"
+		cfg.TLSCertFile = srvCert
+		cfg.TLSKeyFile = srvKey
+		cfg.ClientCAFile = ""
+		cfg.RequireClientCert = false
+
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("expected success for loopback server-only TLS, got: %v", err)
+		}
+	})
+
+	t.Run("External cluster peer + no peer TLS => rejected", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.NodeID = 1
+		cfg.PeerAddress = "127.0.0.1:9098"
+		cfg.ClusterPeers = []cluster.PeerConfig{
+			{ID: 1, Address: "127.0.0.1:9098"},
+			{ID: 2, Address: "192.168.1.100:9098"},
+		}
+
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected error for external cluster peer without peer TLS, got nil")
+		}
+		if !strings.Contains(err.Error(), "requires Raft peer mTLS") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("External cluster peer + InsecureTransport=true without peer TLS => STILL rejected (Finding B)", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.InsecureTransport = true
+		cfg.NodeID = 1
+		cfg.PeerAddress = "127.0.0.1:9098"
+		cfg.ClusterPeers = []cluster.PeerConfig{
+			{ID: 1, Address: "127.0.0.1:9098"},
+			{ID: 2, Address: "192.168.1.100:9098"},
+		}
+
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected error for external cluster peer even with --insecure-transport, got nil")
+		}
+		if !strings.Contains(err.Error(), "requires Raft peer mTLS") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("External cluster peer + valid peer TLS => succeeds", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.NodeID = 1
+		cfg.PeerAddress = "127.0.0.1:9098"
+		cfg.ClusterPeers = []cluster.PeerConfig{
+			{ID: 1, Address: "127.0.0.1:9098"},
+			{ID: 2, Address: "192.168.1.100:9098"},
+		}
+		cfg.PeerTLSCertFile = peerCert
+		cfg.PeerTLSKeyFile = peerKey
+		cfg.PeerCAFile = ca.CertPath
+
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("expected success for external cluster peer with peer mTLS, got: %v", err)
+		}
+	})
+
+	t.Run("Loopback cluster peers + no peer TLS => succeeds (local dev)", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.NodeID = 1
+		cfg.PeerAddress = "127.0.0.1:9098"
+		cfg.ClusterPeers = []cluster.PeerConfig{
+			{ID: 1, Address: "127.0.0.1:9098"},
+			{ID: 2, Address: "127.0.0.1:9097"},
+		}
+
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("expected success for loopback cluster peers without peer TLS, got: %v", err)
+		}
+	})
+}

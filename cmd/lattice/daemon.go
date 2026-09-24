@@ -418,7 +418,9 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 		}
 
 		peerCfg := transport.DefaultPeerConnectionConfig()
-		peerCfg.InsecureTransport = cfg.InsecureTransport
+		// Finding B: Client --insecure-transport flag MUST NOT downgrade Raft peer security.
+		// Peer transport security policy is decoupled from the client insecure-transport flag.
+		peerCfg.InsecureTransport = false
 		peerCfg.PeerTLSCertFile = cfg.PeerTLSCertFile
 		peerCfg.PeerTLSKeyFile = cfg.PeerTLSKeyFile
 		peerCfg.PeerCAFile = cfg.PeerCAFile

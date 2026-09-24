@@ -1039,11 +1039,20 @@ func TestPeerConnectionManager_InsecureTransportPolicy(t *testing.T) {
 		t.Fatalf("expected ErrInsecureTransport for remote peer, got: %v", err)
 	}
 
-	// 2. InsecureTransport = true explicitly opts in to plaintext TCP
+	// 2. Finding B: InsecureTransport = true on non-loopback peer MUST STILL fail closed
 	cfg.InsecureTransport = true
-	mgr, err := NewPeerConnectionManager(topo, cfg)
+	_, err = NewPeerConnectionManager(topo, cfg)
+	if !errors.Is(err, errs.ErrInsecureTransport) {
+		t.Fatalf("expected ErrInsecureTransport for non-loopback peer even with InsecureTransport=true, got: %v", err)
+	}
+
+	// 3. Loopback peer topology succeeds with plaintext TCP for local development/testing
+	loopbackTopo := createTestTopology(t, 1, "127.0.0.1:9001", map[cluster.NodeID]string{
+		2: "127.0.0.1:9098",
+	})
+	mgr, err := NewPeerConnectionManager(loopbackTopo, cfg)
 	if err != nil {
-		t.Fatalf("expected success with InsecureTransport=true, got: %v", err)
+		t.Fatalf("expected success for loopback peer with InsecureTransport=true, got: %v", err)
 	}
 	_ = mgr.Close()
 }
