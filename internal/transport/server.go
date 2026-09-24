@@ -737,6 +737,11 @@ func (s *Server) dispatch(req *Request) (finalResp *Response) {
 			resp.Message = "failed to serialize stats snapshot"
 			return resp
 		}
+		if len(data) > MaxStatsPayloadLength {
+			resp.Status = StatusError
+			resp.Message = fmt.Sprintf("stats snapshot payload length %d exceeds maximum %d", len(data), MaxStatsPayloadLength)
+			return resp
+		}
 		resp.Status = StatusOk
 		resp.Value = data
 

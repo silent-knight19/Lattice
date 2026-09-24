@@ -919,7 +919,8 @@ Lattice rejects slow text protocols and heavy RPC layers in favor of a lean, hig
     "total_sstable_bytes": 20480,
     "flushes_completed": 2,
     "flushes_pending": 0,
-    "wal_bytes_written": 8192
+    "active_wal_segment_bytes": 8192,
+    "wal_bytes_written": 16384
   },
   "cache": {
     "capacity": 67108864,

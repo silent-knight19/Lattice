@@ -187,15 +187,16 @@ func ListSegments(dbPath string) ([]uint64, error) {
 //     Closed previous segments remain completely intact on disk, terminated cleanly at io.EOF,
 //     and independently readable via WALReader.
 type RotatingWriter struct {
-	mu        sync.Mutex
-	dbPath    string
-	opts      Options
-	active    *WALWriter
-	activePtr atomic.Pointer[WALWriter]
-	activeID  uint64
-	activeLen int64
-	closed    bool
-	dirInfo   os.FileInfo
+	mu                sync.Mutex
+	dbPath            string
+	opts              Options
+	active            *WALWriter
+	activePtr         atomic.Pointer[WALWriter]
+	activeID          uint64
+	activeLen         int64
+	totalBytesWritten atomic.Uint64
+	closed            bool
+	dirInfo           os.FileInfo
 
 	// createWriterFn is an internal test seam for injecting creation failures.
 	createWriterFn func(path string) (*WALWriter, error)
@@ -523,8 +524,18 @@ func (rw *RotatingWriter) AppendSync(rec Record) error {
 	if err := rw.active.Sync(); err != nil {
 		return err
 	}
+	rw.totalBytesWritten.Add(uint64(recWireSize))
 	metrics.WALBytesWritten.Add(uint64(recWireSize))
 	return nil
+}
+
+// TotalBytesWritten returns the cumulative physical wire bytes appended and durably
+// synchronized across all WAL segments managed by this RotatingWriter.
+func (rw *RotatingWriter) TotalBytesWritten() uint64 {
+	if rw == nil {
+		return 0
+	}
+	return rw.totalBytesWritten.Load()
 }
 
 // ActiveLen returns the physical byte size of the currently active WAL segment.

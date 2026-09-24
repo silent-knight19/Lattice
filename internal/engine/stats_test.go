@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/silent-knight19/lattice/internal/binary"
+	"github.com/silent-knight19/lattice/internal/engine"
 )
 
 // -----------------------------------------------------------------------------
@@ -281,4 +282,52 @@ func TestEngine_Stats_ConcurrentOperations(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	close(stopCh)
 	wg.Wait()
+}
+
+// -----------------------------------------------------------------------------
+// 7. REAL WAL STATS WITH MONOTONIC ACCUMULATION
+// -----------------------------------------------------------------------------
+
+func TestEngine_Stats_WALRotationSemantics(t *testing.T) {
+	dir := t.TempDir()
+	eng := engine.NewEngineWithOptions(engine.EngineOptions{
+		DBPath: dir,
+	})
+	if err := eng.Open(); err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer eng.Close()
+	ctx := context.Background()
+
+	// Initial stats
+	_, _, stor0, _, err := eng.Stats()
+	if err != nil {
+		t.Fatalf("Stats 0 failed: %v", err)
+	}
+
+	// Write mutations
+	for i := 0; i < 50; i++ {
+		k := []byte(fmt.Sprintf("rot-k-%04d", i))
+		v := []byte(fmt.Sprintf("rot-v-%04d-payload-data", i))
+		if err := eng.Put(ctx, k, v); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+	}
+
+	_, _, stor1, _, err := eng.Stats()
+	if err != nil {
+		t.Fatalf("Stats 1 failed: %v", err)
+	}
+	if stor1.ActiveWALSegmentBytes == 0 {
+		t.Fatalf("expected ActiveWALSegmentBytes > 0, got 0")
+	}
+	if stor1.WALBytesWritten == 0 {
+		t.Fatalf("expected WALBytesWritten > 0, got 0")
+	}
+	if stor1.WALBytesWritten < stor1.ActiveWALSegmentBytes {
+		t.Fatalf("expected WALBytesWritten >= ActiveWALSegmentBytes, got %d < %d", stor1.WALBytesWritten, stor1.ActiveWALSegmentBytes)
+	}
+	if stor1.WALBytesWritten <= stor0.WALBytesWritten {
+		t.Fatalf("expected WALBytesWritten to increase from %d, got %d", stor0.WALBytesWritten, stor1.WALBytesWritten)
+	}
 }

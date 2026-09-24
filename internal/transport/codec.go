@@ -335,6 +335,17 @@ func DecodeResponse(f *Frame) (*Response, error) {
 				}
 			}
 		case OpStats:
+			if uint64(len(f.Payload)) > uint64(MaxPayloadLength) {
+				return nil, &errors.FrameTooLargeError{
+					PayloadSize: uint32(len(f.Payload)),
+					MaxSize:     MaxPayloadLength,
+				}
+			}
+			if len(f.Payload) > MaxStatsPayloadLength {
+				return nil, &errors.InvalidPayloadError{
+					Reason: fmt.Sprintf("STATS response payload length %d exceeds maximum %d", len(f.Payload), MaxStatsPayloadLength),
+				}
+			}
 			valCopy := make([]byte, len(f.Payload))
 			copy(valCopy, f.Payload)
 			resp.Value = valCopy
@@ -390,6 +401,17 @@ func EncodeResponse(resp *Response) (*Frame, error) {
 				payload = []byte{0x00}
 			}
 		case OpStats:
+			if uint64(len(resp.Value)) > uint64(MaxPayloadLength) {
+				return nil, &errors.FrameTooLargeError{
+					PayloadSize: uint32(len(resp.Value)),
+					MaxSize:     MaxPayloadLength,
+				}
+			}
+			if len(resp.Value) > MaxStatsPayloadLength {
+				return nil, &errors.InvalidPayloadError{
+					Reason: fmt.Sprintf("STATS response payload length %d exceeds maximum %d", len(resp.Value), MaxStatsPayloadLength),
+				}
+			}
 			payload = make([]byte, len(resp.Value))
 			copy(payload, resp.Value)
 		default:

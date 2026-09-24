@@ -20,14 +20,18 @@ type MemoryStats struct {
 	BackpressureRejected     uint64  `json:"backpressure_rejected_writes"`
 }
 
+// MaxStatsPayloadLength is the strict upper bound (4096 bytes / 4 KiB) for serialized STATS response payloads.
+const MaxStatsPayloadLength = 4096
+
 // StorageStats captures on-disk SSTable and WAL storage telemetry.
 type StorageStats struct {
-	L0Files           int    `json:"l0_files"`
-	TotalSSTableFiles int    `json:"total_sstable_files"`
-	TotalSSTableBytes uint64 `json:"total_sstable_bytes"`
-	FlushesCompleted  uint64 `json:"flushes_completed"`
-	FlushesPending    int    `json:"flushes_pending"`
-	WALBytesWritten   uint64 `json:"wal_bytes_written"`
+	L0Files               int    `json:"l0_files"`
+	TotalSSTableFiles     int    `json:"total_sstable_files"`
+	TotalSSTableBytes     uint64 `json:"total_sstable_bytes"`
+	FlushesCompleted      uint64 `json:"flushes_completed"`
+	FlushesPending        int    `json:"flushes_pending"`
+	ActiveWALSegmentBytes uint64 `json:"active_wal_segment_bytes"`
+	WALBytesWritten       uint64 `json:"wal_bytes_written"`
 }
 
 // CacheStats captures block cache capacity, occupancy, and hit/miss telemetry.

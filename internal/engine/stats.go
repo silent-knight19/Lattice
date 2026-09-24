@@ -99,21 +99,31 @@ func (e *Engine) Stats() (transport.EngineStats, transport.MemoryStats, transpor
 		BackpressureRejected:     bpStats.RejectedWrites,
 	}
 
-	var walBytes uint64
+	var activeWALBytes uint64
+	var totalWALBytes uint64
 	type activeLenReporter interface {
 		ActiveLen() int64
 	}
+	type totalBytesReporter interface {
+		TotalBytesWritten() uint64
+	}
 	if al, ok := e.wal.(activeLenReporter); ok {
-		walBytes = uint64(al.ActiveLen())
+		activeWALBytes = uint64(al.ActiveLen())
+	}
+	if tb, ok := e.wal.(totalBytesReporter); ok {
+		totalWALBytes = tb.TotalBytesWritten()
+	} else {
+		totalWALBytes = activeWALBytes
 	}
 
 	storStats := transport.StorageStats{
-		L0Files:           l0Files,
-		TotalSSTableFiles: totalFiles,
-		TotalSSTableBytes: totalBytes,
-		FlushesCompleted:  e.flushCount.Load(),
-		FlushesPending:    immCount,
-		WALBytesWritten:   walBytes,
+		L0Files:               l0Files,
+		TotalSSTableFiles:     totalFiles,
+		TotalSSTableBytes:     totalBytes,
+		FlushesCompleted:      e.flushCount.Load(),
+		FlushesPending:        immCount,
+		ActiveWALSegmentBytes: activeWALBytes,
+		WALBytesWritten:       totalWALBytes,
 	}
 
 	cStats := transport.CacheStats{

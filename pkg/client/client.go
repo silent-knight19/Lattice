@@ -271,6 +271,9 @@ func (c *Client) Stats(ctx context.Context) (*StatsSnapshot, error) {
 	if len(resp.Value) == 0 {
 		return nil, errors.New("empty stats response payload")
 	}
+	if len(resp.Value) > MaxStatsPayloadLength {
+		return nil, fmt.Errorf("stats payload size %d exceeds maximum %d", len(resp.Value), MaxStatsPayloadLength)
+	}
 
 	var snap StatsSnapshot
 	if err := json.Unmarshal(resp.Value, &snap); err != nil {

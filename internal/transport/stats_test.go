@@ -176,3 +176,50 @@ func TestServer_Stats_ClusterMode(t *testing.T) {
 		t.Errorf("expected commit_index 100, got %d", snap.Cluster.CommitIndex)
 	}
 }
+
+func TestCodec_StatsResponse_PayloadBounds(t *testing.T) {
+	// 1. Oversized response payload rejected on encode (> 4096 bytes)
+	oversizedResp := &transport.Response{
+		OpCode: transport.OpStats,
+		Status: transport.StatusOk,
+		SeqID:  999,
+		Value:  make([]byte, transport.MaxStatsPayloadLength+1),
+	}
+	if _, err := transport.EncodeResponse(oversizedResp); err == nil {
+		t.Fatalf("expected EncodeResponse to reject oversized STATS payload, got nil")
+	}
+
+	// 2. Oversized response payload rejected on decode (> 4096 bytes)
+	oversizedFrame := &transport.Frame{
+		Header: transport.Header{
+			Magic:         transport.Magic,
+			OpCode:        transport.OpStats,
+			Status:        transport.StatusOk,
+			SeqID:         999,
+			PayloadLength: transport.MaxStatsPayloadLength + 1,
+		},
+		Payload: make([]byte, transport.MaxStatsPayloadLength+1),
+	}
+	if _, err := transport.DecodeResponse(oversizedFrame); err == nil {
+		t.Fatalf("expected DecodeResponse to reject oversized STATS frame, got nil")
+	}
+
+	// 3. Valid sized payload accepted (<= 4096 bytes)
+	validResp := &transport.Response{
+		OpCode: transport.OpStats,
+		Status: transport.StatusOk,
+		SeqID:  1000,
+		Value:  []byte(`{"engine":{"state":"open"}}`),
+	}
+	frame, err := transport.EncodeResponse(validResp)
+	if err != nil {
+		t.Fatalf("expected EncodeResponse to succeed for valid STATS payload: %v", err)
+	}
+	decoded, err := transport.DecodeResponse(frame)
+	if err != nil {
+		t.Fatalf("expected DecodeResponse to succeed for valid STATS frame: %v", err)
+	}
+	if string(decoded.Value) != string(validResp.Value) {
+		t.Errorf("decoded value mismatch: got %q, want %q", string(decoded.Value), string(validResp.Value))
+	}
+}

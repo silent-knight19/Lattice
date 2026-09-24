@@ -355,6 +355,12 @@ func TestClient_Stats(t *testing.T) {
 	if snap2.Memory.ActiveMemTableEntries < 5 {
 		t.Errorf("expected >= 5 active entries, got %d", snap2.Memory.ActiveMemTableEntries)
 	}
+	if snap2.Storage.ActiveWALSegmentBytes == 0 {
+		t.Errorf("expected ActiveWALSegmentBytes > 0 after Put, got 0")
+	}
+	if snap2.Storage.WALBytesWritten == 0 {
+		t.Errorf("expected WALBytesWritten > 0 after Put, got 0")
+	}
 
 	// 3. Context cancelled
 	canceledCtx, cancel := context.WithCancel(ctx)
