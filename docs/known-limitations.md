@@ -1061,8 +1061,12 @@ This document tracks all **genuine architectural and operational limitations** o
   7. *Error Sanitization & Sequence Independence*:
      - Internal storage errors returned across the wire are sanitized to `"internal storage error"`, preventing leakage of filesystem paths, SSTable filenames, or WAL structures.
      - Wire `SeqID` is preserved strictly as a transport-level request correlation identifier; it is never mapped to or confused with internal Engine MVCC sequence numbers.
-  8. *Pipelining & Advanced Concurrency*:
-     - Connections process requests sequentially (one request read -> dispatched -> response written -> next request read). Out-of-order request pipelining and connection multiplexing are not implemented.
+  8. *Pipelining & Multiplexed Concurrency*:
+     - Protocol-level TCP request pipelining and concurrent multiplexed dispatch are fully implemented.
+     - Connections support up to `MaxInFlightPerConn` (default 64) concurrent in-flight requests with out-of-order response emission correlated via `SeqID`.
+     - A dedicated response writer goroutine serializes frames atomically, preventing frame byte interleaving and CRC corruption.
+     - Duplicate active `SeqID` on the same connection is deterministically rejected with `StatusInvalidRequest` while active; `SeqID` reuse is permitted once prior request execution completes.
+     - Server enforces natural TCP window backpressure when connection in-flight limits are reached, and enforces global admission ceilings (`MaxGlobalInFlight = 16384`) with `StatusThrottled`.
 * **Why It Exists**:
   Provides a bounded, DoS-resistant TCP server boundary above the single-node storage engine without violating storage invariants or introducing speculative networking complexity.
 * **Impact**:

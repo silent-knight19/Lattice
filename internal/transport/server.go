@@ -57,6 +57,12 @@ type ServerConfig struct {
 	// MaxConnections is the maximum number of concurrent client connections (default: 4096).
 	MaxConnections int
 
+	// MaxInFlightPerConn is the maximum number of concurrent in-flight requests permitted per TCP connection (default: 64).
+	MaxInFlightPerConn int
+
+	// MaxGlobalInFlight is the maximum total number of concurrent in-flight requests permitted across all connections (default: 16384).
+	MaxGlobalInFlight int
+
 	// HeaderTimeout is the maximum duration allowed to read a frame header (default: 5s).
 	HeaderTimeout time.Duration
 
@@ -90,17 +96,27 @@ type ServerConfig struct {
 	ClusterMode bool
 }
 
+const (
+	// DefaultMaxInFlightPerConn defines the default maximum concurrent in-flight requests per connection.
+	DefaultMaxInFlightPerConn = 64
+
+	// DefaultMaxGlobalInFlight defines the default global ceiling for simultaneously active requests across all connections.
+	DefaultMaxGlobalInFlight = 16384
+)
+
 // DefaultServerConfig returns a production-hardened ServerConfig with safe default timeouts and limits.
 func DefaultServerConfig() ServerConfig {
 	return ServerConfig{
-		Address:         "127.0.0.1:9099",
-		MaxConnections:  4096,
-		HeaderTimeout:   5 * time.Second,
-		PayloadTimeout:  10 * time.Second,
-		IdleTimeout:     60 * time.Second,
-		WriteTimeout:    5 * time.Second,
-		RequestTimeout:  5 * time.Second,
-		ShutdownTimeout: 5 * time.Second,
+		Address:            "127.0.0.1:9099",
+		MaxConnections:     4096,
+		MaxInFlightPerConn: DefaultMaxInFlightPerConn,
+		MaxGlobalInFlight:  DefaultMaxGlobalInFlight,
+		HeaderTimeout:      5 * time.Second,
+		PayloadTimeout:     10 * time.Second,
+		IdleTimeout:        60 * time.Second,
+		WriteTimeout:       5 * time.Second,
+		RequestTimeout:     5 * time.Second,
+		ShutdownTimeout:    5 * time.Second,
 	}
 }
 
@@ -136,6 +152,9 @@ type Server struct {
 	wg           sync.WaitGroup
 	activeConns  atomic.Int64
 
+	globalInFlight    atomic.Int64
+	maxGlobalInFlight int64
+
 	routerMu    sync.RWMutex
 	router      ProposalRouter
 	readRouter  ReadRouter
@@ -157,6 +176,12 @@ func NewServer(cfg ServerConfig, eng Engine) (*Server, error) {
 	}
 	if cfg.MaxConnections <= 0 {
 		cfg.MaxConnections = defaults.MaxConnections
+	}
+	if cfg.MaxInFlightPerConn <= 0 {
+		cfg.MaxInFlightPerConn = defaults.MaxInFlightPerConn
+	}
+	if cfg.MaxGlobalInFlight <= 0 {
+		cfg.MaxGlobalInFlight = defaults.MaxGlobalInFlight
 	}
 	if cfg.HeaderTimeout <= 0 {
 		cfg.HeaderTimeout = defaults.HeaderTimeout
@@ -185,14 +210,15 @@ func NewServer(cfg ServerConfig, eng Engine) (*Server, error) {
 	}
 
 	return &Server{
-		cfg:          cfg,
-		engine:       eng,
-		router:       cfg.ProposalRouter,
-		readRouter:   readRouter,
-		clusterMode:  cfg.ClusterMode,
-		conns:        make(map[net.Conn]struct{}),
-		shutdownCh:   make(chan struct{}),
-		shutdownDone: make(chan struct{}),
+		cfg:               cfg,
+		engine:            eng,
+		router:            cfg.ProposalRouter,
+		readRouter:        readRouter,
+		clusterMode:       cfg.ClusterMode,
+		maxGlobalInFlight: int64(cfg.MaxGlobalInFlight),
+		conns:             make(map[net.Conn]struct{}),
+		shutdownCh:        make(chan struct{}),
+		shutdownDone:      make(chan struct{}),
 	}, nil
 }
 
@@ -405,46 +431,187 @@ func (s *Server) untrackConn(conn net.Conn) {
 	}
 }
 
-// handleConn is the per-connection request-processing loop.
+// handleConn is the per-connection request-processing loop supporting bounded out-of-order request pipelining.
 func (s *Server) handleConn(conn net.Conn) {
+	connCtx, connCancel := context.WithCancel(context.Background())
 	defer func() {
-		conn.Close()
+		connCancel()
+		_ = conn.Close()
 		s.untrackConn(conn)
+	}()
+
+	maxInFlight := s.cfg.MaxInFlightPerConn
+	if maxInFlight <= 0 {
+		maxInFlight = DefaultMaxInFlightPerConn
+	}
+
+	inFlightSem := make(chan struct{}, maxInFlight)
+	respCh := make(chan *Response, maxInFlight)
+	writerDone := make(chan struct{})
+
+	var inFlightWG sync.WaitGroup
+	var activeMu sync.Mutex
+	activeSeqIDs := make(map[uint64]struct{})
+
+	// Dedicated response writer goroutine: guarantees exactly one goroutine writes to conn,
+	// preventing response frame byte interleaving under concurrent request dispatch.
+	go func() {
+		defer close(writerDone)
+		for resp := range respCh {
+			if err := s.writeResponseWithDeadline(conn, resp); err != nil {
+				// Socket write failure (client disconnect, timeout, or broken pipe).
+				// Abort the connection context and close the connection descriptor
+				// to unblock the reader goroutine immediately.
+				connCancel()
+				_ = conn.Close()
+				return
+			}
+		}
 	}()
 
 	isFirst := true
 	for {
-		if s.closed.Load() {
-			return
+		if s.closed.Load() || connCtx.Err() != nil {
+			break
 		}
 
+		// 1. Connection-level backpressure admission control:
+		// Wait until an in-flight slot is available. Natural TCP window flow control
+		// prevents unbounded reading and memory allocation when the pipeline is saturated.
+		select {
+		case inFlightSem <- struct{}{}:
+		case <-connCtx.Done():
+			break
+		case <-s.shutdownCh:
+			break
+		}
+
+		if connCtx.Err() != nil || s.closed.Load() {
+			select {
+			case <-inFlightSem:
+			default:
+			}
+			break
+		}
+
+		// 2. Read frame with deadlines
 		frame, err := s.readFrameWithDeadlines(conn, isFirst)
 		if err != nil {
+			<-inFlightSem
 			// Normal EOF, read timeout (Slowloris/idle), or fatal framing error.
-			return
+			break
 		}
 		isFirst = false
 
-		req, err := DecodeRequest(frame)
-		if err != nil {
-			// Frame was structurally valid, but payload violated application constraints.
+		// 3. Global admission control check
+		if s.maxGlobalInFlight > 0 && s.globalInFlight.Add(1) > s.maxGlobalInFlight {
+			s.globalInFlight.Add(-1)
+			metrics.PipelineRejections.Add(1)
 			resp := &Response{
 				OpCode:  frame.Header.OpCode,
 				SeqID:   frame.Header.SeqID,
-				Status:  StatusInvalidRequest,
-				Message: err.Error(),
+				Status:  StatusThrottled,
+				Message: "server busy: global in-flight request limit reached",
 			}
-			if writeErr := s.writeResponseWithDeadline(conn, resp); writeErr != nil {
-				return
+			select {
+			case respCh <- resp:
+			case <-connCtx.Done():
 			}
+			<-inFlightSem
 			continue
 		}
 
-		resp := s.dispatch(req)
-		if writeErr := s.writeResponseWithDeadline(conn, resp); writeErr != nil {
-			return
+		// 4. Duplicate SeqID defense
+		seqID := frame.Header.SeqID
+		activeMu.Lock()
+		if _, exists := activeSeqIDs[seqID]; exists {
+			activeMu.Unlock()
+			if s.maxGlobalInFlight > 0 {
+				s.globalInFlight.Add(-1)
+			}
+			metrics.PipelineLimitHits.Add(1)
+			resp := &Response{
+				OpCode:  frame.Header.OpCode,
+				SeqID:   seqID,
+				Status:  StatusInvalidRequest,
+				Message: fmt.Sprintf("duplicate active seq_id: %d", seqID),
+			}
+			select {
+			case respCh <- resp:
+			case <-connCtx.Done():
+			}
+			<-inFlightSem
+			continue
 		}
+		activeSeqIDs[seqID] = struct{}{}
+		activeMu.Unlock()
+
+		// 5. Decode Request
+		req, err := DecodeRequest(frame)
+		if err != nil {
+			// Frame was structurally valid, but payload violated application constraints.
+			activeMu.Lock()
+			delete(activeSeqIDs, seqID)
+			activeMu.Unlock()
+			if s.maxGlobalInFlight > 0 {
+				s.globalInFlight.Add(-1)
+			}
+			resp := &Response{
+				OpCode:  frame.Header.OpCode,
+				SeqID:   seqID,
+				Status:  StatusInvalidRequest,
+				Message: err.Error(),
+			}
+			select {
+			case respCh <- resp:
+			case <-connCtx.Done():
+			}
+			<-inFlightSem
+			continue
+		}
+
+		// 6. Concurrently dispatch request
+		inFlightWG.Add(1)
+		metrics.InFlightRequests.Add(1)
+		go func(r *Request, rawSeqID uint64) {
+			defer inFlightWG.Done()
+			var cleanedUp bool
+			defer func() {
+				if !cleanedUp {
+					activeMu.Lock()
+					delete(activeSeqIDs, rawSeqID)
+					activeMu.Unlock()
+				}
+				metrics.InFlightRequests.Add(-1)
+				if s.maxGlobalInFlight > 0 {
+					s.globalInFlight.Add(-1)
+				}
+				<-inFlightSem
+			}()
+
+			resp := s.dispatchWithContext(connCtx, r)
+			activeMu.Lock()
+			delete(activeSeqIDs, rawSeqID)
+			activeMu.Unlock()
+			cleanedUp = true
+
+			select {
+			case respCh <- resp:
+			case <-connCtx.Done():
+			}
+		}(req, seqID)
 	}
+
+	// Reader has exited (EOF, read error, or shutdown).
+	// Trigger context cancellation for in-flight requests and wait for their completion.
+	connCancel()
+	inFlightWG.Wait()
+
+	// All in-flight requests have completed and deposited their responses in respCh.
+	close(respCh)
+
+	// Await completion of the response writer goroutine.
+	<-writerDone
 }
 
 // readFrameWithDeadlines reads a complete M01 frame while strictly defending against Slowloris attacks.
@@ -554,7 +721,12 @@ func (s *Server) writeResponseWithDeadline(conn net.Conn, resp *Response) error 
 }
 
 // dispatch routes a decoded request to the appropriate Engine method and translates outcomes to a Response.
-func (s *Server) dispatch(req *Request) (finalResp *Response) {
+func (s *Server) dispatch(req *Request) *Response {
+	return s.dispatchWithContext(context.Background(), req)
+}
+
+// dispatchWithContext routes a decoded request with execution lifetime bound by parentCtx and RequestTimeout.
+func (s *Server) dispatchWithContext(parentCtx context.Context, req *Request) (finalResp *Response) {
 	start := time.Now()
 	defer func() {
 		if finalResp != nil {
@@ -599,7 +771,7 @@ func (s *Server) dispatch(req *Request) (finalResp *Response) {
 		return resp
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.RequestTimeout)
+	ctx, cancel := context.WithTimeout(parentCtx, s.cfg.RequestTimeout)
 	defer cancel()
 
 	router := s.ProposalRouter()

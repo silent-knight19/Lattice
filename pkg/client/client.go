@@ -283,6 +283,22 @@ func (c *Client) Stats(ctx context.Context) (*StatsSnapshot, error) {
 	return &snap, nil
 }
 
+// Pipeline creates a new request pipeline for bounded multiplexed execution.
+func (c *Client) Pipeline() *Pipeline {
+	return c.PipelineWithMaxOps(DefaultMaxPipelineOps)
+}
+
+// PipelineWithMaxOps creates a new request pipeline with an explicit operations bound.
+func (c *Client) PipelineWithMaxOps(maxOps int) *Pipeline {
+	if maxOps <= 0 {
+		maxOps = DefaultMaxPipelineOps
+	}
+	return &Pipeline{
+		client: c,
+		maxOps: maxOps,
+	}
+}
+
 // Close closes the underlying TCP connection.
 func (c *Client) Close() error {
 	if c.closed.CompareAndSwap(false, true) {

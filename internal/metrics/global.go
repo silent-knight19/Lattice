@@ -61,6 +61,15 @@ var (
 
 	// ActiveConnections tracks currently open client TCP connections.
 	ActiveConnections = NewGauge()
+
+	// InFlightRequests tracks currently active in-flight requests being processed across all connections.
+	InFlightRequests = NewGauge()
+
+	// PipelineLimitHits tracks the number of times a connection hits its maximum in-flight pipeline limit.
+	PipelineLimitHits = NewCounter()
+
+	// PipelineRejections tracks requests rejected due to global pipeline capacity saturation.
+	PipelineRejections = NewCounter()
 )
 
 func init() {
@@ -118,5 +127,20 @@ func init() {
 		"lattice_connections_active",
 		"Current number of active client TCP connections",
 		ActiveConnections,
+	)
+	DefaultRegistry.RegisterGauge(
+		"lattice_requests_in_flight",
+		"Current number of in-flight requests being processed across all connections",
+		InFlightRequests,
+	)
+	DefaultRegistry.RegisterCounter(
+		"lattice_pipeline_limit_hits_total",
+		"Total occurrences of a connection reaching its maximum in-flight pipeline limit",
+		PipelineLimitHits,
+	)
+	DefaultRegistry.RegisterCounter(
+		"lattice_pipeline_rejections_total",
+		"Total requests rejected due to global pipeline saturation",
+		PipelineRejections,
 	)
 }

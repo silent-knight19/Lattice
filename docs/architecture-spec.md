@@ -953,6 +953,42 @@ Lattice rejects slow text protocols and heavy RPC layers in favor of a lean, hig
 * **Bounded Runtime**: Values are extracted from existing atomic counters and in-memory VersionSet metadata under short read-locks. No filesystem scans or SSTable decodes are performed.
 * **Separation from Prometheus (`/metrics`)**: Prometheus `/metrics` provides an HTTP-based, multi-dimensional time-series scrape endpoint with histograms and quantile counters. `OP_STATS` provides a lightweight, human/CLI/SDK-parseable point-in-time snapshot over the binary client protocol.
 
+### 26.3 TCP Request Pipelining and Multiplexed Dispatch
+
+Lattice implements bounded protocol-level TCP request pipelining and concurrent multiplexed dispatch over its binary TCP transport.
+
+#### 1. Conceptual Distinction
+* **Keep-Alive**: Reusing an open TCP connection to send multiple sequential requests (`Request 1 -> Response 1 -> Request 2 -> Response 2`).
+* **Pipelining**: A client transmits multiple requests (`Request A, Request B, Request C`) back-to-back over a single TCP connection without blocking or waiting for intermediate responses.
+* **Concurrent Multiplexed Dispatch (Model A)**: The server reads incoming frames continuously, admits them up to a strictly bounded in-flight concurrency limit, executes requests concurrently in worker goroutines, and emits responses out-of-order as each finishes, correlated strictly via the client's `SeqID`.
+
+#### 2. Connection Pipeline Contract
+* **Maximum In-Flight Requests**:
+  * Per-connection: `MaxInFlightPerConn` (default: `64`).
+  * Global admission ceiling: `MaxGlobalInFlight` (default: `16384`).
+* **Response Ordering (Model A)**: Out-of-order response emission is fully enabled. A faster operation (e.g. cache-hit `GET`) arriving second may complete and be transmitted before an earlier slow operation (e.g. `PUT` awaiting disk sync). Every response preserves the exact `OpCode` and `SeqID` from the client request.
+* **Response Serialization & Frame Integrity**: Multiple concurrent dispatch workers never write directly to the raw socket. Completed responses are placed into a bounded channel (`cap = MaxInFlightPerConn`) drained by a single dedicated response writer goroutine. At most one goroutine writes to `net.Conn` at any time, guaranteeing zero frame byte interleaving and deterministic CRC32-IEEE checksum verification.
+* **Duplicate SeqID Defense**: A connection tracks currently active in-flight `SeqID`s. If an incoming frame specifies a `SeqID` identical to another request currently in flight on the same connection, it is deterministically rejected with `StatusInvalidRequest` (`"duplicate active seq_id: <id>"`). Once an operation completes, its `SeqID` is unmapped and may be reused by subsequent requests.
+* **Backpressure & Flow Control**: When a connection reaches its `MaxInFlightPerConn` limit, the server frame reader pauses reading from the socket until a slot is freed. This naturally shrinks the OS TCP receive window, applying kernel-level backpressure directly to the client without unbounded application-layer buffering. When global capacity is reached, new requests receive `StatusThrottled`.
+* **Causality & Happens-Before Semantics**: Pipelined concurrent requests execute concurrently across worker goroutines and do NOT guarantee execution order equals send order. For example, submitting `PUT k=v` and `GET k` in the same pipeline does not establish an implicit happens-before relationship; the `GET` may execute before the `PUT`. Callers requiring strict read-after-write causality must await previous responses before submitting dependent operations.
+* **Graceful Shutdown & Disconnect Lifecycle**: Connection context cancellation propagates to in-flight requests. On server shutdown (`Server.Shutdown(ctx)`), active connections cease reading, in-flight dispatch goroutines complete or abort promptly, buffered responses drain through the writer goroutine, and resources are untracked without goroutine or channel leaks. Abrupt client socket disconnects cleanly terminate pending work and release semaphore slots immediately.
+
+#### 3. Client SDK Pipeline API
+The official Go SDK (`pkg/client`) provides an explicit, thread-safe `Pipeline` abstraction while maintaining 100% backward compatibility with simple synchronous methods:
+```go
+pipe := client.Pipeline()
+fPut := pipe.Put([]byte("key1"), []byte("val1"))
+fGet := pipe.Get([]byte("key1"))
+fStats := pipe.Stats()
+
+if err := pipe.Execute(ctx); err != nil {
+    // handle network or pipeline error
+}
+
+val, err := fGet.Result()
+```
+The SDK transmits all enqueued operations sequentially without waiting, reads incoming responses in whatever order the server emits them, maps each response to its corresponding Future by `SeqID`, and fulfills the typed results. Simple single-request calls (`client.Get`, `client.Put`, etc.) continue to operate synchronously under connection mutex protection.
+
 ---
 
 # 27. Distributed Cluster Architecture (V1.1 Blueprint)
