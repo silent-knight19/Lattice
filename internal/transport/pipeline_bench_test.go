@@ -9,6 +9,18 @@ import (
 	"github.com/silent-knight19/lattice/pkg/client"
 )
 
+// Note on Benchmark Methodology and Scope:
+// These benchmarks measure transport framing overhead, TCP wire multiplexing, and
+// concurrent dispatch efficiency over loopback. They intentionally use an in-memory
+// mockEngine (zero disk I/O, zero WAL fsync, zero compaction overhead) to isolate
+// transport-layer performance from storage-engine disk latency.
+//
+// The observed throughput speedups (e.g. 1.4x at depth 2, 3.2x at depth 8, 3.4x at depth 32)
+// represent protocol-level and framing pipelining gains over lockstep request-response RTTs,
+// and must NOT be interpreted as generic production database write throughput where disk I/O
+// and WAL durability dominate.
+
+// BenchmarkSequential measures baseline lockstep request-response throughput over TCP.
 func BenchmarkSequential(b *testing.B) {
 	eng := newMockEngine()
 	cfg := transport.DefaultServerConfig()

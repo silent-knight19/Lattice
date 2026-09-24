@@ -309,6 +309,11 @@ func (c *Client) Close() error {
 	return nil
 }
 
+// IsClosed reports whether the client connection has been closed or invalidated.
+func (c *Client) IsClosed() bool {
+	return c.closed.Load()
+}
+
 // execute serializes a Request onto the wire and parses the matching Response.
 func (c *Client) execute(ctx context.Context, req *transport.Request) (*transport.Response, error) {
 	if err := ctx.Err(); err != nil {
@@ -337,18 +342,22 @@ func (c *Client) execute(ctx context.Context, req *transport.Request) (*transpor
 	_ = c.conn.SetDeadline(deadline)
 
 	if err := transport.WriteRequest(c.conn, req); err != nil {
+		_ = c.Close()
 		return nil, fmt.Errorf("send request: %w", err)
 	}
 
 	resp, err := transport.ReadResponse(c.conn)
 	if err != nil {
+		_ = c.Close()
 		return nil, fmt.Errorf("read response: %w", err)
 	}
 
 	if resp.SeqID != req.SeqID {
+		_ = c.Close()
 		return nil, fmt.Errorf("response sequence ID mismatch: expected %d, got %d", req.SeqID, resp.SeqID)
 	}
 	if resp.OpCode != req.OpCode {
+		_ = c.Close()
 		return nil, fmt.Errorf("response opcode mismatch: expected %s, got %s", req.OpCode, resp.OpCode)
 	}
 

@@ -155,10 +155,29 @@ type Server struct {
 	globalInFlight    atomic.Int64
 	maxGlobalInFlight int64
 
+	responseWriteHookMu sync.Mutex
+	responseWriteHook   func(resp *Response)
+
 	routerMu    sync.RWMutex
 	router      ProposalRouter
 	readRouter  ReadRouter
 	clusterMode bool // immutable after construction (P16-SEC-F01)
+}
+
+// responseEnvelope packages a Response with its associated SeqID reservation metadata
+// for safe asynchronous transmission and post-write resource release.
+type responseEnvelope struct {
+	resp          *Response
+	releaseID     uint64
+	shouldRelease bool
+}
+
+// SetResponseWriteHookForTesting configures an optional callback invoked by the response
+// writer immediately before writing a response frame to the wire.
+func (s *Server) SetResponseWriteHookForTesting(fn func(resp *Response)) {
+	s.responseWriteHookMu.Lock()
+	defer s.responseWriteHookMu.Unlock()
+	s.responseWriteHook = fn
 }
 
 // NewServer constructs a new transport Server. It validates the configuration and verifies that eng is non-nil.
@@ -446,7 +465,7 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 
 	inFlightSem := make(chan struct{}, maxInFlight)
-	respCh := make(chan *Response, maxInFlight)
+	respCh := make(chan responseEnvelope, maxInFlight)
 	writerDone := make(chan struct{})
 
 	var inFlightWG sync.WaitGroup
@@ -455,10 +474,24 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	// Dedicated response writer goroutine: guarantees exactly one goroutine writes to conn,
 	// preventing response frame byte interleaving under concurrent request dispatch.
+	// SeqIDs remain strictly reserved until the response frame is completely written to the wire.
 	go func() {
 		defer close(writerDone)
-		for resp := range respCh {
-			if err := s.writeResponseWithDeadline(conn, resp); err != nil {
+		for env := range respCh {
+			s.responseWriteHookMu.Lock()
+			hook := s.responseWriteHook
+			s.responseWriteHookMu.Unlock()
+			if hook != nil {
+				hook(env.resp)
+			}
+
+			err := s.writeResponseWithDeadline(conn, env.resp)
+			if env.shouldRelease {
+				activeMu.Lock()
+				delete(activeSeqIDs, env.releaseID)
+				activeMu.Unlock()
+			}
+			if err != nil {
 				// Socket write failure (client disconnect, timeout, or broken pipe).
 				// Abort the connection context and close the connection descriptor
 				// to unblock the reader goroutine immediately.
@@ -514,7 +547,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				Message: "server busy: global in-flight request limit reached",
 			}
 			select {
-			case respCh <- resp:
+			case respCh <- responseEnvelope{resp: resp, releaseID: 0, shouldRelease: false}:
 			case <-connCtx.Done():
 			}
 			<-inFlightSem
@@ -537,7 +570,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				Message: fmt.Sprintf("duplicate active seq_id: %d", seqID),
 			}
 			select {
-			case respCh <- resp:
+			case respCh <- responseEnvelope{resp: resp, releaseID: 0, shouldRelease: false}:
 			case <-connCtx.Done():
 			}
 			<-inFlightSem
@@ -550,9 +583,6 @@ func (s *Server) handleConn(conn net.Conn) {
 		req, err := DecodeRequest(frame)
 		if err != nil {
 			// Frame was structurally valid, but payload violated application constraints.
-			activeMu.Lock()
-			delete(activeSeqIDs, seqID)
-			activeMu.Unlock()
 			if s.maxGlobalInFlight > 0 {
 				s.globalInFlight.Add(-1)
 			}
@@ -562,9 +592,17 @@ func (s *Server) handleConn(conn net.Conn) {
 				Status:  StatusInvalidRequest,
 				Message: err.Error(),
 			}
+			env := responseEnvelope{
+				resp:          resp,
+				releaseID:     seqID,
+				shouldRelease: true,
+			}
 			select {
-			case respCh <- resp:
+			case respCh <- env:
 			case <-connCtx.Done():
+				activeMu.Lock()
+				delete(activeSeqIDs, seqID)
+				activeMu.Unlock()
 			}
 			<-inFlightSem
 			continue
@@ -575,9 +613,9 @@ func (s *Server) handleConn(conn net.Conn) {
 		metrics.InFlightRequests.Add(1)
 		go func(r *Request, rawSeqID uint64) {
 			defer inFlightWG.Done()
-			var cleanedUp bool
+			var handoffSuccess bool
 			defer func() {
-				if !cleanedUp {
+				if !handoffSuccess {
 					activeMu.Lock()
 					delete(activeSeqIDs, rawSeqID)
 					activeMu.Unlock()
@@ -590,13 +628,15 @@ func (s *Server) handleConn(conn net.Conn) {
 			}()
 
 			resp := s.dispatchWithContext(connCtx, r)
-			activeMu.Lock()
-			delete(activeSeqIDs, rawSeqID)
-			activeMu.Unlock()
-			cleanedUp = true
+			env := responseEnvelope{
+				resp:          resp,
+				releaseID:     rawSeqID,
+				shouldRelease: true,
+			}
 
 			select {
-			case respCh <- resp:
+			case respCh <- env:
+				handoffSuccess = true
 			case <-connCtx.Done():
 			}
 		}(req, seqID)

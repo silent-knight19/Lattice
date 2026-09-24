@@ -5,9 +5,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/silent-knight19/lattice/internal/transport"
 	"github.com/silent-knight19/lattice/pkg/client"
 )
 
@@ -239,6 +242,447 @@ func TestPipeline_ConcurrentPipelinesOnSameClient(t *testing.T) {
 				if err != nil || string(val) != expected {
 					t.Errorf("goroutine %d fut %d mismatch: err=%v, val=%s", gid, i, err, string(val))
 				}
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+func TestPipeline_Failure_PartialWrite(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// Read first frame then close immediately to cause partial write on subsequent frame
+		_, _ = transport.ReadRequest(conn)
+		_ = conn.Close()
+	}()
+
+	c, err := client.Dial(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	pipe := c.Pipeline()
+	f1 := pipe.Put([]byte("k1"), []byte("v1"))
+	f2 := pipe.Put([]byte("k2"), bytes.Repeat([]byte("v2"), 4096))
+	f3 := pipe.Put([]byte("k3"), bytes.Repeat([]byte("v3"), 4096))
+
+	err = pipe.Execute(context.Background())
+	if err == nil {
+		t.Fatalf("expected write error, got nil")
+	}
+	if !c.IsClosed() {
+		t.Errorf("expected client connection to be marked closed")
+	}
+	if f1.Result() == nil || f2.Result() == nil || f3.Result() == nil {
+		t.Errorf("expected all futures to terminate with error")
+	}
+
+	// Subsequent client operation must immediately fail with ErrClientClosed
+	_, getErr := c.Get(context.Background(), []byte("k1"))
+	if !errors.Is(getErr, client.ErrClientClosed) {
+		t.Errorf("expected ErrClientClosed for subsequent operation, got %v", getErr)
+	}
+}
+
+func TestPipeline_Failure_ResponseTimeout(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = transport.ReadRequest(conn)
+		// Delay longer than client timeout
+		time.Sleep(300 * time.Millisecond)
+	}()
+
+	c, err := client.DialWithOptions(ln.Addr().String(), client.Options{Timeout: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	pipe := c.Pipeline()
+	fut := pipe.Put([]byte("k"), []byte("v"))
+
+	err = pipe.Execute(context.Background())
+	if err == nil {
+		t.Fatalf("expected timeout error, got nil")
+	}
+	if !c.IsClosed() {
+		t.Errorf("expected client connection to be invalidated")
+	}
+	if fut.Result() == nil {
+		t.Errorf("expected future to terminate with error")
+	}
+
+	// Ensure subsequent operation fails closed
+	getErr := c.Put(context.Background(), []byte("k2"), []byte("v2"))
+	if !errors.Is(getErr, client.ErrClientClosed) {
+		t.Errorf("expected ErrClientClosed, got %v", getErr)
+	}
+}
+
+func TestPipeline_Failure_ContextCancellation(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = transport.ReadRequest(conn)
+		time.Sleep(300 * time.Millisecond)
+	}()
+
+	c, err := client.Dial(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	pipe := c.Pipeline()
+	fut := pipe.Put([]byte("k"), []byte("v"))
+
+	err = pipe.Execute(ctx)
+	if err == nil {
+		t.Fatalf("expected context error, got nil")
+	}
+	if !c.IsClosed() {
+		t.Errorf("expected client connection to be marked closed")
+	}
+	if fut.Result() == nil {
+		t.Errorf("expected future to terminate with error")
+	}
+}
+
+func TestPipeline_Failure_ServerDisconnect(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		req1, _ := transport.ReadRequest(conn)
+		_, _ = transport.ReadRequest(conn)
+
+		// Send 1 response then close abruptly
+		_ = transport.WriteResponse(conn, &transport.Response{
+			OpCode: req1.OpCode,
+			SeqID:  req1.SeqID,
+			Status: transport.StatusOk,
+		})
+		_ = conn.Close()
+	}()
+
+	c, err := client.Dial(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	pipe := c.Pipeline()
+	f1 := pipe.Put([]byte("k1"), []byte("v1"))
+	f2 := pipe.Put([]byte("k2"), []byte("v2"))
+
+	err = pipe.Execute(context.Background())
+	if err == nil {
+		t.Fatalf("expected read error due to disconnect, got nil")
+	}
+	if !c.IsClosed() {
+		t.Errorf("expected client to be closed")
+	}
+	if f1.Result() != nil {
+		t.Errorf("expected f1 to succeed before disconnect, got: %v", f1.Result())
+	}
+	if f2.Result() == nil {
+		t.Errorf("expected f2 to terminate with error")
+	}
+
+	_, getErr := c.Get(context.Background(), []byte("k1"))
+	if !errors.Is(getErr, client.ErrClientClosed) {
+		t.Errorf("expected ErrClientClosed, got %v", getErr)
+	}
+}
+
+func TestPipeline_Failure_UnexpectedSeqID(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		req, _ := transport.ReadRequest(conn)
+		// Respond with unexpected SeqID
+		_ = transport.WriteResponse(conn, &transport.Response{
+			OpCode: req.OpCode,
+			SeqID:  req.SeqID + 9999,
+			Status: transport.StatusOk,
+		})
+	}()
+
+	c, err := client.Dial(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	pipe := c.Pipeline()
+	fut := pipe.Put([]byte("k"), []byte("v"))
+
+	err = pipe.Execute(context.Background())
+	if err == nil {
+		t.Fatalf("expected unexpected seq ID error, got nil")
+	}
+	if !c.IsClosed() {
+		t.Errorf("expected client to fail closed")
+	}
+	if fut.Result() == nil {
+		t.Errorf("expected future to terminate with error")
+	}
+}
+
+func TestPipeline_Failure_WrongOpCode(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		req, _ := transport.ReadRequest(conn)
+		// Sent OpPut (0x01), server responds with OpDelete (0x03)
+		_ = transport.WriteResponse(conn, &transport.Response{
+			OpCode: transport.OpDelete,
+			SeqID:  req.SeqID,
+			Status: transport.StatusOk,
+		})
+	}()
+
+	c, err := client.Dial(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	pipe := c.Pipeline()
+	fut := pipe.Put([]byte("k"), []byte("v"))
+
+	err = pipe.Execute(context.Background())
+	if err == nil {
+		t.Fatalf("expected opcode mismatch error, got nil")
+	}
+	if !c.IsClosed() {
+		t.Errorf("expected client to fail closed on opcode mismatch")
+	}
+	if fut.Result() == nil {
+		t.Errorf("expected future to terminate with error")
+	}
+}
+
+func TestPipeline_Failure_DuplicateSeqIDResponse(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		req1, _ := transport.ReadRequest(conn)
+		_, _ = transport.ReadRequest(conn)
+		// Send response for req1
+		_ = transport.WriteResponse(conn, &transport.Response{
+			OpCode: req1.OpCode,
+			SeqID:  req1.SeqID,
+			Status: transport.StatusOk,
+		})
+		// Send DUPLICATE response for req1 instead of req2
+		_ = transport.WriteResponse(conn, &transport.Response{
+			OpCode: req1.OpCode,
+			SeqID:  req1.SeqID,
+			Status: transport.StatusOk,
+		})
+	}()
+
+	c, err := client.Dial(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	pipe := c.Pipeline()
+	f1 := pipe.Put([]byte("k1"), []byte("v1"))
+	f2 := pipe.Put([]byte("k2"), []byte("v2"))
+
+	err = pipe.Execute(context.Background())
+	if err == nil {
+		t.Fatalf("expected duplicate SeqID error, got nil")
+	}
+	if !c.IsClosed() {
+		t.Errorf("expected client to fail closed on duplicate response SeqID")
+	}
+	if f1.Result() != nil {
+		t.Errorf("f1 should have succeeded, got %v", f1.Result())
+	}
+	if f2.Result() == nil {
+		t.Errorf("f2 should have failed with error")
+	}
+}
+
+func TestPipeline_SubsequentOperationNeverConsumesStaleResponse(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	serverConnCh := make(chan net.Conn, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		serverConnCh <- conn
+	}()
+
+	c, err := client.Dial(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	serverConn := <-serverConnCh
+	defer serverConn.Close()
+
+	// Enqueue 2 requests in pipeline
+	pipe := c.Pipeline()
+	f1 := pipe.Put([]byte("poison_k1"), []byte("poison_v1"))
+	f2 := pipe.Put([]byte("poison_k2"), []byte("poison_v2"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	var execErr error
+	execDone := make(chan struct{})
+	go func() {
+		defer close(execDone)
+		execErr = pipe.Execute(ctx)
+	}()
+
+	// Read both requests on server side
+	req1, err := transport.ReadRequest(serverConn)
+	if err != nil {
+		t.Fatalf("read req1: %v", err)
+	}
+	req2, err := transport.ReadRequest(serverConn)
+	if err != nil {
+		t.Fatalf("read req2: %v", err)
+	}
+
+	// Client execute will time out because server has not responded
+	<-execDone
+	if execErr == nil {
+		t.Fatalf("expected timeout error, got nil")
+	}
+	if !c.IsClosed() {
+		t.Fatalf("client connection must be marked closed")
+	}
+
+	// Server now emits response for req1 and req2
+	_ = transport.WriteResponse(serverConn, &transport.Response{
+		OpCode: req1.OpCode,
+		SeqID:  req1.SeqID,
+		Status: transport.StatusOk,
+	})
+	_ = transport.WriteResponse(serverConn, &transport.Response{
+		OpCode: req2.OpCode,
+		SeqID:  req2.SeqID,
+		Status: transport.StatusOk,
+	})
+
+	// Subsequent client operation must immediately fail with ErrClientClosed
+	// and NEVER read req1 or req2 response off the socket
+	_, getErr := c.Get(context.Background(), []byte("poison_k1"))
+	if !errors.Is(getErr, client.ErrClientClosed) {
+		t.Fatalf("expected ErrClientClosed preventing stale response consumption, got: %v", getErr)
+	}
+	_ = f1.Result()
+	_ = f2.Result()
+}
+
+func TestPipeline_ModelB_SingleOwnerContract(t *testing.T) {
+	_, addr, cleanup := startServer(t)
+	defer cleanup()
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	// Model B contract:
+	// 1. Client is thread-safe: multiple goroutines can safely construct and execute their own independent pipelines.
+	// 2. An individual *Pipeline instance is NOT thread-safe: it has a single owner.
+	const concurrentClients = 4
+	var wg sync.WaitGroup
+	wg.Add(concurrentClients)
+
+	for g := 0; g < concurrentClients; g++ {
+		gid := g
+		go func() {
+			defer wg.Done()
+			pipe := c.Pipeline() // Single owner: each goroutine has its own pipeline
+			pipe.Put([]byte(fmt.Sprintf("mb_%d", gid)), []byte("val"))
+			if err := pipe.Execute(context.Background()); err != nil {
+				t.Errorf("goroutine %d execute: %v", gid, err)
 			}
 		}()
 	}

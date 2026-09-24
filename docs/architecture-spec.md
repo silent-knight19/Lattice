@@ -960,21 +960,28 @@ Lattice implements bounded protocol-level TCP request pipelining and concurrent 
 #### 1. Conceptual Distinction
 * **Keep-Alive**: Reusing an open TCP connection to send multiple sequential requests (`Request 1 -> Response 1 -> Request 2 -> Response 2`).
 * **Pipelining**: A client transmits multiple requests (`Request A, Request B, Request C`) back-to-back over a single TCP connection without blocking or waiting for intermediate responses.
-* **Concurrent Multiplexed Dispatch (Model A)**: The server reads incoming frames continuously, admits them up to a strictly bounded in-flight concurrency limit, executes requests concurrently in worker goroutines, and emits responses out-of-order as each finishes, correlated strictly via the client's `SeqID`.
+* **Concurrent Multiplexed Dispatch**: The server reads incoming frames continuously, admits them up to a strictly bounded in-flight concurrency limit, executes requests concurrently in worker goroutines, and emits responses out-of-order as each finishes, correlated strictly via the client's `SeqID`.
 
 #### 2. Connection Pipeline Contract
-* **Maximum In-Flight Requests**:
+* **Maximum In-Flight Requests & Resource Bounds**:
   * Per-connection: `MaxInFlightPerConn` (default: `64`).
   * Global admission ceiling: `MaxGlobalInFlight` (default: `16384`).
-* **Response Ordering (Model A)**: Out-of-order response emission is fully enabled. A faster operation (e.g. cache-hit `GET`) arriving second may complete and be transmitted before an earlier slow operation (e.g. `PUT` awaiting disk sync). Every response preserves the exact `OpCode` and `SeqID` from the client request.
+  * Dedicated response channel capacity: bounded to `MaxInFlightPerConn` (64 envelopes).
+  * **Memory Footprint Bound**: In-flight memory per connection is strictly bounded. While the theoretical worst-case payload limit is $64 \times \text{MaxFramePayloadSize} = 64 \times 64\text{ MiB} = 4\text{ GiB}$, real-world operational workloads operating under standard key/value payloads (< 64 KiB) consume $< 4\text{ MiB}$ buffer memory per connection. Natural TCP window backpressure bounds socket buffer expansion.
+* **Response Ordering**: Out-of-order response emission is fully enabled. A faster operation (e.g. cache-hit `GET`) arriving second may complete and be transmitted before an earlier slow operation (e.g. `PUT` awaiting disk sync). Every response preserves the exact `OpCode` and `SeqID` from the client request.
 * **Response Serialization & Frame Integrity**: Multiple concurrent dispatch workers never write directly to the raw socket. Completed responses are placed into a bounded channel (`cap = MaxInFlightPerConn`) drained by a single dedicated response writer goroutine. At most one goroutine writes to `net.Conn` at any time, guaranteeing zero frame byte interleaving and deterministic CRC32-IEEE checksum verification.
-* **Duplicate SeqID Defense**: A connection tracks currently active in-flight `SeqID`s. If an incoming frame specifies a `SeqID` identical to another request currently in flight on the same connection, it is deterministically rejected with `StatusInvalidRequest` (`"duplicate active seq_id: <id>"`). Once an operation completes, its `SeqID` is unmapped and may be reused by subsequent requests.
-* **Backpressure & Flow Control**: When a connection reaches its `MaxInFlightPerConn` limit, the server frame reader pauses reading from the socket until a slot is freed. This naturally shrinks the OS TCP receive window, applying kernel-level backpressure directly to the client without unbounded application-layer buffering. When global capacity is reached, new requests receive `StatusThrottled`.
+* **SeqID Reservation Lifetime & Duplicate Defense**:
+  * A connection tracks active in-flight `SeqID`s across their full lifecycle:
+    $$\text{SeqID Admitted} \longrightarrow \text{Request Execution} \longrightarrow \text{Response Generated} \longrightarrow \text{Accepted by Writer} \longrightarrow \text{Successfully Written} \longrightarrow \text{SeqID Released}$$
+  * An active `SeqID` remains strictly reserved for the complete request/response lifecycle and may NOT be reused while its response is pending, buffered, or being written.
+  * If an incoming frame specifies a `SeqID` identical to another request currently active on the same connection, it is deterministically rejected with `StatusInvalidRequest` (`"duplicate active seq_id: <id>"`).
+  * Rejection envelopes for duplicate requests do not release the original request's reservation. Once the response frame is successfully written to the wire, the `SeqID` is unmapped and becomes eligible for reuse.
+* **Backpressure & Flow Control**: When a connection reaches its `MaxInFlightPerConn` limit, the server frame reader pauses reading from the socket until an in-flight slot is freed. This naturally shrinks the OS TCP receive window, applying kernel-level backpressure directly to the client without unbounded application-layer buffering. When the global capacity (`MaxGlobalInFlight`) is reached, incoming requests receive `StatusThrottled`.
 * **Causality & Happens-Before Semantics**: Pipelined concurrent requests execute concurrently across worker goroutines and do NOT guarantee execution order equals send order. For example, submitting `PUT k=v` and `GET k` in the same pipeline does not establish an implicit happens-before relationship; the `GET` may execute before the `PUT`. Callers requiring strict read-after-write causality must await previous responses before submitting dependent operations.
 * **Graceful Shutdown & Disconnect Lifecycle**: Connection context cancellation propagates to in-flight requests. On server shutdown (`Server.Shutdown(ctx)`), active connections cease reading, in-flight dispatch goroutines complete or abort promptly, buffered responses drain through the writer goroutine, and resources are untracked without goroutine or channel leaks. Abrupt client socket disconnects cleanly terminate pending work and release semaphore slots immediately.
 
-#### 3. Client SDK Pipeline API
-The official Go SDK (`pkg/client`) provides an explicit, thread-safe `Pipeline` abstraction while maintaining 100% backward compatibility with simple synchronous methods:
+#### 3. Client SDK Pipeline API & Concurrency Model
+The official Go SDK (`pkg/client`) provides an explicit `Pipeline` abstraction while maintaining 100% backward compatibility with simple synchronous methods:
 ```go
 pipe := client.Pipeline()
 fPut := pipe.Put([]byte("key1"), []byte("val1"))
@@ -987,7 +994,21 @@ if err := pipe.Execute(ctx); err != nil {
 
 val, err := fGet.Result()
 ```
-The SDK transmits all enqueued operations sequentially without waiting, reads incoming responses in whatever order the server emits them, maps each response to its corresponding Future by `SeqID`, and fulfills the typed results. Simple single-request calls (`client.Get`, `client.Put`, etc.) continue to operate synchronously under connection mutex protection.
+
+* **Concurrency Model (Model B — Single-Owner Pipeline)**:
+  * The `*client.Client` instance is fully thread-safe for concurrent operations across multiple goroutines.
+  * However, an individual `*client.Pipeline` instance is NOT thread-safe and must NOT be mutated or executed concurrently by multiple goroutines.
+  * Concurrent callers must each instantiate and execute their own independent `Pipeline` via `client.Pipeline()`. The SDK synchronizes connection access under `Client.mu` during `Execute()`.
+* **Fail-Closed Connection Invalidation on Indeterminate Failure**:
+  * If `Pipeline.Execute` encounters an indeterminate wire state—including partial request write failure, response read timeout, context deadline expiration, unexpected EOF, malformed payload, unexpected `SeqID`, duplicate response `SeqID`, or opcode mismatch—the underlying client connection is immediately closed and invalidated (`client.Close()`).
+  * All unresolved futures are failed with the causal error, terminating exactly once.
+  * The closed connection cannot be reused; subsequent operations on the `Client` fail immediately with `ErrClientClosed`, strictly preventing any subsequent operation from consuming stale, unread response frames off the socket.
+* **Response Identity & Protocol Validation**:
+  * Every incoming response frame is strictly validated against pending operations:
+    1. `SeqID` must match an outstanding request. Unknown or duplicate responses trigger immediate fail-closed connection termination.
+    2. `OpCode` must match the expected opcode for that `SeqID`. OpCode mismatches trigger immediate fail-closed connection termination.
+    3. Status/data consistency is validated (e.g. non-empty and bounded stats payload on `StatusOk`).
+* **Synchronous API Compatibility**: Single-request methods (`client.Get`, `client.Put`, `client.Delete`, `client.Exists`, `client.Batch`, `client.Stats`) operate synchronously under `Client.mu` protection and fail closed upon wire errors.
 
 ---
 

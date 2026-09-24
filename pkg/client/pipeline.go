@@ -23,6 +23,12 @@ const DefaultMaxPipelineOps = 64
 
 // Pipeline coordinates bounded TCP request pipelining over a single connection,
 // dispatching requests back-to-back and correlating responses out-of-order via SeqID.
+//
+// Concurrency Model (Model B — Single-Owner Pipeline):
+// The Client instance is fully thread-safe for concurrent operations across goroutines.
+// However, an individual *Pipeline instance is NOT thread-safe and must NOT be mutated
+// or executed concurrently by multiple goroutines. Each concurrent caller must construct
+// and execute its own independent Pipeline instance via client.Pipeline().
 type Pipeline struct {
 	client *Client
 	ops    []pipelineOp
@@ -359,7 +365,13 @@ func (p *Pipeline) Len() int {
 
 // Execute transmits all enqueued requests back-to-back over the TCP connection,
 // awaits all responses, and maps each response to its corresponding Future by SeqID.
-// Does NOT impose artificial send-order execution on independent requests.
+//
+// Protocol Safety & Connection State Invariant:
+// Once Execute reaches an indeterminate wire state (e.g. write failure after earlier requests
+// were transmitted, read timeout, unexpected SeqID, duplicate response, wrong OpCode,
+// malformed payload, or context cancellation), the underlying Client connection is immediately
+// closed and invalidated via client.Close(). All unresolved futures are failed with the causal
+// error. This strictly prevents subsequent operations from consuming stale responses off the socket.
 func (p *Pipeline) Execute(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -385,11 +397,13 @@ func (p *Pipeline) Execute(ctx context.Context) error {
 	}
 
 	type preparedOp struct {
-		req *transport.Request
-		op  pipelineOp
+		req    *transport.Request
+		op     pipelineOp
+		opCode transport.OpCode
 	}
 	prepared := make([]preparedOp, 0, len(p.ops))
 	pending := make(map[uint64]pipelineOp, len(p.ops))
+	expectedOp := make(map[uint64]transport.OpCode, len(p.ops))
 
 	for _, op := range p.ops {
 		req, err := op.request()
@@ -401,57 +415,80 @@ func (p *Pipeline) Execute(ctx context.Context) error {
 			return err
 		}
 		req.SeqID = p.client.seqID.Add(1)
-		prepared = append(prepared, preparedOp{req: req, op: op})
+		prepared = append(prepared, preparedOp{req: req, op: op, opCode: req.OpCode})
 		pending[req.SeqID] = op
+		expectedOp[req.SeqID] = req.OpCode
+	}
+
+	failClosed := func(cause error) error {
+		_ = p.client.Close()
+		for _, o := range pending {
+			o.fulfill(nil, cause)
+		}
+		p.ops = nil
+		return cause
 	}
 
 	deadline := time.Now().Add(p.client.timeout)
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d
 	}
-	_ = p.client.conn.SetDeadline(deadline)
+	if err := p.client.conn.SetDeadline(deadline); err != nil {
+		return failClosed(fmt.Errorf("set connection deadline: %w", err))
+	}
 
 	// Phase 1: Transmit all requests sequentially without waiting for responses
 	for _, pop := range prepared {
+		if err := ctx.Err(); err != nil {
+			return failClosed(fmt.Errorf("pipeline write context canceled: %w", err))
+		}
 		if err := transport.WriteRequest(p.client.conn, pop.req); err != nil {
-			sendErr := fmt.Errorf("send pipelined request (seq %d): %w", pop.req.SeqID, err)
-			for _, o := range pending {
-				o.fulfill(nil, sendErr)
-			}
-			p.ops = nil
-			return sendErr
+			return failClosed(fmt.Errorf("send pipelined request (seq %d): %w", pop.req.SeqID, err))
 		}
 	}
 
-	// Phase 2: Read exactly len(prepared) responses, correlating each by SeqID
-	var firstErr error
+	// Phase 2: Read exactly len(prepared) responses, correlating each by SeqID and verifying OpCode
 	for i := 0; i < len(prepared); i++ {
+		if err := ctx.Err(); err != nil {
+			return failClosed(fmt.Errorf("pipeline read context canceled: %w", err))
+		}
 		resp, err := transport.ReadResponse(p.client.conn)
 		if err != nil {
-			readErr := fmt.Errorf("read pipelined response (%d/%d): %w", i+1, len(prepared), err)
-			for _, o := range pending {
-				o.fulfill(nil, readErr)
-			}
-			p.ops = nil
-			return readErr
+			return failClosed(fmt.Errorf("read pipelined response (%d/%d): %w", i+1, len(prepared), err))
 		}
 
 		op, exists := pending[resp.SeqID]
 		if !exists {
-			continue
+			return failClosed(fmt.Errorf("unexpected or duplicate response sequence ID: %d", resp.SeqID))
 		}
+
+		expected := expectedOp[resp.SeqID]
+		if resp.OpCode != expected {
+			return failClosed(fmt.Errorf("response opcode mismatch for seq %d: expected %s, got %s", resp.SeqID, expected, resp.OpCode))
+		}
+
+		// Validate response status/data consistency
+		if resp.Status == transport.StatusOk {
+			switch expected {
+			case transport.OpStats:
+				if len(resp.Value) == 0 {
+					return failClosed(fmt.Errorf("empty stats payload for seq %d", resp.SeqID))
+				}
+				if len(resp.Value) > MaxStatsPayloadLength {
+					return failClosed(fmt.Errorf("stats payload size %d exceeds maximum for seq %d", len(resp.Value), resp.SeqID))
+				}
+			}
+		}
+
 		delete(pending, resp.SeqID)
 		op.fulfill(resp, nil)
 	}
 
-	for _, o := range pending {
-		missingErr := errors.New("missing response for pipelined request")
-		o.fulfill(nil, missingErr)
-		if firstErr == nil {
-			firstErr = missingErr
-		}
+	if len(pending) > 0 {
+		return failClosed(fmt.Errorf("pipeline completed with %d missing responses", len(pending)))
 	}
 
+	_ = p.client.conn.SetDeadline(time.Time{})
 	p.ops = nil
-	return firstErr
+	return nil
 }

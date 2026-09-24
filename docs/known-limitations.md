@@ -1065,8 +1065,9 @@ This document tracks all **genuine architectural and operational limitations** o
      - Protocol-level TCP request pipelining and concurrent multiplexed dispatch are fully implemented.
      - Connections support up to `MaxInFlightPerConn` (default 64) concurrent in-flight requests with out-of-order response emission correlated via `SeqID`.
      - A dedicated response writer goroutine serializes frames atomically, preventing frame byte interleaving and CRC corruption.
-     - Duplicate active `SeqID` on the same connection is deterministically rejected with `StatusInvalidRequest` while active; `SeqID` reuse is permitted once prior request execution completes.
+     - `SeqID` reservation lifetime extends across the entire operation lifecycle (`admitted -> execution -> response generated -> buffered -> written to wire -> SeqID released`). An active `SeqID` cannot be reused while its response is pending, buffered, or being written. Duplicate active `SeqID` on the same connection is deterministically rejected with `StatusInvalidRequest` while active without unmapping the original request. Once the response frame is fully written to the client, its `SeqID` is unmapped and becomes eligible for reuse.
      - Server enforces natural TCP window backpressure when connection in-flight limits are reached, and enforces global admission ceilings (`MaxGlobalInFlight = 16384`) with `StatusThrottled`.
+     - The client SDK implements Model B (single-owner pipeline): `Client` is thread-safe, but an individual `Pipeline` must not be shared across goroutines. Indeterminate pipeline failures (partial write, timeout, context cancellation, unexpected SeqID, duplicate response, OpCode mismatch) fail closed, invalidate the connection (`client.Close()`), and prevent subsequent operations from consuming stale responses off the socket.
 * **Why It Exists**:
   Provides a bounded, DoS-resistant TCP server boundary above the single-node storage engine without violating storage invariants or introducing speculative networking complexity.
 * **Impact**:

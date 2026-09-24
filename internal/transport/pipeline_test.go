@@ -3,6 +3,7 @@ package transport_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -537,6 +538,7 @@ func TestPipeline_MaliciousInput(t *testing.T) {
 	eng := newMockEngine()
 	cfg := transport.DefaultServerConfig()
 	srv := startTestServer(t, cfg, eng)
+	_ = eng.Put(context.Background(), []byte("k"), []byte("v_init"))
 
 	conn, err := net.Dial("tcp", srv.Addr().String())
 	if err != nil {
@@ -769,5 +771,387 @@ func TestPipeline_Clustered(t *testing.T) {
 	}
 	if resps[503].Status != transport.StatusOk || !bytes.Equal(resps[503].Value, []byte("cluster_read_val")) {
 		t.Errorf("expected StatusOk with cluster_read_val for seq 503, got %v (%s)", resps[503].Status, string(resps[503].Value))
+	}
+}
+
+// TestPipeline_SeqIDReuse_AfterFullResponseCompletion verifies that once a response
+// is fully written to the client, the SeqID is released and can immediately be reused.
+func TestPipeline_SeqIDReuse_AfterFullResponseCompletion(t *testing.T) {
+	eng := newMockEngine()
+	cfg := transport.DefaultServerConfig()
+	srv := startTestServer(t, cfg, eng)
+
+	conn, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	const targetSeqID = uint64(888)
+
+	for iteration := 1; iteration <= 3; iteration++ {
+		req := &transport.Request{
+			OpCode: transport.OpPut,
+			SeqID:  targetSeqID,
+			Key:    []byte(fmt.Sprintf("reuse_key_%d", iteration)),
+			Value:  []byte(fmt.Sprintf("reuse_val_%d", iteration)),
+		}
+		if err := transport.WriteRequest(conn, req); err != nil {
+			t.Fatalf("iteration %d write failed: %v", iteration, err)
+		}
+
+		resp, err := transport.ReadResponse(conn)
+		if err != nil {
+			t.Fatalf("iteration %d read failed: %v", iteration, err)
+		}
+		if resp.SeqID != targetSeqID || resp.Status != transport.StatusOk {
+			t.Fatalf("iteration %d unexpected response: status=%v, seq=%d", iteration, resp.Status, resp.SeqID)
+		}
+	}
+}
+
+// TestPipeline_SeqIDReuse_WhileResponseBuffered verifies that an active SeqID
+// is NOT released when the response has been generated, but is still buffered in the writer channel.
+func TestPipeline_SeqIDReuse_WhileResponseBuffered(t *testing.T) {
+	eng := newMockEngine()
+	cfg := transport.DefaultServerConfig()
+	srv := startTestServer(t, cfg, eng)
+
+	hookEntered := make(chan struct{}, 1)
+	releaseHook := make(chan struct{})
+
+	srv.SetResponseWriteHookForTesting(func(resp *transport.Response) {
+		if resp.SeqID == 999 && resp.Status == transport.StatusOk {
+			select {
+			case hookEntered <- struct{}{}:
+			default:
+			}
+			<-releaseHook
+		}
+	})
+
+	conn, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Req 1: SeqID = 999
+	req1 := &transport.Request{
+		OpCode: transport.OpPut,
+		SeqID:  999,
+		Key:    []byte("k1"),
+		Value:  []byte("v1"),
+	}
+	if err := transport.WriteRequest(conn, req1); err != nil {
+		t.Fatalf("write req1: %v", err)
+	}
+
+	// Wait until Req 1 has executed and entered the response writer hook (buffered/pending write)
+	<-hookEntered
+
+	// While response 1 is pending/buffered, attempt to reuse SeqID 999
+	req2 := &transport.Request{
+		OpCode: transport.OpPut,
+		SeqID:  999,
+		Key:    []byte("k2"),
+		Value:  []byte("v2"),
+	}
+	if err := transport.WriteRequest(conn, req2); err != nil {
+		t.Fatalf("write req2: %v", err)
+	}
+
+	// Give reader thread a moment to process req2 while writer is still blocked on releaseHook
+	time.Sleep(50 * time.Millisecond)
+
+	// Now unblock the writer
+	close(releaseHook)
+
+	// Resp 1 should be the original StatusOk
+	resp1, err := transport.ReadResponse(conn)
+	if err != nil {
+		t.Fatalf("read resp1: %v", err)
+	}
+	if resp1.SeqID != 999 || resp1.Status != transport.StatusOk {
+		t.Fatalf("expected resp1 StatusOk, got %v (seq %d)", resp1.Status, resp1.SeqID)
+	}
+
+	// Resp 2 MUST be StatusInvalidRequest (duplicate active seq_id: 999)
+	resp2, err := transport.ReadResponse(conn)
+	if err != nil {
+		t.Fatalf("read resp2: %v", err)
+	}
+	if resp2.SeqID != 999 || resp2.Status != transport.StatusInvalidRequest {
+		t.Fatalf("expected resp2 StatusInvalidRequest for buffered reuse attempt, got %v (seq %d)", resp2.Status, resp2.SeqID)
+	}
+
+	// Clear testing hook
+	srv.SetResponseWriteHookForTesting(nil)
+
+	// Now that both responses have been completely written, SeqID 999 must be reusable
+	req3 := &transport.Request{
+		OpCode: transport.OpPut,
+		SeqID:  999,
+		Key:    []byte("k3"),
+		Value:  []byte("v3"),
+	}
+	if err := transport.WriteRequest(conn, req3); err != nil {
+		t.Fatalf("write req3: %v", err)
+	}
+	resp3, err := transport.ReadResponse(conn)
+	if err != nil {
+		t.Fatalf("read resp3: %v", err)
+	}
+	if resp3.SeqID != 999 || resp3.Status != transport.StatusOk {
+		t.Fatalf("expected resp3 StatusOk on reuse after completion, got %v", resp3.Status)
+	}
+}
+
+// TestPipeline_SeqIDReuse_WhileWriterBlocked verifies that while the response writer
+// is blocked writing bytes to the socket, any reuse of that SeqID is rejected.
+func TestPipeline_SeqIDReuse_WhileWriterBlocked(t *testing.T) {
+	eng := newMockEngine()
+	cfg := transport.DefaultServerConfig()
+	srv := startTestServer(t, cfg, eng)
+
+	writerBlocked := make(chan struct{})
+	writerEntered := make(chan struct{}, 1)
+
+	srv.SetResponseWriteHookForTesting(func(resp *transport.Response) {
+		if resp.SeqID == 7777 && resp.Status == transport.StatusOk {
+			select {
+			case writerEntered <- struct{}{}:
+			default:
+			}
+			<-writerBlocked
+		}
+	})
+
+	conn, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Send Req 1 with SeqID 7777
+	req1 := &transport.Request{
+		OpCode: transport.OpPut,
+		SeqID:  7777,
+		Key:    []byte("wb1"),
+		Value:  []byte("val1"),
+	}
+	if err := transport.WriteRequest(conn, req1); err != nil {
+		t.Fatalf("write req1: %v", err)
+	}
+
+	// Await writer entering hook
+	<-writerEntered
+
+	// Send Req 2 with same SeqID 7777
+	req2 := &transport.Request{
+		OpCode: transport.OpPut,
+		SeqID:  7777,
+		Key:    []byte("wb2"),
+		Value:  []byte("val2"),
+	}
+	if err := transport.WriteRequest(conn, req2); err != nil {
+		t.Fatalf("write req2: %v", err)
+	}
+
+	// Reader will process req2 and see SeqID 7777 is still active, queuing a rejection envelope.
+	time.Sleep(50 * time.Millisecond)
+
+	// Unblock writer
+	close(writerBlocked)
+
+	resp1, err := transport.ReadResponse(conn)
+	if err != nil {
+		t.Fatalf("read resp1: %v", err)
+	}
+	if resp1.SeqID != 7777 || resp1.Status != transport.StatusOk {
+		t.Fatalf("expected resp1 StatusOk, got status %v", resp1.Status)
+	}
+
+	resp2, err := transport.ReadResponse(conn)
+	if err != nil {
+		t.Fatalf("read resp2: %v", err)
+	}
+	if resp2.SeqID != 7777 || resp2.Status != transport.StatusInvalidRequest {
+		t.Fatalf("expected resp2 StatusInvalidRequest, got %v", resp2.Status)
+	}
+
+	srv.SetResponseWriteHookForTesting(nil)
+}
+
+// TestPipeline_SeqIDReuse_ConcurrentRepeatedReuse tests multiple concurrent goroutines
+// attempting to claim and execute the same SeqID simultaneously on one connection.
+// Exactly one request must succeed, and all other duplicate attempts must be rejected.
+func TestPipeline_SeqIDReuse_ConcurrentRepeatedReuse(t *testing.T) {
+	eng := newMockEngine()
+	// Add slight delay to engine put to widen the race window
+	eng.putFn = func(ctx context.Context, key, val []byte) error {
+		time.Sleep(30 * time.Millisecond)
+		return nil
+	}
+
+	cfg := transport.DefaultServerConfig()
+	srv := startTestServer(t, cfg, eng)
+
+	conn, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	const targetSeqID = uint64(54321)
+	const concurrentAttempts = 10
+
+	var writeMu sync.Mutex
+	var startWg sync.WaitGroup
+	startWg.Add(1)
+
+	var sendWg sync.WaitGroup
+	sendWg.Add(concurrentAttempts)
+
+	for i := 0; i < concurrentAttempts; i++ {
+		go func(idx int) {
+			defer sendWg.Done()
+			startWg.Wait()
+
+			req := &transport.Request{
+				OpCode: transport.OpPut,
+				SeqID:  targetSeqID,
+				Key:    []byte(fmt.Sprintf("conc_key_%d", idx)),
+				Value:  []byte(fmt.Sprintf("conc_val_%d", idx)),
+			}
+			writeMu.Lock()
+			_ = transport.WriteRequest(conn, req)
+			writeMu.Unlock()
+		}(i)
+	}
+
+	// Release all goroutines simultaneously
+	startWg.Done()
+	sendWg.Wait()
+
+	// Read all responses
+	var okCount, rejectCount int
+	for i := 0; i < concurrentAttempts; i++ {
+		resp, err := transport.ReadResponse(conn)
+		if err != nil {
+			t.Fatalf("read resp %d: %v", i, err)
+		}
+		if resp.SeqID != targetSeqID {
+			t.Fatalf("expected seq %d, got %d", targetSeqID, resp.SeqID)
+		}
+		if resp.Status == transport.StatusOk {
+			okCount++
+		} else if resp.Status == transport.StatusInvalidRequest {
+			rejectCount++
+		} else {
+			t.Fatalf("unexpected status %v", resp.Status)
+		}
+	}
+
+	// Exactly 1 must have owned the SeqID, the other 9 must have been rejected
+	if okCount != 1 {
+		t.Fatalf("expected exactly 1 StatusOk, got %d", okCount)
+	}
+	if rejectCount != concurrentAttempts-1 {
+		t.Fatalf("expected %d StatusInvalidRequest, got %d", concurrentAttempts-1, rejectCount)
+	}
+}
+
+// TestPipeline_Lifecycle_ServerShutdownWithFullPipeline tests server shutdown
+// while a saturated pipeline of requests is actively executing.
+func TestPipeline_Lifecycle_ServerShutdownWithFullPipeline(t *testing.T) {
+	eng := newMockEngine()
+	eng.putFn = func(ctx context.Context, key, val []byte) error {
+		select {
+		case <-time.After(50 * time.Millisecond):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	cfg := transport.DefaultServerConfig()
+	srv := startTestServer(t, cfg, eng)
+
+	conn, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	const nReqs = 16
+	for i := 0; i < nReqs; i++ {
+		req := &transport.Request{
+			OpCode: transport.OpPut,
+			SeqID:  uint64(i + 1),
+			Key:    []byte(fmt.Sprintf("shut_key_%d", i)),
+			Value:  []byte("val"),
+		}
+		if err := transport.WriteRequest(conn, req); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+
+	// Trigger server shutdown while requests are in flight
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer shutdownCancel()
+
+	shutdownErr := srv.Shutdown(shutdownCtx)
+	if shutdownErr != nil && !errors.Is(shutdownErr, context.Canceled) {
+		t.Fatalf("shutdown failed: %v", shutdownErr)
+	}
+}
+
+// TestPipeline_Lifecycle_ClientDisconnectWithFullPipeline tests immediate client disconnect
+// after sending a pipeline of requests, proving server cleans up all in-flight resources without leaks.
+func TestPipeline_Lifecycle_ClientDisconnectWithFullPipeline(t *testing.T) {
+	eng := newMockEngine()
+	eng.putFn = func(ctx context.Context, key, val []byte) error {
+		select {
+		case <-time.After(30 * time.Millisecond):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	cfg := transport.DefaultServerConfig()
+	srv := startTestServer(t, cfg, eng)
+
+	conn, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+
+	const nReqs = 20
+	for i := 0; i < nReqs; i++ {
+		req := &transport.Request{
+			OpCode: transport.OpPut,
+			SeqID:  uint64(i + 1),
+			Key:    []byte(fmt.Sprintf("dc_key_%d", i)),
+			Value:  []byte("val"),
+		}
+		_ = transport.WriteRequest(conn, req)
+	}
+
+	// Abruptly close client connection
+	_ = conn.Close()
+
+	// Wait for server to process disconnection and clean up
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if srv.ActiveConnections() == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if srv.ActiveConnections() != 0 {
+		t.Fatalf("expected 0 active connections after disconnect, got %d", srv.ActiveConnections())
 	}
 }
