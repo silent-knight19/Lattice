@@ -241,4 +241,75 @@ func TestClient_Close(t *testing.T) {
 	if err := c.Batch(ctx, b); !errors.Is(err, client.ErrClientClosed) {
 		t.Errorf("expected ErrClientClosed, got %v", err)
 	}
+	if _, err := c.Exists(ctx, []byte("k")); !errors.Is(err, client.ErrClientClosed) {
+		t.Errorf("expected ErrClientClosed, got %v", err)
+	}
+}
+
+func TestClient_Exists(t *testing.T) {
+	_, addr, cleanup := startServer(t)
+	defer cleanup()
+
+	c, err := client.Dial(addr)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer c.Close()
+
+	ctx := context.Background()
+
+	// Missing key returns false
+	exists, err := c.Exists(ctx, []byte("absent"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if exists {
+		t.Errorf("expected false for absent key")
+	}
+
+	// Put key
+	if err := c.Put(ctx, []byte("present"), []byte("val")); err != nil {
+		t.Fatalf("put failed: %v", err)
+	}
+
+	// Existing key returns true
+	exists, err = c.Exists(ctx, []byte("present"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !exists {
+		t.Errorf("expected true for present key")
+	}
+
+	// Delete key
+	if err := c.Delete(ctx, []byte("present")); err != nil {
+		t.Fatalf("delete failed: %v", err)
+	}
+
+	// Deleted key returns false
+	exists, err = c.Exists(ctx, []byte("present"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if exists {
+		t.Errorf("expected false for deleted key")
+	}
+
+	// Binary key
+	binKey := []byte{0x00, 0xff, 0x01, 0xfe}
+	if err := c.Put(ctx, binKey, []byte("binval")); err != nil {
+		t.Fatalf("put bin key failed: %v", err)
+	}
+	exists, err = c.Exists(ctx, binKey)
+	if err != nil || !exists {
+		t.Errorf("expected true for bin key, got %v, err=%v", exists, err)
+	}
+
+	// Validation
+	if _, err := c.Exists(ctx, nil); !errors.Is(err, client.ErrEmptyKey) {
+		t.Errorf("expected ErrEmptyKey, got %v", err)
+	}
+	if _, err := c.Exists(ctx, make([]byte, 65536)); !errors.Is(err, client.ErrKeyTooLarge) {
+		t.Errorf("expected ErrKeyTooLarge, got %v", err)
+	}
 }

@@ -935,6 +935,13 @@ func (e *testEngine) Get(key []byte) ([]byte, error) {
 	return nil, latticeErrors.ErrKeyNotFound
 }
 
+func (e *testEngine) Exists(key []byte) (bool, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	_, ok := e.store[string(key)]
+	return ok, nil
+}
+
 func TestRouter_RouteRead(t *testing.T) {
 	peers := map[cluster.NodeID]string{
 		1: "127.0.0.1:9001",

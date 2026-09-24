@@ -44,6 +44,13 @@ func (m *batchMockSM) Get(key []byte) ([]byte, error) {
 	return cp, nil
 }
 
+func (m *batchMockSM) Exists(key []byte) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.store[string(key)]
+	return ok, nil
+}
+
 func (m *batchMockSM) Delete(ctx context.Context, key []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -168,6 +168,35 @@ func (c *Client) Delete(ctx context.Context, key []byte) error {
 	return fmt.Errorf("delete failed (status 0x%02x): %s", resp.Status, resp.Message)
 }
 
+// Exists reports whether the specified key exists in the database.
+// Returns (true, nil) if the key exists, (false, nil) if missing, or (false, err) on error.
+func (c *Client) Exists(ctx context.Context, key []byte) (bool, error) {
+	if len(key) == 0 {
+		return false, ErrEmptyKey
+	}
+	if len(key) > transport.MaxKeyLength {
+		return false, ErrKeyTooLarge
+	}
+
+	req := &transport.Request{
+		OpCode: transport.OpExists,
+		Key:    key,
+	}
+
+	resp, err := c.execute(ctx, req)
+	if err != nil {
+		return false, err
+	}
+
+	if resp.Status == transport.StatusOk {
+		return resp.Exists, nil
+	}
+	if resp.Status == transport.StatusKeyNotFound {
+		return false, nil
+	}
+	return false, fmt.Errorf("exists failed (status 0x%02x): %s", resp.Status, resp.Message)
+}
+
 // Batch atomically applies an ordered sequence of PUT and DELETE mutations in WriteBatch.
 // Sends one logical OP_BATCH frame to the server.
 func (c *Client) Batch(ctx context.Context, batch *WriteBatch) error {

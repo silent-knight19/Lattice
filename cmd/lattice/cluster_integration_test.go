@@ -355,3 +355,7 @@ func (e *testCountingEngine) Batch(ctx context.Context, batch []binary.BatchOp) 
 	e.batchCalls++
 	return nil
 }
+
+func (e *testCountingEngine) Exists(key []byte) (bool, error) {
+	return false, nil
+}

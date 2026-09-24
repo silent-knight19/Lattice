@@ -552,23 +552,39 @@ func TestExecuteCommand_MockCases(t *testing.T) {
 		t.Errorf("expected OK, got %q", out.String())
 	}
 
-	// 6. EXISTS Server Unsupported Response
+	// 6. EXISTS Server Response (True and False)
 	out.Reset()
 	client.executeFn = func(req *transport.Request) (*transport.Response, error) {
 		return &transport.Response{
-			OpCode:  transport.OpExists,
-			Status:  transport.StatusInvalidRequest,
-			SeqID:   req.SeqID,
-			Message: "unsupported operation: EXISTS is not implemented by storage engine",
+			OpCode: transport.OpExists,
+			Status: transport.StatusOk,
+			SeqID:  req.SeqID,
+			Exists: true,
 		}, nil
 	}
 	cmd, _ = ParseCommand("EXISTS k")
 	if err := executeCommand(client, cmd, &out, style); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	expectedExistsErr := "(error) unsupported operation: EXISTS is not implemented by storage engine"
-	if strings.TrimSpace(out.String()) != expectedExistsErr {
-		t.Errorf("expected %q, got %q", expectedExistsErr, out.String())
+	if strings.TrimSpace(out.String()) != "true" {
+		t.Errorf("expected %q, got %q", "true", out.String())
+	}
+
+	out.Reset()
+	client.executeFn = func(req *transport.Request) (*transport.Response, error) {
+		return &transport.Response{
+			OpCode: transport.OpExists,
+			Status: transport.StatusOk,
+			SeqID:  req.SeqID,
+			Exists: false,
+		}, nil
+	}
+	cmd, _ = ParseCommand("EXISTS missing_k")
+	if err := executeCommand(client, cmd, &out, style); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.TrimSpace(out.String()) != "false" {
+		t.Errorf("expected %q, got %q", "false", out.String())
 	}
 
 	// 7. STATS Server Unsupported Response
@@ -914,7 +930,8 @@ func TestRealTCPIntegration(t *testing.T) {
 		"GET b2",
 		"GET empty:key",
 
-		// 6. EXISTS (Unsupported operation from server)
+		// 6. EXISTS
+		"EXISTS b1",
 		"EXISTS anykey",
 
 		// 7. STATS (Unsupported operation from server)
@@ -947,7 +964,8 @@ func TestRealTCPIntegration(t *testing.T) {
 		"v1",
 		"v2",
 		"NOT FOUND",
-		"(error) unsupported operation: EXISTS is not implemented by storage engine",
+		"true",
+		"false",
 		"(error) unsupported operation: STATS is not implemented by storage engine",
 	}
 

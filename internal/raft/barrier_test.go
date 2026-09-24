@@ -80,6 +80,16 @@ func (m *mockStateMachine) Get(key []byte) ([]byte, error) {
 	return nil, errors.ErrKeyNotFound
 }
 
+func (m *mockStateMachine) Exists(key []byte) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.err != nil {
+		return false, m.err
+	}
+	_, ok := m.puts[string(key)]
+	return ok, nil
+}
+
 func (m *mockStateMachine) SetError(err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

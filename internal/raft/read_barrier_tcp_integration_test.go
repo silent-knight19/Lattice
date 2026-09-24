@@ -142,6 +142,13 @@ func (c *controllableEngineSM) Get(key []byte) ([]byte, error) {
 	return cp, nil
 }
 
+func (c *controllableEngineSM) Exists(key []byte) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, ok := c.data[string(key)]
+	return ok, nil
+}
+
 type barrierTCPNode struct {
 	id      cluster.NodeID
 	addr    string

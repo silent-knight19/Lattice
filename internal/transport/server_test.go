@@ -21,12 +21,13 @@ import (
 
 // mockEngine satisfies transport.Engine with injectable hooks for error testing.
 type mockEngine struct {
-	mu      sync.RWMutex
-	store   map[string][]byte
-	putFn   func(ctx context.Context, key, val []byte) error
-	getFn   func(key []byte) ([]byte, error)
-	delFn   func(ctx context.Context, key []byte) error
-	batchFn func(ctx context.Context, batch []binary.BatchOp) error
+	mu       sync.RWMutex
+	store    map[string][]byte
+	putFn    func(ctx context.Context, key, val []byte) error
+	getFn    func(key []byte) ([]byte, error)
+	delFn    func(ctx context.Context, key []byte) error
+	batchFn  func(ctx context.Context, batch []binary.BatchOp) error
+	existsFn func(key []byte) (bool, error)
 }
 
 func newMockEngine() *mockEngine {
@@ -88,6 +89,16 @@ func (m *mockEngine) Batch(ctx context.Context, batch []binary.BatchOp) error {
 		}
 	}
 	return nil
+}
+
+func (m *mockEngine) Exists(key []byte) (bool, error) {
+	if m.existsFn != nil {
+		return m.existsFn(key)
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.store[string(key)]
+	return ok, nil
 }
 
 func startTestServer(t *testing.T, cfg transport.ServerConfig, eng transport.Engine) *transport.Server {
@@ -244,15 +255,6 @@ func TestServer_UnsupportedOpcodes_DoNotFake(t *testing.T) {
 		req     *transport.Request
 		wantMsg string
 	}{
-		{
-			name: "OpExists",
-			req: &transport.Request{
-				OpCode: transport.OpExists,
-				SeqID:  201,
-				Key:    []byte("any_key"),
-			},
-			wantMsg: "EXISTS is not implemented",
-		},
 		{
 			name: "OpStats",
 			req: &transport.Request{

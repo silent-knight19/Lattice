@@ -977,6 +977,7 @@ func (e *Engine) Batch(ctx context.Context, ops []binary.BatchOp) error {
 }
 
 // Get retrieves the newest value associated with key across memory and disk.
+// Get retrieves the value associated with key.
 //
 // Precedence (newest wins, tombstone shadows):
 //  1. Active MemTable (newest layer).
@@ -993,17 +994,49 @@ func (e *Engine) Get(key []byte) ([]byte, error) {
 	defer func() {
 		metrics.EngineReadLatency.ObserveDuration(time.Since(start))
 	}()
+
+	val, found, err := e.pointLookup(key, true)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, errors.ErrKeyNotFound
+	}
+	return val, nil
+}
+
+// Exists reports whether the specified key exists and is not tombstoned.
+// It executes a low-overhead point lookup that avoids materializing or copying the value payload.
+// Returns (true, nil) if the key exists, (false, nil) if missing or deleted, or (false, err) on storage failure.
+func (e *Engine) Exists(key []byte) (bool, error) {
+	start := time.Now()
+	defer func() {
+		metrics.EngineReadLatency.ObserveDuration(time.Since(start))
+	}()
+
+	_, found, err := e.pointLookup(key, false)
+	if err != nil {
+		return false, err
+	}
+	return found, nil
+}
+
+// pointLookup executes an internal point read across active MemTable, immutable
+// MemTables, and persistent SSTables.
+// When wantVal is true (used by Get), it materializes and returns a defensive copy of the value.
+// When wantVal is false (used by Exists), it avoids calling Value(), allocating zero value buffers.
+func (e *Engine) pointLookup(key []byte, wantVal bool) ([]byte, bool, error) {
 	if e == nil {
-		return nil, errors.ErrNilReceiver
+		return nil, false, errors.ErrNilReceiver
 	}
 	if err := binary.ValidateKey(key); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	e.mu.RLock()
 	if e.state == engineStateRecovering {
 		e.mu.RUnlock()
-		return nil, errors.ErrRecoveryInProgress
+		return nil, false, errors.ErrRecoveryInProgress
 	}
 	active := e.activeMem
 	imm := make([]*memtable.SkipList, len(e.immMems))
@@ -1014,14 +1047,14 @@ func (e *Engine) Get(key []byte) ([]byte, error) {
 
 	// 1. Active MemTable (tombstone-aware).
 	if active != nil {
-		val, put, tomb := lookupMemLayer(active, key)
+		v, put, tomb := lookupMemLayer(active, key, wantVal)
 		if put {
 			e.mu.RUnlock()
-			return val, nil
+			return v, true, nil
 		}
 		if tomb {
 			e.mu.RUnlock()
-			return nil, errors.ErrKeyNotFound
+			return nil, false, nil
 		}
 	}
 	// 2. Immutable MemTables, newest first.
@@ -1029,35 +1062,35 @@ func (e *Engine) Get(key []byte) ([]byte, error) {
 		if imm[i] == nil {
 			continue
 		}
-		val, put, tomb := lookupMemLayer(imm[i], key)
+		v, put, tomb := lookupMemLayer(imm[i], key, wantVal)
 		if put {
 			e.mu.RUnlock()
-			return val, nil
+			return v, true, nil
 		}
 		if tomb {
 			e.mu.RUnlock()
-			return nil, errors.ErrKeyNotFound
+			return nil, false, nil
 		}
 	}
 	e.mu.RUnlock()
 
 	// 3. Persistent Version via transient TableReaders + shared block cache.
 	if vset == nil || dbPath == "" || !vset.HasCurrent() {
-		return nil, errors.ErrKeyNotFound
+		return nil, false, nil
 	}
 	ver := vset.Current()
 	if ver == nil {
-		return nil, errors.ErrKeyNotFound
+		return nil, false, nil
 	}
 	defer ver.Unref()
-	return e.getFromVersion(key, ver, dbPath, bc)
+	return e.pointLookupFromVersion(key, ver, dbPath, bc, wantVal)
 }
 
 // lookupMemLayer inspects a single SkipList for key, distinguishing PUT,
 // tombstone, and absence. It uses Iterator.Seek so the newest revision's
-// OpType decides: PUT returns (value, true, false), DELETE returns
-// (nil, false, true), absence returns (nil, false, false).
-func lookupMemLayer(sl *memtable.SkipList, key []byte) (val []byte, put bool, tomb bool) {
+// OpType decides. If wantVal is false, it returns (nil, true, false) for PUT
+// without calling it.Value(), avoiding defensive copy allocations.
+func lookupMemLayer(sl *memtable.SkipList, key []byte, wantVal bool) (val []byte, put bool, tomb bool) {
 	if sl == nil {
 		return nil, false, false
 	}
@@ -1079,16 +1112,16 @@ func lookupMemLayer(sl *memtable.SkipList, key []byte) (val []byte, put bool, to
 	if ik.OpType == binary.OpTypeDelete {
 		return nil, false, true
 	}
-	return it.Value(), true, false
+	if wantVal {
+		return it.Value(), true, false
+	}
+	return nil, true, false
 }
 
-// getFromVersion searches a pinned Version newest-to-oldest. L0 files overlap
-// and are searched newest FileNum first; L1.. files are non-overlapping and
-// pruned by decoded user-key range. The first containing file decides: PUT
-// returns its value, tombstone returns ErrKeyNotFound without consulting
-// older files/levels. Range misses continue. Open/read/decode failures are
-// returned as errors, never as not-found.
-func (e *Engine) getFromVersion(key []byte, ver *version.Version, dbPath string, bc *cache.ShardedCache) ([]byte, error) {
+// pointLookupFromVersion searches a pinned Version newest-to-oldest.
+// When wantVal is true, the value is retrieved and returned.
+// When wantVal is false, it returns (nil, true, nil) on existence without copying the value.
+func (e *Engine) pointLookupFromVersion(key []byte, ver *version.Version, dbPath string, bc *cache.ShardedCache, wantVal bool) ([]byte, bool, error) {
 	// L0: overlapping, newest first.
 	l0 := ver.Files(0)
 	if len(l0) > 1 {
@@ -1103,15 +1136,15 @@ func (e *Engine) getFromVersion(key []byte, ver *version.Version, dbPath string,
 		l0 = cp
 	}
 	for _, meta := range l0 {
-		found, tomb, val, err := lookupSSTableFile(dbPath, meta, key, bc)
+		found, tomb, val, err := lookupSSTableFile(dbPath, meta, key, bc, wantVal)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if tomb {
-			return nil, errors.ErrKeyNotFound
+			return nil, false, nil
 		}
 		if found {
-			return val, nil
+			return val, true, nil
 		}
 	}
 	// L1..L6: at most one file per level can contain the key.
@@ -1119,27 +1152,27 @@ func (e *Engine) getFromVersion(key []byte, ver *version.Version, dbPath string,
 		for _, meta := range ver.Files(lvl) {
 			ok, err := fileRangeContains(meta, key)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			if !ok {
 				continue
 			}
-			found, tomb, val, err := lookupSSTableFile(dbPath, meta, key, bc)
+			found, tomb, val, err := lookupSSTableFile(dbPath, meta, key, bc, wantVal)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			if tomb {
-				return nil, errors.ErrKeyNotFound
+				return nil, false, nil
 			}
 			if found {
-				return val, nil
+				return val, true, nil
 			}
 			// Range matched but key absent: non-overlapping level, no other
 			// file in this level can contain it.
 			break
 		}
 	}
-	return nil, errors.ErrKeyNotFound
+	return nil, false, nil
 }
 
 // fileRangeContains reports whether key falls within the SSTable's decoded
@@ -1164,8 +1197,9 @@ func fileRangeContains(meta version.FileMetadata, key []byte) (bool, error) {
 
 // lookupSSTableFile opens a transient TableReader for meta, seeks key via a
 // TableIterator (to observe OpType), and closes the reader before returning.
-// It uses the Engine's shared block cache without exposing shard internals.
-func lookupSSTableFile(dbPath string, meta version.FileMetadata, key []byte, bc *cache.ShardedCache) (found bool, tomb bool, val []byte, err error) {
+// If wantVal is false, it returns (true, false, nil, nil) without calling it.Value(),
+// avoiding allocating and copying data block values.
+func lookupSSTableFile(dbPath string, meta version.FileMetadata, key []byte, bc *cache.ShardedCache, wantVal bool) (found bool, tomb bool, val []byte, err error) {
 	var cacheIf sstable.BlockCache
 	if bc != nil {
 		cacheIf = bc
@@ -1200,7 +1234,10 @@ func lookupSSTableFile(dbPath string, meta version.FileMetadata, key []byte, bc 
 	if ik.OpType == binary.OpTypeDelete {
 		return false, true, nil, nil
 	}
-	return true, false, it.Value(), nil
+	if wantVal {
+		return true, false, it.Value(), nil
+	}
+	return true, false, nil, nil
 }
 
 // Close performs clean Engine shutdown and resource reclamation.

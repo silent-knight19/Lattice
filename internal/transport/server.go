@@ -23,6 +23,7 @@ type Engine interface {
 	Get(key []byte) ([]byte, error)
 	Delete(ctx context.Context, key []byte) error
 	Batch(ctx context.Context, batch []binary.BatchOp) error
+	Exists(key []byte) (bool, error)
 }
 
 // ProposalRouter defines the interface for routing client write mutations in replicated mode (P16-S01-M02).
@@ -671,8 +672,29 @@ func (s *Server) dispatch(req *Request) (finalResp *Response) {
 		s.mapEngineError(err, resp)
 
 	case OpExists:
-		resp.Status = StatusInvalidRequest
-		resp.Message = "unsupported operation: EXISTS is not implemented by storage engine"
+		readRouter := s.ReadRouter()
+		if readRouter != nil {
+			r, err := readRouter.RouteRead(ctx, req)
+			if err != nil {
+				resp.Status = StatusError
+				resp.Message = "internal routing error"
+				return resp
+			}
+			return r
+		}
+		// In cluster mode, NEVER fall through to direct unverified Engine reads.
+		if s.clusterMode {
+			resp.Status = StatusError
+			resp.Message = "cluster mode active but consensus router unavailable"
+			return resp
+		}
+		exists, err := s.engine.Exists(req.Key)
+		if err == nil {
+			resp.Status = StatusOk
+			resp.Exists = exists
+		} else {
+			s.mapEngineError(err, resp)
+		}
 
 	case OpBatch:
 		if router != nil {

@@ -1063,6 +1063,7 @@ func (e *noopEngine) Delete(ctx context.Context, key []byte) error   { return ni
 func (e *noopEngine) Batch(ctx context.Context, batch []binary.BatchOp) error {
 	return nil
 }
+func (e *noopEngine) Exists(key []byte) (bool, error) { return false, nil }
 
 // countingEngine counts direct Engine.Put/Delete calls.
 type countingEngine struct {
@@ -1084,6 +1085,7 @@ func (e *countingEngine) Batch(ctx context.Context, batch []binary.BatchOp) erro
 	e.batchCount.Add(1)
 	return nil
 }
+func (e *countingEngine) Exists(key []byte) (bool, error) { return false, nil }
 
 // mockRouter is a simple ProposalRouter for testing.
 type mockRouter struct{}

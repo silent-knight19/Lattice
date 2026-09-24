@@ -404,7 +404,7 @@ func (n *Node) routeReadWithTopology(ctx context.Context, req *transport.Request
 	}
 
 	// 1. Validate operation code
-	if req.OpCode != transport.OpGet {
+	if req.OpCode != transport.OpGet && req.OpCode != transport.OpExists {
 		resp.Status = transport.StatusInvalidRequest
 		resp.Message = fmt.Sprintf("unsupported operation for read router: 0x%02x", byte(req.OpCode))
 		return resp, nil
@@ -503,6 +503,18 @@ func (n *Node) routeReadWithTopology(ctx context.Context, req *transport.Request
 	if eng == nil {
 		resp.Status = transport.StatusError
 		resp.Message = "storage engine unavailable for read router"
+		return resp, nil
+	}
+
+	if req.OpCode == transport.OpExists {
+		exists, err := eng.Exists(req.Key)
+		if err == nil {
+			resp.Status = transport.StatusOk
+			resp.Exists = exists
+			return resp, nil
+		}
+		resp.Status = transport.StatusError
+		resp.Message = "internal storage error"
 		return resp, nil
 	}
 
