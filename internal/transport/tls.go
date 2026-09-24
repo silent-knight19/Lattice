@@ -381,3 +381,99 @@ func PeerClientTLSConfig(certFile, keyFile, peerCAFile string, targetPeerID clus
 
 	return cfg, nil
 }
+
+// ValidatePeerTLSConfig verifies that cfg satisfies the mandatory mutual TLS 1.3
+// security policy for Lattice Raft peer transport.
+//
+// Invariants enforced:
+//   - cfg must be non-nil.
+//   - MinVersion must be tls.VersionTLS13.
+//   - MaxVersion, if set, must be >= tls.VersionTLS13.
+//   - InsecureSkipVerify must not be true.
+//   - ClientAuth must be tls.RequireAndVerifyClientCert (mutual TLS).
+//   - ClientCAs must be non-nil.
+//   - Certificates must not be empty (or GetCertificate / GetClientCertificate configured).
+//
+// Rejects:
+//   - nil TLS config
+//   - TLS < 1.3
+//   - TLS 1.3 with NoClientCert
+//   - TLS 1.3 with RequestClientCert
+//   - TLS 1.3 with VerifyClientCertIfGiven
+//   - TLS 1.3 with RequireAnyClientCert
+//   - TLS 1.3 with RequireAndVerifyClientCert but nil ClientCAs
+//   - missing certificate/key
+//
+// Accepts:
+//   - correctly constructed peer mTLS configuration
+func ValidatePeerTLSConfig(cfg *tls.Config) error {
+	if cfg == nil {
+		return fmt.Errorf("%w: peer TLS configuration is nil; mutual TLS 1.3 required", errors.ErrInsecureTransport)
+	}
+
+	if cfg.MinVersion < tls.VersionTLS13 || (cfg.MaxVersion != 0 && cfg.MaxVersion < tls.VersionTLS13) {
+		return fmt.Errorf("%w: peer TLS configuration mandates TLS 1.3 (min=%x, max=%x)",
+			errors.ErrInsecureTransport, cfg.MinVersion, cfg.MaxVersion)
+	}
+
+	if cfg.InsecureSkipVerify {
+		return fmt.Errorf("%w: peer TLS InsecureSkipVerify must not be enabled", errors.ErrInsecureTransport)
+	}
+
+	switch cfg.ClientAuth {
+	case tls.RequireAndVerifyClientCert:
+		// Required mutual TLS invariant
+	case tls.NoClientCert:
+		return fmt.Errorf("%w: peer TLS requires mutual client certificate verification (got NoClientCert)", errors.ErrInsecureTransport)
+	case tls.RequestClientCert:
+		return fmt.Errorf("%w: peer TLS requires mandatory client certificate verification (got RequestClientCert)", errors.ErrInsecureTransport)
+	case tls.VerifyClientCertIfGiven:
+		return fmt.Errorf("%w: peer TLS requires mandatory client certificate verification (got VerifyClientCertIfGiven)", errors.ErrInsecureTransport)
+	case tls.RequireAnyClientCert:
+		return fmt.Errorf("%w: peer TLS requires verified client certificate against trusted CA (got RequireAnyClientCert)", errors.ErrInsecureTransport)
+	default:
+		return fmt.Errorf("%w: peer TLS invalid ClientAuth mode (%v); RequireAndVerifyClientCert required", errors.ErrInsecureTransport, cfg.ClientAuth)
+	}
+
+	if cfg.ClientCAs == nil {
+		return fmt.Errorf("%w: peer TLS requires non-nil trusted ClientCAs pool for mutual authentication", errors.ErrInsecureTransport)
+	}
+
+	if len(cfg.Certificates) == 0 && cfg.GetCertificate == nil && cfg.GetClientCertificate == nil {
+		return fmt.Errorf("%w: peer TLS requires configured X.509 certificate and private key", errors.ErrInsecureTransport)
+	}
+
+	return nil
+}
+
+// ValidatePeerDialerTLSConfig verifies that outbound dialer TLS config cfg satisfies
+// the TLS 1.3 client authentication and trusted CA invariants.
+func ValidatePeerDialerTLSConfig(cfg *tls.Config) error {
+	if cfg == nil {
+		return fmt.Errorf("%w: peer dialer TLS configuration is nil; mutual TLS 1.3 required", errors.ErrInsecureTransport)
+	}
+
+	if cfg.MinVersion < tls.VersionTLS13 || (cfg.MaxVersion != 0 && cfg.MaxVersion < tls.VersionTLS13) {
+		return fmt.Errorf("%w: peer dialer TLS configuration mandates TLS 1.3 (min=%x, max=%x)",
+			errors.ErrInsecureTransport, cfg.MinVersion, cfg.MaxVersion)
+	}
+
+	if cfg.InsecureSkipVerify {
+		return fmt.Errorf("%w: peer dialer TLS InsecureSkipVerify must not be enabled", errors.ErrInsecureTransport)
+	}
+
+	if len(cfg.Certificates) == 0 && cfg.GetCertificate == nil && cfg.GetClientCertificate == nil {
+		return fmt.Errorf("%w: peer dialer TLS requires client certificate for mutual authentication", errors.ErrInsecureTransport)
+	}
+
+	if cfg.RootCAs == nil && cfg.ClientCAs == nil {
+		return fmt.Errorf("%w: peer dialer TLS requires non-nil trusted CA pool", errors.ErrInsecureTransport)
+	}
+
+	if cfg.ClientAuth != 0 && cfg.ClientAuth != tls.RequireAndVerifyClientCert {
+		return fmt.Errorf("%w: peer dialer TLS ClientAuth must be RequireAndVerifyClientCert if specified (got %v)",
+			errors.ErrInsecureTransport, cfg.ClientAuth)
+	}
+
+	return nil
+}

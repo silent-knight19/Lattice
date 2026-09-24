@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"math"
@@ -1607,5 +1608,48 @@ func TestPeerConnectionManager_InboundConnectionLimit(t *testing.T) {
 	}
 	if got := mgr.ActiveInboundConnections(); got != 0 {
 		t.Errorf("expected 0 active inbound conns after closing all, got %d", got)
+	}
+}
+
+func TestPeerConnectionManager_RejectOneWayTLS_NonLoopback(t *testing.T) {
+	topo := createTestTopology(t, 1, "127.0.0.1:9001", map[cluster.NodeID]string{
+		2: "192.168.1.100:9098",
+	})
+
+	ca := NewTestCA(t, "Reject One-Way Integration CA")
+	node1Cert, node1Key := ca.IssuePeerCert(t, 1)
+	kp, err := tls.LoadX509KeyPair(node1Cert, node1Key)
+	if err != nil {
+		t.Fatalf("LoadX509KeyPair failed: %v", err)
+	}
+	caPool, err := LoadCertPool(ca.CertPath)
+	if err != nil {
+		t.Fatalf("LoadCertPool failed: %v", err)
+	}
+
+	// 1. Deliberately constructed one-way TLS 1.3 configuration on TLSConfig
+	cfg := DefaultPeerConnectionConfig()
+	cfg.TLSConfig = &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		ClientAuth:   tls.NoClientCert, // one-way TLS
+		Certificates: []tls.Certificate{kp},
+		ClientCAs:    caPool,
+	}
+	_, err = NewPeerConnectionManager(topo, cfg)
+	if !errors.Is(err, errs.ErrInsecureTransport) {
+		t.Fatalf("expected ErrInsecureTransport for one-way TLS on TLSConfig, got: %v", err)
+	}
+
+	// 2. Deliberately constructed one-way TLS 1.3 configuration on ListenerTLSConfig
+	cfg = DefaultPeerConnectionConfig()
+	cfg.ListenerTLSConfig = &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		ClientAuth:   tls.NoClientCert, // one-way TLS
+		Certificates: []tls.Certificate{kp},
+		ClientCAs:    caPool,
+	}
+	_, err = NewPeerConnectionManager(topo, cfg)
+	if !errors.Is(err, errs.ErrInsecureTransport) {
+		t.Fatalf("expected ErrInsecureTransport for one-way TLS on ListenerTLSConfig, got: %v", err)
 	}
 }

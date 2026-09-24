@@ -32,7 +32,7 @@ The system design specifies the following architectural targets (currently under
 * **Probabilistic Filtering**: Murmur3-based **Bloom filters** (10 bits/key, 7 hash functions) targeting $\ge 99\%$ cold read disk avoidance.
 * **Compaction Strategy**: Leveled compaction ($L_0$ overlapping, $L_1..L_N$ non-overlapping partitioned runs with a $10\times$ multiplier) driven by k-way merge iterators.
 * **Concurrency Model**: Version-pinned snapshot reads (`VersionSet` with atomic reference counting) ensuring reads never block on background flushes or compactions.
-* **Wire Protocol**: Custom length-prefixed binary framing protocol over TLS 1.3 / mTLS sockets (with loopback plaintext fallback for local development) with frame-bomb protections and concurrent request pipelining.
+* **Wire Protocol**: Custom length-prefixed binary framing protocol over TLS 1.3 / mutual TLS (mTLS) sockets for both client data plane and Raft peer consensus transport (with loopback plaintext fallback for local development) with frame-bomb protections and concurrent request pipelining.
 * **Distributed Consensus (V1.1 Target)**: Single-group **Raft** consensus supporting leader election, randomized heartbeat timers, quorum replication ($Q = \lfloor N/2 \rfloor + 1$), and linearizable reads via the `ReadIndex` protocol.
 
 ---
