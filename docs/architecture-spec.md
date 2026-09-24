@@ -1412,6 +1412,13 @@ Lattice is engineered as an enterprise-grade internal data tier with rigorous de
     - Client authorization governs strictly the client transport data plane (`:9099`).
     - Raft peer consensus transport (`:9098`) operates under a separate, dedicated peer security domain requiring peer mTLS with `OU = Lattice Raft Peer` and `NodeID` verification against cluster topology. Raft peers cannot issue client commands, and client certificates cannot participate in Raft consensus.
 
+12. **Policy File Security & Strict Parser Invariants**:
+    - Policy file loading uses `security.CleanAndValidatePath`, pre-open `os.Lstat`, `openFileNoFollow` with `syscall.O_NOFOLLOW` on supported platforms (Linux/macOS), descriptor `f.Stat()`, post-open `os.Lstat`, and double `os.SameFile` inode pinning.
+    - Symlinks, directories, non-regular files, and replacement races fail closed immediately (`ErrInvalidAuthzPolicy`).
+    - Policy file size is strictly bounded to 1 MiB with `io.LimitReader` to eliminate allocation attacks.
+    - JSON parsing strictly requires exactly one complete document; trailing garbage, concatenated documents, or duplicate fingerprints (same-role or conflicting) are rejected fail-closed.
+    - Loaded policy is immutable in-memory; file mutation or deletion after startup has zero effect on runtime authorization.
+
 ---
 
 # 40. Configuration Management

@@ -703,4 +703,77 @@ func TestConfig_ClientAuthzPolicy(t *testing.T) {
 			t.Fatal("expected error for conflicting duplicate fingerprint, got nil")
 		}
 	})
+
+	t.Run("Same-role duplicate fingerprint in flag rejected", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		args := []string{
+			"--client-authz-policy", fp1 + "=reader," + fp1 + "=reader",
+		}
+		_, _, err := ParseFlags(args, &stdout, &stderr)
+		if err == nil {
+			t.Fatal("expected error for same-role duplicate fingerprint in flag, got nil")
+		}
+	})
+
+	t.Run("CLI flag and policy file merge deterministically", func(t *testing.T) {
+		dir := t.TempDir()
+		policyPath := filepath.Join(dir, "policy.json")
+		data := fmt.Sprintf(`{"%s": "admin"}`, fp2)
+		if err := os.WriteFile(policyPath, []byte(data), 0600); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+
+		var stdout, stderr bytes.Buffer
+		args := []string{
+			"--client-authz-policy", fp1 + "=reader",
+			"--client-authz-policy-file", policyPath,
+		}
+		cfg, _, err := ParseFlags(args, &stdout, &stderr)
+		if err != nil {
+			t.Fatalf("ParseFlags failed: %v", err)
+		}
+		if len(cfg.ClientAuthzPolicy) != 2 {
+			t.Fatalf("expected 2 policy entries, got %d", len(cfg.ClientAuthzPolicy))
+		}
+		if cfg.ClientAuthzPolicy[fp1] != "reader" || cfg.ClientAuthzPolicy[fp2] != "admin" {
+			t.Fatalf("unexpected policy map: %+v", cfg.ClientAuthzPolicy)
+		}
+	})
+
+	t.Run("CLI flag and policy file with conflicting duplicate rejected", func(t *testing.T) {
+		dir := t.TempDir()
+		policyPath := filepath.Join(dir, "policy.json")
+		data := fmt.Sprintf(`{"%s": "writer"}`, fp1)
+		if err := os.WriteFile(policyPath, []byte(data), 0600); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+
+		var stdout, stderr bytes.Buffer
+		args := []string{
+			"--client-authz-policy", fp1 + "=reader",
+			"--client-authz-policy-file", policyPath,
+		}
+		_, _, err := ParseFlags(args, &stdout, &stderr)
+		if err == nil {
+			t.Fatal("expected error for conflicting duplicate between CLI and file, got nil")
+		}
+	})
+
+	t.Run("Policy file with trailing garbage rejected", func(t *testing.T) {
+		dir := t.TempDir()
+		policyPath := filepath.Join(dir, "garbage.json")
+		data := fmt.Sprintf(`{"%s": "reader"} garbage`, fp1)
+		if err := os.WriteFile(policyPath, []byte(data), 0600); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+
+		var stdout, stderr bytes.Buffer
+		args := []string{
+			"--client-authz-policy-file", policyPath,
+		}
+		_, _, err := ParseFlags(args, &stdout, &stderr)
+		if err == nil {
+			t.Fatal("expected error for policy file with trailing garbage, got nil")
+		}
+	})
 }

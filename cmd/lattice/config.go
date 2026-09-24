@@ -118,11 +118,15 @@ func DefaultConfig() Config {
 
 // isLoopback reports whether the given address resolves to a local loopback interface.
 func isLoopback(addr string) bool {
+	if addr == "" {
+		return false
+	}
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		host = addr
 	}
-	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") || host == "127.0.0.1" || host == "::1" || host == "pipe" || host == "local" {
 		return true
 	}
 	ip := net.ParseIP(host)
@@ -466,7 +470,7 @@ func (c *Config) Validate() error {
 			c.ClientAuthzPolicy[fp] = string(role)
 		}
 	}
-	if len(c.ClientAuthzPolicy) > 0 {
+	if c.ClientAuthzPolicy != nil {
 		if _, err := transport.NewAuthzPolicy(c.ClientAuthzPolicy); err != nil {
 			return fmt.Errorf("config error: invalid client authorization policy: %w", err)
 		}

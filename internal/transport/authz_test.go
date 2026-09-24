@@ -533,17 +533,14 @@ func TestAuthz_Duplicate_Policy_Entries(t *testing.T) {
 		t.Fatalf("expected conflicting duplicate entries to fail, got nil")
 	}
 
-	// Identical duplicate entries must be deterministically validated
+	// Identical duplicate entries must also fail closed
 	identicalEntries := []PolicyEntry{
 		{Fingerprint: validFP, Role: RoleReader},
 		{Fingerprint: validFP, Role: RoleReader},
 	}
-	p, err := NewAuthzPolicyFromEntries(identicalEntries)
-	if err != nil {
-		t.Fatalf("expected identical duplicate entries to be deterministically validated, got %v", err)
-	}
-	if role, ok := p.Lookup(validFP); !ok || role != RoleReader {
-		t.Fatalf("expected role reader, got %s (ok=%v)", role, ok)
+	_, err = NewAuthzPolicyFromEntries(identicalEntries)
+	if err == nil {
+		t.Fatalf("expected identical duplicate entries to fail closed, got nil")
 	}
 }
 
@@ -1818,5 +1815,317 @@ func TestAuthz_Adversarial_UnauthorizedExistsNeverCallsEngineExists(t *testing.T
 	}
 	if eng.existsCount.Load() != 0 {
 		t.Fatalf("expected engine.Exists invocation count == 0, got %d", eng.existsCount.Load())
+	}
+}
+
+func TestAuthz_Parser_StrictSingleDocument(t *testing.T) {
+	fp1 := "1111111111111111111111111111111111111111111111111111111111111111"
+	fp2 := "2222222222222222222222222222222222222222222222222222222222222222"
+
+	tests := []struct {
+		name        string
+		data        string
+		expectError bool
+	}{
+		{
+			name:        "valid single object",
+			data:        fmt.Sprintf(`{"%s": "reader"}`, fp1),
+			expectError: false,
+		},
+		{
+			name:        "valid single object with trailing whitespace",
+			data:        fmt.Sprintf("{\"%s\": \"reader\"}  \n\t  ", fp1),
+			expectError: false,
+		},
+		{
+			name:        "valid single array",
+			data:        fmt.Sprintf(`[{"fingerprint": "%s", "role": "reader"}]`, fp1),
+			expectError: false,
+		},
+		{
+			name:        "valid single array with trailing whitespace",
+			data:        fmt.Sprintf("[{\"fingerprint\": \"%s\", \"role\": \"reader\"}]  \n\t  ", fp1),
+			expectError: false,
+		},
+		{
+			name:        "valid empty object",
+			data:        `{}`,
+			expectError: false,
+		},
+		{
+			name:        "valid empty array",
+			data:        `[]`,
+			expectError: false,
+		},
+		{
+			name:        "trailing garbage after object",
+			data:        fmt.Sprintf(`{"%s": "reader"} garbage`, fp1),
+			expectError: true,
+		},
+		{
+			name:        "concatenated second object",
+			data:        fmt.Sprintf(`{"%s": "reader"} {"%s": "writer"}`, fp1, fp2),
+			expectError: true,
+		},
+		{
+			name:        "object followed by array",
+			data:        fmt.Sprintf(`{"%s": "reader"} []`, fp1),
+			expectError: true,
+		},
+		{
+			name:        "array followed by object",
+			data:        `[] {}`,
+			expectError: true,
+		},
+		{
+			name:        "trailing garbage after array",
+			data:        fmt.Sprintf(`[{"fingerprint": "%s", "role": "reader"}] garbage`, fp1),
+			expectError: true,
+		},
+		{
+			name:        "concatenated second array",
+			data:        `[] []`,
+			expectError: true,
+		},
+		{
+			name:        "not an object or array (bare string)",
+			data:        `"hello"`,
+			expectError: true,
+		},
+		{
+			name:        "not an object or array (bare number)",
+			data:        `12345`,
+			expectError: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseAuthzPolicyJSON([]byte(tc.data))
+			if tc.expectError {
+				if err == nil {
+					t.Fatalf("expected error for %s, got nil", tc.name)
+				}
+				if !stdErrors.Is(err, errors.ErrInvalidAuthzPolicy) {
+					t.Fatalf("expected ErrInvalidAuthzPolicy, got: %v", err)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("expected success for %s, got: %v", tc.name, err)
+				}
+			}
+		})
+	}
+}
+
+func TestAuthz_Parser_DuplicateFingerprints_FailClosed(t *testing.T) {
+	fp1 := "1111111111111111111111111111111111111111111111111111111111111111"
+	fpHexUpper := strings.ToUpper("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
+	fpHexLower := strings.ToLower(fpHexUpper)
+
+	tests := []struct {
+		name string
+		data string
+	}{
+		{
+			name: "duplicate exact key in object same role",
+			data: fmt.Sprintf(`{"%s": "reader", "%s": "reader"}`, fp1, fp1),
+		},
+		{
+			name: "duplicate exact key in object conflicting role",
+			data: fmt.Sprintf(`{"%s": "reader", "%s": "writer"}`, fp1, fp1),
+		},
+		{
+			name: "duplicate canonical key in object",
+			data: fmt.Sprintf(`{"%s": "reader", "%s": "writer"}`, fpHexUpper, fpHexLower),
+		},
+		{
+			name: "duplicate exact in array same role",
+			data: fmt.Sprintf(`[{"fingerprint": "%s", "role": "reader"}, {"fingerprint": "%s", "role": "reader"}]`, fp1, fp1),
+		},
+		{
+			name: "duplicate exact in array conflicting role",
+			data: fmt.Sprintf(`[{"fingerprint": "%s", "role": "reader"}, {"fingerprint": "%s", "role": "writer"}]`, fp1, fp1),
+		},
+		{
+			name: "duplicate canonical in array",
+			data: fmt.Sprintf(`[{"fingerprint": "%s", "role": "reader"}, {"fingerprint": "%s", "role": "writer"}]`, fpHexUpper, fpHexLower),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseAuthzPolicyJSON([]byte(tc.data))
+			if err == nil {
+				t.Fatalf("expected error for duplicate fingerprint in %s, got nil", tc.name)
+			}
+			if !stdErrors.Is(err, errors.ErrInvalidAuthzPolicy) {
+				t.Fatalf("expected ErrInvalidAuthzPolicy, got: %v", err)
+			}
+		})
+	}
+
+	// Also test ParseAuthzPolicyString duplicates
+	strTests := []string{
+		fmt.Sprintf("%s=reader,%s=reader", fp1, fp1),
+		fmt.Sprintf("%s=reader,%s=writer", fp1, fp1),
+		fmt.Sprintf("%s=reader,%s=writer", fpHexUpper, fpHexLower),
+	}
+	for i, s := range strTests {
+		t.Run(fmt.Sprintf("string duplicate %d", i), func(t *testing.T) {
+			_, err := ParseAuthzPolicyString(s)
+			if err == nil {
+				t.Fatalf("expected error for duplicate fingerprint in string, got nil")
+			}
+			if !stdErrors.Is(err, errors.ErrInvalidAuthzPolicy) {
+				t.Fatalf("expected ErrInvalidAuthzPolicy, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestAuthz_PolicyFile_Symlinks_FailClosed(t *testing.T) {
+	tmpDir := t.TempDir()
+	fp := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	validData := fmt.Sprintf(`{"%s": "admin"}`, fp)
+
+	realPolicyFile := filepath.Join(tmpDir, "real_policy.json")
+	if err := os.WriteFile(realPolicyFile, []byte(validData), 0600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	// 1. Symlink to valid policy file
+	symlinkPath := filepath.Join(tmpDir, "symlink_policy.json")
+	if err := os.Symlink(realPolicyFile, symlinkPath); err != nil {
+		t.Fatalf("Symlink failed: %v", err)
+	}
+
+	_, err := LoadAuthzPolicyFile(symlinkPath)
+	if err == nil {
+		t.Fatalf("expected LoadAuthzPolicyFile on symlink to fail closed, got nil")
+	}
+	if !stdErrors.Is(err, errors.ErrInvalidAuthzPolicy) {
+		t.Fatalf("expected ErrInvalidAuthzPolicy for symlink, got: %v", err)
+	}
+
+	// 2. Symlink to external file
+	extDir := t.TempDir()
+	extTarget := filepath.Join(extDir, "ext_policy.json")
+	if err := os.WriteFile(extTarget, []byte(validData), 0600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	extSymlink := filepath.Join(tmpDir, "ext_symlink.json")
+	if err := os.Symlink(extTarget, extSymlink); err != nil {
+		t.Fatalf("Symlink failed: %v", err)
+	}
+	_, err = LoadAuthzPolicyFile(extSymlink)
+	if err == nil {
+		t.Fatalf("expected LoadAuthzPolicyFile on external symlink to fail closed, got nil")
+	}
+	if !stdErrors.Is(err, errors.ErrInvalidAuthzPolicy) {
+		t.Fatalf("expected ErrInvalidAuthzPolicy for external symlink, got: %v", err)
+	}
+}
+
+func TestAuthz_PolicyFile_ReplacementRace_FailsClosed(t *testing.T) {
+	tmpDir := t.TempDir()
+	fp := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	validData := fmt.Sprintf(`{"%s": "admin"}`, fp)
+
+	policyPath := filepath.Join(tmpDir, "policy.json")
+	if err := os.WriteFile(policyPath, []byte(validData), 0600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	// Set test hook that replaces policyPath between open and fstat/lstatAfter
+	restore := SetPolicyPostOpenHookForTesting(func(path string, f *os.File) error {
+		_ = os.Remove(path)
+		// Write a replacement file with a different inode
+		_ = os.WriteFile(path, []byte(`{"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": "writer"}`), 0600)
+		return nil
+	})
+	defer restore()
+
+	_, err := LoadAuthzPolicyFile(policyPath)
+	if err == nil {
+		t.Fatalf("expected LoadAuthzPolicyFile to fail closed on replacement race, got nil")
+	}
+	if !stdErrors.Is(err, errors.ErrInvalidAuthzPolicy) {
+		t.Fatalf("expected ErrInvalidAuthzPolicy for replacement race, got: %v", err)
+	}
+}
+
+func TestAuthz_PolicyFile_MutationAfterStartup_ZeroRuntimeEffect(t *testing.T) {
+	tmpDir := t.TempDir()
+	ca := NewTestCA(t, "ca")
+	readerCert, readerKey := ca.IssueClientCert(t, "reader")
+	readerFP := certFingerprintFromFile(t, readerCert)
+
+	policyPath := filepath.Join(tmpDir, "authz_policy.json")
+	if err := os.WriteFile(policyPath, []byte(fmt.Sprintf(`{"%s": "reader"}`, readerFP)), 0600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	loadedPolicy, err := LoadAuthzPolicyFile(policyPath)
+	if err != nil {
+		t.Fatalf("LoadAuthzPolicyFile failed: %v", err)
+	}
+
+	srvCert, srvKey := ca.IssueServerCert(t, "server")
+
+	cfg := DefaultServerConfig()
+	cfg.Address = "127.0.0.1:0"
+	cfg.TLSCertFile = srvCert
+	cfg.TLSKeyFile = srvKey
+	cfg.ClientCAFile = ca.CertPath
+	cfg.RequireClientCert = true
+	cfg.AuthzPolicy = loadedPolicy
+
+	eng := newCountingMockEngine()
+	srv, err := NewServer(cfg, eng)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+	defer ln.Close()
+
+	go func() { _ = srv.Serve(ln) }()
+	defer func() { _ = srv.Shutdown(context.Background()) }()
+
+	// Overwrite policy file on disk AFTER startup
+	if err := os.WriteFile(policyPath, []byte(fmt.Sprintf(`{"%s": "writer"}`, readerFP)), 0600); err != nil {
+		t.Fatalf("WriteFile overwrite failed: %v", err)
+	}
+
+	conn := dialClientWithCert(t, ln.Addr().String(), ca, readerCert, readerKey)
+	defer conn.Close()
+
+	// GET must succeed (reader role from immutable in-memory policy)
+	getReq := &Request{OpCode: OpGet, Key: []byte("k"), SeqID: 1}
+	_ = WriteRequest(conn, getReq)
+	getResp, err := ReadResponse(conn)
+	if err != nil {
+		t.Fatalf("ReadResponse failed: %v", err)
+	}
+	if getResp.Status != StatusKeyNotFound && getResp.Status != StatusOk {
+		t.Fatalf("expected StatusOk or StatusKeyNotFound, got 0x%02x (%s)", getResp.Status, getResp.Message)
+	}
+
+	// PUT must FAIL (reader role denied write; disk mutation to "writer" has ZERO effect)
+	putReq := &Request{OpCode: OpPut, Key: []byte("k"), Value: []byte("v"), SeqID: 2}
+	_ = WriteRequest(conn, putReq)
+	putResp, err := ReadResponse(conn)
+	if err != nil {
+		t.Fatalf("ReadResponse failed: %v", err)
+	}
+	if putResp.Status != StatusPermissionDenied {
+		t.Fatalf("SECURITY VIOLATION: reader performed PUT after disk policy file was mutated! Expected StatusPermissionDenied, got 0x%02x", putResp.Status)
+	}
+	if eng.putCount.Load() != 0 {
+		t.Fatalf("SECURITY VIOLATION: Engine.Put invoked %d times after disk policy mutation", eng.putCount.Load())
 	}
 }

@@ -1050,7 +1050,7 @@ func (s *Server) dispatchWithContext(parentCtx context.Context, req *Request) (f
 			resp.Message = "permission denied"
 			return resp
 		}
-	} else if !isLoopbackAddress(s.cfg.Address) && (s.cfg.TLSConfig != nil || s.cfg.TLSCertFile != "") {
+	} else if (!isLoopbackAddress(s.cfg.Address) || (s.addr != nil && !isLoopbackAddress(s.addr.String()))) && (s.cfg.TLSConfig != nil || s.cfg.TLSCertFile != "") {
 		// Defense-in-depth: non-loopback production TLS without an authorization policy fails closed
 		resp.Status = StatusPermissionDenied
 		resp.Message = "permission denied"

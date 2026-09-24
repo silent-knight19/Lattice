@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/silent-knight19/lattice/internal/errors"
 	"github.com/silent-knight19/lattice/internal/security"
@@ -136,6 +137,7 @@ type AuthzPolicy struct {
 }
 
 // NewAuthzPolicy constructs and validates an immutable AuthzPolicy from a map of fingerprint to role.
+// Conflicting or duplicate bindings for the same canonical fingerprint fail closed.
 func NewAuthzPolicy(entries map[string]string) (*AuthzPolicy, error) {
 	if entries == nil {
 		return &AuthzPolicy{bindings: make(map[string]Role)}, nil
@@ -154,10 +156,8 @@ func NewAuthzPolicy(entries map[string]string) (*AuthzPolicy, error) {
 		}
 
 		if existing, exists := bindings[canonicalFP]; exists {
-			if existing != role {
-				return nil, fmt.Errorf("%w: conflicting duplicate role for fingerprint %s: %q vs %q",
-					errors.ErrInvalidAuthzPolicy, canonicalFP, existing, role)
-			}
+			return nil, fmt.Errorf("%w: duplicate binding for fingerprint %s (%q vs %q)",
+				errors.ErrInvalidAuthzPolicy, canonicalFP, existing, role)
 		}
 		bindings[canonicalFP] = role
 	}
@@ -166,6 +166,7 @@ func NewAuthzPolicy(entries map[string]string) (*AuthzPolicy, error) {
 }
 
 // NewAuthzPolicyFromRoles constructs and validates an immutable AuthzPolicy from a map of fingerprint to typed Role.
+// Conflicting or duplicate bindings for the same canonical fingerprint fail closed.
 func NewAuthzPolicyFromRoles(entries map[string]Role) (*AuthzPolicy, error) {
 	if entries == nil {
 		return &AuthzPolicy{bindings: make(map[string]Role)}, nil
@@ -183,10 +184,8 @@ func NewAuthzPolicyFromRoles(entries map[string]Role) (*AuthzPolicy, error) {
 		}
 
 		if existing, exists := bindings[canonicalFP]; exists {
-			if existing != role {
-				return nil, fmt.Errorf("%w: conflicting duplicate role for fingerprint %s: %q vs %q",
-					errors.ErrInvalidAuthzPolicy, canonicalFP, existing, role)
-			}
+			return nil, fmt.Errorf("%w: duplicate binding for fingerprint %s (%q vs %q)",
+				errors.ErrInvalidAuthzPolicy, canonicalFP, existing, role)
 		}
 		bindings[canonicalFP] = role
 	}
@@ -195,7 +194,7 @@ func NewAuthzPolicyFromRoles(entries map[string]Role) (*AuthzPolicy, error) {
 }
 
 // NewAuthzPolicyFromEntries constructs an AuthzPolicy from an ordered list of PolicyEntry structures,
-// rejecting conflicting duplicate bindings.
+// rejecting all duplicate bindings fail-closed.
 func NewAuthzPolicyFromEntries(entries []PolicyEntry) (*AuthzPolicy, error) {
 	bindings := make(map[string]Role, len(entries))
 	for _, entry := range entries {
@@ -209,10 +208,8 @@ func NewAuthzPolicyFromEntries(entries []PolicyEntry) (*AuthzPolicy, error) {
 		}
 
 		if existing, exists := bindings[canonicalFP]; exists {
-			if existing != entry.Role {
-				return nil, fmt.Errorf("%w: conflicting duplicate role for fingerprint %s: %q vs %q",
-					errors.ErrInvalidAuthzPolicy, canonicalFP, existing, entry.Role)
-			}
+			return nil, fmt.Errorf("%w: duplicate binding for fingerprint %s (%q vs %q)",
+				errors.ErrInvalidAuthzPolicy, canonicalFP, existing, entry.Role)
 		}
 		bindings[canonicalFP] = entry.Role
 	}
@@ -293,27 +290,24 @@ func (p *AuthzPolicy) Bindings() map[string]Role {
 	return cpy
 }
 
+var (
+	policyHookMu       sync.Mutex
+	policyPostOpenHook func(path string, f *os.File) error
+)
+
 // ParseAuthzPolicyJSON parses and validates an AuthzPolicy from JSON data.
 // Supported formats:
 //   - Mapping object: {"<fingerprint>": "<role>", ...}
 //   - Array of objects: [{"fingerprint": "...", "role": "..."}, ...]
+//
+// Exactly one complete JSON document is accepted. Concatenated documents,
+// trailing garbage, or duplicate keys/fingerprints are rejected fail-closed.
 func ParseAuthzPolicyJSON(data []byte) (*AuthzPolicy, error) {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 {
 		return nil, fmt.Errorf("%w: empty policy JSON data", errors.ErrInvalidAuthzPolicy)
 	}
 
-	if trimmed[0] == '[' {
-		var entries []PolicyEntry
-		dec := json.NewDecoder(bytes.NewReader(trimmed))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&entries); err != nil {
-			return nil, fmt.Errorf("%w: malformed JSON array: %v", errors.ErrInvalidAuthzPolicy, err)
-		}
-		return NewAuthzPolicyFromEntries(entries)
-	}
-
-	// Detect duplicate keys in JSON object
 	dec := json.NewDecoder(bytes.NewReader(trimmed))
 	dec.DisallowUnknownFields()
 
@@ -322,73 +316,180 @@ func ParseAuthzPolicyJSON(data []byte) (*AuthzPolicy, error) {
 		return nil, fmt.Errorf("%w: invalid JSON: %v", errors.ErrInvalidAuthzPolicy, err)
 	}
 	delim, ok := t.(json.Delim)
-	if !ok || delim != '{' {
-		return nil, fmt.Errorf("%w: expected JSON object or array", errors.ErrInvalidAuthzPolicy)
+	if !ok {
+		return nil, fmt.Errorf("%w: expected JSON object or array, got %T", errors.ErrInvalidAuthzPolicy, t)
 	}
 
-	bindings := make(map[string]Role)
-	seenRaw := make(map[string]struct{})
-
-	for dec.More() {
-		keyTok, err := dec.Token()
-		if err != nil {
-			return nil, fmt.Errorf("%w: failed to read JSON key: %v", errors.ErrInvalidAuthzPolicy, err)
-		}
-		key, ok := keyTok.(string)
-		if !ok {
-			return nil, fmt.Errorf("%w: expected string JSON key", errors.ErrInvalidAuthzPolicy)
-		}
-
-		var roleStr string
-		if err := dec.Decode(&roleStr); err != nil {
-			return nil, fmt.Errorf("%w: failed to decode role for key %s: %v", errors.ErrInvalidAuthzPolicy, key, err)
-		}
-
-		canonicalFP, err := ValidateFingerprint(key)
-		if err != nil {
-			return nil, err
-		}
-
-		role, err := ParseRole(roleStr)
-		if err != nil {
-			return nil, err
-		}
-
-		if _, duplicate := seenRaw[canonicalFP]; duplicate {
-			if existing := bindings[canonicalFP]; existing != role {
-				return nil, fmt.Errorf("%w: conflicting duplicate entry for fingerprint %s: %q vs %q",
-					errors.ErrInvalidAuthzPolicy, canonicalFP, existing, role)
+	switch delim {
+	case '[':
+		var entries []PolicyEntry
+		seenFP := make(map[string]struct{})
+		for dec.More() {
+			var entry PolicyEntry
+			if err := dec.Decode(&entry); err != nil {
+				return nil, fmt.Errorf("%w: malformed JSON array entry: %v", errors.ErrInvalidAuthzPolicy, err)
 			}
+			canonicalFP, err := ValidateFingerprint(entry.Fingerprint)
+			if err != nil {
+				return nil, err
+			}
+			if !entry.Role.Valid() {
+				return nil, fmt.Errorf("%w: unsupported role %q for fingerprint %s", errors.ErrInvalidAuthzPolicy, entry.Role, canonicalFP)
+			}
+			if _, duplicate := seenFP[canonicalFP]; duplicate {
+				return nil, fmt.Errorf("%w: duplicate entry for fingerprint %s", errors.ErrInvalidAuthzPolicy, canonicalFP)
+			}
+			seenFP[canonicalFP] = struct{}{}
+			entry.Fingerprint = canonicalFP
+			entries = append(entries, entry)
 		}
-		seenRaw[canonicalFP] = struct{}{}
-		bindings[canonicalFP] = role
-	}
 
-	return &AuthzPolicy{bindings: bindings}, nil
+		// Consume closing delimiter ']'
+		closingTok, err := dec.Token()
+		if err != nil {
+			return nil, fmt.Errorf("%w: missing closing delimiter ']': %v", errors.ErrInvalidAuthzPolicy, err)
+		}
+		closingDelim, ok := closingTok.(json.Delim)
+		if !ok || closingDelim != ']' {
+			return nil, fmt.Errorf("%w: expected closing delimiter ']', got %v", errors.ErrInvalidAuthzPolicy, closingTok)
+		}
+
+		// Verify no trailing data after array
+		if extraTok, err := dec.Token(); err != io.EOF {
+			return nil, fmt.Errorf("%w: unexpected trailing data after JSON array (got %v)", errors.ErrInvalidAuthzPolicy, extraTok)
+		}
+
+		return NewAuthzPolicyFromEntries(entries)
+
+	case '{':
+		bindings := make(map[string]Role)
+		seenFP := make(map[string]struct{})
+
+		for dec.More() {
+			keyTok, err := dec.Token()
+			if err != nil {
+				return nil, fmt.Errorf("%w: failed to read JSON key: %v", errors.ErrInvalidAuthzPolicy, err)
+			}
+			key, ok := keyTok.(string)
+			if !ok {
+				return nil, fmt.Errorf("%w: expected string JSON key", errors.ErrInvalidAuthzPolicy)
+			}
+
+			var roleStr string
+			if err := dec.Decode(&roleStr); err != nil {
+				return nil, fmt.Errorf("%w: failed to decode role for key %s: %v", errors.ErrInvalidAuthzPolicy, key, err)
+			}
+
+			canonicalFP, err := ValidateFingerprint(key)
+			if err != nil {
+				return nil, err
+			}
+
+			role, err := ParseRole(roleStr)
+			if err != nil {
+				return nil, err
+			}
+
+			if _, duplicate := seenFP[canonicalFP]; duplicate {
+				return nil, fmt.Errorf("%w: duplicate entry for fingerprint %s", errors.ErrInvalidAuthzPolicy, canonicalFP)
+			}
+			seenFP[canonicalFP] = struct{}{}
+			bindings[canonicalFP] = role
+		}
+
+		// Consume closing delimiter '}'
+		closingTok, err := dec.Token()
+		if err != nil {
+			return nil, fmt.Errorf("%w: missing closing delimiter '}': %v", errors.ErrInvalidAuthzPolicy, err)
+		}
+		closingDelim, ok := closingTok.(json.Delim)
+		if !ok || closingDelim != '}' {
+			return nil, fmt.Errorf("%w: expected closing delimiter '}', got %v", errors.ErrInvalidAuthzPolicy, closingTok)
+		}
+
+		// Verify no trailing data after object
+		if extraTok, err := dec.Token(); err != io.EOF {
+			return nil, fmt.Errorf("%w: unexpected trailing data after JSON object (got %v)", errors.ErrInvalidAuthzPolicy, extraTok)
+		}
+
+		return &AuthzPolicy{bindings: bindings}, nil
+
+	default:
+		return nil, fmt.Errorf("%w: expected JSON object or array, got %c", errors.ErrInvalidAuthzPolicy, delim)
+	}
 }
 
 // LoadAuthzPolicyFile reads a JSON configuration file and constructs an AuthzPolicy.
+// It enforces descriptor-based validation, pre/post Lstat, O_NOFOLLOW open semantics,
+// double SameFile inode pinning to eliminate TOCTOU and symlink replacement races,
+// and enforces a 1 MiB size limit.
 func LoadAuthzPolicyFile(path string) (*AuthzPolicy, error) {
 	cleanPath, err := security.CleanAndValidatePath(path)
 	if err != nil {
 		return nil, fmt.Errorf("%w: invalid policy file path: %v", errors.ErrInvalidAuthzPolicy, err)
 	}
 
-	f, err := os.Open(cleanPath)
+	// 1. Pre-open inspection of the policy file path without following symlinks
+	lstatBefore, err := os.Lstat(cleanPath)
 	if err != nil {
-		return nil, fmt.Errorf("%w: cannot access policy file: %v", errors.ErrInvalidAuthzPolicy, err)
+		return nil, fmt.Errorf("%w: cannot inspect policy file %s: %v", errors.ErrInvalidAuthzPolicy, cleanPath, err)
+	}
+	if lstatBefore.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("%w: policy file path %q is a symlink", errors.ErrInvalidAuthzPolicy, cleanPath)
+	}
+	if lstatBefore.IsDir() {
+		return nil, fmt.Errorf("%w: path %s is a directory, not a policy file", errors.ErrInvalidAuthzPolicy, cleanPath)
+	}
+	if !lstatBefore.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: policy file %q is not a regular file (mode: %s)", errors.ErrInvalidAuthzPolicy, cleanPath, lstatBefore.Mode())
+	}
+
+	// 2. Open file descriptor with O_RDONLY and O_NOFOLLOW
+	f, err := openFileNoFollow(cleanPath, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, fmt.Errorf("%w: cannot open policy file: %v", errors.ErrInvalidAuthzPolicy, err)
 	}
 	defer f.Close()
 
-	info, err := f.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("%w: cannot stat policy file: %v", errors.ErrInvalidAuthzPolicy, err)
+	// 3. Post-open test hook for race/substitution simulation
+	policyHookMu.Lock()
+	hook := policyPostOpenHook
+	policyHookMu.Unlock()
+	if hook != nil {
+		if err := hook(cleanPath, f); err != nil {
+			return nil, err
+		}
 	}
-	if info.IsDir() {
+
+	// 4. Descriptor inspection via fstat
+	fstat, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("%w: cannot stat opened policy file: %v", errors.ErrInvalidAuthzPolicy, err)
+	}
+	if fstat.IsDir() {
 		return nil, fmt.Errorf("%w: path %s is a directory, not a policy file", errors.ErrInvalidAuthzPolicy, cleanPath)
 	}
+	if !fstat.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: opened policy file %q is not a regular file (mode: %s)", errors.ErrInvalidAuthzPolicy, cleanPath, fstat.Mode())
+	}
+
+	// 5. Post-open pathname re-inspection without following symlinks
+	lstatAfter, err := os.Lstat(cleanPath)
+	if err != nil {
+		return nil, fmt.Errorf("%w: cannot re-inspect policy file post-open: %v", errors.ErrInvalidAuthzPolicy, err)
+	}
+	if lstatAfter.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("%w: policy file %q was replaced with a symlink during open", errors.ErrInvalidAuthzPolicy, cleanPath)
+	}
+
+	// 6. Inode pinning & object identity invariance (TOCTOU defense)
+	if !os.SameFile(fstat, lstatBefore) || !os.SameFile(fstat, lstatAfter) {
+		return nil, fmt.Errorf("%w: policy file %s was replaced during open", errors.ErrInvalidAuthzPolicy, cleanPath)
+	}
+
+	// 7. Bounded size check and allocation defense
 	const maxPolicyFileSize = 1024 * 1024 // 1 MiB
-	if info.Size() > maxPolicyFileSize {
+	if fstat.Size() > maxPolicyFileSize {
 		return nil, fmt.Errorf("%w: policy file exceeds maximum allowed limit (1 MiB)", errors.ErrInvalidAuthzPolicy)
 	}
 
@@ -423,11 +524,20 @@ func ParseAuthzPolicyString(s string) (*AuthzPolicy, error) {
 		}
 		fp := strings.TrimSpace(parts[0])
 		role := strings.TrimSpace(parts[1])
-		if existing, exists := entries[strings.ToLower(fp)]; exists && strings.ToLower(existing) != strings.ToLower(role) {
-			return nil, fmt.Errorf("%w: conflicting duplicate role for fingerprint %s: %q vs %q",
-				errors.ErrInvalidAuthzPolicy, fp, existing, role)
+
+		canonicalFP, err := ValidateFingerprint(fp)
+		if err != nil {
+			return nil, err
 		}
-		entries[fp] = role
+		cleanRole, err := ParseRole(role)
+		if err != nil {
+			return nil, err
+		}
+		if existing, exists := entries[canonicalFP]; exists {
+			return nil, fmt.Errorf("%w: duplicate role binding for fingerprint %s (%q vs %q)",
+				errors.ErrInvalidAuthzPolicy, canonicalFP, existing, cleanRole)
+		}
+		entries[canonicalFP] = string(cleanRole)
 	}
 
 	return NewAuthzPolicy(entries)
