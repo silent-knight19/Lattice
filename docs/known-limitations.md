@@ -1765,22 +1765,31 @@ This document tracks all **genuine architectural and operational limitations** o
 * **Limitation & Architectural Boundaries**:
   1. *Certificate Fingerprint Identity & Certificate Rotation*:
      - Client principals are identified exclusively by the SHA-256 digest of their DER-encoded leaf X.509 certificate (`sha256.Sum256(cert.Raw)`), formatted as a 64-character lowercase hex string.
-     - Rotating a client certificate (even with identical Subject CN/SANs or key material) produces a new certificate fingerprint. Operators must update the server authorization policy (`--client-authz-policy` or `--client-authz-policy-file`) with the new fingerprint before activating rotated certificates.
-     - Dynamic online policy reload (hot reloading without restart) is intentionally out of scope; policy changes take effect upon server restart or configuration reload.
-  2. *Strict Transport Security Domain Separation*:
+     - Rotating a client certificate (even with identical Subject CN/SANs or key material) produces a new certificate fingerprint. Operators must update the server authorization policy (`--client-authz-policy` or `--client-authz-policy-file`) with the new fingerprint before activating rotated certificates. There is no automatic certificate rotation.
+     - Dynamic online policy reload (hot reloading without restart) is intentionally out of scope; policy changes take effect upon server restart or configuration reload. Policy is immutable after server construction.
+  2. *Mandatory Policy on External Client Transport*:
+     - When operating on non-loopback addresses with TLS/mTLS, a valid client authorization policy is mandatory.
+     - Omitting the policy (`authzPolicy == nil`) fails closed at server construction/startup (`ErrInsecureTransport` + `ErrInvalidAuthzPolicy`).
+     - Configuring an explicit empty policy (`{}`) succeeds during startup but denies every operation at runtime with `StatusPermissionDenied` (`0x07`).
+  3. *Local Development & Plaintext Boundaries*:
+     - Loopback transport (`127.0.0.1`, `localhost`, `::1`) without authorization policy preserves open local development semantics; configuring a policy on loopback enforces RBAC.
+     - Non-loopback plaintext transport (`InsecureTransport = true`) rejects any configured client authorization policy at startup, failing closed because plaintext connections have no cryptographic identity.
+  4. *Strict Protocol Opcode Matrix & Transport Security Domain Separation*:
+     - Operations are governed by authoritative opcodes: `PUT` (`0x01`), `GET` (`0x02`), `DELETE` (`0x03`), `EXISTS` (`0x04`), `BATCH` (`0x05`), `STATS` (`0x06`).
+     - Roles enforce: `reader` (GET, EXISTS, STATS), `writer` (GET, EXISTS, STATS, PUT, DELETE, BATCH), `admin` (all client operations).
      - RBAC policies apply exclusively to client-facing transport (`:9099`).
      - Raft consensus peer transport (`:9098`) uses dedicated mutual TLS with peer certificate verification (`OU = Lattice Raft Peer`) and NodeID matching against the canonical cluster topology. Raft peers cannot issue client data plane operations, and client certificates cannot participate in consensus RPCs.
-  3. *Pre-Consensus and Pre-Storage Enforcement Boundary*:
+  5. *Pre-Consensus and Pre-Storage Enforcement Boundary*:
      - Authorization checks execute at the connection dispatch layer before engine mutations or consensus proposal submission (`ProposalRouter.RouteWrite` / `ReadRouter.RouteRead`).
      - Denied operations are rejected immediately with `StatusPermissionDenied` (`0x07`) and `"permission denied"`. Denied writes never enter the Raft replication log or state machine, ensuring zero side-effects.
-  4. *Fail-Closed Default & Zero Information Disclosure*:
-     - Unauthenticated connections (e.g. plaintext loopback in development) or client certificates whose fingerprints are absent from the authorization policy fail closed.
+  6. *Fail-Closed Default & Zero Information Disclosure*:
+     - Unauthenticated connections or client certificates whose fingerprints are absent from the authorization policy fail closed.
      - Denied responses return bounded uniform payloads (`"permission denied"`) without disclosing internal configuration, registered fingerprints, or stack traces.
 * **Why It Exists**:
   Provides a robust, zero-trust cryptographic role-based access control layer on top of TLS 1.3 mTLS client identities while preserving consensus isolation and avoiding information leaks.
 * **Dimensional Impact**:
   * Correctness: **Optimal** (Deterministic principal resolution, fail-closed authorization, request-context immutability).
-  * Security: **Audited & Hardened** (Fail-closed on missing/unknown certs, pre-consensus rejection, side-effect freedom, uniform error payload).
+  * Security: **Audited & Hardened** (Mandatory external policy, fail-closed on missing/unknown certs, pre-consensus rejection, side-effect freedom, uniform error payload).
   * Performance: **Optimal** (O(1) map lookup in memory post-handshake, zero heap allocations on authorization decision path).
 
 ---

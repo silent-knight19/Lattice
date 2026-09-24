@@ -472,6 +472,19 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// Problem 6: Non-loopback client authorization security policy enforcement
+	if !isLoopback(host) {
+		if hasTLS {
+			if c.ClientAuthzPolicy == nil && c.ClientAuthzPolicyFile == "" {
+				return fmt.Errorf("config error: external address %q with TLS requires client authorization policy (--client-authz-policy or --client-authz-policy-file): %w", c.Address, errors.ErrInvalidAuthzPolicy)
+			}
+		} else {
+			if c.ClientAuthzPolicy != nil || c.ClientAuthzPolicyFile != "" {
+				return fmt.Errorf("config error: non-loopback plaintext transport cannot enforce client authorization policy on %q: %w", c.Address, errors.ErrInvalidAuthzPolicy)
+			}
+		}
+	}
+
 	// Peer mTLS validation
 	if c.PeerTLSCertFile != "" || c.PeerTLSKeyFile != "" || c.PeerCAFile != "" {
 		if c.PeerTLSCertFile == "" || c.PeerTLSKeyFile == "" || c.PeerCAFile == "" {

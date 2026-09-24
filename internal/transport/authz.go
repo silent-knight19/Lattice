@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -373,20 +374,30 @@ func LoadAuthzPolicyFile(path string) (*AuthzPolicy, error) {
 		return nil, fmt.Errorf("%w: invalid policy file path: %v", errors.ErrInvalidAuthzPolicy, err)
 	}
 
-	info, err := os.Stat(cleanPath)
+	f, err := os.Open(cleanPath)
 	if err != nil {
 		return nil, fmt.Errorf("%w: cannot access policy file: %v", errors.ErrInvalidAuthzPolicy, err)
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("%w: cannot stat policy file: %v", errors.ErrInvalidAuthzPolicy, err)
 	}
 	if info.IsDir() {
 		return nil, fmt.Errorf("%w: path %s is a directory, not a policy file", errors.ErrInvalidAuthzPolicy, cleanPath)
 	}
-	if info.Size() > 1024*1024 {
+	const maxPolicyFileSize = 1024 * 1024 // 1 MiB
+	if info.Size() > maxPolicyFileSize {
 		return nil, fmt.Errorf("%w: policy file exceeds maximum allowed limit (1 MiB)", errors.ErrInvalidAuthzPolicy)
 	}
 
-	data, err := os.ReadFile(cleanPath)
+	data, err := io.ReadAll(io.LimitReader(f, maxPolicyFileSize+1))
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to read policy file: %v", errors.ErrInvalidAuthzPolicy, err)
+	}
+	if int64(len(data)) > maxPolicyFileSize {
+		return nil, fmt.Errorf("%w: policy file exceeds maximum allowed limit (1 MiB)", errors.ErrInvalidAuthzPolicy)
 	}
 
 	return ParseAuthzPolicyJSON(data)

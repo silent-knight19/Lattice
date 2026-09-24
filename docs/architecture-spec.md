@@ -1352,36 +1352,65 @@ Lattice is engineered as an enterprise-grade internal data tier with rigorous de
    - Storage abstractions enforce isolation barriers preventing cross-tenant key scans or unauthorized cross-namespace access.
 
 ### 39.5 Client Authorization & Role-Based Access Control (RBAC)
-1. **Cryptographic Identity Derivation**:
-   - Client principal identities are derived deterministically from the authenticated X.509 client leaf certificate presented during TLS 1.3 mutual handshake:
+
+1. **Client Protocol Opcodes**:
+   The client data-plane framing protocol defines the following authoritative opcode constants:
+   - `PUT` = `0x01` (`OpPut`)
+   - `GET` = `0x02` (`OpGet`)
+   - `DELETE` = `0x03` (`OpDelete`)
+   - `EXISTS` = `0x04` (`OpExists`)
+   - `BATCH` = `0x05` (`OpBatch`)
+   - `STATS` = `0x06` (`OpStats`)
+
+2. **Cryptographic Authentication & Identity Derivation**:
+   - Mutual TLS (TLS 1.3) establishes the cryptographically authenticated client certificate during the TLS handshake.
+   - Client principal identities are derived deterministically from the authenticated X.509 client leaf certificate:
      $$\text{Principal Fingerprint} = \text{hex}(\text{SHA-256}(\text{cert.Raw}))$$
    - The principal identity is represented canonically as a 64-character lowercase hexadecimal string.
    - Self-asserted attributes (e.g. Common Name, SANs, Organizational Units) are non-authoritative for authorization; the SHA-256 digest of the DER-encoded leaf certificate forms the immutable cryptographic identity anchor.
 
-2. **Server-Owned RBAC Policy & Roles**:
+3. **Server-Owned RBAC Policy & Roles**:
    - The server maintains an immutable, server-owned policy mapping certificate fingerprints to authorization roles:
-     - `reader`: Read-only access. Permitted: `OpGet` (`GET`), `OpExists` (`EXISTS`), `OpStats` (`STATS`). Denied: `OpPut` (`PUT`), `OpDelete` (`DELETE`), `OpBatch` (`BATCH`).
-     - `writer`: Read and write access. Permitted: `OpGet` (`GET`), `OpExists` (`EXISTS`), `OpStats` (`STATS`), `OpPut` (`PUT`), `OpDelete` (`DELETE`), `OpBatch` (`BATCH`).
+     - `reader`: Read-only access. Permitted: `GET` (`0x02`), `EXISTS` (`0x04`), `STATS` (`0x06`). Denied: `PUT` (`0x01`), `DELETE` (`0x03`), `BATCH` (`0x05`).
+     - `writer`: Read and write access. Permitted: `GET` (`0x02`), `EXISTS` (`0x04`), `STATS` (`0x06`), `PUT` (`0x01`), `DELETE` (`0x03`), `BATCH` (`0x05`).
      - `admin`: Full administrative access. Permitted: all supported client operations (`GET`, `PUT`, `DELETE`, `EXISTS`, `BATCH`, `STATS`).
    - Unknown roles or unconfigured roles fail closed.
+   - Unknown certificate fingerprint: any authenticated certificate whose fingerprint is not present in the authorization policy is immediately denied with `StatusPermissionDenied` (`0x07`).
 
-3. **Connection Identity Binding & Request Immutability**:
+4. **External Production Transport Security (Mandatory Policy)**:
+   - On non-loopback addresses operating with TLS/mTLS, a valid authorization policy is **mandatory**.
+   - Missing authorization policy (`authzPolicy == nil`) causes server construction and startup to fail closed immediately, returning an error wrapping `ErrInsecureTransport` and `ErrInvalidAuthzPolicy`. The server will not accept any client requests.
+   - Explicitly configured empty policy (`map[string]string{}` or `{}`) is permitted at startup, but denies all client operations at runtime with `StatusPermissionDenied` (`0x07`) and zero side-effects.
+
+5. **Local Development & Loopback Transport**:
+   - Loopback listeners (`127.0.0.1`, `localhost`, `::1`) preserve existing local development semantics when no authorization policy is configured (`authzPolicy == nil`).
+   - When an authorization policy is configured on loopback, RBAC is strictly enforced.
+
+6. **Plaintext Transport & Insecure Escape Hatch**:
+   - Explicit non-loopback plaintext transport (`InsecureTransport = true`) remains a development escape hatch only when compatible with the configured authorization state.
+   - If a non-loopback plaintext listener has an authorization policy configured, it fails closed at construction/startup (`ErrInsecureTransport` + `ErrInvalidAuthzPolicy`), because plaintext transport provides no cryptographic client identity to enforce the policy against. Plaintext transport cannot bypass a configured authorization policy.
+
+7. **Connection Identity Binding & Request Immutability**:
    - Client identity resolution occurs once per connection during post-handshake connection initialization (`handleConn`).
    - The authenticated `Principal` (containing certificate fingerprint and assigned `Role`) is bound directly to the connection context (`context.Context`).
    - Pipelined requests, concurrent operations on the same connection, and individual request framing cannot override, spoof, or modify the authenticated principal or role. Inbound wire frames carry no authorization tokens or role claims; authorization is strictly derived from the underlying TLS connection state.
 
-4. **Pre-Storage & Pre-Consensus Enforcement Boundary**:
+8. **Pre-Storage & Pre-Consensus Enforcement Boundary**:
    - Authorization decisions are enforced at the transport dispatch layer (`dispatchWithContext`) *prior* to invoking the storage engine (`engine.Engine`) in single-node mode, or routing writes/reads through the consensus proposal router (`ProposalRouter.RouteWrite`) and read router (`ReadRouter.RouteRead`) in cluster mode.
    - Denied operations return immediately with `StatusPermissionDenied = 0x07` and payload `"permission denied"`.
-   - **Zero Side Effects**: Unauthorized write operations are rejected before entering the Raft log, generating proposals, acquiring engine locks, or modifying MemTables/WALs.
+   - **Zero Side Effects**: Unauthorized write operations are rejected before entering the Raft log, generating proposals, acquiring engine locks, or modifying MemTables/WALs. Denied reads never invoke `Engine.Get`, `Engine.Exists`, or `ReadRouter.RouteRead`.
 
-5. **Fail-Closed Semantics & Information Disclosure Immunity**:
-   - Any client connection lacking an authenticated client certificate (such as unencrypted loopback development connections without mutual TLS) or presenting a certificate whose fingerprint is not present in the server's authorization policy is immediately denied when executing operations.
+9. **Fail-Closed Semantics & Information Disclosure Immunity**:
+   - Any client connection lacking an authenticated client certificate when policy is required, or presenting a certificate whose fingerprint is not present in the server's authorization policy, is immediately denied when executing operations.
    - Denied responses return `StatusPermissionDenied` (`0x07`) with the uniform error payload `"permission denied"`. Internal fingerprint hashes, policy rules, and internal configuration details are never disclosed to clients.
 
-6. **Cluster-Mode & Transport Domain Separation**:
-   - Client authorization governs the client transport data plane (`:9099`).
-   - Raft peer consensus transport (`:9098`) operates under a separate, dedicated peer security domain requiring peer mTLS with `OU = Lattice Raft Peer` and `NodeID` verification against cluster topology. Raft peers cannot issue client commands, and client certificates cannot participate in Raft consensus.
+10. **Certificate Rotation & Immutability**:
+    - Because identity is fingerprint-based: rotating a client certificate produces a new leaf DER SHA-256 fingerprint; the server authorization policy must be updated with the new fingerprint. There is no implicit or automatic certificate rotation.
+    - Server authorization policy is immutable once constructed and cannot be altered via request, wire data, or runtime mutation.
+
+11. **Peer Consensus Isolation**:
+    - Client authorization governs strictly the client transport data plane (`:9099`).
+    - Raft peer consensus transport (`:9098`) operates under a separate, dedicated peer security domain requiring peer mTLS with `OU = Lattice Raft Peer` and `NodeID` verification against cluster topology. Raft peers cannot issue client commands, and client certificates cannot participate in Raft consensus.
 
 ---
 

@@ -741,16 +741,36 @@ func TestSecurityPolicy_ClientTransport_Matrix(t *testing.T) {
 		}
 	})
 
-	t.Run("External + TLS + Client CA + RequireClientCert=true => Accepted", func(t *testing.T) {
+	t.Run("External + TLS + Client CA + RequireClientCert=true + No Authz Policy => Rejected", func(t *testing.T) {
 		cfg := DefaultServerConfig()
 		cfg.Address = nonLoopback
 		cfg.TLSCertFile = serverCert
 		cfg.TLSKeyFile = serverKey
 		cfg.ClientCAFile = ca.CertPath
 		cfg.RequireClientCert = true
+		cfg.ClientAuthzPolicy = nil
+		_, err := NewServer(cfg, handler)
+		if err == nil {
+			t.Fatal("expected error for external listener with TLS and mTLS but missing Authz Policy, got nil")
+		}
+		if !stdErrors.Is(err, errors.ErrInsecureTransport) || !stdErrors.Is(err, errors.ErrInvalidAuthzPolicy) {
+			t.Fatalf("expected error wrapping ErrInsecureTransport and ErrInvalidAuthzPolicy, got: %v", err)
+		}
+	})
+
+	t.Run("External + TLS + Client CA + RequireClientCert=true + Authz Policy => Accepted", func(t *testing.T) {
+		cfg := DefaultServerConfig()
+		cfg.Address = nonLoopback
+		cfg.TLSCertFile = serverCert
+		cfg.TLSKeyFile = serverKey
+		cfg.ClientCAFile = ca.CertPath
+		cfg.RequireClientCert = true
+		cfg.ClientAuthzPolicy = map[string]string{
+			"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": "reader",
+		}
 		srv, err := NewServer(cfg, handler)
 		if err != nil {
-			t.Fatalf("expected success for external listener with full mTLS, got: %v", err)
+			t.Fatalf("expected success for external listener with full mTLS and authz policy, got: %v", err)
 		}
 		if srv == nil {
 			t.Fatal("expected non-nil server")

@@ -492,16 +492,55 @@ func TestConfig_SecurityPolicy_ClientAndPeerMTLS(t *testing.T) {
 		}
 	})
 
-	t.Run("External client address + TLS + client CA + RequireClientCert=true => succeeds", func(t *testing.T) {
+	t.Run("External client address + TLS + mTLS + missing authz policy => rejected", func(t *testing.T) {
 		cfg := DefaultConfig()
 		cfg.Address = "192.168.1.10:9099"
 		cfg.TLSCertFile = srvCert
 		cfg.TLSKeyFile = srvKey
 		cfg.ClientCAFile = ca.CertPath
 		cfg.RequireClientCert = true
+		cfg.ClientAuthzPolicy = nil
+		cfg.ClientAuthzPolicyFile = ""
+
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected error for external client listener with TLS but missing authz policy, got nil")
+		}
+		if !strings.Contains(err.Error(), "requires client authorization policy") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("External client address + TLS + client CA + RequireClientCert=true + authz policy => succeeds", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Address = "192.168.1.10:9099"
+		cfg.TLSCertFile = srvCert
+		cfg.TLSKeyFile = srvKey
+		cfg.ClientCAFile = ca.CertPath
+		cfg.RequireClientCert = true
+		cfg.ClientAuthzPolicy = map[string]string{
+			"1111111111111111111111111111111111111111111111111111111111111111": "reader",
+		}
 
 		if err := cfg.Validate(); err != nil {
-			t.Fatalf("expected success for external client listener with full mTLS, got: %v", err)
+			t.Fatalf("expected success for external client listener with full mTLS and authz policy, got: %v", err)
+		}
+	})
+
+	t.Run("External client address + plaintext + InsecureTransport=true + authz policy => rejected", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Address = "192.168.1.10:9099"
+		cfg.InsecureTransport = true
+		cfg.ClientAuthzPolicy = map[string]string{
+			"1111111111111111111111111111111111111111111111111111111111111111": "reader",
+		}
+
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected error for external plaintext listener with authz policy, got nil")
+		}
+		if !strings.Contains(err.Error(), "non-loopback plaintext transport cannot enforce client authorization policy") {
+			t.Errorf("unexpected error: %v", err)
 		}
 	})
 

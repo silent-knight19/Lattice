@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	stdErrors "errors"
 	"net"
 	"sync/atomic"
@@ -77,17 +78,26 @@ func setupClientTLSSecurityTest(t *testing.T) (
 	if err != nil {
 		t.Fatalf("LoadX509KeyPair legit client failed: %v", err)
 	}
+	if len(legitClientKP.Certificate) > 0 {
+		legitClientKP.Leaf, _ = x509.ParseCertificate(legitClientKP.Certificate[0])
+	}
 
 	attackerCert, attackerKey := attackerCA.IssueClientCert(t, "rogue-client")
 	attackerClientKP, err = tls.LoadX509KeyPair(attackerCert, attackerKey)
 	if err != nil {
 		t.Fatalf("LoadX509KeyPair attacker client failed: %v", err)
 	}
+	if len(attackerClientKP.Certificate) > 0 {
+		attackerClientKP.Leaf, _ = x509.ParseCertificate(attackerClientKP.Certificate[0])
+	}
 
 	peerCert, peerKey := legitCA.IssuePeerCert(t, 101)
 	peerKP, err = tls.LoadX509KeyPair(peerCert, peerKey)
 	if err != nil {
 		t.Fatalf("LoadX509KeyPair peer cert failed: %v", err)
+	}
+	if len(peerKP.Certificate) > 0 {
+		peerKP.Leaf, _ = x509.ParseCertificate(peerKP.Certificate[0])
 	}
 
 	pool, err := LoadCertPool(legitCA.CertPath)
@@ -125,6 +135,8 @@ func TestServer_GetConfigForClientSecurity(t *testing.T) {
 		cfg := DefaultServerConfig()
 		cfg.Address = "198.51.100.1:9099" // Non-loopback production address
 		cfg.TLSConfig = srvTLS
+		legitFP := CertificateFingerprintSHA256(legitClientKP.Leaf)
+		cfg.AuthzPolicy, _ = NewAuthzPolicy(map[string]string{legitFP: "admin"})
 
 		srv, err := NewServer(cfg, eng)
 		if err != nil {
@@ -688,12 +700,29 @@ func TestServer_PositiveNegativeMatrix(t *testing.T) {
 		cfg := DefaultServerConfig()
 		cfg.Address = "198.51.100.1:9099"
 		cfg.TLSConfig = baseValidTLS.Clone()
+		cfg.AuthzPolicy, _ = NewAuthzPolicy(map[string]string{"1111111111111111111111111111111111111111111111111111111111111111": "reader"})
 		srv, err := NewServer(cfg, eng)
 		if err != nil {
 			t.Fatalf("expected success, got %v", err)
 		}
 		if srv == nil {
 			t.Fatal("expected non-nil server")
+		}
+	})
+
+	// 9b. Non-loopback, valid mTLS, missing AuthzPolicy => REJECT
+	t.Run("Matrix: Non-loopback, valid mTLS, missing AuthzPolicy => REJECT", func(t *testing.T) {
+		cfg := DefaultServerConfig()
+		cfg.Address = "198.51.100.1:9099"
+		cfg.TLSConfig = baseValidTLS.Clone()
+		cfg.AuthzPolicy = nil
+		cfg.ClientAuthzPolicy = nil
+		_, err := NewServer(cfg, eng)
+		if err == nil {
+			t.Fatal("expected error for non-loopback TLS with missing authz policy, got nil")
+		}
+		if !stdErrors.Is(err, errors.ErrInvalidAuthzPolicy) || !stdErrors.Is(err, errors.ErrInsecureTransport) {
+			t.Fatalf("expected ErrInvalidAuthzPolicy and ErrInsecureTransport, got: %v", err)
 		}
 	})
 
@@ -782,6 +811,8 @@ func TestServer_PositiveNegativeMatrix(t *testing.T) {
 				cfg := DefaultServerConfig()
 				cfg.Address = "198.51.100.1:9099"
 				cfg.TLSConfig = srvTLS
+				legitFP := CertificateFingerprintSHA256(legitClientKP.Leaf)
+				cfg.AuthzPolicy, _ = NewAuthzPolicy(map[string]string{legitFP: "admin"})
 				srv, err := NewServer(cfg, srvEng)
 				if err != nil {
 					t.Fatalf("NewServer failed: %v", err)
@@ -906,6 +937,8 @@ func TestServer_ListenLifecycle_GetConfigForClientSecurity(t *testing.T) {
 		cfg := DefaultServerConfig()
 		cfg.Address = "198.51.100.1:9099" // Non-loopback production address
 		cfg.TLSConfig = srvTLS
+		legitFP := CertificateFingerprintSHA256(legitClientKP.Leaf)
+		cfg.AuthzPolicy, _ = NewAuthzPolicy(map[string]string{legitFP: "admin"})
 
 		srv, err := NewServer(cfg, eng)
 		if err != nil {
@@ -950,6 +983,8 @@ func TestServer_ListenLifecycle_GetConfigForClientSecurity(t *testing.T) {
 		cfg := DefaultServerConfig()
 		cfg.Address = "198.51.100.1:9099"
 		cfg.TLSConfig = srvTLS
+		legitFP := CertificateFingerprintSHA256(legitClientKP.Leaf)
+		cfg.AuthzPolicy, _ = NewAuthzPolicy(map[string]string{legitFP: "admin"})
 
 		srv, err := NewServer(cfg, eng)
 		if err != nil {
@@ -994,6 +1029,8 @@ func TestServer_ListenLifecycle_GetConfigForClientSecurity(t *testing.T) {
 		cfg := DefaultServerConfig()
 		cfg.Address = "198.51.100.1:9099"
 		cfg.TLSConfig = srvTLS
+		legitFP := CertificateFingerprintSHA256(legitClientKP.Leaf)
+		cfg.AuthzPolicy, _ = NewAuthzPolicy(map[string]string{legitFP: "admin"})
 
 		srv, err := NewServer(cfg, eng)
 		if err != nil {
@@ -1038,13 +1075,15 @@ func TestServer_ListenLifecycle_GetConfigForClientSecurity(t *testing.T) {
 // TestServer_HandleConn_DefenseInDepth_PlaintextRejected verifies that unencrypted connections
 // cannot slip through to application request processing on non-loopback servers.
 func TestServer_HandleConn_DefenseInDepth_PlaintextRejected(t *testing.T) {
-	_, _, serverKP, _, _, _, baseValidTLS := setupClientTLSSecurityTest(t)
+	_, _, serverKP, legitClientKP, _, _, baseValidTLS := setupClientTLSSecurityTest(t)
 
 	eng := newCountingEngine()
 	cfg := DefaultServerConfig()
 	cfg.Address = "198.51.100.1:9099"
 	cfg.TLSConfig = baseValidTLS.Clone()
 	cfg.TLSConfig.Certificates = []tls.Certificate{serverKP}
+	legitFP := CertificateFingerprintSHA256(legitClientKP.Leaf)
+	cfg.AuthzPolicy, _ = NewAuthzPolicy(map[string]string{legitFP: "admin"})
 
 	srv, err := NewServer(cfg, eng)
 	if err != nil {

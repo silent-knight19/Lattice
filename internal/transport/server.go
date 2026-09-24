@@ -223,10 +223,28 @@ func NewServer(cfg ServerConfig, eng Engine) (*Server, error) {
 		cfg.Address = defaults.Address
 	}
 
+	// Compile and validate authoritative client authorization policy (Problem 6 RBAC).
+	var authzPolicy *AuthzPolicy
+	if cfg.AuthzPolicy != nil && cfg.ClientAuthzPolicy != nil {
+		return nil, fmt.Errorf("%w: cannot specify both AuthzPolicy and ClientAuthzPolicy", errors.ErrInvalidAuthzPolicy)
+	}
+	if cfg.AuthzPolicy != nil {
+		if err := cfg.AuthzPolicy.Validate(); err != nil {
+			return nil, err
+		}
+		authzPolicy = cfg.AuthzPolicy
+	} else if cfg.ClientAuthzPolicy != nil {
+		p, err := NewAuthzPolicy(cfg.ClientAuthzPolicy)
+		if err != nil {
+			return nil, err
+		}
+		authzPolicy = p
+	}
+
 	isLoopback := isLoopbackAddress(cfg.Address)
 	hasTLS := cfg.TLSConfig != nil || cfg.TLSCertFile != ""
 
-	// Finding A: Non-loopback client transport security policy enforcement
+	// Finding A & Problem 6: Non-loopback client transport security policy enforcement
 	if !isLoopback {
 		if !hasTLS && !cfg.InsecureTransport {
 			return nil, errors.ErrInsecureTransport
@@ -243,6 +261,19 @@ func NewServer(cfg ServerConfig, eng Engine) (*Server, error) {
 					return nil, fmt.Errorf("%w: non-loopback address %q with TLS requires ClientCAFile and RequireClientCert=true for production mTLS",
 						errors.ErrInsecureTransport, cfg.Address)
 				}
+			}
+
+			// Problem 6: Non-loopback + production client TLS mandates a valid authorization policy.
+			if authzPolicy == nil {
+				return nil, fmt.Errorf("%w: non-loopback address %q with TLS requires client authorization policy: %w",
+					errors.ErrInsecureTransport, cfg.Address, errors.ErrInvalidAuthzPolicy)
+			}
+		} else {
+			// Plaintext transport on non-loopback with InsecureTransport = true
+			if authzPolicy != nil {
+				// Section 5: non-loopback plaintext + authorization policy configured = fail closed
+				return nil, fmt.Errorf("%w: non-loopback plaintext transport cannot enforce client authorization policy on %q: %w",
+					errors.ErrInsecureTransport, cfg.Address, errors.ErrInvalidAuthzPolicy)
 			}
 		}
 	}
@@ -289,23 +320,6 @@ func NewServer(cfg ServerConfig, eng Engine) (*Server, error) {
 		if rr, ok := cfg.ProposalRouter.(ReadRouter); ok {
 			readRouter = rr
 		}
-	}
-
-	var authzPolicy *AuthzPolicy
-	if cfg.AuthzPolicy != nil && cfg.ClientAuthzPolicy != nil {
-		return nil, fmt.Errorf("%w: cannot specify both AuthzPolicy and ClientAuthzPolicy", errors.ErrInvalidAuthzPolicy)
-	}
-	if cfg.AuthzPolicy != nil {
-		if err := cfg.AuthzPolicy.Validate(); err != nil {
-			return nil, err
-		}
-		authzPolicy = cfg.AuthzPolicy
-	} else if cfg.ClientAuthzPolicy != nil {
-		p, err := NewAuthzPolicy(cfg.ClientAuthzPolicy)
-		if err != nil {
-			return nil, err
-		}
-		authzPolicy = p
 	}
 
 	return &Server{
@@ -411,6 +425,15 @@ func (s *Server) Listen(addr string) error {
 				s.started.Store(false)
 				return fmt.Errorf("%w: non-loopback address %q requires mutual TLS: %v", errors.ErrInsecureTransport, bindAddr, err)
 			}
+			if s.authzPolicy == nil {
+				s.started.Store(false)
+				return fmt.Errorf("%w: non-loopback address %q with TLS requires client authorization policy: %w", errors.ErrInsecureTransport, bindAddr, errors.ErrInvalidAuthzPolicy)
+			}
+		} else {
+			if s.authzPolicy != nil {
+				s.started.Store(false)
+				return fmt.Errorf("%w: non-loopback plaintext transport cannot enforce client authorization policy on %q: %w", errors.ErrInsecureTransport, bindAddr, errors.ErrInvalidAuthzPolicy)
+			}
 		}
 	}
 
@@ -455,6 +478,15 @@ func (s *Server) Serve(l net.Listener) error {
 			if err := ValidateClientServerTLSConfig(s.cfg.TLSConfig); err != nil {
 				s.started.Store(false)
 				return fmt.Errorf("%w: non-loopback address %q requires mutual TLS: %v", errors.ErrInsecureTransport, addrStr, err)
+			}
+			if s.authzPolicy == nil {
+				s.started.Store(false)
+				return fmt.Errorf("%w: non-loopback address %q with TLS requires client authorization policy: %w", errors.ErrInsecureTransport, addrStr, errors.ErrInvalidAuthzPolicy)
+			}
+		} else {
+			if s.authzPolicy != nil {
+				s.started.Store(false)
+				return fmt.Errorf("%w: non-loopback plaintext transport cannot enforce client authorization policy on %q: %w", errors.ErrInsecureTransport, addrStr, errors.ErrInvalidAuthzPolicy)
 			}
 		}
 	}
@@ -1018,6 +1050,11 @@ func (s *Server) dispatchWithContext(parentCtx context.Context, req *Request) (f
 			resp.Message = "permission denied"
 			return resp
 		}
+	} else if !isLoopbackAddress(s.cfg.Address) && (s.cfg.TLSConfig != nil || s.cfg.TLSCertFile != "") {
+		// Defense-in-depth: non-loopback production TLS without an authorization policy fails closed
+		resp.Status = StatusPermissionDenied
+		resp.Message = "permission denied"
+		return resp
 	}
 
 	ctx, cancel := context.WithTimeout(parentCtx, s.cfg.RequestTimeout)
@@ -1284,11 +1321,6 @@ func (s *Server) AuthzPolicy() *AuthzPolicy {
 // TestDispatch exposes dispatch for testing internal request routing without opening network connections.
 func (s *Server) TestDispatch(req *Request) *Response {
 	return s.dispatch(req)
-}
-
-// TestDispatchWithContext exposes dispatchWithContext for testing with explicit request contexts.
-func (s *Server) TestDispatchWithContext(ctx context.Context, req *Request) *Response {
-	return s.dispatchWithContext(ctx, req)
 }
 
 // ServeConnForTesting runs handleConn synchronously on conn for testing connection error paths.

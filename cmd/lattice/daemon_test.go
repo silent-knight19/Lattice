@@ -1281,6 +1281,7 @@ func TestDaemon_SecurityPolicy_IntegrationWiring(t *testing.T) {
 			"--peer-tls-cert", peerCert,
 			"--peer-tls-key", peerKey,
 			"--peer-ca", ca.CertPath,
+			"--client-authz-policy", "1111111111111111111111111111111111111111111111111111111111111111=reader",
 		}
 
 		cfg, isHelp, err := ParseFlags(args, stdout, stderr)
@@ -1292,6 +1293,34 @@ func TestDaemon_SecurityPolicy_IntegrationWiring(t *testing.T) {
 		}
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("expected Validate() to succeed for valid mTLS configuration, got: %v", err)
+		}
+	})
+
+	t.Run("External client with mTLS but missing client-authz-policy fails config validation", func(t *testing.T) {
+		tempDir := t.TempDir()
+		stdout := &safeBuffer{}
+		stderr := &safeBuffer{}
+
+		args := []string{
+			"--data-dir", tempDir,
+			"--address", "192.168.1.10:9099",
+			"--tls-cert", srvCert,
+			"--tls-key", srvKey,
+			"--client-ca", ca.CertPath,
+			"--require-client-cert",
+			"--node-id", "1",
+			"--peer-address", "127.0.0.1:9098",
+			"--cluster-peers", "1=127.0.0.1:9098,2=192.168.1.100:9098",
+			"--peer-tls-cert", peerCert,
+			"--peer-tls-key", peerKey,
+			"--peer-ca", ca.CertPath,
+		}
+
+		_, _, err := ParseFlags(args, stdout, stderr)
+		if err == nil {
+			t.Fatal("expected ParseFlags to fail when client-authz-policy is omitted on external client, got nil")
+		} else if !strings.Contains(err.Error(), "requires client authorization policy") {
+			t.Errorf("expected error message mentioning client authorization policy, got: %v", err)
 		}
 	})
 }

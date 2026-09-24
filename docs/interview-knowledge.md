@@ -4652,7 +4652,7 @@ Offset 68..71 (4B, CRC32-IEEE):
   The wire frame begins with a fixed 18-byte Big-Endian binary header:
   - `Offset 0..1` (2 bytes): `Magic = 0x4C54` (`"LT"` in ASCII). Rejects non-Lattice packets immediately.
   - `Offset 2` (1 byte): `Version = 0x01`. Protocol version indicator.
-  - `Offset 3` (1 byte): `OpCode`. Identifies operation type (Client: `0x01` PUT, `0x02` GET, `0x03` DELETE, `0x04` STATS; Peer: `0x81` RequestVote, `0x82` AppendEntries, etc.).
+  - `Offset 3` (1 byte): `OpCode`. Identifies operation type (Client: `0x01` PUT, `0x02` GET, `0x03` DELETE, `0x04` EXISTS, `0x05` BATCH, `0x06` STATS; Peer: `0x81` RequestVote, `0x82` AppendEntries, etc.).
   - `Offset 4` (1 byte): `Flags`. Bitfield for compression, heartbeat, or error flags.
   - `Offset 5` (1 byte): `Reserved = 0x00`. Padded for 8-byte boundary alignment.
   - `Offset 6..13` (8 bytes): `SeqID uint64`. Big-Endian sequence identifier used by clients to correlate request-response pairs.

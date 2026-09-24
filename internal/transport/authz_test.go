@@ -5,9 +5,12 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	stdErrors "errors"
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1343,4 +1346,477 @@ func TestAuthz_ServerShutdownWithAuthzInFlight(t *testing.T) {
 	_ = ln.Close()
 
 	wg.Wait()
+}
+
+func TestAuthz_NonLoopbackTLS_RequiresAuthorizationPolicy(t *testing.T) {
+	ca := NewTestCA(t, "ca")
+	srvCert, srvKey := ca.IssueServerCert(t, "server")
+
+	cfg := DefaultServerConfig()
+	cfg.Address = "192.0.2.1:8000"
+	cfg.TLSCertFile = srvCert
+	cfg.TLSKeyFile = srvKey
+	cfg.ClientCAFile = ca.CertPath
+	cfg.RequireClientCert = true
+	cfg.ClientAuthzPolicy = nil
+	cfg.AuthzPolicy = nil
+
+	eng := newCountingMockEngine()
+	srv, err := NewServer(cfg, eng)
+	if err == nil {
+		t.Fatalf("expected NewServer to fail for non-loopback TLS with missing authz policy")
+	}
+	if !stdErrors.Is(err, errors.ErrInsecureTransport) {
+		t.Errorf("expected error wrapping ErrInsecureTransport, got: %v", err)
+	}
+	if !stdErrors.Is(err, errors.ErrInvalidAuthzPolicy) {
+		t.Errorf("expected error wrapping ErrInvalidAuthzPolicy, got: %v", err)
+	}
+	if srv != nil {
+		t.Fatalf("expected nil server, got non-nil")
+	}
+}
+
+func TestAuthz_NonLoopbackTLS_ExplicitEmptyPolicy_DeniesAll(t *testing.T) {
+	ca := NewTestCA(t, "ca")
+	srvCert, srvKey := ca.IssueServerCert(t, "server")
+	clientCert, clientKey := ca.IssueClientCert(t, "client")
+
+	cfg := DefaultServerConfig()
+	cfg.Address = "127.0.0.1:0"
+	cfg.TLSCertFile = srvCert
+	cfg.TLSKeyFile = srvKey
+	cfg.ClientCAFile = ca.CertPath
+	cfg.RequireClientCert = true
+	cfg.ClientAuthzPolicy = map[string]string{}
+
+	eng := newCountingMockEngine()
+	srv, err := NewServer(cfg, eng)
+	if err != nil {
+		t.Fatalf("NewServer failed for explicit empty policy: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+	defer ln.Close()
+
+	go func() { _ = srv.Serve(ln) }()
+	defer func() { _ = srv.Shutdown(context.Background()) }()
+
+	conn := dialClientWithCert(t, ln.Addr().String(), ca, clientCert, clientKey)
+	defer conn.Close()
+
+	ops := []struct {
+		name string
+		req  *Request
+	}{
+		{"GET", &Request{OpCode: OpGet, Key: []byte("k"), SeqID: 1}},
+		{"PUT", &Request{OpCode: OpPut, Key: []byte("k"), Value: []byte("v"), SeqID: 2}},
+		{"DELETE", &Request{OpCode: OpDelete, Key: []byte("k"), SeqID: 3}},
+		{"EXISTS", &Request{OpCode: OpExists, Key: []byte("k"), SeqID: 4}},
+		{"BATCH", &Request{OpCode: OpBatch, Batch: []BatchOp{{Type: BatchOpPut, Key: []byte("k"), Value: []byte("v")}}, SeqID: 5}},
+		{"STATS", &Request{OpCode: OpStats, SeqID: 6}},
+	}
+
+	for _, tc := range ops {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := WriteRequest(conn, tc.req); err != nil {
+				t.Fatalf("WriteRequest failed: %v", err)
+			}
+			resp, err := ReadResponse(conn)
+			if err != nil {
+				t.Fatalf("ReadResponse failed: %v", err)
+			}
+			if resp.Status != StatusPermissionDenied {
+				t.Errorf("expected StatusPermissionDenied (0x07), got 0x%02x (%s)", resp.Status, resp.Message)
+			}
+		})
+	}
+
+	if eng.putCount.Load() != 0 {
+		t.Errorf("Engine.Put invoked %d times", eng.putCount.Load())
+	}
+	if eng.getCount.Load() != 0 {
+		t.Errorf("Engine.Get invoked %d times", eng.getCount.Load())
+	}
+	if eng.deleteCount.Load() != 0 {
+		t.Errorf("Engine.Delete invoked %d times", eng.deleteCount.Load())
+	}
+	if eng.existsCount.Load() != 0 {
+		t.Errorf("Engine.Exists invoked %d times", eng.existsCount.Load())
+	}
+	if eng.batchCount.Load() != 0 {
+		t.Errorf("Engine.Batch invoked %d times", eng.batchCount.Load())
+	}
+	if eng.statsCount.Load() != 0 {
+		t.Errorf("Engine.Stats invoked %d times", eng.statsCount.Load())
+	}
+}
+
+func TestAuthz_Loopback_NoPolicy_PreservesLegacyDevelopmentBehavior(t *testing.T) {
+	cfg := DefaultServerConfig()
+	cfg.Address = "127.0.0.1:0"
+	cfg.InsecureTransport = true
+	cfg.ClientAuthzPolicy = nil
+	cfg.AuthzPolicy = nil
+
+	eng := newCountingMockEngine()
+	srv, err := NewServer(cfg, eng)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+	defer ln.Close()
+
+	go func() { _ = srv.Serve(ln) }()
+	defer func() { _ = srv.Shutdown(context.Background()) }()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	putReq := &Request{OpCode: OpPut, Key: []byte("dev_key"), Value: []byte("dev_val"), SeqID: 1}
+	if err := WriteRequest(conn, putReq); err != nil {
+		t.Fatalf("WriteRequest failed: %v", err)
+	}
+	putResp, err := ReadResponse(conn)
+	if err != nil {
+		t.Fatalf("ReadResponse failed: %v", err)
+	}
+	if putResp.Status != StatusOk {
+		t.Fatalf("expected StatusOk, got 0x%02x (%s)", putResp.Status, putResp.Message)
+	}
+
+	getReq := &Request{OpCode: OpGet, Key: []byte("dev_key"), SeqID: 2}
+	if err := WriteRequest(conn, getReq); err != nil {
+		t.Fatalf("WriteRequest failed: %v", err)
+	}
+	getResp, err := ReadResponse(conn)
+	if err != nil {
+		t.Fatalf("ReadResponse failed: %v", err)
+	}
+	if getResp.Status != StatusOk {
+		t.Fatalf("expected StatusOk, got 0x%02x (%s)", getResp.Status, getResp.Message)
+	}
+	if string(getResp.Value) != "dev_val" {
+		t.Fatalf("expected 'dev_val', got %q", string(getResp.Value))
+	}
+}
+
+func TestAuthz_Loopback_WithPolicy_EnforcesRBAC(t *testing.T) {
+	ca := NewTestCA(t, "ca")
+	readerCert, readerKey := ca.IssueClientCert(t, "reader")
+	readerFP := certFingerprintFromFile(t, readerCert)
+	policy := map[string]string{readerFP: "reader"}
+
+	eng := newCountingMockEngine()
+	_ = eng.Put(context.Background(), []byte("lb_key"), []byte("lb_val"))
+
+	addr, cleanup := setupAuthzTestServer(t, ca, policy, eng, nil, false)
+	defer cleanup()
+
+	conn := dialClientWithCert(t, addr, ca, readerCert, readerKey)
+	defer conn.Close()
+
+	getReq := &Request{OpCode: OpGet, Key: []byte("lb_key"), SeqID: 1}
+	if err := WriteRequest(conn, getReq); err != nil {
+		t.Fatalf("WriteRequest failed: %v", err)
+	}
+	getResp, err := ReadResponse(conn)
+	if err != nil {
+		t.Fatalf("ReadResponse failed: %v", err)
+	}
+	if getResp.Status != StatusOk {
+		t.Fatalf("expected StatusOk, got 0x%02x (%s)", getResp.Status, getResp.Message)
+	}
+
+	putReq := &Request{OpCode: OpPut, Key: []byte("lb_key2"), Value: []byte("lb_val2"), SeqID: 2}
+	if err := WriteRequest(conn, putReq); err != nil {
+		t.Fatalf("WriteRequest failed: %v", err)
+	}
+	putResp, err := ReadResponse(conn)
+	if err != nil {
+		t.Fatalf("ReadResponse failed: %v", err)
+	}
+	if putResp.Status != StatusPermissionDenied {
+		t.Fatalf("expected StatusPermissionDenied, got 0x%02x (%s)", putResp.Status, putResp.Message)
+	}
+}
+
+func TestAuthz_NonLoopbackPlaintext_WithPolicy_FailsClosed(t *testing.T) {
+	cfg := DefaultServerConfig()
+	cfg.Address = "192.0.2.1:8000"
+	cfg.InsecureTransport = true
+	cfg.ClientAuthzPolicy = map[string]string{
+		"1111111111111111111111111111111111111111111111111111111111111111": "reader",
+	}
+
+	eng := newCountingMockEngine()
+	srv, err := NewServer(cfg, eng)
+	if err == nil {
+		t.Fatalf("expected NewServer to fail for non-loopback plaintext with authz policy")
+	}
+	if !stdErrors.Is(err, errors.ErrInsecureTransport) {
+		t.Errorf("expected ErrInsecureTransport, got: %v", err)
+	}
+	if !stdErrors.Is(err, errors.ErrInvalidAuthzPolicy) {
+		t.Errorf("expected ErrInvalidAuthzPolicy, got: %v", err)
+	}
+	if srv != nil {
+		t.Fatalf("expected nil server, got non-nil")
+	}
+}
+
+func TestAuthz_NonLoopbackPlaintext_NoPolicy_PreservesInsecureMode(t *testing.T) {
+	cfg := DefaultServerConfig()
+	cfg.Address = "192.0.2.1:8000"
+	cfg.InsecureTransport = true
+	cfg.ClientAuthzPolicy = nil
+	cfg.AuthzPolicy = nil
+
+	eng := newCountingMockEngine()
+	srv, err := NewServer(cfg, eng)
+	if err != nil {
+		t.Fatalf("expected NewServer to succeed for non-loopback plaintext with InsecureTransport=true and no policy: %v", err)
+	}
+	if srv == nil {
+		t.Fatalf("expected non-nil server")
+	}
+}
+
+func TestAuthz_FingerprintCanonicalization_Uppercase(t *testing.T) {
+	ca := NewTestCA(t, "ca")
+	writerCert, writerKey := ca.IssueClientCert(t, "writer")
+	writerFP := certFingerprintFromFile(t, writerCert)
+
+	upperFP := strings.ToUpper(writerFP)
+	policy := map[string]string{upperFP: "writer"}
+
+	eng := newCountingMockEngine()
+	addr, cleanup := setupAuthzTestServer(t, ca, policy, eng, nil, false)
+	defer cleanup()
+
+	conn := dialClientWithCert(t, addr, ca, writerCert, writerKey)
+	defer conn.Close()
+
+	req := &Request{OpCode: OpPut, Key: []byte("upper_key"), Value: []byte("upper_val"), SeqID: 1}
+	if err := WriteRequest(conn, req); err != nil {
+		t.Fatalf("WriteRequest failed: %v", err)
+	}
+	resp, err := ReadResponse(conn)
+	if err != nil {
+		t.Fatalf("ReadResponse failed: %v", err)
+	}
+	if resp.Status != StatusOk {
+		t.Fatalf("expected StatusOk, got 0x%02x (%s)", resp.Status, resp.Message)
+	}
+}
+
+func TestAuthz_PolicyFile_SecurityBoundaries(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// 1. Missing policy file
+	missingPath := filepath.Join(tmpDir, "missing.json")
+	_, err := LoadAuthzPolicyFile(missingPath)
+	if err == nil || !stdErrors.Is(err, errors.ErrInvalidAuthzPolicy) {
+		t.Errorf("expected ErrInvalidAuthzPolicy for missing file, got: %v", err)
+	}
+
+	// 2. Directory path
+	dirPath := filepath.Join(tmpDir, "some_dir")
+	if err := os.Mkdir(dirPath, 0700); err != nil {
+		t.Fatalf("mkdir failed: %v", err)
+	}
+	_, err = LoadAuthzPolicyFile(dirPath)
+	if err == nil || !stdErrors.Is(err, errors.ErrInvalidAuthzPolicy) {
+		t.Errorf("expected ErrInvalidAuthzPolicy for directory path, got: %v", err)
+	}
+
+	// 3. Empty file
+	emptyPath := filepath.Join(tmpDir, "empty.json")
+	if err := os.WriteFile(emptyPath, []byte(""), 0600); err != nil {
+		t.Fatalf("write empty file failed: %v", err)
+	}
+	_, err = LoadAuthzPolicyFile(emptyPath)
+	if err == nil || !stdErrors.Is(err, errors.ErrInvalidAuthzPolicy) {
+		t.Errorf("expected ErrInvalidAuthzPolicy for empty file, got: %v", err)
+	}
+
+	// 4. Oversized policy file (> 1MB)
+	oversizedPath := filepath.Join(tmpDir, "oversized.json")
+	bigData := make([]byte, 1024*1024+10)
+	for i := range bigData {
+		bigData[i] = ' '
+	}
+	if err := os.WriteFile(oversizedPath, bigData, 0600); err != nil {
+		t.Fatalf("write oversized file failed: %v", err)
+	}
+	_, err = LoadAuthzPolicyFile(oversizedPath)
+	if err == nil || !stdErrors.Is(err, errors.ErrInvalidAuthzPolicy) {
+		t.Errorf("expected ErrInvalidAuthzPolicy for oversized file, got: %v", err)
+	}
+
+	// 5. Malformed JSON
+	malformedPath := filepath.Join(tmpDir, "malformed.json")
+	if err := os.WriteFile(malformedPath, []byte("{not json}"), 0600); err != nil {
+		t.Fatalf("write malformed file failed: %v", err)
+	}
+	_, err = LoadAuthzPolicyFile(malformedPath)
+	if err == nil || !stdErrors.Is(err, errors.ErrInvalidAuthzPolicy) {
+		t.Errorf("expected ErrInvalidAuthzPolicy for malformed JSON, got: %v", err)
+	}
+
+	// 6. Invalid fingerprint
+	badFpPath := filepath.Join(tmpDir, "bad_fp.json")
+	if err := os.WriteFile(badFpPath, []byte(`{"tooshort": "reader"}`), 0600); err != nil {
+		t.Fatalf("write bad fp file failed: %v", err)
+	}
+	_, err = LoadAuthzPolicyFile(badFpPath)
+	if err == nil || !stdErrors.Is(err, errors.ErrInvalidAuthzPolicy) {
+		t.Errorf("expected ErrInvalidAuthzPolicy for bad fingerprint, got: %v", err)
+	}
+
+	// 7. Invalid role
+	badRolePath := filepath.Join(tmpDir, "bad_role.json")
+	validFP := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	if err := os.WriteFile(badRolePath, []byte(fmt.Sprintf(`{"%s": "superadmin"}`, validFP)), 0600); err != nil {
+		t.Fatalf("write bad role file failed: %v", err)
+	}
+	_, err = LoadAuthzPolicyFile(badRolePath)
+	if err == nil || !stdErrors.Is(err, errors.ErrInvalidAuthzPolicy) {
+		t.Errorf("expected ErrInvalidAuthzPolicy for bad role, got: %v", err)
+	}
+
+	// 8. Valid empty JSON object "{}"
+	validEmptyPath := filepath.Join(tmpDir, "valid_empty.json")
+	if err := os.WriteFile(validEmptyPath, []byte(`{}`), 0600); err != nil {
+		t.Fatalf("write valid empty file failed: %v", err)
+	}
+	pEmpty, err := LoadAuthzPolicyFile(validEmptyPath)
+	if err != nil {
+		t.Fatalf("expected nil error for valid empty JSON, got: %v", err)
+	}
+	if pEmpty == nil || pEmpty.Len() != 0 {
+		t.Fatalf("expected empty policy with Len() == 0")
+	}
+
+	// 9. Valid populated JSON
+	validPopulatedPath := filepath.Join(tmpDir, "valid_populated.json")
+	if err := os.WriteFile(validPopulatedPath, []byte(fmt.Sprintf(`{"%s": "admin"}`, validFP)), 0600); err != nil {
+		t.Fatalf("write valid populated file failed: %v", err)
+	}
+	pPopulated, err := LoadAuthzPolicyFile(validPopulatedPath)
+	if err != nil {
+		t.Fatalf("expected nil error for valid populated JSON, got: %v", err)
+	}
+	if pPopulated == nil || pPopulated.Len() != 1 {
+		t.Fatalf("expected policy with Len() == 1")
+	}
+	role, ok := pPopulated.Lookup(validFP)
+	if !ok || role != RoleAdmin {
+		t.Fatalf("expected RoleAdmin, got %s (ok=%v)", role, ok)
+	}
+}
+
+type fakeCustomAddr string
+
+func (a fakeCustomAddr) Network() string { return "tcp" }
+func (a fakeCustomAddr) String() string  { return string(a) }
+
+type fakeCustomListener struct {
+	addr net.Addr
+}
+
+func (f *fakeCustomListener) Accept() (net.Conn, error) { return nil, net.ErrClosed }
+func (f *fakeCustomListener) Close() error              { return nil }
+func (f *fakeCustomListener) Addr() net.Addr            { return f.addr }
+
+func TestAuthz_Lifecycle_CustomListener_EnforcesAuthz(t *testing.T) {
+	ca := NewTestCA(t, "ca")
+	srvCert, srvKey := ca.IssueServerCert(t, "server")
+
+	cfg := DefaultServerConfig()
+	cfg.Address = "127.0.0.1:0"
+	cfg.TLSCertFile = srvCert
+	cfg.TLSKeyFile = srvKey
+	cfg.ClientCAFile = ca.CertPath
+	cfg.RequireClientCert = true
+	cfg.ClientAuthzPolicy = nil
+	cfg.AuthzPolicy = nil
+
+	eng := newCountingMockEngine()
+	srv, err := NewServer(cfg, eng)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+
+	ln := &fakeCustomListener{addr: fakeCustomAddr("198.51.100.1:9090")}
+	err = srv.Serve(ln)
+	if err == nil {
+		t.Fatalf("expected Serve with non-loopback custom listener to fail closed without authz policy")
+	}
+	if !stdErrors.Is(err, errors.ErrInsecureTransport) {
+		t.Errorf("expected ErrInsecureTransport, got: %v", err)
+	}
+	if !stdErrors.Is(err, errors.ErrInvalidAuthzPolicy) {
+		t.Errorf("expected ErrInvalidAuthzPolicy, got: %v", err)
+	}
+}
+
+func TestAuthz_Adversarial_UnauthorizedGetNeverCallsEngineGet(t *testing.T) {
+	eng := newCountingMockEngine()
+
+	ca := NewTestCA(t, "ca")
+	unknownCert, unknownKey := ca.IssueClientCert(t, "unknown")
+	policy := map[string]string{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": "writer"}
+
+	addr, cleanup := setupAuthzTestServer(t, ca, policy, eng, nil, false)
+	defer cleanup()
+
+	conn := dialClientWithCert(t, addr, ca, unknownCert, unknownKey)
+	defer conn.Close()
+
+	req := &Request{OpCode: OpGet, Key: []byte("key"), SeqID: 1}
+	_ = WriteRequest(conn, req)
+	resp, _ := ReadResponse(conn)
+
+	if resp.Status != StatusPermissionDenied {
+		t.Fatalf("expected StatusPermissionDenied, got 0x%02x", resp.Status)
+	}
+	if eng.getCount.Load() != 0 {
+		t.Fatalf("expected engine.Get invocation count == 0, got %d", eng.getCount.Load())
+	}
+}
+
+func TestAuthz_Adversarial_UnauthorizedExistsNeverCallsEngineExists(t *testing.T) {
+	eng := newCountingMockEngine()
+
+	ca := NewTestCA(t, "ca")
+	unknownCert, unknownKey := ca.IssueClientCert(t, "unknown")
+	policy := map[string]string{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": "writer"}
+
+	addr, cleanup := setupAuthzTestServer(t, ca, policy, eng, nil, false)
+	defer cleanup()
+
+	conn := dialClientWithCert(t, addr, ca, unknownCert, unknownKey)
+	defer conn.Close()
+
+	req := &Request{OpCode: OpExists, Key: []byte("key"), SeqID: 1}
+	_ = WriteRequest(conn, req)
+	resp, _ := ReadResponse(conn)
+
+	if resp.Status != StatusPermissionDenied {
+		t.Fatalf("expected StatusPermissionDenied, got 0x%02x", resp.Status)
+	}
+	if eng.existsCount.Load() != 0 {
+		t.Fatalf("expected engine.Exists invocation count == 0, got %d", eng.existsCount.Load())
+	}
 }
