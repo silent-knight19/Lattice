@@ -4,11 +4,13 @@ import (
 	stdErrors "errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
+	"github.com/silent-knight19/lattice/internal/metrics"
 )
 
 // ReplaySink consumes valid Write-Ahead Log records during multi-segment crash recovery.
@@ -151,14 +153,37 @@ func RecoverWALFrom(dbPath string, sink ReplaySink, expectedStartID uint64) (Rec
 
 	for i := 0; i < len(ids)-1; i++ {
 		histID := ids[i]
+
+		// Load the seal-time attestation. Absent is tolerated for pre-attestation
+		// databases; a mismatch is fatal, because a historical segment is immutable
+		// and any divergence means whole records were lost.
+		histAtt, attErr := ReadAttestation(cleanDBPath, histID)
+		hasHistAtt := attErr == nil
+		switch {
+		case attErr == nil:
+		case stdErrors.Is(attErr, errors.ErrAttestationAbsent):
+			metrics.WALAttestationAbsent.Add(1)
+		case stdErrors.Is(attErr, errors.ErrAttestationCorrupted):
+			return report, fmt.Errorf("wal: historical segment %d attestation is unusable: %w", histID, attErr)
+		default:
+			return report, fmt.Errorf("wal: failed to read historical segment %d attestation: %w", histID, attErr)
+		}
+
 		reader, err := OpenSegmentReader(cleanDBPath, histID)
 		if err != nil {
 			return report, fmt.Errorf("wal: failed to open historical segment %d: %w", histID, err)
 		}
-
+		var (
+			histRecords uint64
+			histLastSeq binary.SeqNum
+		)
 		for {
 			rec, nextErr := reader.Next()
 			if nextErr == nil {
+				histRecords++
+				if rec.SeqNum > histLastSeq {
+					histLastSeq = rec.SeqNum
+				}
 				if !hasHistSeq {
 					hasHistSeq = true
 					prevHistSeq = rec.SeqNum
@@ -184,6 +209,17 @@ func RecoverWALFrom(dbPath string, sink ReplaySink, expectedStartID uint64) (Rec
 			return report, fmt.Errorf("wal: historical segment %d is corrupted: %w", histID, nextErr)
 		}
 
+		// Attestation check for the now-fully-scanned historical segment. reader.Offset()
+		// is the exact physical length of the valid prefix, and the loop above only
+		// breaks on a clean io.EOF, so offset == segment length here.
+		if hasHistAtt {
+			if vErr := VerifyAttestation(histID, &histAtt, histRecords, reader.Offset()); vErr != nil {
+				_ = reader.Close()
+				metrics.WALAttestationMismatches.Add(1)
+				return report, vErr
+			}
+		}
+
 		if closeErr := reader.Close(); closeErr != nil {
 			return report, fmt.Errorf("wal: failed to close historical segment %d: %w", histID, closeErr)
 		}
@@ -200,6 +236,39 @@ func RecoverWALFrom(dbPath string, sink ReplaySink, expectedStartID uint64) (Rec
 	}
 	initialLatestSize := statInfo.Size()
 
+	// Verify the active segment's attestation BEFORE recovering it. The sidecar was
+	// written at the previous Close (unsealed) or at rotation (sealed), so it proves
+	// the segment has not already lost records before this recovery run. Doing it
+	// first matters: RecoverSegment truncates a torn tail, which would otherwise
+	// silently erase the evidence of a boundary-aligned truncation that happened
+	// earlier.
+	latestAtt, latErr := ReadAttestation(cleanDBPath, latestID)
+	hasLatestAtt := latErr == nil
+	switch {
+	case latErr == nil:
+	case stdErrors.Is(latErr, errors.ErrAttestationAbsent):
+		metrics.WALAttestationAbsent.Add(1)
+	case stdErrors.Is(latErr, errors.ErrAttestationCorrupted):
+		return report, fmt.Errorf("wal: latest segment %d attestation is unusable: %w", latestID, latErr)
+	default:
+		return report, fmt.Errorf("wal: failed to read latest segment %d attestation: %w", latestID, latErr)
+	}
+
+	if hasLatestAtt {
+		// Count records without mutating anything, to compare against the attestation.
+		observed, obsErr := countSegmentRecords(latestPath)
+		if obsErr != nil {
+			return report, fmt.Errorf("wal: failed to scan latest segment %d: %w", latestID, obsErr)
+		}
+		// A torn tail is expected here and is handled below by RecoverSegment, so
+		// compare only up to the last complete record: a smaller valid prefix than
+		// attested still means whole records vanished.
+		if obsErr := VerifyAttestation(latestID, &latestAtt, observed.count, observed.offset); obsErr != nil {
+			metrics.WALAttestationMismatches.Add(1)
+			return report, obsErr
+		}
+	}
+
 	recRes, recErr := RecoverSegment(latestPath)
 	if recErr != nil {
 		report.Truncated = recRes.Truncated
@@ -209,6 +278,14 @@ func RecoverWALFrom(dbPath string, sink ReplaySink, expectedStartID uint64) (Rec
 	if recRes.Truncated {
 		report.Truncated = true
 		report.TruncatedBytes = initialLatestSize - recRes.RecoveredOffset
+	}
+
+	// Refresh the active segment's attestation so the post-recovery, post-truncation
+	// length becomes the new baseline. Written unsealed because OpenRotatingWriter
+	// will reopen and append to this segment.
+	if err := WriteAttestation(cleanDBPath, latestID,
+		NewAttestation(uint64(recRes.ValidRecords), recRes.RecoveredOffset, 0, false)); err != nil {
+		metrics.WALAttestationWriteFailures.Add(1)
 	}
 
 	// Step 6: Phase 3 - Logical Streaming Replay & Global Sequence Monotonicity.
@@ -269,6 +346,46 @@ func RecoverWALFrom(dbPath string, sink ReplaySink, expectedStartID uint64) (Rec
 	}
 
 	return report, nil
+}
+
+// segmentScan is a read-only structural summary of a segment file.
+type segmentScan struct {
+	count   uint64
+	offset  int64
+	lastSeq binary.SeqNum
+}
+
+// countSegmentRecords walks a segment read-only and reports how many complete
+// CRC-verified records it holds plus the byte offset just past the last one.
+//
+// It stops at the first record that does not decode cleanly (torn tail,
+// corruption, or EOF) without mutating the file, so it is safe to call before
+// RecoverSegment. Because the scan stops early, count and offset describe the
+// complete valid prefix, which is exactly what an attestation compares against.
+func countSegmentRecords(path string) (segmentScan, error) {
+	var out segmentScan
+	f, err := openFileNoFollow(filepath.Clean(path), os.O_RDONLY, 0)
+	if err != nil {
+		return out, err
+	}
+	defer func() { _ = f.Close() }()
+
+	for {
+		rec, derr := DecodeRecord(f)
+		if derr != nil {
+			// Clean EOF, a torn tail, or corruption all end the scan here.
+			return out, nil
+		}
+		recLen := int64(MinRecordSize + len(rec.Key) + len(rec.Value))
+		if out.offset > math.MaxInt64-recLen {
+			return out, fmt.Errorf("wal: segment scan offset overflows int64")
+		}
+		out.offset += recLen
+		out.count++
+		if rec.SeqNum > out.lastSeq {
+			out.lastSeq = rec.SeqNum
+		}
+	}
 }
 
 // ValidateSegmentContinuity validates that a sorted slice of segment IDs has no duplicates and no gaps,

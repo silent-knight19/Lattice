@@ -133,7 +133,7 @@ State accumulation is performed in an isolated in-memory `versionBuilder`:
 Entrypoint: `(e *Engine) RecoverWAL() error`
 
 ### 4.1 Segment Discovery & Continuity
-1. The engine scans the `<dbPath>/wal/` directory for segment files conforming to `wal_%06d.log`.
+1. The engine scans the `<dbPath>/wal/` directory for segment files conforming to `wal_%012d.log` (twelve-digit, zero-padded; see `SegmentName` in `internal/wal/rotation.go`). Attestation sidecars (`wal_%012d.log.att`) are skipped because they do not match that grammar.
 2. Segments are sorted and replayed in ascending numeric order ($1..N$).
 3. **Continuity**: The initial segment must be ID `1` (`ValidateSegmentContinuity`). Any missing segment ID (e.g. segments 1, 3 present) fails closed with `*errors.SegmentGapError`.
 
@@ -156,6 +156,34 @@ Entrypoint: `(e *Engine) RecoverWAL() error`
 ### 4.4 Torn-Tail Truncation vs Historical Corruption
 - **Active (Latest) Segment**: A torn write or incomplete record at EOF is safely truncated back to the last valid record barrier.
 - **Historical (Sealed) Segments**: Any corruption, torn write, or framing defect in a historical segment fails closed without truncation or mutation.
+
+#### 4.4.1 Segment Attestation
+
+Per-record CRC32 cannot detect the loss of *whole* records. A segment tail removed exactly at a record boundary decodes as a clean `io.EOF`, so before attestation existed recovery reported success with silently missing acknowledged writes. To close that, every segment carries a sidecar `wal_%012d.log.att` recording what it held when it was sealed or last observed:
+
+| offset | size | field |
+|---|---|---|
+| 0 | 4 | magic (`WATT`) |
+| 4 | 2 | version |
+| 6 | 2 | flags (bit 0 = sealed) |
+| 8 | 8 | recordCount |
+| 16 | 8 | finalOffset |
+| 24 | 8 | lastSeqNum |
+| 32 | 4 | CRC32-IEEE over bytes `[0:32)` |
+
+Seal-time attestations are written by `RotatingWriter` when a segment rotates; the active segment is attested **unsealed** on `Close`, because `OpenRotatingWriter` reopens and appends to it.
+
+Recovery decision table:
+
+1. **Absent sidecar** → tolerated, counted in `lattice_wal_attestation_absent_total`. This is the normal state for any database created before attestation existed and for segments never sealed. It is explicitly **not** a verification pass, and it never fails recovery — otherwise every pre-existing database would be unopenable.
+2. **Corrupt sidecar** (bad size, magic, version, flags, or CRC) → fails closed with `ErrAttestationCorrupted`. Ignoring it would re-open the hole attestation exists to close.
+3. **Sealed segment diverged** → fails closed with `ErrAttestationMismatch`, with no truncation. A sealed segment is immutable by construction, so any divergence means whole records were lost or the file was modified out of band.
+4. **Active segment shrank or lost records** → fails closed with `ErrAttestationMismatch`. The active segment may legitimately grow, so growth is accepted and the sidecar is refreshed after recovery.
+5. **Matches** → pass.
+
+The active segment's attestation is verified *before* `RecoverSegment` runs, so evidence of an earlier boundary-aligned truncation is not erased by this recovery pass's own torn-tail repair. The sidecar is then rewritten to the post-truncation baseline, so a legacy database upgrades itself on first recovery.
+
+Because a sealed segment's attested length is final, a crash between sealing and writing the sidecar degrades to case 1 (absent), which is safe.
 
 ---
 

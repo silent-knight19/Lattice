@@ -1873,4 +1873,24 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 96. WAL Segment Attestation for Whole-Record Loss
+
+* **What Changed**: Per-record CRC32 protects each WAL record against corruption but structurally cannot detect the loss of whole records. `internal/wal` had no segment footer, record count, final LSN, chained checksum, or cumulative digest of any kind, so a segment tail removed exactly at a record boundary decoded as a clean `io.EOF`. Measured before the fix: 12 records recovered, then 68 bytes and one acknowledged record removed from a sealed segment at a record boundary, and `RecoverWAL` returned `err=nil`, `Truncated=false`, and replayed 11 records with no indication anything was wrong. This also defeated the guarantee in `docs/recovery-spec.md` §4.4 that historical segments "fail closed" on any defect.
+* **Fix**: A 36-byte sidecar `wal_%012d.log.att` sits beside each segment, CRC32-IEEE protected, recording `recordCount`, `finalOffset`, and `lastSeqNum` plus a `sealed` flag.
+  1. *Sealed at rotation*: `RotatingWriter` attests the finished segment when it rotates away. Its length is final, so any later divergence is corruption.
+  2. *Unsealed on Close*: the active segment is attested unsealed, because `OpenRotatingWriter` reopens and appends to it, so its length is not final and growth must stay legal.
+  3. *Verified before repair*: the active segment's attestation is checked **before** `RecoverSegment`, so this recovery pass's own torn-tail truncation cannot erase evidence of an earlier boundary-aligned truncation. The sidecar is then refreshed to the new baseline.
+  4. *Decision table*: absent → tolerated and counted (pre-attestation databases); corrupt → `ErrAttestationCorrupted`, fails closed; sealed divergence → `ErrAttestationMismatch`, fails closed with no truncation; active shrink or record loss → `ErrAttestationMismatch`, fails closed; active growth → accepted and refreshed; match → pass.
+* **Backward Compatibility**: A missing sidecar is never treated as a pass and never fails recovery. Failing closed on absence would make every database created before this change permanently unopenable. Recovery re-attests the active segment, so a legacy database upgrades itself on first open.
+* **Ordering Constraint (security-relevant)**: The seal-time sidecar write is placed **after** the parent-directory symlink and `os.SameFile` verification in `rotateLocked`, not immediately after the segment's `Close`. An earlier placement wrote the sidecar through a swapped-in symlink and created a file inside an attacker-controlled directory. This was caught by the pre-existing `TestRotatingWriter_ParentDirectorySwapped_FailsClosed` and is now pinned by it.
+* **Counters**: `RotatingWriter` tracks the active segment's record count and highest SeqNum incrementally, and **seeds both from a scan on resume**. Without seeding, a reopened writer would describe only the new session's appends and later report phantom loss against a file that had been growing correctly.
+* **Format Width**: `recordCount`, `finalOffset`, and `lastSeqNum` are all full 64-bit fields. `SeqNum` is a `uint64` across the codebase, so narrowing the last field would have capped attestation at 2^32 and mis-verified exactly the large databases that need it most.
+* **Verification**: `internal/wal/attest_test.go` covers the encode/decode round trip including values above 2^32, exhaustive single-byte corruption of every CRC-covered byte, the full decision table, sealed-segment truncation, active-segment truncation and growth, the legacy no-sidecar path, corrupt-sidecar fail-closed, sidecars never being mistaken for segments, repeated-recovery stability, and staging-residue cleanup. `go test -race ./internal/wal/` is clean.
+* **Dimensional Impact**:
+  * Correctness: **Large improvement** (whole-record loss becomes detectable instead of silent).
+  * Performance: **Negligible** (one sidecar write per rotation or close; one bounded scan when resuming the active segment).
+  * Security: **Improved** (detects tampering and loss; no symlink-following write, pinned by an existing test).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*

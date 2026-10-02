@@ -67,12 +67,8 @@ func OriginGuard(allow *OriginAllowlist) Middleware {
 // nothing about the server's configuration. SEC-5 will add the full header set; this
 // function is the single place that decides what a rejection looks like.
 func writeForbidden(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Cache-Control", "no-store")
 	// No Access-Control-* headers. See OriginGuard's documentation.
-	w.WriteHeader(http.StatusForbidden)
-	_, _ = w.Write([]byte(`{"error":{"code":"forbidden","message":"request origin is not permitted"}}` + "\n"))
+	writeError(w, http.StatusForbidden, "forbidden", "request origin is not permitted")
 }
 
 // corsForbiddenResponseHeaders lists headers that must never appear on any admin

@@ -41,6 +41,21 @@ var (
 	// WALBytesWritten counts cumulative bytes appended and synced to WAL log files on disk.
 	WALBytesWritten = NewCounter()
 
+	// WALAttestationWriteFailures counts failures to durably record a WAL segment
+	// attestation sidecar. Non-fatal: the segment itself is valid, but its contents
+	// become unverifiable against whole-record loss.
+	WALAttestationWriteFailures = NewCounter()
+
+	// WALAttestationMismatches counts segments whose on-disk contents diverged from
+	// their attestation during recovery, indicating whole-record loss that per-record
+	// CRC32 cannot detect.
+	WALAttestationMismatches = NewCounter()
+
+	// WALAttestationAbsent counts segments with no attestation sidecar, i.e.
+	// pre-attestation databases or segments never sealed. These fall back to the
+	// unverifiable posture rather than failing recovery.
+	WALAttestationAbsent = NewCounter()
+
 	// CompactionDuration tracks leveled compaction execution duration.
 	CompactionDuration = NewHistogramVec(
 		DefaultCompactionBuckets,
@@ -102,6 +117,21 @@ func init() {
 		"lattice_wal_bytes_written_total",
 		"Total cumulative bytes appended and durably synced to Write-Ahead Log segment files",
 		WALBytesWritten,
+	)
+	DefaultRegistry.RegisterCounter(
+		"lattice_wal_attestation_write_failures_total",
+		"Total failures to durably record a WAL segment attestation sidecar",
+		WALAttestationWriteFailures,
+	)
+	DefaultRegistry.RegisterCounter(
+		"lattice_wal_attestation_mismatches_total",
+		"Total WAL segments whose contents diverged from their attestation during recovery",
+		WALAttestationMismatches,
+	)
+	DefaultRegistry.RegisterCounter(
+		"lattice_wal_attestation_absent_total",
+		"Total WAL segments discovered with no attestation sidecar (unverifiable posture)",
+		WALAttestationAbsent,
 	)
 	DefaultRegistry.RegisterHistogramVec(
 		"lattice_compaction_duration_seconds",

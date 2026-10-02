@@ -156,7 +156,16 @@ against other local users. Recorded in `docs/known-limitations.md` at TD-6.
 - **Tests:** `Host: evil.com` → 400 · `Host: 127.0.0.1:9999` (wrong port) → 400 ·
   correct host → 200 · wildcard-bind attempt without `--insecure-transport` → startup error.
 
-## SEC-3 — CSRF token for mutating requests (M) — *Critical*
+## SEC-3 — CSRF token for mutating requests (M) — *Critical*  ✅ **COMPLETE + VERIFIED**
+
+> **Status: DONE.** `internal/admin/csrf.go`, `internal/admin/respond.go` (shared rejection
+> helpers, per SEC-9), `csrf_test.go`. Package total: **189 cases**, `-race` clean.
+> **Verified in real Chrome against the full SEC-1+2+3 stack:** a legitimate same-origin write
+> returns **200**; a token-without-confirm and a confirm-without-token both return **403**;
+> **zero** forgeries reached the handler across every run.
+> **Two real bugs were caught by the tests** (a `GET /session` panic and a token-validation
+> defect that would have bricked the console). See [`sec3-verification.md`](./sec3-verification.md).
+> Subtasks 3.1–3.6 met.
 
 - **Files:** `internal/admin/csrf.go`, `cmd/lattice/admin.go`
 - **3.1** Generate a 256-bit cryptographically random token at **daemon startup**

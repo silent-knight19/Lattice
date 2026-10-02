@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
 	"github.com/silent-knight19/lattice/internal/metrics"
 )
@@ -210,7 +211,15 @@ type RotatingWriter struct {
 	activeLen         int64
 	totalBytesWritten atomic.Uint64
 	closed            bool
-	dirInfo           os.FileInfo
+
+	// activeRecordCount and activeLastSeqNum track what the active segment holds so a
+	// seal-time attestation can record the segment's full contents. Guarded by mu.
+	activeRecordCount uint64
+	activeLastSeqNum  binary.SeqNum
+
+	// attestFn is a test seam for injecting attestation write failures.
+	attestFn func(dbPath string, id uint64, att Attestation) error
+	dirInfo  os.FileInfo
 
 	// createWriterFn is an internal test seam for injecting creation failures.
 	createWriterFn func(path string) (*WALWriter, error)
@@ -263,9 +272,11 @@ func OpenRotatingWriter(dbPath string, opts Options) (*RotatingWriter, error) {
 	}
 
 	var (
-		activeWriter *WALWriter
-		activeID     uint64
-		activeLen    int64
+		activeWriter      *WALWriter
+		activeID          uint64
+		activeLen         int64
+		activeRecordCount uint64
+		activeLastSeqNum  binary.SeqNum
 	)
 
 	if len(existingIDs) == 0 {
@@ -295,18 +306,34 @@ func OpenRotatingWriter(dbPath string, opts Options) (*RotatingWriter, error) {
 		}
 		activeWriter = w
 		activeLen = size
+
+		// Seed the record count and highest SeqNum from what the resumed segment
+		// already holds. activeLen comes from Stat, but the counters are maintained
+		// incrementally per append, so without this scan they would start at zero and
+		// a seal-time attestation would describe only this session's appends. That
+		// would understate the segment and later report phantom loss.
+		//
+		// The scan stops at the first record that does not decode cleanly. In the
+		// engine's Open() the segment has already been through RecoverWAL, so it is
+		// clean; stopping early keeps this safe if it is not.
+		if scan, sErr := countSegmentRecords(SegmentPath(cleanDBPath, activeID)); sErr == nil {
+			activeRecordCount = scan.count
+			activeLastSeqNum = scan.lastSeq
+		}
 	}
 
 	rw := &RotatingWriter{
-		dbPath:         cleanDBPath,
-		opts:           opts,
-		active:         activeWriter,
-		activeID:       activeID,
-		activeLen:      activeLen,
-		closed:         false,
-		dirInfo:        dirInfo,
-		createWriterFn: CreateWriter,
-		syncDirFn:      SyncDir,
+		dbPath:            cleanDBPath,
+		opts:              opts,
+		active:            activeWriter,
+		activeID:          activeID,
+		activeLen:         activeLen,
+		activeRecordCount: activeRecordCount,
+		activeLastSeqNum:  activeLastSeqNum,
+		closed:            false,
+		dirInfo:           dirInfo,
+		createWriterFn:    CreateWriter,
+		syncDirFn:         SyncDir,
 	}
 	rw.activePtr.Store(activeWriter)
 
@@ -502,6 +529,10 @@ func (rw *RotatingWriter) appendLocked(rec Record) error {
 	}
 
 	rw.activeLen += recWireSize
+	rw.activeRecordCount++
+	if rec.SeqNum > rw.activeLastSeqNum {
+		rw.activeLastSeqNum = rec.SeqNum
+	}
 	return nil
 }
 
@@ -601,6 +632,13 @@ func (rw *RotatingWriter) rotateLocked() error {
 
 	nextID := oldID + 1
 
+	// Facts about the segment being sealed, captured before the counters are reset.
+	var (
+		sealedLen     int64
+		sealedRecords uint64
+		sealedLastSeq binary.SeqNum
+	)
+
 	// Step 1: Seal, flush, and close current active segment
 	// FIND-NEW-02: on Close failure the old descriptor is unusable; nil the
 	// active handle so subsequent Append fails closed instead of writing to
@@ -610,6 +648,15 @@ func (rw *RotatingWriter) rotateLocked() error {
 			rw.active = nil
 			return fmt.Errorf("wal: failed to close segment %d during rotation: %w", oldID, err)
 		}
+		// The finished segment is sealed here: its bytes are durable and its length is
+		// final. The attestation is deliberately NOT written yet, because Step 1.5 has
+		// not yet proven that Dir(dbPath) is still the real WAL directory rather than a
+		// symlink an attacker swapped in. Writing the sidecar first would follow that
+		// symlink and create a file inside an attacker-controlled directory. It is
+		// written at Step 3, after the directory has been verified and synced.
+		sealedLen = rw.activeLen
+		sealedRecords = rw.activeRecordCount
+		sealedLastSeq = rw.activeLastSeqNum
 	}
 
 	// Step 1.5: Verify parent directory has not been replaced with a symlink or swapped
@@ -658,7 +705,33 @@ func (rw *RotatingWriter) rotateLocked() error {
 	rw.activePtr.Store(newWriter)
 	rw.activeID = nextID
 	rw.activeLen = 0
+	rw.activeRecordCount = 0
+	rw.activeLastSeqNum = 0
+
+	// Step 3: Attest the sealed segment.
+	//
+	// Placed here, after Step 1.5 proved the WAL directory is still the genuine one and
+	// Step 2.5 synced it, so the sidecar cannot be written through a swapped symlink.
+	// Recording recordCount/finalOffset/lastSeqNum makes a later boundary-aligned
+	// truncation of this immutable segment detectable, which per-record CRC32
+	// fundamentally cannot catch. Failure is non-fatal: the segment is valid, and a
+	// missing sidecar only downgrades it to the pre-attestation (unverifiable) posture.
+	if oldWriter != nil {
+		if err := rw.writeAttestation(oldID, sealedLen, sealedRecords, sealedLastSeq, true); err != nil {
+			metrics.WALAttestationWriteFailures.Add(1)
+		}
+	}
 	return nil
+}
+
+// writeAttestation records a segment's attested facts, routed through the test seam.
+func (rw *RotatingWriter) writeAttestation(id uint64, finalOffset int64, recordCount uint64,
+	lastSeq binary.SeqNum, sealed bool) error {
+	fn := rw.attestFn
+	if fn == nil {
+		fn = WriteAttestation
+	}
+	return fn(rw.dbPath, id, NewAttestation(recordCount, finalOffset, lastSeq, sealed))
 }
 
 // Close flushes data, executes the durability barrier on the active segment,
@@ -677,9 +750,17 @@ func (rw *RotatingWriter) Close() error {
 	rw.closed = true
 
 	if rw.active != nil {
+		activeID := rw.activeID
 		err := rw.active.Close()
 		rw.active = nil
 		rw.activePtr.Store(nil)
+		// Attest the active segment as NOT sealed. It is reopened and appended to on
+		// the next Open, so its length is not final; recording it now means a later
+		// shrink is detectable as loss rather than being read as a clean EOF.
+		if aerr := rw.writeAttestation(activeID, rw.activeLen, rw.activeRecordCount,
+			rw.activeLastSeqNum, false); aerr != nil {
+			metrics.WALAttestationWriteFailures.Add(1)
+		}
 		return err
 	}
 	return nil

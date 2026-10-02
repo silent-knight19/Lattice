@@ -32,6 +32,23 @@ var (
 	// physical end-of-file of an active WAL during crash recovery replay.
 	ErrTornWrite = stdErrors.New("torn write detected at tail of log")
 
+	// ErrAttestationAbsent indicates that no segment attestation sidecar exists for a
+	// WAL segment. Expected for databases created before attestation existed and for
+	// segments that have never been sealed; it is never treated as a verification pass.
+	ErrAttestationAbsent = stdErrors.New("wal segment attestation is absent")
+
+	// ErrAttestationCorrupted indicates that a segment attestation sidecar is
+	// structurally invalid: wrong size, bad magic, unsupported version, unknown flags,
+	// or a CRC32 mismatch.
+	ErrAttestationCorrupted = stdErrors.New("wal segment attestation is corrupted")
+
+	// ErrAttestationMismatch indicates that a WAL segment's on-disk contents diverge
+	// from its attestation. For a sealed segment any divergence means the segment is
+	// not immutable as declared; for an active segment it means bytes were lost. In
+	// both cases whole records may have silently disappeared, which per-record CRC32
+	// cannot detect.
+	ErrAttestationMismatch = stdErrors.New("wal segment does not match its attestation")
+
 	// ErrCompactionRunning indicates that a requested compaction operation cannot
 	// proceed because another compaction worker is actively processing the targeted levels.
 	ErrCompactionRunning = stdErrors.New("compaction already in progress")

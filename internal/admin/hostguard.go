@@ -170,9 +170,5 @@ func HostGuard(allow *HostAllowlist, scheme string) Middleware {
 
 // writeBadHost emits the standard 400 response for a request with an unrecognized Host.
 func writeBadHost(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusBadRequest)
-	_, _ = w.Write([]byte(`{"error":{"code":"bad_host","message":"request host is not permitted"}}` + "\n"))
+	writeError(w, http.StatusBadRequest, "bad_host", "request host is not permitted")
 }
