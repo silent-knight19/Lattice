@@ -68,9 +68,17 @@ func TestNewAdminServerWarnsOnEnable(t *testing.T) {
 			t.Errorf("startup output missing %q; got:\n%s", want, got)
 		}
 	}
-	// The committed dist is a placeholder, so the operator must be told how to fix it.
-	if !strings.Contains(got, "npm run build") {
-		t.Errorf("expected placeholder-asset hint; got:\n%s", got)
+
+	// The "build the frontend" hint tracks whether a real bundle is embedded. It is asserted
+	// against the server's own state rather than hardcoded, because both states are correct
+	// at different times: while web/dist held only the placeholder the hint had to appear,
+	// and once FE-1 produces a real bundle it must NOT nag.
+	if srv.HasRealBuild() {
+		if strings.Contains(got, "npm run build") {
+			t.Errorf("a real bundle is embedded, so the placeholder hint must be absent; got:\n%s", got)
+		}
+	} else if !strings.Contains(got, "npm run build") {
+		t.Errorf("only a placeholder is embedded, so the build hint must appear; got:\n%s", got)
 	}
 }
 

@@ -65,7 +65,10 @@ func NewStaticHandler() (*StaticHandler, error) {
 
 // NewStaticHandlerFS builds a handler over an arbitrary fs.FS, for tests.
 func NewStaticHandlerFS(fsys fs.FS) *StaticHandler {
-	h := &StaticHandler{fsys: fsys}
+	// hasAssets must be populated here too, exactly as NewStaticHandler does. Omitting it
+	// left every FS-constructed handler reporting HasRealBuild()==false regardless of its
+	// contents, so the real-build branch of the startup warning could not be exercised.
+	h := &StaticHandler{fsys: fsys, hasAssets: web.HasAssets(fsys)}
 	if sum, err := hashFile(fsys, indexFile); err == nil {
 		h.indexETag = sum
 	}

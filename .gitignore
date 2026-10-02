@@ -12,6 +12,17 @@ out/
 cmd/lattice/lattice
 cmd/lattice-cli/lattice-cli
 cmd/lattice-bench/lattice-bench
+
+# The Lattice Console SPA is the ONE dist/ that must be committed.
+#
+# web/dist is embedded by web/embed.go via //go:embed all:dist. If it were ignored, a
+# fresh clone would contain no matching files and EVERY `go build ./...` would fail with
+# "pattern all:dist: no matching files found" — including for contributors with no
+# Node.js installed. The built bundle is committed so the Go build is self-contained.
+#
+# These negations must stay BELOW the `dist/` rule above, since last-match-wins.
+!web/dist/
+!web/dist/**
 cmd/lattice-audit/lattice-audit
 *.exe
 *.exe~

@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	stdErrors "errors"
 	"fmt"
 	"time"
 
@@ -284,6 +285,22 @@ func (n *Node) drainCommittedEntries() {
 			}
 
 			if err := n.applySingleEntry(entry); err != nil {
+				if isRetryableStateMachineError(err) {
+					// The entry is already committed, so it MUST eventually be applied.
+					// A retryable state-machine error (write backpressure, L0 stall) says
+					// nothing about the entry's validity, and the condition resolves on its
+					// own once pressure subsides. Halting here would be unrecoverable: the
+					// apply loop exits on any recorded ApplyError and setApplyError never
+					// clears it, so a transient stall would permanently freeze lastApplied
+					// and strand every committed entry behind it.
+					//
+					// Back off and retry the SAME entry. lastApplied is not advanced, so
+					// ordering and exactly-once application are preserved.
+					if !n.backoffRetryableApply() {
+						return
+					}
+					break // re-enter the outer loop and re-fetch from lastApplied+1
+				}
 				n.setApplyError(err)
 				return // HALT immediately! lastApplied is NOT advanced
 			}
@@ -294,10 +311,83 @@ func (n *Node) drainCommittedEntries() {
 			appliedIdx = entry.Index
 			n.mu.Unlock()
 
+			// Progress was made, so a resolved stall should retry at the base interval.
+			n.applyErrMu.Lock()
+			n.applyRetryAttempts = 0
+			n.applyErrMu.Unlock()
+
 			// Broadcast progress to read-barrier waiters (P17-S01-M02)
 			n.notifyApplyWaiters(entry.Index, nil)
 		}
 	}
+}
+
+// isRetryableStateMachineError reports whether an apply failure is a transient
+// resource condition rather than a permanent defect.
+//
+// Retryable: the operation is well-formed and the state machine is healthy, but it
+// declined the write for now because the engine is under pressure. The committed
+// entry remains applicable once pressure subsides.
+//
+// Terminal: corruption, a malformed command, a storage failure, or any other defect
+// that will not resolve on its own. Retrying those would either spin forever or hide
+// a genuine fault.
+//
+// The distinction matters because the apply loop is single-shot: it exits on the
+// first recorded ApplyError and never restarts.
+func isRetryableStateMachineError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// A terminal storage error must never be retried: the Storage is poisoned and
+	// every subsequent attempt fails identically.
+	if stdErrors.Is(err, errors.ErrRaftStoragePoisoned) {
+		return false
+	}
+	return stdErrors.Is(err, errors.ErrL0StallTimeout) ||
+		stdErrors.Is(err, errors.ErrMemoryLimitExceeded) ||
+		stdErrors.Is(err, errors.ErrWriteThrottled)
+}
+
+const (
+	// applyRetryBackoff is the base wait before retrying a committed entry that the
+	// state machine declined under resource pressure.
+	applyRetryBackoff = 50 * time.Millisecond
+
+	// applyRetryBackoffMax caps the exponential backoff so a long stall does not push
+	// retry attempts into very long sleeps.
+	applyRetryBackoffMax = 2 * time.Second
+)
+
+// backoffRetryableApply sleeps before the caller retries a retryable apply failure.
+// Returns false when the node is shutting down, in which case the caller must stop.
+func (n *Node) backoffRetryableApply() bool {
+	n.applyErrMu.Lock()
+	attempts := n.applyRetryAttempts
+	n.applyRetryAttempts++
+	n.applyErrMu.Unlock()
+
+	delay := applyRetryBackoff
+	for i := 0; i < attempts; i++ {
+		delay *= 2
+		if delay >= applyRetryBackoffMax {
+			break
+		}
+	}
+	if delay > applyRetryBackoffMax {
+		delay = applyRetryBackoffMax
+	}
+
+	// applyStopCh is the same lifecycle channel the apply loop already selects on, so
+	// shutdown interrupts the backoff immediately rather than waiting it out.
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-n.applyStopCh:
+		return false
+	case <-timer.C:
+	}
+	return !n.closed.Load()
 }
 
 // applySingleEntry validates and executes a single committed entry against the state machine.
@@ -344,13 +434,15 @@ func (n *Node) applySingleEntry(entry LogEntry) error {
 		switch cmd.Op {
 		case binary.OpTypePut:
 			if err := n.stateMachine.Put(ctx, cmd.Key, cmd.Value); err != nil {
-				return fmt.Errorf("%w: state machine Put failed at index %d: %v", errors.ErrRaftApplyFailed, entry.Index, err)
+				return fmt.Errorf("%w: state machine Put failed at index %d: %w",
+					errors.ErrRaftApplyFailed, entry.Index, err)
 			}
 			return nil
 
 		case binary.OpTypeDelete:
 			if err := n.stateMachine.Delete(ctx, cmd.Key); err != nil {
-				return fmt.Errorf("%w: state machine Delete failed at index %d: %v", errors.ErrRaftApplyFailed, entry.Index, err)
+				return fmt.Errorf("%w: state machine Delete failed at index %d: %w",
+					errors.ErrRaftApplyFailed, entry.Index, err)
 			}
 			return nil
 
@@ -364,7 +456,8 @@ func (n *Node) applySingleEntry(entry LogEntry) error {
 				}
 			}
 			if err := n.stateMachine.Batch(ctx, ops); err != nil {
-				return fmt.Errorf("%w: state machine Batch failed at index %d: %v", errors.ErrRaftApplyFailed, entry.Index, err)
+				return fmt.Errorf("%w: state machine Batch failed at index %d: %w",
+					errors.ErrRaftApplyFailed, entry.Index, err)
 			}
 			return nil
 

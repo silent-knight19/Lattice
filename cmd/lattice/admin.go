@@ -126,6 +126,17 @@ func (a *AdminServer) Bus() *admin.EventBus {
 	return a.bus
 }
 
+// HasRealBuild reports whether a real (non-placeholder) console bundle is embedded.
+//
+// It is the same signal that decides whether the startup hint is printed, so tests and
+// future callers can reason about it rather than parsing log output.
+func (a *AdminServer) HasRealBuild() bool {
+	if a == nil {
+		return false
+	}
+	return a.server.HasRealBuild()
+}
+
 // Start begins serving.
 func (a *AdminServer) Start() error {
 	if a == nil {

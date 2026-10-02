@@ -660,7 +660,12 @@ independently if time is short.
 > JS deps are **build-time only**. Shipped artefact is a static bundle in `go:embed`.
 > The Go binary gains zero dependencies.
 
-## FE-1 — Scaffold and build pipeline (M)
+## FE-1 — Scaffold and build pipeline (M)  ✅ **COMPLETE + VERIFIED**
+
+> **Status: DONE.** `web/` — Vite 8 + React 19 + TypeScript 5.9 + Tailwind 4. `npm ci && npm run build`
+> produces `web/dist`, embedded by `web/embed.go` and served by the running daemon.
+> See [`fe1-verification.md`](./fe1-verification.md). Subtasks 1.1–1.4 met.
+> **Also fixed a blocking fresh-clone bug** (1.2-adjacent) — see the note below.
 
 - **1.1** `web/` — Vite + React 18 + TypeScript + Tailwind. Pin exact versions in
   `package-lock.json`; commit it.
@@ -672,6 +677,26 @@ independently if time is short.
 - **1.4** Vite dev server must **proxy** `/api` to the daemon and must not be exposed publicly.
 - **Tests:** `npm run build` succeeds; `tsc --noEmit` clean; bundle contains no unexpected
   `eval`/`new Function` (which would violate the CSP from SEC-5).
+
+> **Deviations from the original text, each evidence-based** (full reasoning in
+> `fe1-verification.md`):
+>
+> - **React 18 → 19.3.0.** The 19.x line has been GA since 2024-12-05, so it is the mature
+>   version; "18" was simply current when this plan was written.
+> - **TypeScript → 5.9.3, not 7.x.** TypeScript 7.0.2 ships **no compiler API**, and
+>   typescript-eslint (which FE-2.3 needs for the `react/no-danger` XSS rule) declares peer
+>   `typescript >=4.8.4 <6.1.0`. On TS 7 `npm ci` fails `ERESOLVE` and a forced install
+>   crashes ESLint. TS 7 would therefore break a **security control in this very plan**.
+> - **Tailwind 4.3.3 with CSS-first config.** The planned `tailwind.config.ts` is a v3
+>   artefact; v4 moves configuration into `@theme` blocks in CSS. The file tree in §8.3
+>   should be read accordingly.
+> - **ESLint 10, not 9.** `eslint@9` prints an explicit "no longer supported" deprecation on
+>   install; typescript-eslint 8.71 supports `^10`.
+>
+> **Blocking bug found and fixed:** `.gitignore`'s `dist/` rule excluded `web/dist`, so a
+> fresh clone had **no** embedded assets and *every* `go build ./...` failed with
+> `pattern all:dist: no matching files found` — including for contributors with no Node.js.
+> Negation rules (`!web/dist/`, `!web/dist/**`) now keep the built bundle committed.
 
 ## FE-2 — API client and XSS-safe primitives (M) — *Critical*
 

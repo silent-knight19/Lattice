@@ -1,0 +1,23 @@
+@import 'tailwindcss';
+
+/* Dark by default (operators' preference, per the design doc §Accessibility).
+   The `light` class on <html> switches to the light palette. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html.light {
+  color-scheme: light;
+}
+
+body {
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}

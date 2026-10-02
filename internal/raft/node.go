@@ -137,8 +137,13 @@ type Node struct {
 	applyWg          sync.WaitGroup
 	applyErrMu       sync.RWMutex
 	applyErr         error
-	applyCtx         context.Context
-	applyCancel      context.CancelFunc
+	// applyRetryAttempts drives the exponential backoff applied when the state machine
+	// declines a committed entry under resource pressure. Guarded by applyErrMu and
+	// reset whenever an entry applies successfully, so a resolved stall retries at the
+	// base interval again.
+	applyRetryAttempts int
+	applyCtx           context.Context
+	applyCancel        context.CancelFunc
 
 	// Read barrier waiters state (P17-S01-M02)
 	applyWaitMu        sync.Mutex
@@ -2296,11 +2301,21 @@ func (n *Node) HandleAppendEntries(fromPeerID cluster.NodeID, req *transport.App
 	// mismatches and replication outcomes.
 	n.ResetElectionTimer()
 	if terminal != nil {
-		// Persistent storage is terminally unusable. Report an explicit error so
-		// the leader learns this follower is broken instead of retrying forever
-		// against a phantom log mismatch.
-		// Record the terminal condition on the node so health reporting and the
-		// apply loop surface it instead of the follower looking healthy.
+		// Persistent storage is terminally unusable, so this follower can no longer
+		// make progress on any replication.
+		//
+		// Record the terminal condition locally: setApplyError halts the apply loop and
+		// surfaces through ApplyError(), so health reporting and reads stop treating the
+		// replica as serving committed state. Without this the follower would keep
+		// answering AppendEntries while unable to durably store anything.
+		//
+		// Note on what the leader learns: nothing, yet. PeerFrameHandler has no return
+		// value and the daemon discards HandlePeerFrame's error, so the returned error
+		// below is dropped and the leader sees only Success=false. That is the same
+		// signal as a retryable log mismatch, so the leader will keep retrying this
+		// follower. Propagating a distinct status would require changing the
+		// PeerFrameHandler signature and the response encoding; recorded here so the
+		// behaviour is documented rather than assumed.
 		n.setApplyError(terminal)
 		return &transport.AppendEntriesResponse{
 			Term:       uint64(currTerm),

@@ -359,3 +359,53 @@ func TestStatic_NoSniffHeader(t *testing.T) {
 }
 
 var _ fs.FS = staticTestFS
+
+// TestStaticHandlerFS_ReportsHasAssetsForBothStates pins the behaviour NewStaticHandlerFS
+// previously got wrong: it left hasAssets false regardless of FS contents, so the
+// real-build branch of the daemon's startup warning could never be exercised.
+func TestStaticHandlerFS_ReportsHasAssetsForBothStates(t *testing.T) {
+	tests := []struct {
+		name string
+		fsys fs.FS
+		want bool
+	}{
+		{
+			name: "placeholder: assets dir with no bundle files",
+			fsys: fstest.MapFS{
+				"index.html":             {Data: []byte("<html>placeholder</html>")},
+				"assets/placeholder.txt": {Data: []byte("x")},
+			},
+			want: false,
+		},
+		{
+			name: "real build: hashed js bundle",
+			fsys: fstest.MapFS{
+				"index.html":             {Data: []byte("<html></html>")},
+				"assets/index-abc123.js": {Data: []byte("console.log(1)")},
+			},
+			want: true,
+		},
+		{
+			name: "real build: hashed css bundle",
+			fsys: fstest.MapFS{
+				"index.html":              {Data: []byte("<html></html>")},
+				"assets/index-def456.css": {Data: []byte("body{}")},
+			},
+			want: true,
+		},
+		{
+			name: "no assets dir at all",
+			fsys: fstest.MapFS{"index.html": {Data: []byte("<html></html>")}},
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := NewStaticHandlerFS(tc.fsys)
+			if got := h.HasRealBuild(); got != tc.want {
+				t.Errorf("HasRealBuild() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

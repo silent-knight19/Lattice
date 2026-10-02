@@ -309,14 +309,19 @@ func OpenRotatingWriter(dbPath string, opts Options) (*RotatingWriter, error) {
 
 		// Seed the record count and highest SeqNum from what the resumed segment
 		// already holds. activeLen comes from Stat, but the counters are maintained
-		// incrementally per append, so without this scan they would start at zero and
-		// a seal-time attestation would describe only this session's appends. That
-		// would understate the segment and later report phantom loss.
+		// incrementally per append, so without a seed they would start at zero and a
+		// seal-time attestation would describe only this session's appends. That would
+		// understate the segment and later report phantom loss.
 		//
-		// The scan stops at the first record that does not decode cleanly. In the
-		// engine's Open() the segment has already been through RecoverWAL, so it is
-		// clean; stopping early keeps this safe if it is not.
-		if scan, sErr := countSegmentRecords(SegmentPath(cleanDBPath, activeID)); sErr == nil {
+		// Recovery already walked this segment and rewrote its attestation with exactly
+		// these facts, so prefer that over a second full scan; fall back to scanning only
+		// when no sidecar exists (a pre-attestation database, or a writer opened without
+		// a preceding RecoverWAL). The scan stops at the first record that does not
+		// decode cleanly, so it stays safe if the segment is not clean.
+		if att, aErr := ReadAttestation(cleanDBPath, activeID); aErr == nil {
+			activeRecordCount = att.RecordCount
+			activeLastSeqNum = att.LastSeqNum
+		} else if scan, sErr := countSegmentRecords(SegmentPath(cleanDBPath, activeID)); sErr == nil {
 			activeRecordCount = scan.count
 			activeLastSeqNum = scan.lastSeq
 		}

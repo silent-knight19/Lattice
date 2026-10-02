@@ -317,14 +317,12 @@ func RecoverWALFrom(dbPath string, sink ReplaySink, expectedStartID uint64) (Rec
 		report.Truncated = true
 		report.TruncatedBytes = initialLatestSize - recRes.RecoveredOffset
 	}
+	// Retained for the attestation refresh after the replay pass.
+	latestValidRecords := recRes.ValidRecords
+	latestValidOffset := recRes.RecoveredOffset
 
-	// Refresh the active segment's attestation so the post-recovery, post-truncation
-	// length becomes the new baseline. Written unsealed because OpenRotatingWriter
-	// will reopen and append to this segment.
-	if err := WriteAttestation(cleanDBPath, latestID,
-		NewAttestation(uint64(recRes.ValidRecords), recRes.RecoveredOffset, 0, false)); err != nil {
-		metrics.WALAttestationWriteFailures.Add(1)
-	}
+	// The active segment's attestation is refreshed at the end of this function, after
+	// the replay pass has established the true last sequence number.
 
 	// Step 6: Phase 3 - Logical Streaming Replay & Global Sequence Monotonicity.
 	// All segments on disk are now verified and physically clean.
@@ -382,6 +380,18 @@ func RecoverWALFrom(dbPath string, sink ReplaySink, expectedStartID uint64) (Rec
 		if closeErr := reader.Close(); closeErr != nil {
 			return report, fmt.Errorf("wal: failed to close segment %d after replay: %w", segID, closeErr)
 		}
+	}
+
+	// Refresh the active segment's attestation so the post-recovery, post-truncation
+	// length becomes the new baseline. Written unsealed because OpenRotatingWriter
+	// will reopen and append to this segment.
+	//
+	// This runs after the replay pass so lastSeqNum is the real value; writing it
+	// earlier recorded 0, which left the sidecar inconsistent with the segment it
+	// describes.
+	refreshAtt := NewAttestation(uint64(latestValidRecords), latestValidOffset, report.LastSeqNum, false)
+	if err := WriteAttestation(cleanDBPath, latestID, refreshAtt); err != nil {
+		metrics.WALAttestationWriteFailures.Add(1)
 	}
 
 	return report, nil

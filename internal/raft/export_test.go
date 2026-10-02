@@ -156,3 +156,9 @@ func (n *Node) LeaderEpochForTest() uint64 {
 	defer n.mu.RUnlock()
 	return n.leaderEpoch
 }
+
+// IsRetryableStateMachineErrorForTesting exposes the apply-error classifier so tests
+// can pin which state-machine failures the apply loop retries versus halts on.
+func IsRetryableStateMachineErrorForTesting(err error) bool {
+	return isRetryableStateMachineError(err)
+}
