@@ -5,8 +5,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/silent-knight19/lattice/internal/metrics"
 )
@@ -43,33 +41,6 @@ const (
 // has no business being broadcast to every connected console.
 const maxEventFieldLen = 256
 
-// sanitizeEventField makes a string safe to place in an event payload.
-//
-// It strips control characters (blocking log/terminal escape injection in the rendering
-// console and JSON smuggling) and truncates to a bounded length. Printable UTF-8 is left
-// intact so the console can display it; invalid UTF-8 is replaced with U+FFFD.
-func sanitizeEventField(s string) string {
-	if len(s) > maxEventFieldLen {
-		s = s[:maxEventFieldLen]
-		// Truncating mid-rune would produce invalid UTF-8; cut back to a rune boundary.
-		for len(s) > 0 && !utf8.ValidString(s) {
-			s = s[:len(s)-1]
-		}
-	}
-	var b []byte
-	for _, r := range s {
-		if r == utf8.RuneError {
-			b = append(b, "�"...)
-			continue
-		}
-		if unicode.IsControl(r) {
-			continue
-		}
-		b = utf8.AppendRune(b, r)
-	}
-	return string(b)
-}
-
 // Event is a single item on the bus.
 //
 // Fields are strings and numbers only. There is deliberately no []byte field: raw key or
@@ -92,9 +63,9 @@ type Event struct {
 func NewEvent(kind string, nodeID uint64, fields map[string]string) Event {
 	safe := make(map[string]string, len(fields))
 	for k, v := range fields {
-		safe[sanitizeEventField(k)] = sanitizeEventField(v)
+		safe[SanitizeLogField(k)] = SanitizeLogField(v)
 	}
-	return Event{Kind: sanitizeEventField(kind), Time: time.Now(), NodeID: nodeID, Fields: safe}
+	return Event{Kind: SanitizeLogField(kind), Time: time.Now(), NodeID: nodeID, Fields: safe}
 }
 
 // ErrSubscriberLimit reports that the bus refused a subscription because it is at capacity.

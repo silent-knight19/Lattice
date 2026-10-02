@@ -28,13 +28,12 @@ type errorDetail struct {
 // The caller must pass a STATIC message. Passing anything derived from the request or
 // from internal error values would defeat the purpose of this helper.
 func writeError(w http.ResponseWriter, status int, code, message string) {
-	h := w.Header()
-	h.Set("Content-Type", "application/json; charset=utf-8")
-	h.Set("X-Content-Type-Options", "nosniff")
-	h.Set("Cache-Control", "no-store")
-	w.WriteHeader(status)
-	body := `{"error":{"code":"` + code + `","message":"` + message + `"}}` + "\n"
-	_, _ = w.Write([]byte(body))
+	// Delegate to WriteCoded so guards and endpoint failures emit one identical envelope
+	// with one identical set of static messages.
+	if m, ok := staticMessages[code]; ok {
+		message = m
+	}
+	WriteCoded(w, status, code)
 }
 
 // writeMethodNotAllowed rejects a request that used an unsupported method on a route.

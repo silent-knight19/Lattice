@@ -303,7 +303,16 @@ against other local users. Recorded in `docs/known-limitations.md` at TD-6.
   `go test -race` clean · subscriber disconnect releases its slot · slow consumer causes drops,
   not producer blocking.
 
-## SEC-9 — Error sanitisation (S) — *High*
+## SEC-9 — Error sanitisation (S) — *High*  ✅ **COMPLETE + VERIFIED**
+
+> **Status: DONE.** `internal/admin/errors.go`, `internal/admin/requestid.go`, and
+> `respond.go` (unified onto one envelope writer), `errors_test.go`.
+> Package total: **339 cases**, `-race` clean.
+> **Verified live:** a maximally hostile `InvalidPathError` (absolute SSH key path + root +
+> symlink reason) produced `{"code":"invalid_path","message":"the supplied path was rejected"}`
+> with **zero** leakage of any of the 6 secret markers, while the **server log captured the
+> full detail keyed by `X-Request-Id`**. See [`sec9-verification.md`](./sec9-verification.md).
+> Subtasks 9.1–9.4 met.
 
 - **File:** `internal/admin/respond.go`
 - **9.1** Every error response uses a stable, opaque envelope:
@@ -317,7 +326,18 @@ against other local users. Recorded in `docs/known-limitations.md` at TD-6.
 - **Tests:** force an internal error, assert the body contains no path and no raw Go error;
   assert a request ID is present and echoed in logs.
 
-## SEC-10 — Structured logging with injection defence (S) — *Medium*
+## SEC-10 — Structured logging with injection defence (S) — *Medium*  ✅ **COMPLETE + VERIFIED**
+
+> **Status: DONE.** `internal/admin/log.go` (`AdminLogger`, `SanitizeLogField`, `RedactValue`,
+> `AuditMiddleware`, `ErrorSink`), `log_test.go`. `events.go`'s duplicate sanitiser was removed
+> in favour of the canonical one. Package total: **364 cases**, `-race` clean.
+> **Verified live:** a POST whose key contained `\nINFO FORGED LOG LINE {"level":"INFO"}` produced
+> **4 records, all valid single-line JSON, 0 forged lines**; the live CSRF token logged under a
+> *neutral* field name was **redacted**; the audit line retained
+> `request_id / method / route / decision / role / principal_fp`.
+> **Probing found three real gaps in the existing logger** (documented below), and a fourth bug
+> I introduced and then fixed. See [`sec10-verification.md`](./sec10-verification.md).
+> Subtasks 10.1–10.4 met.
 
 - **File:** `internal/admin/log.go`
 - **10.1** Log to stderr via the existing `internal/logger`.

@@ -4,8 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	stdErrors "errors"
 	"fmt"
-	"io"
 	"net"
 	"sort"
 	"sync"
@@ -84,6 +84,23 @@ type PeerConnectionConfig struct {
 	// WriteTimeout is the deadline applied to individual frame writes (default: 5s).
 	WriteTimeout time.Duration
 
+	// PeerIdleTimeout bounds how long an established peer connection may sit without
+	// delivering a complete frame before it is treated as stalled and torn down
+	// (default: 60s).
+	//
+	// The deadline is reset every time a frame is successfully decoded, so a
+	// slow-but-alive peer is never disconnected; only a peer that has gone completely
+	// silent is. This is what the client data plane calls IdleTimeout.
+	//
+	// The bound exists because a stalled peer otherwise holds its supervisor slot
+	// indefinitely: the first-frame read deadline set at accept time is cleared once
+	// that frame arrives, and nothing ever sets one again. A peer that stops sending
+	// without closing its socket would therefore never be reclaimed.
+	//
+	// Raft heartbeats every 50ms, so 60s leaves a margin of roughly 1200x and cannot
+	// disturb a healthy peer.
+	PeerIdleTimeout time.Duration
+
 	// RawDialFunc is an optional raw network dialer seam (e.g. for connection tracking,
 	// partition simulation, or proxying). On non-loopback peers, Lattice always owns the
 	// TLS 1.3 mTLS handshake and upgrades the connection using its manager-owned peer TLS configuration.
@@ -118,6 +135,11 @@ type PeerConnectionConfig struct {
 }
 
 // DefaultPeerConnectionConfig returns production-hardened defaults for peer connections.
+// DefaultPeerIdleTimeout is the default bound on silence from an established peer.
+// It mirrors the client data plane's IdleTimeout. Raft heartbeats every 50ms, so
+// this leaves a very large margin over healthy traffic.
+const DefaultPeerIdleTimeout = 60 * time.Second
+
 func DefaultPeerConnectionConfig() PeerConnectionConfig {
 	return PeerConnectionConfig{
 		DialTimeout:     3 * time.Second,
@@ -125,6 +147,7 @@ func DefaultPeerConnectionConfig() PeerConnectionConfig {
 		ReconnectMax:    5 * time.Second,
 		KeepAlivePeriod: 15 * time.Second,
 		WriteTimeout:    5 * time.Second,
+		PeerIdleTimeout: DefaultPeerIdleTimeout,
 	}
 }
 
@@ -865,15 +888,53 @@ func (s *peerSupervisor) adoptInboundConnection(ctx context.Context, conn net.Co
 }
 
 // runReader continuously consumes framed messages from conn using DecodeFrame.
+//
+// Every read is bounded by PeerIdleTimeout and the deadline is cleared after each
+// frame is decoded, so the bound measures *silence* rather than total session length:
+// a slow-but-alive peer stays connected indefinitely while a peer that stops sending
+// without closing is torn down and its supervisor slot reclaimed.
 func (s *peerSupervisor) runReader(ctx context.Context, gen uint64, conn net.Conn) {
 	defer s.readerWg.Done()
-	defer s.disconnect(gen, io.EOF)
+
+	// Named so the deferred disconnect can report why the reader stopped. A plain
+	// io.EOF would be indistinguishable from a normal close.
+	var readErr error
+	defer func() { s.disconnect(gen, readErr) }()
+
+	idle := s.cfg.PeerIdleTimeout
 
 	for {
+		// Arm the idle bound for this read. Set on every iteration, and refreshed by
+		// the successful read below, so the peer must produce at least one frame per
+		// idle window.
+		if idle > 0 {
+			if err := conn.SetReadDeadline(time.Now().Add(idle)); err != nil {
+				readErr = fmt.Errorf("peer reader: failed to set read deadline: %w", err)
+				return
+			}
+		}
+
 		// Existing DecodeFrame enforces Magic, MaxPayloadLength, and CRC32-IEEE integrity
 		frame, err := DecodeFrame(conn)
 		if err != nil {
+			readErr = err
+			// Distinguish a stalled peer from an orderly close so the cause is
+			// observable in logs and metrics rather than looking like a clean EOF.
+			var nerr net.Error
+			if stdErrors.As(err, &nerr) && nerr.Timeout() {
+				readErr = fmt.Errorf("%w: peer idle for %v without delivering a frame",
+					errors.ErrPeerIdleTimeout, idle)
+			}
 			return
+		}
+
+		// Progress was made: clear the deadline so the next read arms a fresh window.
+		// This is what keeps a legitimately slow peer connected.
+		if idle > 0 {
+			if err := conn.SetReadDeadline(time.Time{}); err != nil {
+				readErr = fmt.Errorf("peer reader: failed to clear read deadline: %w", err)
+				return
+			}
 		}
 
 		// Opcode namespace check: peer transport connections only accept valid peer RPCs (0x81..0x84)
@@ -960,8 +1021,12 @@ func NewPeerConnectionManager(topology *cluster.Topology, cfg PeerConnectionConf
 	if cfg.WriteTimeout == 0 {
 		cfg.WriteTimeout = defaults.WriteTimeout
 	}
+	if cfg.PeerIdleTimeout == 0 {
+		cfg.PeerIdleTimeout = defaults.PeerIdleTimeout
+	}
 
-	if cfg.DialTimeout < 0 || cfg.ReconnectMin < 0 || cfg.ReconnectMax < 0 || cfg.KeepAlivePeriod < 0 || cfg.WriteTimeout < 0 {
+	if cfg.DialTimeout < 0 || cfg.ReconnectMin < 0 || cfg.ReconnectMax < 0 || cfg.KeepAlivePeriod < 0 ||
+		cfg.WriteTimeout < 0 || cfg.PeerIdleTimeout < 0 {
 		return nil, fmt.Errorf("%w: timeouts and intervals must be non-negative", errors.ErrInvalidManagerConfig)
 	}
 

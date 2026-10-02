@@ -504,6 +504,13 @@ var (
 	// ErrPeerNotFound indicates that the target node ID does not exist in the cluster topology.
 	ErrPeerNotFound = stdErrors.New("peer node not found in topology")
 
+	// ErrPeerIdleTimeout indicates that an established peer connection delivered no
+	// frame within the configured idle bound and was torn down.
+	//
+	// Distinct from a clean EOF so a stalled peer is distinguishable from an orderly
+	// close in logs and metrics.
+	ErrPeerIdleTimeout = stdErrors.New("peer connection idle timeout: no frame received within bound")
+
 	// ErrPeerUnavailable indicates that the target peer connection is disconnected, reconnecting, or closing.
 	ErrPeerUnavailable = stdErrors.New("peer is currently disconnected or unavailable")
 

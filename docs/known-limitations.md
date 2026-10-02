@@ -1948,4 +1948,21 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 100. Peer Transport Had No Idle Read Deadline
+
+* **What Changed**: `handleInboundConn` set a read deadline for a peer's *first* frame as a Slowloris defense, then cleared it with `conn.SetReadDeadline(time.Time{})` once that frame arrived. Nothing ever set a read deadline again. `runReader` therefore blocked indefinitely inside `DecodeFrame`, so a peer that stopped sending **without closing its socket** held its supervisor slot forever: the slot was never reclaimed, no reconnect could occur, and recovery required a process restart. Verified by removing the new bound — `runReader` was still blocked after 10s with a `PeerIdleTimeout` of 150ms.
+* **Asymmetry**: The client data plane has had `IdleTimeout` (60s, `ServerConfig`) for the whole of Phase 11. The peer plane had `WriteTimeout` (5s) but no read-side counterpart, so a peer was protected against a peer that would not *read*, but not one that would not *send*.
+* **Fix**: `PeerConnectionConfig` gained `PeerIdleTimeout` (`DefaultPeerIdleTimeout` = 60s, mirroring the client plane's `IdleTimeout`). Every read in `runReader` is bounded by it, and the deadline is **cleared after each successfully decoded frame**, so the bound measures *silence* rather than session length. A slow-but-alive peer is never dropped; only a peer that has gone completely silent is torn down. Both inbound and outbound connections route through `runReader`, so one change covers both directions.
+* **Safety Margin**: Raft heartbeats every 50ms, so the 60s default leaves roughly 1200x margin. `TestPeerIdle_HeartbeatCadenceNeverTripsIt` pins the real cadence against a deliberately tight bound to prove the relationship holds at any scale.
+* **Observability**: A stalled peer now yields `ErrPeerIdleTimeout` (`"peer connection idle timeout: no frame received within bound"`) rather than an indistinguishable `io.EOF`, so the cause is visible in logs and metrics. The `net.Error.Timeout()` classification distinguishes a stall from an orderly close.
+* **Defaulting**: `PeerIdleTimeout <= 0` falls back to the default, so a caller passing the zero value gets a bounded reader rather than silently reintroducing the unbounded one. Negative values are rejected at manager construction, consistent with the other timeouts.
+* **Verification**: `internal/transport/peer_idle_test.go` covers a silent peer being dropped near its bound (and not early), a slow-but-alive peer surviving across many idle windows, real heartbeat cadence never tripping the bound, the default being positive and applied, zero being defaulted rather than unbounded, and negative rejection. Tests drive `runReader` over `net.Pipe`, which supports deadlines and needs no ports. `go test -race ./internal/transport/` is clean.
+* **Residual**: A peer that keeps sending frames but never completes a Raft round trip is not covered by this bound; that is a liveness question for the consensus layer rather than the transport.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (bounded reader, generation-guarded teardown unchanged).
+  * Performance: **Negligible** (two `SetReadDeadline` calls per frame, no allocation).
+  * Security: **Improved** (a resource-exhaustion path via a silently stalled peer is closed).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*
