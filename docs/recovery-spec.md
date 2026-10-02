@@ -142,7 +142,9 @@ Entrypoint: `(e *Engine) RecoverWAL() error`
 2. **Filtering Contract**:
    - WAL records with `SeqNum <= checkpoint` are **skipped**. They are already durable in immutable SSTables referenced by the MANIFEST.
    - WAL records with `SeqNum > checkpoint` are replayed into a fresh, private in-memory MemTable.
-3. Every WAL record framing and CRC32-Castagnoli checksum are physically validated before checkpoint comparison.
+3. Every WAL record's framing and **CRC32-IEEE** checksum (polynomial `0xEDB88320`, Go `hash/crc32.IEEETable`) are physically validated before checkpoint comparison.
+
+   **Integrity, not authenticity.** CRC32-IEEE is an unkeyed 32-bit checksum. It reliably detects *accidental* corruption — bit rot, hardware faults, partial writes — and it is fail-closed for those. It provides **no** protection against a deliberate attacker holding segment write access: any field (`Type`, `SeqNum`, `Timestamp`, key, value) can be altered and a valid CRC recomputed in linear time. This is asserted by the project's own suite in `internal/wal/corruption_test.go`, which forges a record, recomputes its CRC, and shows it decodes cleanly. Detecting tampering therefore depends on segment attestation (`wal_%012d.log.att`, see §4.4.1) and filesystem permissions (`0600` files in a `0700` directory), never on the per-record checksum.
 4. Global sequence monotonicity is strictly enforced across all segments. Sequence regressions fail closed with `*errors.SequenceOutOfOrderError`.
 
 ### 4.3 Batch Atomicity & Resource Ceilings

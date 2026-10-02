@@ -34,7 +34,7 @@
   POSIX Filesystem Layer (`/var/lib/lattice`)
   - Strict File Permissions (0700/0600)
   - Path Whitelisting (No Path Traversal)
-  - CRC32 Block & Log Verification
+  - CRC32 Block & Log Verification (integrity only; unkeyed, no authenticity)
 ═══════════════════════════════════════════
             │
             ▼
@@ -89,7 +89,11 @@
 * **Likelihood**: Medium (Disk bit rot, firmware bugs, sudden power loss).
 * **Existing Mitigation**: Every WAL record, every 4KB SSTable block, and every MANIFEST record contains a hardware-accelerated CRC32-IEEE checksum. During startup recovery, records are verified before processing. EOF torn writes are truncated safely; mid-log corruptions halt the engine with `ErrChecksumMismatch`. The authoritative physical wire formats, recovery protocols, and checksum invariants are documented in [`docs/wal-record-format.md`](file:///Users/sachinkumarsingh/Projectss/Lattice/docs/wal-record-format.md), [`docs/sstable-format-spec.md`](file:///Users/sachinkumarsingh/Projectss/Lattice/docs/sstable-format-spec.md), [`docs/bloom-filter-format.md`](file:///Users/sachinkumarsingh/Projectss/Lattice/docs/bloom-filter-format.md), [`docs/manifest-format-spec.md`](file:///Users/sachinkumarsingh/Projectss/Lattice/docs/manifest-format-spec.md), and [`docs/recovery-spec.md`](file:///Users/sachinkumarsingh/Projectss/Lattice/docs/recovery-spec.md).
 * **Automated Test**: Mutation fuzzing tests flipping random bits in WAL and SSTable files; assert 100% detection.
-* **Residual Risk**: Low (CRC32 detects all single, double, and burst errors up to 32 bits).
+* **Residual Risk**: **Split by adversary class.**
+  * *Accidental corruption (bit rot, hardware fault, power loss)*: **Low.** CRC32-IEEE detects all single- and double-bit errors and all burst errors up to 32 bits, and every read path fails closed on mismatch.
+  * *Deliberate tampering by an actor with segment write access*: **Not mitigated by this control.** CRC32-IEEE is unkeyed, so any field can be altered and a valid checksum recomputed in linear time; there is no MAC, AEAD, or keyed digest anywhere in the WAL, SSTable block, or MANIFEST formats. This is asserted by `internal/wal/corruption_test.go`, which forges a record, recomputes its CRC, and shows it decodes cleanly.
+  * *Deliberate tampering is instead addressed by*: filesystem permissions (`0600` segment and SSTable files inside `0700` directories), symlink/`O_NOFOLLOW` and inode-pinning defenses against path substitution, and WAL segment attestation (`wal_%012d.log.att`, `docs/recovery-spec.md` §4.4.1), which detects whole-record loss and out-of-band modification. See `docs/wal-record-format.md` §6.1.
+  * *Explicitly out of scope*: keyed authentication (HMAC/AEAD) of on-disk structures, and cryptographic logging to an append-only remote sink. Both require a key-management design that this project has not undertaken; the local filesystem is treated as a trust boundary.
 
 ---
 

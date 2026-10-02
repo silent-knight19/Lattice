@@ -628,7 +628,8 @@ flowchart TD
 ### 19.1 Torn Write & Incomplete Flush Recovery
 If an ungraceful crash or power loss interrupts a write while bytes are being pushed to disk, the WAL parser will detect a CRC32 mismatch at the tail of the log.
 * **Tail Truncation Policy**: If and only if the corrupted record occurs at the final boundary of the latest WAL segment, Lattice treats this as an unacknowledged partial write, truncates the corrupted tail, logs an administrative warning, and resumes safely.
-* **Mid-Log Corruption**: If a CRC32 error occurs in the middle of a log file, it indicates media degradation or tampering. The engine halts immediately (`panic`) to prevent silent data corruption.
+* **Mid-Log Corruption**: A CRC32 mismatch anywhere other than the tail of the latest segment is treated as media degradation. Recovery **fails closed with an error** (`wal: historical segment %d is corrupted: %w`, or `ErrChecksumMismatch`) and the database does not open; the engine does **not** `panic`. Note that a CRC32 mismatch does not imply tampering: because the checksum is unkeyed, an attacker with write access would simply recompute a valid CRC rather than leave a mismatch. See [`docs/wal-record-format.md`](wal-record-format.md) §6.1.
+* **Whole-Record Loss**: A tail removed exactly at a record boundary is *not* detectable by per-record CRC32 and historically was accepted silently. WAL segment attestation (`wal_%012d.log.att`, [`docs/recovery-spec.md`](recovery-spec.md) §4.4.1) now makes it a hard failure.
 
 ---
 

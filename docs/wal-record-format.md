@@ -13,7 +13,7 @@
 This document establishes the authoritative, byte-level on-disk contract for Write-Ahead Log (WAL) records in Lattice. Every mutating operation (single-key `PUT`, tombstone `DELETE`, and atomic write batches) is persisted to an active WAL segment prior to acknowledgement to caller threads.
 
 The format satisfies the following non-negotiable invariants:
-1. **Hardware-Accelerated CRC32-IEEE Fail-Closed Verification:** Bit-rot, hardware corruption, and adversarial bit flips are deterministically detected.
+1. **Hardware-Accelerated CRC32-IEEE Fail-Closed Verification:** Bit-rot, hardware faults, and partial writes are deterministically detected, and the record is rejected fail-closed. This is an **integrity** guarantee only. The checksum is unkeyed, so it detects *accidental* corruption but provides **no authenticity**: an attacker with segment write access can alter any field and recompute a valid CRC in linear time. See §6.1.
 2. **Crash & Torn-Tail Recovery Safety:** Partial tail writes caused by unbuffered power loss or kernel panics are cleanly truncated at EOF, while mid-log corruptions halt recovery immediately.
 3. **Anti-DoS Memory Ceilings:** 32-bit length fields are validated against strict ceilings prior to buffer allocation, preventing allocation bombs.
 4. **Platform-Independent Endianness:** All integer fields are encoded in standard Network Byte Order (Big-Endian).
@@ -102,6 +102,15 @@ Any decoded record advertising `KeyLength > 65535`, `ValueLength > 4194304`, or 
 ## 6. Checksum Coverage & Algorithm
 
 - **Algorithm:** CRC32-IEEE (Polynomial `0xEDB88320`), standard Go `hash/crc32.IEEETable`.
+
+### 6.1 Integrity vs. Authenticity
+
+CRC32-IEEE is an **unkeyed** 32-bit checksum. It is a strong detector of accidental corruption and is relied upon for that purpose throughout recovery, but it is **not** a cryptographic integrity mechanism:
+
+- Any field in the covered range — `RecordType`, `SeqNum`, `Timestamp`, key bytes, value bytes — can be modified and a matching CRC recomputed in O(n). There is no secret, MAC, or AEAD anywhere in the WAL format.
+- This is not theoretical. `internal/wal/corruption_test.go` deliberately forges a record, recomputes its CRC32, and asserts the tampered record decodes successfully, pinning the property as intended behavior.
+- Consequently, a WAL segment cannot be treated as tamper-evident. Whole-record loss and out-of-band modification are addressed instead by segment attestation (`wal_%012d.log.att`, see [`docs/recovery-spec.md`](recovery-spec.md) §4.4.1), and access is constrained by filesystem permissions: segment files are `0600` inside a `0700` `wal/` directory.
+- Counter-measures for an attacker who already holds those file permissions (keyed MAC/AEAD, append-only remote log shipping) are **not** implemented and are out of the current threat-model scope, which treats the local filesystem as a trust boundary.
 - **Coverage Range:** Exact byte slice `buf[4 : WireLength]` spanning:
   1. `RecordType` (1 byte)
   2. `SeqNum` (8 bytes)

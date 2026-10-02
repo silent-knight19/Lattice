@@ -1893,4 +1893,22 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 97. CRC32-IEEE Is Integrity-Only; Documentation Previously Overclaimed
+
+* **Doc Defect Corrected**: `docs/recovery-spec.md` §4.2 stated that WAL records are validated with "CRC32-**Castagnoli**". The implementation is CRC32-**IEEE** (`crc32.ChecksumIEEE`, `internal/binary/crc.go`). Verified: zero `Castagnoli` references in any Go source; the only surviving mentions are in `docs/interview-knowledge.md`, where Castagnoli is correctly described as an *alternative considered* in an interview Q&A. `docs/recovery-spec.md` and `docs/wal-record-format.md` are now consistent with the code.
+* **The More Serious Finding Was Not the Typo**: Three separate documents claimed protection the format does not provide.
+  1. `docs/wal-record-format.md` §1 claimed "adversarial bit flips are deterministically detected". False. The checksum is unkeyed, so a deliberate adversary recomputes a valid CRC in O(n).
+  2. `docs/threat-model.md` Trust Boundary 2 listed "CRC32 Block & Log Verification" with no qualifier, and rated Residual Risk "**Low**" for a threat whose own text names a "**Malicious actor**". CRC32 does nothing against that adversary class.
+  3. `docs/architecture-spec.md` §19.1 stated that a mid-log CRC32 error "indicates media degradation **or tampering**" and that "the engine halts immediately (`panic`)". Both wrong: a CRC mismatch says nothing about tampering (an attacker would recompute rather than leave a mismatch), and recovery fails closed with a returned error, never a `panic`.
+* **Property Actually Guaranteed**: CRC32-IEEE is a reliable **integrity** check against *accidental* corruption — bit rot, hardware faults, partial writes — and is fail-closed on every read path. It is **not** tamper-evident and provides no authenticity. This is pinned as intended behavior by the project's own `internal/wal/corruption_test.go`, which forges a record, recomputes its CRC, and asserts the tampered record decodes successfully.
+* **Tamper Resistance Comes From Elsewhere**: Filesystem permissions (`0600` segment and SSTable files inside `0700` directories), `O_NOFOLLOW` plus inode pinning against path substitution, and WAL segment attestation for whole-record loss (entry 96). The local filesystem is treated as a trust boundary.
+* **Out Of Scope**: Keyed authentication (HMAC/AEAD) of on-disk structures and cryptographic shipping to an append-only remote sink. Both require a key-management design that has not been undertaken. Deliberately not implemented rather than silently assumed.
+* **Verification**: Doc-only change; no code or on-disk format was modified, so the WAL, SSTable, and MANIFEST formats remain byte-compatible. Confirmed by `grep` that no normative spec still claims adversarial detection, tamper-evidence, or a Castagnoli checksum, and that `go build`, `go vet`, and the full suite remain clean.
+* **Dimensional Impact**:
+  * Correctness: **Documentation accuracy** (the specs now describe the code that exists).
+  * Performance: **None**.
+  * Security: **Honest posture** (an overstated mitigation is worse than an acknowledged gap, because it invites deploying without a compensating control).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*
