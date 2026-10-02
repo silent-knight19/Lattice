@@ -3342,7 +3342,38 @@ Offset 68..71 (4B, CRC32-IEEE):
     - `FilesCleaned`: exact count of successfully unlinked files.
     - `DirectorySyncFailed: true`: explicitly marks that directory metadata synchronization failed.
     - `SyncError`: captures the exact underlying I/O error.
-    - `report.Error()`: propagates the sync failure so the caller knows durability was not confirmed, while preserving accurate accounting and allowing idempotent retries.
+### 8. Why must `ReplayManifest` open and inspect active SSTables via `openFileNoFollow` and double `os.SameFile` checks instead of relying solely on `os.Lstat`?
+* **Question**: During manifest replay, each active SSTable referenced in the reconstructed Version is verified on disk. Why is a simple `os.Lstat` insufficient, and why must the engine open each file with `openFileNoFollow` and perform double `os.SameFile` pinning?
+* **Answer**:
+  - **The Inode Substitution Gap**: `os.Lstat` inspects directory entries at a single instant in time. An attacker or racing process could replace the verified `.sst` regular file with a symlink or another file between `os.Lstat` and subsequent reader initialization.
+  - **Descriptor Pinning**:
+    1. `openFileNoFollow(sstPath, os.O_RDONLY, 0)` opens the target regular file without following symlinks (`O_NOFOLLOW`).
+    2. `fstat, err := f.Stat()` inspects the descriptor itself, guaranteeing it is a regular file with non-negative size.
+    3. `os.SameFile(fstat, lstatBefore)` and `os.SameFile(fstat, lstatAfter)` prove that the opened file descriptor is byte-identical to the path-resolved object.
+    4. Parent directory `os.SameFile` pre- and post-inspection verifies that the parent directory was not substituted while validating SSTables.
+
+### 9. Why must `e.state` remain in `engineStateRecovering` throughout orphan staging file cleanup, transitioning to `engineStateRecovered` only as the final step?
+* **Question**: In the startup recovery pipeline, state is privately reconstructed and published into the Engine under lock. Why must `e.state` remain `engineStateRecovering` while `CleanOrphanedFilesWithReport()` runs, rather than transitioning to `engineStateRecovered` immediately after MemTable installation?
+* **Answer**:
+  - **The Mutation Race Window**: If `e.state` were marked `engineStateRecovered` before orphan cleanup, concurrent write mutations (`Put`, `Delete`, `WriteBatch`) would immediately be permitted. Those mutations could trigger background flushes or compactions that create *new* staging files (`.tmp_*.sst_*`).
+  - **Premature Deletion Hazard**: The running cleaner might then see a newly created, valid staging file from an active flush and mistakenly classify or race to delete it.
+  - **Failure Semantics**: If orphan cleanup suffers a critical directory synchronization failure, the recovery pipeline must fail closed. Marking recovered prematurely would leave an engine in a partially recovered, un-synchronized state while reporting failure to the caller.
+  - **The Invariant**: `e.state` remains `engineStateRecovering` until orphan cleanup finishes successfully. Only then is `e.state` transitioned to `engineStateRecovered`.
+
+### 10. Why must recovery scan staging files (`.tmp_<num>.sst_<suffix>`) when initializing `nextFileNum`, and how is `math.MaxUint64` overflow guarded?
+* **Question**: Why does scanning only canonical `%06d.sst` files leave a file-number collision hazard after a crash, and how does Lattice prevent counter wraparound?
+* **Answer**:
+  - **The Staging Crash Window**: If the system crashes while `TableWriter` was writing a staging file (e.g. `.tmp_000042.sst_123456`) before it was linked to `000042.sst`, only the staging file exists on disk.
+  - If recovery only scanned finalized `%06d.sst` files, `maxPhysicalFileNum` would not observe file number 42. A subsequent allocation would allocate 42 again and collide with the leftover staging file.
+  - By parsing the base file number from staging files matching `IsOrphanStagingFile`, `maxPhysicalFileNum` is advanced past all uncommitted staging artifacts.
+  - **Overflow Protection**: If `maxPhysicalFileNum == math.MaxUint64` or `replayedNextFile == math.MaxUint64`, recovery fails closed with `ErrFileNumOverflow`. In `AllocateFileNum()`, an atomic CAS loop verifies `cur != math.MaxUint64` before incrementing, preventing wraparound to zero.
+
+### 11. Why must nested `BATCH_START` markers in the WAL fail closed with `ErrCorruptedBatch`?
+* **Question**: When replaying the WAL, what happens if a second `BATCH_START` arrives before the preceding batch received a `BATCH_COMMIT`?
+* **Answer**:
+  - **The Silent Dropping Vulnerability**: In naive recovery implementations, receiving a second `BATCH_START` resets the batch buffer to empty, silently discarding the earlier batch operations without any error or log notice.
+  - **Corruption vs. Crash**: An uncommitted batch can only occur at the clean physical end-of-log (EOF) resulting from a crash. Seeing another `BATCH_START` within the same log stream means the log was corrupted, truncated, or interleaved with invalid framing.
+  - Lattice fails closed with `ErrCorruptedBatch`, ensuring no corrupted or partial batch can ever be silently ignored or partially applied.
 
 ---
 

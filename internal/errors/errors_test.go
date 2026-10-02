@@ -2400,3 +2400,33 @@ func TestPeerConnectionManagerErrors(t *testing.T) {
 		t.Errorf("unexpected bare msg: %s", bareRfe.Error())
 	}
 }
+
+func TestProblem7RecoveryErrors(t *testing.T) {
+	if errors.ErrFileNumOverflow == nil {
+		t.Fatal("ErrFileNumOverflow must not be nil")
+	}
+	if errors.ErrCorruptedBatch == nil {
+		t.Fatal("ErrCorruptedBatch must not be nil")
+	}
+
+	fnoe := &errors.FileNumOverflowError{Current: 18446744073709551615}
+	if !stdErrors.Is(fnoe, errors.ErrFileNumOverflow) {
+		t.Error("FileNumOverflowError must match ErrFileNumOverflow via errors.Is")
+	}
+	if !strings.Contains(fnoe.Error(), "overflow") {
+		t.Errorf("unexpected msg: %s", fnoe.Error())
+	}
+	var nilFnoe *errors.FileNumOverflowError
+	if nilFnoe.Error() != errors.ErrFileNumOverflow.Error() {
+		t.Errorf("nil error mismatch: got %q, want %q", nilFnoe.Error(), errors.ErrFileNumOverflow.Error())
+	}
+
+	wrapped := fmt.Errorf("allocator failure: %w", fnoe)
+	if !stdErrors.Is(wrapped, errors.ErrFileNumOverflow) {
+		t.Error("wrapped FileNumOverflowError must match ErrFileNumOverflow")
+	}
+	var extracted *errors.FileNumOverflowError
+	if !stdErrors.As(wrapped, &extracted) || extracted.Current != 18446744073709551615 {
+		t.Errorf("errors.As extraction failed: got %+v", extracted)
+	}
+}

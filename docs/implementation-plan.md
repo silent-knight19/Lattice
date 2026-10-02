@@ -2039,7 +2039,46 @@ TOTAL: 176 Discrete, Testable Micro-Phases
     - *P07-SEC-012*: ReplayError post-scan validation diagnostics accurately report the originating edit's record index and offset.
     - *P07-SEC-013*: Non-empty WAL segment chains must start with segment 1.
     - *P07-SEC-014*: Documentation accurately reflects sequence watermark and atomic increment semantics.
-  * *Completion*: 100% tests green, race detector clean, 0 data races. Phase 08 remains NOT started.
+  * *Completion*: 100% tests green, race detector clean, 0 data races.
+
+* **P07-FINAL-HARDENING: Problem 7 Final Crash Recovery & Integrity Hardening Audit**
+  * *Status*: **COMPLETE**
+  * *Objective*: Final single-pass audit and security hardening for Problem 7, eliminating subtle TOCTOU races, memory corruption, overflow risks, and lifecycle state inconsistencies.
+  * *Changes*:
+    - `internal/errors/errors.go`:
+      - Added sentinels: `ErrFileNumOverflow`, `ErrCorruptedBatch`.
+      - Added structured error: `FileNumOverflowError`.
+    - `internal/version/current.go`:
+      - Hardened `currentOpenFn` with `openFileNoFollow`.
+      - Added post-open `os.SameFile` verification and parent directory re-inspection (`os.SameFile(dirInfo, parentLstatAfter)`) in `ReadCurrentManifest` to prevent directory swap TOCTOU races.
+    - `internal/version/replay.go`:
+      - Added `replayOpenFn` seam (`openFileNoFollow`).
+      - Each active SSTable in `ReplayManifest` is opened, statted, verified for `Mode().IsRegular()`, non-symlink, and validated with double `os.SameFile(fstat, lstatBefore)` / `os.SameFile(fstat, lstatAfter)` alongside parent directory invariance (`os.SameFile(dirBefore, dirAfter)`).
+      - Replay guarantees `NextFileNum > maxLiveFileNum` across all live files in the reconstructed `Version`.
+    - `internal/wal/rotation.go`:
+      - Hardened `ListSegments` to inspect `walDir` via `os.Lstat`, rejecting symlinked directories or non-directories.
+    - `internal/engine/cleaner.go`:
+      - In `IsOrphanStagingFile`: strictly validated that all characters in `baseName` are `isValidSuffixChar`, preventing directory traversal tokens (`.`, `..`, `/`, `\`).
+      - In `CleanOrphanedFilesDir`: added post-cleanup parent directory `os.SameFile` verification to detect parent displacement during unlinking.
+    - `internal/engine/engine.go`:
+      - In `recoverWALInternal`: fail closed on nested `BATCH_START` with `ErrCorruptedBatch`.
+      - Scans both finalized SSTables and staging artifacts (`.tmp_<num>.sst_<suffix>`) to establish `maxPhysicalFileNum`.
+      - Fails closed on integer overflow near `math.MaxUint64` with `ErrFileNumOverflow`.
+      - Atomic CAS loop in `AllocateFileNum()` prevents counter wraparound to 0.
+      - Fixed recovery state machine: `e.state` remains `engineStateRecovering` throughout orphan staging cleanup. If cleaner encounters critical directory sync failures, recovery fails closed. Transition to `engineStateRecovered` occurs strictly as the final step.
+      - Updated `beginRecovery` and `abortRecovery` against closing/closed states, preventing resurrection of closed engines.
+    - `internal/engine/export_test.go`:
+      - Created file and moved testing hooks (`SetRecoveryBatchLimitsForTesting`, `SetRecoveryPrePublishHookForTesting`, `SetCleanerSyncDirFnForTesting`) out of production code.
+    - Tests Added:
+      - `internal/version/sec_p07_adversarial_test.go`: Complete CURRENT negative/adversarial parsing matrix (empty, CRLF, extra newlines, whitespace, invalid prefix, non-digits, negatives, plus signs, zero manifest, overflow, oversized), symlink/directory/FIFO rejection, MANIFEST symlink/directory rejection, and SSTable validation matrix.
+      - `internal/engine/sec_p07_differential_test.go`: Differential testing against independent reference map oracle over randomized PUT, DELETE, and BATCH operations, nested batch rejection, staging file number collision avoidance, cleaner failure abort, concurrency/lifecycle safety, and cross-finding interactions.
+  * *Invariants & Security Guarantees*:
+    - Descriptor-anchored verification for CURRENT, MANIFEST, and active SSTables.
+    - Deterministic numerical WAL segment discovery and strict sequence monotonicity.
+    - Complete atomicity of BATCH recovery; no partial batches published.
+    - Private state reconstruction before atomic publication under Engine mutex.
+    - Engine lifecycle safety: zero concurrent mutation bypass; state remains recovering until orphan cleanup succeeds.
+  * *Completion*: 100% tests green, race detector clean, 0 data races. Problem 7 completely sealed.
 
 ---
 

@@ -375,6 +375,13 @@ var (
 	// the maximum allowed record count or memory byte budget.
 	ErrRecoveryBatchLimitExceeded = stdErrors.New("recovery batch limit exceeded")
 
+	// ErrFileNumOverflow indicates that incrementing or initializing a file number would exceed
+	// the maximum 64-bit unsigned integer representation (wraparound prohibited).
+	ErrFileNumOverflow = stdErrors.New("file number overflow")
+
+	// ErrCorruptedBatch indicates that a WAL batch contains invalid, conflicting, or nested batch markers.
+	ErrCorruptedBatch = stdErrors.New("corrupted batch: invalid or nested batch markers")
+
 	// ErrInvalidMagic indicates that a network frame header magic number does not match 0x4C415454 ("LATT").
 	ErrInvalidMagic = stdErrors.New("invalid protocol magic: expected 0x4C415454")
 
@@ -685,6 +692,24 @@ func (e *SegmentIDOverflowError) Error() string {
 // Is reports whether this error matches target sentinel ErrSegmentIDOverflow.
 func (e *SegmentIDOverflowError) Is(target error) bool {
 	return target == ErrSegmentIDOverflow
+}
+
+// FileNumOverflowError provides structured context when incrementing or calculating a file number
+// exceeds 64-bit unsigned integer capacity.
+// It matches ErrFileNumOverflow when interrogated with errors.Is().
+type FileNumOverflowError struct {
+	Current uint64
+}
+
+func (e *FileNumOverflowError) Error() string {
+	if e == nil {
+		return ErrFileNumOverflow.Error()
+	}
+	return fmt.Sprintf("file number overflow: current %d is at maximum uint64 limit", e.Current)
+}
+
+func (e *FileNumOverflowError) Is(target error) bool {
+	return target == ErrFileNumOverflow
 }
 
 // InvalidRecordTypeError provides structured context when an unrecognized WAL record type byte is encountered.

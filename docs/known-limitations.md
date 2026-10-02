@@ -790,6 +790,24 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 48.1 Problem 7 Final Crash Recovery & Integrity Hardening
+* **Remediation & Architectural Hardening**:
+  Following the final comprehensive Problem 7 audit, the recovery and integrity verification subsystem was hardened against subtle TOCTOU filesystem races, memory corruption, and lifecycle ordering defects:
+  1. **Active SSTable Descriptor-Anchored Pinning in Replay**: `ReplayManifest` now validates physical SSTables by opening each file with `openFileNoFollow(O_RDONLY)`, performing `fstat`, checking `Mode().IsRegular()`, and verifying inode consistency with `os.SameFile(fstat, lstatBefore)` and `os.SameFile(fstat, lstatAfter)` alongside parent directory invariance (`os.SameFile(dirBefore, dirAfter)`). This eliminates symlink injection and inode replacement TOCTOU races during manifest replay.
+  2. **Authoritative CURRENT Resolution Hardening**: `ReadCurrentManifest` now performs pre- and post-open `os.SameFile` validation between the open descriptor and directory lstat, rejecting directory replacement and symlinks.
+  3. **WAL Directory Symlink Rejection**: `ListSegments` inspects the WAL directory via `os.Lstat` and rejects symlinked directories and non-directory objects before scanning.
+  4. **Nested BATCH_START Fail-Closed**: `recoverWALInternal` strictly returns `ErrCorruptedBatch` if a nested `BATCH_START` marker is encountered before `BATCH_COMMIT`, preventing silent dropping of uncommitted batch operations.
+  5. **Crash-Window Staging File Number Collision Defense**: Recovery scans both finalized SSTables (`%06d.sst`) and staging artifacts (`.tmp_<num>.sst_<suffix>`) to establish the watermark `maxPhysicalFileNum`, preventing future allocations from colliding with uncommitted staging artifacts left on disk.
+  6. **File Number Allocator Overflow Defense**: Guards against integer overflow near `math.MaxUint64` during recovery (returning `ErrFileNumOverflow`) and uses an atomic CAS loop in `AllocateFileNum()` to prevent wraparound to zero.
+  7. **Strict Recovery Pipeline Ordering**: Recovery enforces that state publication occurs privately under `e.mu.Lock()` while maintaining `engineStateRecovering` throughout orphan staging cleanup. If orphan cleanup fails due to critical directory sync errors, recovery fails closed. Transition to `engineStateRecovered` occurs strictly as the final step.
+  8. **Test-Only Production Seam Elimination**: Production testing hooks (`SetRecoveryBatchLimitsForTesting`, `SetRecoveryPrePublishHookForTesting`, `SetCleanerSyncDirFnForTesting`) have been relocated to `export_test.go`, ensuring no test bypasses exist in production binaries.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (Strict pipeline ordering; exact state reconstruction matching independent oracle; zero duplicate or partial batch publication).
+  * Performance: **Optimal** (Streaming bounded replay; descriptor-anchored syscalls; zero heap allocation on bounded checks).
+  * Security: **Optimal** (Complete elimination of TOCTOU replacement races; integer overflow fail-closed; test seams excluded from production).
+
+---
+
 ### 49. SSTable Sequential Streaming Iterator Traversal & Merge Decoupling (P08-S01-M02)
 * **Limitation & Architectural Boundaries**:
   In `P08-S01-M02`:

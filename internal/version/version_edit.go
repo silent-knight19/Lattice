@@ -306,6 +306,11 @@ func (e *VersionEdit) Validate() error {
 		fileNum uint64
 	}
 
+	// 0. Validate scalar fields
+	if e.hasLastSeqNum && e.lastSeqNum > binary.MaxSeqNum {
+		return errors.ErrSeqNumOverflow
+	}
+
 	// 1. Validate deleted files
 	deletedSet := make(map[levelFileKey]struct{}, len(e.deletedFiles))
 	for _, d := range e.deletedFiles {

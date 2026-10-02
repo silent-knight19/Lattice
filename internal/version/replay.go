@@ -257,8 +257,11 @@ func (b *versionBuilder) applyEdit(edit *VersionEdit, recordIndex int, offset in
 	return nil
 }
 
-// Test seam for physical SSTable filesystem inspection
-var replayLstatFn = os.Lstat
+// Test seams for physical SSTable filesystem inspection
+var (
+	replayLstatFn = os.Lstat
+	replayOpenFn  = openFileNoFollow
+)
 
 // ReplayManifest executes the sequential VersionEdit replay engine according to the P07-S01-M02 specification.
 //
@@ -458,6 +461,34 @@ func ReplayManifest(discovered *DiscoveredManifest) (*ReplayResult, error) {
 
 	// Physical SSTable existence, file-type, and size validation on disk (P07-SEC-008, P07-SEC-012)
 	cleanDir := filepath.Clean(discovered.Dir)
+
+	// Pre-inspect parent directory identity
+	dirStatBefore, err := replayLstatFn(cleanDir)
+	if err != nil {
+		return nil, &ReplayError{
+			ManifestNum: discovered.ManifestNum,
+			RecordIndex: -1,
+			Offset:      -1,
+			Err:         fmt.Errorf("replay: failed to inspect directory %s: %w", cleanDir, err),
+		}
+	}
+	if dirStatBefore.Mode()&os.ModeSymlink != 0 {
+		return nil, &ReplayError{
+			ManifestNum: discovered.ManifestNum,
+			RecordIndex: -1,
+			Offset:      -1,
+			Err:         fmt.Errorf("%w: directory %s cannot be a symbolic link", os.ErrInvalid, cleanDir),
+		}
+	}
+	if !dirStatBefore.IsDir() {
+		return nil, &ReplayError{
+			ManifestNum: discovered.ManifestNum,
+			RecordIndex: -1,
+			Offset:      -1,
+			Err:         &errors.NotADirectoryError{Path: cleanDir, Mode: dirStatBefore.Mode()},
+		}
+	}
+
 	for lvl := 0; lvl < NumLevels; lvl++ {
 		for _, prov := range finalProvs[lvl] {
 			meta := prov.Meta
@@ -507,8 +538,72 @@ func ReplayManifest(discovered *DiscoveredManifest) (*ReplayResult, error) {
 				}
 			}
 
+			// Open file descriptor with O_RDONLY and O_NOFOLLOW to pin inode and detect substitution races
+			f, openErr := replayOpenFn(sstPath, os.O_RDONLY, 0)
+			if openErr != nil {
+				if os.IsNotExist(openErr) {
+					return nil, &ReplayError{
+						ManifestNum: discovered.ManifestNum,
+						RecordIndex: prov.RecordIndex,
+						Offset:      prov.Offset,
+						Err:         fmt.Errorf("%w: %s", errors.ErrMissingSSTable, sstPath),
+					}
+				}
+				return nil, &ReplayError{
+					ManifestNum: discovered.ManifestNum,
+					RecordIndex: prov.RecordIndex,
+					Offset:      prov.Offset,
+					Err:         fmt.Errorf("replay: failed to open sstable %s: %w", sstPath, openErr),
+				}
+			}
+
+			fstat, statErr := f.Stat()
+			postInfo, lstatErr := replayLstatFn(sstPath)
+			_ = f.Close()
+
+			if statErr != nil {
+				return nil, &ReplayError{
+					ManifestNum: discovered.ManifestNum,
+					RecordIndex: prov.RecordIndex,
+					Offset:      prov.Offset,
+					Err:         fmt.Errorf("replay: failed to stat open sstable %s: %w", sstPath, statErr),
+				}
+			}
+			if lstatErr != nil {
+				return nil, &ReplayError{
+					ManifestNum: discovered.ManifestNum,
+					RecordIndex: prov.RecordIndex,
+					Offset:      prov.Offset,
+					Err:         fmt.Errorf("replay: failed to lstat sstable %s post-open: %w", sstPath, lstatErr),
+				}
+			}
+			if postInfo.Mode()&os.ModeSymlink != 0 {
+				return nil, &ReplayError{
+					ManifestNum: discovered.ManifestNum,
+					RecordIndex: prov.RecordIndex,
+					Offset:      prov.Offset,
+					Err:         fmt.Errorf("%w: sstable %s was replaced with a symlink", errors.ErrSSTableSymlink, sstPath),
+				}
+			}
+			if !fstat.Mode().IsRegular() || !postInfo.Mode().IsRegular() {
+				return nil, &ReplayError{
+					ManifestNum: discovered.ManifestNum,
+					RecordIndex: prov.RecordIndex,
+					Offset:      prov.Offset,
+					Err:         fmt.Errorf("%w: sstable %s descriptor is not a regular file", os.ErrInvalid, sstPath),
+				}
+			}
+			if !os.SameFile(fstat, info) || !os.SameFile(fstat, postInfo) {
+				return nil, &ReplayError{
+					ManifestNum: discovered.ManifestNum,
+					RecordIndex: prov.RecordIndex,
+					Offset:      prov.Offset,
+					Err:         fmt.Errorf("%w: sstable %s was replaced during open (inode substitution)", os.ErrInvalid, sstPath),
+				}
+			}
+
 			// SSTable physical size validation against authoritative manifest metadata (P07-SEC-008)
-			if uint64(info.Size()) != meta.FileSize {
+			if info.Size() < 0 || uint64(info.Size()) != meta.FileSize || fstat.Size() != info.Size() {
 				return nil, &ReplayError{
 					ManifestNum: discovered.ManifestNum,
 					RecordIndex: prov.RecordIndex,
@@ -524,12 +619,40 @@ func ReplayManifest(discovered *DiscoveredManifest) (*ReplayResult, error) {
 		}
 	}
 
+	// Post-inspect parent directory identity to detect displacement
+	dirStatAfter, pErr := replayLstatFn(cleanDir)
+	if pErr != nil || !os.SameFile(dirStatBefore, dirStatAfter) {
+		return nil, &ReplayError{
+			ManifestNum: discovered.ManifestNum,
+			RecordIndex: -1,
+			Offset:      -1,
+			Err:         fmt.Errorf("%w: parent directory %s was replaced during SSTable validation", os.ErrInvalid, cleanDir),
+		}
+	}
+
+	// Ensure NextFileNum watermark is strictly greater than all live file numbers
+	var maxLiveFileNum uint64
+	for lvl := 0; lvl < NumLevels; lvl++ {
+		for _, f := range finalLevels[lvl] {
+			if f.FileNum > maxLiveFileNum {
+				maxLiveFileNum = f.FileNum
+			}
+		}
+	}
+	nextFileNum := builder.nextFileNum
+	if nextFileNum <= maxLiveFileNum {
+		nextFileNum = maxLiveFileNum + 1
+	}
+	if nextFileNum < 1 {
+		nextFileNum = 1
+	}
+
 	// Construct final immutable Version snapshot (initial refCount = 1)
 	finalVersion := NewVersion(finalLevels)
 
 	return &ReplayResult{
 		Version:      finalVersion,
-		NextFileNum:  builder.nextFileNum,
+		NextFileNum:  nextFileNum,
 		LastSeqNum:   builder.lastSeqNum,
 		ValidRecords: recordIndex,
 		FinalOffset:  offset,

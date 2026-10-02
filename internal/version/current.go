@@ -48,7 +48,7 @@ var (
 	currentRenameAtFn     = renameAt
 	currentCreateTempAtFn = createTempAt
 	currentSyncDirFn      = syncDir
-	currentOpenFn         = func(name string) (*os.File, error) { return os.Open(name) }
+	currentOpenFn         = func(name string) (*os.File, error) { return openFileNoFollow(name, os.O_RDONLY, 0) }
 	currentReadFn         = func(f *os.File, p []byte) (int, error) { return f.Read(p) }
 	currentLstatFn        = os.Lstat
 	isRenameFnOverridden  atomic.Bool
@@ -588,23 +588,32 @@ func ReadCurrentManifest(dir string) (uint64, error) {
 			return 0, fmt.Errorf("%w: target %s is not a regular file (mode=%v)", errors.ErrCurrentCorrupted, currentPath, finfo.Mode())
 		}
 
-		if os.SameFile(cInfo, finfo) {
+		postInfo, lstatErr := currentLstatFn(currentPath)
+		if lstatErr != nil {
+			_ = currentCloseFn(openFile)
+			if attempt == maxRetries-1 {
+				return 0, fmt.Errorf("%w: failed to lstat %s post-open: %w", os.ErrInvalid, currentPath, lstatErr)
+			}
+			continue
+		}
+		if postInfo.Mode()&os.ModeSymlink != 0 {
+			_ = currentCloseFn(openFile)
+			return 0, fmt.Errorf("%w: target %s is a symlink", errors.ErrCurrentSymlink, currentPath)
+		}
+		if !postInfo.Mode().IsRegular() {
+			_ = currentCloseFn(openFile)
+			return 0, fmt.Errorf("%w: target %s is not a regular file post-open", errors.ErrCurrentCorrupted, currentPath)
+		}
+
+		if os.SameFile(cInfo, finfo) && os.SameFile(postInfo, finfo) {
 			f = openFile
 			break
 		}
 
 		// Concurrent atomic rename occurred between Lstat and Open.
-		// Verify that the opened file matches current on-disk state and is NOT a symlink.
-		postInfo, lstatErr := currentLstatFn(currentPath)
-		if lstatErr == nil {
-			if postInfo.Mode()&os.ModeSymlink != 0 {
-				_ = currentCloseFn(openFile)
-				return 0, fmt.Errorf("%w: target %s is a symlink", errors.ErrCurrentSymlink, currentPath)
-			}
-			if os.SameFile(postInfo, finfo) {
-				f = openFile
-				break
-			}
+		if os.SameFile(postInfo, finfo) {
+			f = openFile
+			break
 		}
 
 		// If still in flux under high concurrent contention, close and retry
@@ -614,7 +623,18 @@ func ReadCurrentManifest(dir string) (uint64, error) {
 		}
 	}
 
-	// 5. Bounded read into fixed stack buffer (zero heap allocations)
+	// 5. Parent directory re-inspection invariance (TOCTOU parent replacement defense)
+	parentLstatAfter, pErr := currentLstatFn(cleanDir)
+	if pErr != nil {
+		_ = currentCloseFn(f)
+		return 0, fmt.Errorf("%w: parent directory %s could not be statted post-open: %w", os.ErrInvalid, cleanDir, pErr)
+	}
+	if !os.SameFile(dirInfo, parentLstatAfter) {
+		_ = currentCloseFn(f)
+		return 0, fmt.Errorf("%w: parent directory %s was replaced during open", os.ErrInvalid, cleanDir)
+	}
+
+	// 6. Bounded read into fixed stack buffer (zero heap allocations)
 	var buf [MaxCurrentFileSize + 1]byte
 	var totalRead int
 	for totalRead < len(buf) {

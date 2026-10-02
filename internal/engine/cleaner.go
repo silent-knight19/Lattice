@@ -87,6 +87,11 @@ func IsOrphanStagingFile(name string) bool {
 	if baseName == "." || baseName == ".." {
 		return false
 	}
+	for i := 0; i < len(baseName); i++ {
+		if !isValidSuffixChar(baseName[i]) {
+			return false
+		}
+	}
 
 	// 6. Validate random suffix after ".sst_"
 	suffix := rest[sstIdx+len(".sst_"):]
@@ -238,20 +243,19 @@ func CleanOrphanedFilesDir(dbPath string) (CleanOrphanReport, error) {
 		}
 	}
 
+	// Post-cleanup parent directory re-verification: detect parent replacement during cleanup
+	postDirInfo, postErr := os.Lstat(cleanDBPath)
+	if postErr != nil {
+		report.Failures["__dbDir__"] = fmt.Errorf("cleaner: failed to re-stat db directory after cleanup: %w", postErr)
+	} else if !os.SameFile(dirStat, postDirInfo) {
+		report.Failures["__dbDir__"] = errors.ErrParentDirectorySwapped
+	}
+
 	return report, report.Error()
 }
 
 var cleanerSyncDirFn = func(f *os.File) error {
 	return f.Sync()
-}
-
-// SetCleanerSyncDirFnForTesting overrides cleanerSyncDirFn for testing directory sync failures.
-func SetCleanerSyncDirFnForTesting(fn func(*os.File) error) func() {
-	prev := cleanerSyncDirFn
-	cleanerSyncDirFn = fn
-	return func() {
-		cleanerSyncDirFn = prev
-	}
 }
 
 // CleanOrphanedFiles scans the database directory and removes unreferenced crash-window

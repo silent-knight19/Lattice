@@ -27,11 +27,14 @@ Lattice implements a multi-tier crash-consistency and durability model combining
 |  [ Step 3: WAL Replay ]                                                                           |
 |  Scan WAL Segments (1..N) -> Filter (SeqNum <= Checkpoint) -> Replay Uncommitted (SeqNum > Ckpt)  |
 |                                                                                                   |
-|  [ Step 4: Orphan File Cleanup ]                                                                  |
+|  [ Step 4: Atomic State Publication (under Engine lock, state remains engineStateRecovering) ]     |
+|  Advance SeqNum Watermark -> Advance FileNum Watermark -> Publish MemTable & VersionSet           |
+|                                                                                                   |
+|  [ Step 5: Safe Orphan File Cleanup ]                                                             |
 |  Scan DB directory -> Clean valid staging artifacts (.tmp_*.sst_*) -> Preserve all persistent     |
 |                                                                                                   |
-|  [ Step 5: Atomic State Publication ]                                                             |
-|  Advance SeqNum Watermark -> Advance FileNum Watermark -> Publish Active MemTable & VersionSet   |
+|  [ Step 6: Mark Engine Recovered ]                                                                |
+|  Verify clean directory state -> Transition state to engineStateRecovered                         |
 |                                                                                                   |
 +---------------------------------------------------------------------------------------------------+
 ```
@@ -227,7 +230,8 @@ Repeated recovery executions produce identical active MemTable contents, identic
 State publication occurs atomically under `Engine.mu.Lock()`:
 1. Active MemTable installed: `e.activeMem = recoveryMem`.
 2. Immutable MemTables installed: `e.immMems = recoveryImm`.
-3. Sequence counter advanced: `e.nextSeqNum.Store(max(checkpoint, wal.LastSeqNum) + 1)`.
-4. File number counter advanced: `e.nextFileNum.Store(max(manifest.NextFileNum, maxPhysicalSSTNum + 1))`.
+3. Sequence counter advanced: `e.nextSeqNum.Store(max(checkpoint, wal.LastSeqNum))`. (The subsequent write increments via `Add(1)`).
+4. File number counter advanced: `e.nextFileNum.Store(max(manifest.NextFileNum, maxPhysicalSSTNum + 1))` (scanning both SSTables and staging artifacts, preventing overflow).
 5. Reconstructed `Version` installed into `e.vset`.
-6. Lifecycle state transitioned to `engineStateRecovered`.
+6. Engine lifecycle state remains `engineStateRecovering` throughout subsequent orphan staging cleanup.
+7. After orphan staging cleanup succeeds without critical directory sync error, lifecycle state transitions to `engineStateRecovered`.

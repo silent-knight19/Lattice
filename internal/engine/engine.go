@@ -8,6 +8,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -58,38 +60,10 @@ var (
 	recoveryBatchLimitsMu   sync.Mutex
 )
 
-// SetRecoveryBatchLimitsForTesting configures custom recovery batch limits for testing and returns a restore function.
-func SetRecoveryBatchLimitsForTesting(maxRecords int, maxBytes uint64) func() {
-	recoveryBatchLimitsMu.Lock()
-	prevRecords := recoveryBatchMaxRecords
-	prevBytes := recoveryBatchMaxBytes
-	recoveryBatchMaxRecords = maxRecords
-	recoveryBatchMaxBytes = maxBytes
-	recoveryBatchLimitsMu.Unlock()
-	return func() {
-		recoveryBatchLimitsMu.Lock()
-		recoveryBatchMaxRecords = prevRecords
-		recoveryBatchMaxBytes = prevBytes
-		recoveryBatchLimitsMu.Unlock()
-	}
-}
-
 var (
 	recoveryPrePublishHookMu sync.Mutex
 	recoveryPrePublishHook   func(*Engine)
 )
-
-// SetRecoveryPrePublishHookForTesting registers a testing hook called right before recovery acquires mu.Lock() to publish.
-func SetRecoveryPrePublishHookForTesting(hook func(*Engine)) func() {
-	recoveryPrePublishHookMu.Lock()
-	recoveryPrePublishHook = hook
-	recoveryPrePublishHookMu.Unlock()
-	return func() {
-		recoveryPrePublishHookMu.Lock()
-		recoveryPrePublishHook = nil
-		recoveryPrePublishHookMu.Unlock()
-	}
-}
 
 // Engine coordinates the active MemTable, immutable flush candidates,
 // VersionSet snapshot management, and backpressure gating (SEC-003).
@@ -487,8 +461,17 @@ func (e *Engine) NextFileNum() uint64 {
 
 // AllocateFileNum atomically allocates and returns a new unique file number (P07-SEC-006).
 // Allocations start from the recovered nextFileNum watermark and advance monotonically.
+// Panics if the 64-bit file number counter is exhausted to prevent wraparound.
 func (e *Engine) AllocateFileNum() uint64 {
-	return e.nextFileNum.Add(1) - 1
+	for {
+		cur := e.nextFileNum.Load()
+		if cur == math.MaxUint64 {
+			panic("engine: file number counter exhausted (overflow math.MaxUint64)")
+		}
+		if e.nextFileNum.CompareAndSwap(cur, cur+1) {
+			return cur
+		}
+	}
 }
 
 // allocSeqNumLocked allocates the next sequence number for a mutation.
@@ -1337,7 +1320,7 @@ func (e *Engine) beginRecovery() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.closed.Load() || e.state == engineStateClosed {
+	if e.closed.Load() || e.state == engineStateClosed || e.state == engineStateClosing {
 		return errors.ErrWriterClosed
 	}
 	if e.state == engineStateRecovering {
@@ -1361,6 +1344,9 @@ func (e *Engine) beginRecovery() error {
 func (e *Engine) abortRecovery() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.closed.Load() || e.state == engineStateClosed || e.state == engineStateClosing {
+		return
+	}
 	if e.state == engineStateRecovering {
 		e.state = engineStateNotRecovering
 	}
@@ -1441,12 +1427,22 @@ func (e *Engine) RecoverWAL() error {
 	cleanReport, cleanErr := e.CleanOrphanedFilesWithReport()
 	e.mu.Lock()
 	e.lastCleanerReport = cleanReport
-	e.mu.Unlock()
-	if cleanErr != nil {
-		if isCriticalCleanerError(cleanErr, cleanReport) {
-			return fmt.Errorf("engine: failed to clean orphaned temporary files: %w", cleanErr)
+	if cleanErr != nil && isCriticalCleanerError(cleanErr, cleanReport) {
+		if !e.closed.Load() && e.state != engineStateClosed && e.state != engineStateClosing {
+			e.state = engineStateNotRecovering
 		}
+		e.mu.Unlock()
+		return fmt.Errorf("engine: failed to clean orphaned temporary files: %w", cleanErr)
 	}
+
+	if e.closed.Load() || e.state == engineStateClosed || e.state == engineStateClosing {
+		e.mu.Unlock()
+		return errors.ErrWriterClosed
+	}
+
+	// Step 4: Mark Engine recovered
+	e.state = engineStateRecovered
+	e.mu.Unlock()
 
 	return nil
 }
@@ -1473,12 +1469,22 @@ func (e *Engine) RecoverWALFromCheckpoint(checkpoint binary.SeqNum) error {
 	cleanReport, cleanErr := e.CleanOrphanedFilesWithReport()
 	e.mu.Lock()
 	e.lastCleanerReport = cleanReport
-	e.mu.Unlock()
-	if cleanErr != nil {
-		if isCriticalCleanerError(cleanErr, cleanReport) {
-			return fmt.Errorf("engine: failed to clean orphaned temporary files: %w", cleanErr)
+	if cleanErr != nil && isCriticalCleanerError(cleanErr, cleanReport) {
+		if !e.closed.Load() && e.state != engineStateClosed && e.state != engineStateClosing {
+			e.state = engineStateNotRecovering
 		}
+		e.mu.Unlock()
+		return fmt.Errorf("engine: failed to clean orphaned temporary files: %w", cleanErr)
 	}
+
+	if e.closed.Load() || e.state == engineStateClosed || e.state == engineStateClosing {
+		e.mu.Unlock()
+		return errors.ErrWriterClosed
+	}
+
+	e.state = engineStateRecovered
+	e.mu.Unlock()
+
 	return nil
 }
 
@@ -1513,12 +1519,22 @@ func (e *Engine) RecoverWALWithManifestResult(res *version.ReplayResult) error {
 	cleanReport, cleanErr := e.CleanOrphanedFilesWithReport()
 	e.mu.Lock()
 	e.lastCleanerReport = cleanReport
-	e.mu.Unlock()
-	if cleanErr != nil {
-		if isCriticalCleanerError(cleanErr, cleanReport) {
-			return fmt.Errorf("engine: failed to clean orphaned temporary files: %w", cleanErr)
+	if cleanErr != nil && isCriticalCleanerError(cleanErr, cleanReport) {
+		if !e.closed.Load() && e.state != engineStateClosed && e.state != engineStateClosing {
+			e.state = engineStateNotRecovering
 		}
+		e.mu.Unlock()
+		return fmt.Errorf("engine: failed to clean orphaned temporary files: %w", cleanErr)
 	}
+
+	if e.closed.Load() || e.state == engineStateClosed || e.state == engineStateClosing {
+		e.mu.Unlock()
+		return errors.ErrWriterClosed
+	}
+
+	e.state = engineStateRecovered
+	e.mu.Unlock()
+
 	return nil
 }
 
@@ -1537,6 +1553,9 @@ func (e *Engine) recoverWALInternal(dbPath string, checkpoint binary.SeqNum, rep
 	sink := wal.ReplayFunc(func(rec wal.Record) error {
 		switch rec.Type {
 		case wal.RecordTypeBatchStart:
+			if inBatch {
+				return errors.ErrCorruptedBatch
+			}
 			inBatch = true
 			batchBuffer = nil
 			batchRecordCount = 0
@@ -1663,14 +1682,32 @@ func (e *Engine) recoverWALInternal(dbPath string, checkpoint binary.SeqNum, rep
 	}
 
 	// 4. File number watermark initialization and advancement (P07-SEC-004, P07-SEC-006)
-	// Scan dbPath for existing canonical SSTables to detect any uncommitted crash-window files
+	// Scan dbPath for existing canonical SSTables and staging artifacts to detect any uncommitted crash-window files
 	var maxPhysicalFileNum uint64
-	if entries, readErr := os.ReadDir(dbPath); readErr == nil {
-		for _, entry := range entries {
-			if !entry.IsDir() {
-				if num, ok := version.ParseTableFilename(entry.Name()); ok {
-					if num > maxPhysicalFileNum {
-						maxPhysicalFileNum = num
+	entries, readErr := os.ReadDir(dbPath)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		if replayRes != nil && replayRes.Version != nil {
+			replayRes.Version.Unref()
+		}
+		e.state = engineStateNotRecovering
+		return fmt.Errorf("engine: failed to scan db directory for existing files: %w", readErr)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			name := entry.Name()
+			if num, ok := version.ParseTableFilename(name); ok {
+				if num > maxPhysicalFileNum {
+					maxPhysicalFileNum = num
+				}
+			} else if IsOrphanStagingFile(name) {
+				// Parse staging file number: .tmp_<baseName>.sst_<suffix>
+				rest := name[len(".tmp_"):]
+				if sstIdx := strings.Index(rest, ".sst_"); sstIdx > 0 {
+					baseName := rest[:sstIdx]
+					if sNum, parseErr := strconv.ParseUint(baseName, 10, 64); parseErr == nil {
+						if sNum > maxPhysicalFileNum {
+							maxPhysicalFileNum = sNum
+						}
 					}
 				}
 			}
@@ -1681,6 +1718,14 @@ func (e *Engine) recoverWALInternal(dbPath string, checkpoint binary.SeqNum, rep
 	if replayRes != nil {
 		replayedNextFile = replayRes.NextFileNum
 	}
+	if maxPhysicalFileNum == math.MaxUint64 || replayedNextFile == math.MaxUint64 {
+		if replayRes != nil && replayRes.Version != nil {
+			replayRes.Version.Unref()
+		}
+		e.state = engineStateNotRecovering
+		return errors.ErrFileNumOverflow
+	}
+
 	targetFileNum := replayedNextFile
 	if maxPhysicalFileNum >= targetFileNum {
 		targetFileNum = maxPhysicalFileNum + 1
@@ -1702,9 +1747,7 @@ func (e *Engine) recoverWALInternal(dbPath string, checkpoint binary.SeqNum, rep
 		e.backpressure.RecordUsage(totalBytes)
 	}
 
-	// 6. State transition to recovered
-	e.state = engineStateRecovered
-
+	// Note: e.state remains engineStateRecovering until orphan cleanup succeeds in caller.
 	return nil
 }
 

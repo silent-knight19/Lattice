@@ -114,6 +114,20 @@ func ParseSegmentPath(path string) (uint64, error) {
 //   - Returns an empty slice (nil error) if the directory contains no segment files or does not exist.
 func ListSegments(dbPath string) ([]uint64, error) {
 	walDir := Dir(dbPath)
+	dirInfo, err := os.Lstat(walDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("wal: failed to stat directory %s: %w", walDir, err)
+	}
+	if dirInfo.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("wal: cannot open symlinked directory %s: %w", walDir, os.ErrInvalid)
+	}
+	if !dirInfo.IsDir() {
+		return nil, &errors.NotADirectoryError{Path: walDir, Mode: dirInfo.Mode()}
+	}
+
 	entries, err := os.ReadDir(walDir)
 	if err != nil {
 		if os.IsNotExist(err) {
