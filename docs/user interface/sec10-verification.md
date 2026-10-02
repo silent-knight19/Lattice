@@ -148,7 +148,57 @@ provided for the same reason.
 
 ## Remaining
 
-- **SEC-6**: flag wiring and the startup warning (ADM-7).
 - **SEC-11**: static asset serving over `embed.FS`.
 - **SEC-12**: consolidated attack suite — the natural home for a regression test that a
   32-hex request id is never redacted, since that bug was security-adjacent.
+
+---
+
+## Addendum (SEC-6 work): a flaky FALSE-POSITIVE leak test in `internal/logger`
+
+Found while running the **full repository** gate for the first time — a gate that had never
+been run end-to-end before, and it immediately paid for itself.
+
+### Symptom
+
+```
+--- FAIL: TestSEC002_ExpandedSensitiveKeywords/card_cvc
+    raw secret value leaked in output for key "card_cvc":
+    {"time":"...19.459888 +0530 IST",...,"card_cvc":"[REDACTED]"}
+```
+
+The value **is** `[REDACTED]`. The test reported a leak that never happened.
+
+### Root cause
+
+`internal/logger/nested_redaction_test.go` asserted non-leakage with:
+
+```go
+if strings.Contains(buf.String(), tc.rawVal) {   // tc.rawVal == "888"
+```
+
+`buf.String()` is the **entire log line, including the `time` field**. The timestamp carries
+sub-second digits, so the secret `"888"` appeared inside the legitimate timestamp
+`"...19.459888"`. The assertion therefore failed whenever the clock happened to produce those
+three digits — a **clock-dependent flake**, not a redaction failure.
+
+This is a security test in the redaction suite emitting a **false leak report**. The practical
+harm is credibility: a flaky "SECRET LEAKED" in CI trains reviewers to dismiss real findings,
+which is the worst possible failure mode for a control whose entire job is to be believed.
+
+### Fix
+
+The leak scan now excludes the `time` field and re-marshals the remainder, so the secret is
+still checked everywhere it could actually be logged — the message and every other field.
+
+The fix was verified in both directions:
+
+- **False positive gone:** `-count=20` passes.
+- **Still detects a genuine leak:** a temporary test logged `"888"` under a key the redactor
+  does not know; the scan still caught it. The assertion was not weakened into something that
+  can never fail. (That temporary test was removed after proving the point.)
+
+### Why it belonged here
+
+It is a defect in the redaction suite that SEC-10 verified, discovered only because SEC-6
+required running the full repository gate rather than the admin package alone.

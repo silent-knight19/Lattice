@@ -242,7 +242,13 @@ against other local users. Recorded in `docs/known-limitations.md` at TD-6.
 - **Tests:** headers present on all five response classes; no `unsafe-inline` anywhere in CSP;
   `no-store` present on every API response.
 
-## SEC-6 — Loopback-only binding enforcement (S) — *High*
+## SEC-6 — Loopback-only binding enforcement (S) — *High*  ✅ **COMPLETE + VERIFIED**
+
+> **Status: DONE.** `cmd/lattice/admin.go`, `internal/admin/server.go`, validation in
+> `cmd/lattice/config.go`. 30 admin-wiring tests + 3 `web` tests, `-race` clean.
+> **This closes Part 0.** See [`sec6-verification.md`](./sec6-verification.md).
+> Subtasks 6.1–6.5 met. Delivered together with **ADM-1** (`admin.NewServer` lifecycle),
+> which SEC-6 depends on, and the first slice of **ADM-7** (daemon wiring).
 
 - **File:** `cmd/lattice/admin.go`, reuses `isLoopback` from `config.go:120`
 - **6.1** Default `--admin-address` to empty (server disabled). Opt-in only.
@@ -254,6 +260,18 @@ against other local users. Recorded in `docs/known-limitations.md` at TD-6.
   explicit `--admin-allow-remote` flag. Two independent opt-ins cannot be triggered by accident.
 - **Tests:** remote bind without the second flag → startup error · with both → starts and warns ·
   empty address → no listener · port conflict → clean fail-fast.
+
+> **Note — deviation from the original wording.** 6.2/6.4 were specified in terms of
+> `--pprof-address`'s rule, but pprof's rule is *stricter*: pprof refuses every non-loopback
+> bind and has **no** `--insecure-transport` escape. Admin is deliberately the opposite — it
+> permits a remote bind, but only behind **two** independent opt-ins. Matching pprof exactly
+> would have made 6.4 unimplementable; matching metrics exactly would have made 6.4
+> redundant. The shipped behaviour is the two-opt-in rule, verified by
+> `TestAdminFlagNonLoopbackRequiresBothOptIns`.
+>
+> A **wildcard** bind (`0.0.0.0`/`::`) is refused outright even with both opt-ins, because it
+> publishes the console on every interface and yields no derivable Host allowlist
+> (`TestNewAdminServerRefusesWildcardEvenWithOptIns`).
 
 ## SEC-7 — Request size caps + handler timeouts (S) — *High*  ✅ **COMPLETE + VERIFIED**
 
@@ -351,7 +369,19 @@ against other local users. Recorded in `docs/known-limitations.md` at TD-6.
 - **Tests:** a key containing `\nFAKE LOG LINE` produces exactly one log line ·
   token values never appear in captured output.
 
-## SEC-11 — Static asset serving safety (S) — *High*
+## SEC-11 — Static asset serving safety (S) — *High*  ✅ **COMPLETE + VERIFIED**
+
+> **Status: DONE.** `internal/admin/static.go`, `internal/admin/static_test.go`, and a new
+> `web/` package (`web/embed.go` + committed placeholder `web/dist/`).
+> Package total: **391 cases**, `-race` clean.
+> **Verified live with literal unnormalised bytes (via `nc`, bypassing curl's client-side
+> path normalisation):** `/../etc/passwd`, `/../../../../etc/passwd`,
+> `/assets/../../../etc/passwd` and `/api/v1/../` all returned **404**; percent-encoded forms
+> returned the SPA shell with **no** `/etc/passwd` content. All `/api*` paths returned **JSON
+> 404, never HTML**. `index.html` served `no-store` with a content-derived ETag.
+> **SEC-11.5 confirmed:** `go build ./...` succeeds with only the placeholder present and no
+> Node.js installed. See [`sec11-verification.md`](./sec11-verification.md).
+> Subtasks 11.1–11.5 met.
 
 - **File:** `internal/admin/static.go`
 - **11.1** Serve only from the embedded `web/dist` filesystem via `embed.FS`. **No filesystem
@@ -367,7 +397,14 @@ against other local users. Recorded in `docs/known-limitations.md` at TD-6.
 - **Tests:** `/../../etc/passwd` → 404/400 · `/api/v1/../` → JSON 404 · null byte → 400 ·
   `index.html` is `no-store` · build succeeds with `web/dist` absent.
 
-## SEC-12 — Security test suite (M) — *deliverable artefact*
+## SEC-12 — Security test suite (M) — *deliverable artefact*  ✅ **COMPLETE + VERIFIED**
+
+> **Status: DONE.** `internal/admin/security_test.go` + `security_test_helpers_test.go`.
+> Package total: **430 cases**, `-race` clean, **passes under `-short`** (the CI gate) in ~1.1s.
+> Every attack class from SEC-0…SEC-11 is now exercised against one fully-wired server, with
+> **server-side execution counters** as ground truth per F12. Includes the SEC-12.2 route
+> completeness gate and the SEC-12.3 CORS invariant.
+> See [`sec12-verification.md`](./sec12-verification.md). Subtasks 12.1–12.4 met.
 
 - **File:** `internal/admin/security_test.go`
 - **12.1** One table-driven test file that runs the **entire** attack suite against a live
@@ -380,7 +417,15 @@ against other local users. Recorded in `docs/known-limitations.md` at TD-6.
 - **Done when:** this file is the regression net for every later feature task, and each feature
   task adds its own cases here.
 
-## SEC-13 — Security documentation (S)
+## SEC-13 — Security documentation (S)  ✅ **COMPLETE**
+
+> **Status: DONE.** `SECURITY.md` gained **Trust Boundary 5** and a new §6 operator checklist;
+> `docs/threat-model.md` gained **Threats 16–20**; `docs/known-limitations.md` gained
+> **limitations 102–107**, including an explicit statement that the admin server is **not yet
+> wired into the daemon** (ADM-7), so no claim in these documents implies it is reachable today.
+> Every test name and Go symbol cited was verified to exist. Subtasks 13.1–13.3 met.
+
+- **File:** `internal/admin/log.go`
 
 - **13.1** Add a console section to `SECURITY.md` covering the threat model and controls.
 - **13.2** Record the accepted risks explicitly in `docs/known-limitations.md`:

@@ -282,8 +282,30 @@ func TestSEC002_ExpandedSensitiveKeywords(t *testing.T) {
 			if data[tc.key] != tc.expected {
 				t.Errorf("key %q: expected %q, got %q", tc.key, tc.expected, data[tc.key])
 			}
-			if strings.Contains(buf.String(), tc.rawVal) {
-				t.Errorf("raw secret value leaked in output for key %q: %s", tc.key, buf.String())
+
+			// Scan for the raw secret with the timestamp field removed.
+			//
+			// The "time" field carries sub-second digits, so a numeric secret such as "888"
+			// can appear inside a legitimate timestamp (e.g. "...19.459888"). Scanning the
+			// whole line then reports a LEAK that never happened, failing at random
+			// depending on the clock. Excluding "time" keeps the assertion meaningful — the
+			// secret is still checked everywhere it could actually be logged, including the
+			// message and every other field.
+			scan := data
+			if _, ok := data["time"]; ok {
+				scan = make(map[string]any, len(data))
+				for k, v := range data {
+					if k != "time" {
+						scan[k] = v
+					}
+				}
+			}
+			scanned, err := json.Marshal(scan)
+			if err != nil {
+				t.Fatalf("re-marshal for leak scan: %v", err)
+			}
+			if strings.Contains(string(scanned), tc.rawVal) {
+				t.Errorf("raw secret value leaked in output for key %q: %s", tc.key, scanned)
 			}
 		})
 	}

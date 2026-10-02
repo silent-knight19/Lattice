@@ -103,6 +103,7 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 		eng         *engine.Engine
 		pprofSrv    *PprofServer
 		metricsSrv  *metrics.Server
+		adminSrv    *AdminServer
 		srv         *transport.Server
 		raftStorage *raft.Storage
 		raftNode    *raft.Node
@@ -134,6 +135,10 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 			metrics.DefaultRegistry.UnregisterGaugeFunc("lattice_lsm_level_files")
 			metrics.DefaultRegistry.UnregisterGaugeFunc("lattice_disk_free_bytes")
 			metrics.DefaultRegistry.UnregisterGaugeFunc("lattice_disk_total_bytes")
+		}
+		if adminSrv != nil {
+			_ = adminSrv.Shutdown(context.Background())
+			adminSrv.UnregisterMetrics(metrics.DefaultRegistry)
 		}
 		if eng != nil {
 			_ = eng.Close()
@@ -389,6 +394,18 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 		}
 	}
 
+	// Step 2c: Initialize the Lattice Console admin API if configured (SEC-6).
+	//
+	// Binding happens here, alongside pprof, so a port conflict is discovered before the
+	// engine commits to recovering the data directory.
+	var adminErr error
+	adminSrv, adminErr = NewAdminServer(cfg, stdout)
+	if adminErr != nil {
+		cleanup()
+		fmt.Fprintf(stderr, "lattice: failed to start admin console on %s: %v\n", cfg.AdminAddress, adminErr)
+		return ExitStartupError
+	}
+
 	// Step 3: Initialize Transport Server & Raft Subsystem (GAP C)
 	srvCfg := transport.DefaultServerConfig()
 	srvCfg.Address = cfg.Address
@@ -524,6 +541,16 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 		fmt.Fprintf(stdout, "lattice: pprof diagnostics listening on http://%s/debug/pprof/\n", pprofAddr)
 	}
 
+	// Step 5b: Start the Lattice Console if configured.
+	if adminSrv != nil {
+		if err := adminSrv.Start(); err != nil {
+			cleanup()
+			fmt.Fprintf(stderr, "lattice: failed to start admin console server: %v\n", err)
+			return ExitStartupError
+		}
+		adminSrv.RegisterMetrics(metrics.DefaultRegistry)
+	}
+
 	// Step 6: Running State Established
 	if cfg.Topology != nil {
 		fmt.Fprintf(stdout, "lattice: cluster topology initialized (node_id: %d, peers: %d, endpoint: %s)\n",
@@ -602,6 +629,15 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 		metrics.DefaultRegistry.UnregisterGaugeFunc("lattice_lsm_level_files")
 		metrics.DefaultRegistry.UnregisterGaugeFunc("lattice_disk_free_bytes")
 		metrics.DefaultRegistry.UnregisterGaugeFunc("lattice_disk_total_bytes")
+	}
+
+	if adminSrv != nil {
+		if adminErr := adminSrv.Shutdown(shutCtx); adminErr != nil {
+			fmt.Fprintf(stderr, "lattice: warning: admin console shutdown error: %v\n", adminErr)
+		} else if sErr := adminSrv.Err(); sErr != nil {
+			fmt.Fprintf(stderr, "lattice: warning: admin console accept error: %v\n", sErr)
+		}
+		adminSrv.UnregisterMetrics(metrics.DefaultRegistry)
 	}
 
 	if engErr := eng.Close(); engErr != nil {

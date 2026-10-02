@@ -986,10 +986,44 @@ type PeerConnectionManager struct {
 
 	listener           net.Listener
 	activeInboundConns atomic.Int64
+
+	// pendingInbound counts accepted inbound connections that have not yet completed
+	// the TLS handshake. Kept separate from activeInboundConns, which is only released
+	// when handleInboundConn returns, so a stalled unauthenticated handshake cannot
+	// consume a MaxInboundPeerConnections slot.
+	//
+	// Only counted while listenerTLS is true. A plaintext loopback listener performs
+	// no handshake and is trusted on first frame, so bounding its first-frame wait
+	// would silently reduce the documented MaxInboundPeerConnections capacity without
+	// addressing the threat, which is specifically stalled mTLS handshakes.
+	pendingInbound atomic.Int64
+
+	// listenerTLS records whether the inbound listener performs a TLS handshake. Set
+	// when the listener is constructed.
+	listenerTLS atomic.Bool
 }
 
 // MaxInboundPeerConnections is the maximum number of concurrent inbound connections permitted on the peer listener.
 const MaxInboundPeerConnections = 64
+
+// MaxPendingPeerHandshakes bounds concurrent pre-authentication TLS handshakes on the
+// inbound peer listener. Deliberately well below MaxInboundPeerConnections so a
+// stalled handshake burst cannot consume every inbound peer slot.
+const MaxPendingPeerHandshakes = 16
+
+// releasePendingInbound returns one pre-authentication handshake slot, never
+// dropping below zero so a double release cannot corrupt the count.
+func (m *PeerConnectionManager) releasePendingInbound() {
+	for {
+		cur := m.pendingInbound.Load()
+		if cur <= 0 {
+			return
+		}
+		if m.pendingInbound.CompareAndSwap(cur, cur-1) {
+			return
+		}
+	}
+}
 
 // NewPeerConnectionManager constructs a new PeerConnectionManager.
 //
@@ -1210,8 +1244,10 @@ func (m *PeerConnectionManager) StartListener(addr string) error {
 	if m.cfg.ListenerTLSConfig != nil {
 		listenerTLS := WrapPeerServerTLSConfig(m.cfg.ListenerTLSConfig, m.topology)
 		ln, err = tls.Listen("tcp", addr, listenerTLS)
+		m.listenerTLS.Store(true)
 	} else {
 		ln, err = net.Listen("tcp", addr)
+		m.listenerTLS.Store(false)
 	}
 	if err != nil {
 		return err
@@ -1246,6 +1282,9 @@ func (m *PeerConnectionManager) ServeListener(ln net.Listener) error {
 	if m.cfg.ListenerTLSConfig != nil {
 		listenerTLS := WrapPeerServerTLSConfig(m.cfg.ListenerTLSConfig, m.topology)
 		ln = tls.NewListener(ln, listenerTLS)
+		m.listenerTLS.Store(true)
+	} else {
+		m.listenerTLS.Store(false)
 	}
 
 	m.listener = ln
@@ -1289,7 +1328,25 @@ func (m *PeerConnectionManager) acceptLoop(ln net.Listener) {
 			}
 		}
 
+		// Bound pre-authentication concurrency BEFORE an inbound slot is consumed.
+		// activeInboundConns is only released when handleInboundConn returns, which
+		// includes the TLS handshake, so a handful of unauthenticated peers stalling
+		// their handshakes could otherwise occupy all MaxInboundPeerConnections slots
+		// and block every legitimate peer. A connection rejected here never touches
+		// activeInboundConns.
+		pendingCounted := m.listenerTLS.Load()
+		if pendingCounted {
+			if m.pendingInbound.Load() >= MaxPendingPeerHandshakes {
+				_ = conn.Close()
+				continue
+			}
+			m.pendingInbound.Add(1)
+		}
+
 		if m.activeInboundConns.Load() >= MaxInboundPeerConnections {
+			if pendingCounted {
+				m.releasePendingInbound()
+			}
 			_ = conn.Close()
 			continue
 		}
@@ -1305,6 +1362,19 @@ func (m *PeerConnectionManager) acceptLoop(ln net.Listener) {
 
 func (m *PeerConnectionManager) handleInboundConn(conn net.Conn) {
 	defer m.wg.Done()
+	// acceptLoop counted this connection against MaxPendingPeerHandshakes only when
+	// the listener performs TLS. Release that slot as soon as the handshake completes
+	// or fails. Guarded so the early returns below cannot double-release or release a
+	// slot this connection never held.
+	var pendingReleased bool
+	releasePending := func() {
+		if pendingReleased || !m.listenerTLS.Load() {
+			return
+		}
+		pendingReleased = true
+		m.releasePendingInbound()
+	}
+	defer releasePending()
 
 	var authenticatedNodeID cluster.NodeID
 	if tc, ok := conn.(*tls.Conn); ok {
@@ -1315,6 +1385,9 @@ func (m *PeerConnectionManager) handleInboundConn(conn net.Conn) {
 		handshakeCtx, handshakeCancel := context.WithTimeout(m.ctx, handshakeTimeout)
 		err := tc.HandshakeContext(handshakeCtx)
 		handshakeCancel()
+		// No longer pre-authentication, so the pending slot is free regardless of
+		// outcome. Idempotent, and a no-op on a plaintext listener.
+		releasePending()
 		if err != nil {
 			_ = conn.Close()
 			return

@@ -75,6 +75,20 @@ type ServerConfig struct {
 	// MaxConnections is the maximum number of concurrent client connections (default: 4096).
 	MaxConnections int
 
+	// MaxPendingHandshakes bounds how many connections may be simultaneously in the
+	// TLS handshake, before authentication, without consuming a MaxConnections slot
+	// (default: 256).
+	//
+	// Slots are otherwise consumed by trackConn *before* handleConn performs the
+	// handshake, so unauthenticated peers holding stalled handshakes could occupy every
+	// MaxConnections slot and refuse legitimate clients. Connections over this cap are
+	// closed immediately and never touch activeConns.
+	//
+	// It is intentionally far below MaxConnections: a burst of legitimate clients
+	// handshakes in well under the HeaderTimeout, while an attacker deliberately stalls
+	// and can therefore be shed cheaply.
+	MaxPendingHandshakes int
+
 	// MaxInFlightPerConn is the maximum number of concurrent in-flight requests permitted per TCP connection (default: 64).
 	MaxInFlightPerConn int
 
@@ -130,19 +144,26 @@ const (
 	DefaultMaxGlobalInFlight = 16384
 )
 
+// DefaultMaxPendingHandshakes bounds concurrent pre-authentication TLS handshakes on
+// the client listener. Deliberately far below DefaultMaxConnections: a legitimate
+// burst handshakes in milliseconds, whereas an attacker stalling handshakes can
+// occupy a slot for the full HeaderTimeout.
+const DefaultMaxPendingHandshakes = 256
+
 // DefaultServerConfig returns a production-hardened ServerConfig with safe default timeouts and limits.
 func DefaultServerConfig() ServerConfig {
 	return ServerConfig{
-		Address:            "127.0.0.1:9099",
-		MaxConnections:     4096,
-		MaxInFlightPerConn: DefaultMaxInFlightPerConn,
-		MaxGlobalInFlight:  DefaultMaxGlobalInFlight,
-		HeaderTimeout:      5 * time.Second,
-		PayloadTimeout:     10 * time.Second,
-		IdleTimeout:        60 * time.Second,
-		WriteTimeout:       5 * time.Second,
-		RequestTimeout:     5 * time.Second,
-		ShutdownTimeout:    5 * time.Second,
+		Address:              "127.0.0.1:9099",
+		MaxConnections:       4096,
+		MaxPendingHandshakes: DefaultMaxPendingHandshakes,
+		MaxInFlightPerConn:   DefaultMaxInFlightPerConn,
+		MaxGlobalInFlight:    DefaultMaxGlobalInFlight,
+		HeaderTimeout:        5 * time.Second,
+		PayloadTimeout:       10 * time.Second,
+		IdleTimeout:          60 * time.Second,
+		WriteTimeout:         5 * time.Second,
+		RequestTimeout:       5 * time.Second,
+		ShutdownTimeout:      5 * time.Second,
 	}
 }
 
@@ -198,6 +219,12 @@ type Server struct {
 	shutdownDone chan struct{}
 	wg           sync.WaitGroup
 	activeConns  atomic.Int64
+
+	// pendingHandshakes counts connections that have been accepted and are inside the
+	// TLS handshake but have not yet been authenticated. Guarded separately from
+	// activeConns so a stalled unauthenticated handshake cannot consume a
+	// MaxConnections slot.
+	pendingHandshakes atomic.Int64
 
 	globalInFlight    atomic.Int64
 	maxGlobalInFlight int64
@@ -572,12 +599,66 @@ func (s *Server) acceptLoop(l net.Listener) {
 			continue
 		}
 
-		if !s.trackConn(conn) {
+		// Bound pre-authentication concurrency BEFORE a MaxConnections slot is
+		// consumed. trackConn below increments activeConns, which handleConn does not
+		// release until the connection is fully torn down; doing that before the TLS
+		// handshake let unauthenticated peers hold every slot for the duration of a
+		// stalled handshake and refuse legitimate clients. A connection rejected here
+		// never touches activeConns.
+		//
+		// A CAS loop keeps the counter exact under concurrent accepts without adding a
+		// lock on the accept hot path.
+		pendingCap := s.cfg.MaxPendingHandshakes
+		if pendingCap <= 0 {
+			pendingCap = DefaultMaxPendingHandshakes
+		}
+		if !s.acquirePendingHandshake(int64(pendingCap)) {
 			conn.Close()
 			continue
 		}
 
+		if !s.trackConn(conn) {
+			s.releasePendingHandshake()
+			conn.Close()
+			continue
+		}
+
+		// handleConn releases the pending count as soon as the connection stops being
+		// pre-authentication, and again on the error paths before the handshake.
 		go s.handleConn(conn)
+	}
+}
+
+// acquirePendingHandshake reserves one of the pre-authentication handshake slots.
+// Returns false when the cap is already reached, in which case the caller must close
+// the connection without consuming a MaxConnections slot.
+func (s *Server) acquirePendingHandshake(cap int64) bool {
+	for {
+		cur := s.pendingHandshakes.Load()
+		if cur >= cap {
+			return false
+		}
+		if s.pendingHandshakes.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
+}
+
+// releasePendingHandshake returns one pre-authentication handshake slot.
+//
+// Saturating at zero on purpose: if the counter were ever driven negative, the
+// acquire guard `cur >= cap` would never trip again and the bound would silently
+// become unbounded, which is the fail-open direction. Saturating makes an
+// over-release harmless.
+func (s *Server) releasePendingHandshake() {
+	for {
+		cur := s.pendingHandshakes.Load()
+		if cur <= 0 {
+			return
+		}
+		if s.pendingHandshakes.CompareAndSwap(cur, cur-1) {
+			return
+		}
 	}
 }
 
@@ -619,6 +700,19 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.untrackConn(conn)
 	}()
 
+	// The pre-authentication slot is held only across the TLS handshake. Releasing it
+	// here means a slow handshake cannot throttle authenticated connections, and it is
+	// released exactly once whether the handshake succeeds, fails, or is bypassed
+	// (plaintext loopback, where there is no handshake at all).
+	pendingReleased := false
+	releasePending := func() {
+		if !pendingReleased {
+			pendingReleased = true
+			s.releasePendingHandshake()
+		}
+	}
+	defer releasePending()
+
 	isLoopback := IsLoopbackAddress(s.cfg.Address)
 	if conn.LocalAddr() != nil && !IsLoopbackAddress(conn.LocalAddr().String()) {
 		isLoopback = false
@@ -636,6 +730,11 @@ func (s *Server) handleConn(conn net.Conn) {
 		handshakeCtx, handshakeCancel := context.WithTimeout(connCtx, handshakeTimeout)
 		err := tc.HandshakeContext(handshakeCtx)
 		handshakeCancel()
+		// The connection is no longer pre-authentication, whether the handshake
+		// succeeded or failed. Release the slot now rather than holding it for the
+		// connection's whole lifetime; the deferred release is idempotent and covers
+		// the early-return paths.
+		releasePending()
 		if err != nil {
 			return
 		}

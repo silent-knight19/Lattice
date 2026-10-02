@@ -69,17 +69,31 @@ func (l *ClusterPeersList) UnmarshalJSON(data []byte) error {
 
 // Config encapsulates process and server configuration for the Lattice daemon.
 type Config struct {
-	DataDir           string            `json:"data_dir"`
-	Address           string            `json:"address"`
-	Port              int               `json:"port"`
-	ConfigPath        string            `json:"-"`
-	InsecureTransport bool              `json:"insecure_transport"`
-	PprofAddress      string            `json:"pprof_address"`
-	MetricsAddress    string            `json:"metrics_address"`
-	NodeID            uint64            `json:"node_id"`
-	PeerAddress       string            `json:"peer_address"`
-	ClusterPeers      ClusterPeersList  `json:"cluster_peers"`
-	Topology          *cluster.Topology `json:"-"`
+	DataDir           string `json:"data_dir"`
+	Address           string `json:"address"`
+	Port              int    `json:"port"`
+	ConfigPath        string `json:"-"`
+	InsecureTransport bool   `json:"insecure_transport"`
+	PprofAddress      string `json:"pprof_address"`
+	MetricsAddress    string `json:"metrics_address"`
+
+	// Lattice Console admin API (SEC-6). AdminAddress is empty by default, which
+	// disables the console entirely; the operator must opt in.
+	AdminAddress string `json:"admin_address"`
+	// AdminAllowRemote is a SECOND, independent opt-in required before the admin
+	// server may bind a non-loopback address. InsecureTransport alone is not enough,
+	// because it is easy to enable for the data path and would then silently expose
+	// engine internals.
+	AdminAllowRemote bool `json:"admin_allow_remote"`
+	// AdminAuthzPolicy and AdminAuthzPolicyFile reuse the existing certificate
+	// fingerprint -> role mapping format from internal/transport, so operators who
+	// already run --client-authz-policy need no new configuration.
+	AdminAuthzPolicy     map[string]string `json:"admin_authz_policy"`
+	AdminAuthzPolicyFile string            `json:"admin_authz_policy_file"`
+	NodeID               uint64            `json:"node_id"`
+	PeerAddress          string            `json:"peer_address"`
+	ClusterPeers         ClusterPeersList  `json:"cluster_peers"`
+	Topology             *cluster.Topology `json:"-"`
 
 	// Client TLS
 	TLSCertFile       string `json:"tls_cert_file"`
@@ -139,6 +153,10 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 		flagInsecureTransport     bool
 		flagPprofAddress          string
 		flagMetricsAddress        string
+		flagAdminAddress          string
+		flagAdminAllowRemote      bool
+		flagAdminAuthzPolicy      string
+		flagAdminAuthzPolicyFile  string
 		flagNodeID                uint64
 		flagPeerAddress           string
 		flagClusterPeers          string
@@ -164,6 +182,10 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 	fs.BoolVar(&flagInsecureTransport, "insecure-transport", false, "Explicit opt-in permitting unencrypted plaintext TCP on non-loopback addresses")
 	fs.StringVar(&flagPprofAddress, "pprof-address", "", "TCP bind address for HTTP pprof profiling diagnostics (e.g. 127.0.0.1:6060, loopback only)")
 	fs.StringVar(&flagMetricsAddress, "metrics-address", "", "TCP bind address for Prometheus metrics HTTP endpoint (e.g. 127.0.0.1:9100, :9100)")
+	fs.StringVar(&flagAdminAddress, "admin-address", "", "TCP bind address for the Lattice Console admin API (e.g. 127.0.0.1:7070, LOOPBACK ONLY; empty disables the console)")
+	fs.BoolVar(&flagAdminAllowRemote, "admin-allow-remote", false, "Permit the admin API to bind a NON-loopback address. Requires --insecure-transport as well; two independent opt-ins")
+	fs.StringVar(&flagAdminAuthzPolicy, "admin-authz-policy", "", "Comma-separated admin authorization policy mapping certificate fingerprints to roles (format: fp=role,fp=role)")
+	fs.StringVar(&flagAdminAuthzPolicyFile, "admin-authz-policy-file", "", "Path to JSON file containing admin authorization policy mapping certificate fingerprints to roles")
 	fs.Uint64Var(&flagNodeID, "node-id", 0, "Cluster node ID (> 0 in cluster mode; 0 for single-node)")
 	fs.StringVar(&flagPeerAddress, "peer-address", "", "TCP bind address for Raft peer transport (e.g. 127.0.0.1:9098)")
 	fs.StringVar(&flagClusterPeers, "cluster-peers", "", "Comma-separated list of cluster peers (format: id=host:port, e.g. 1=10.0.0.1:9098,2=10.0.0.2:9098)")
@@ -248,6 +270,28 @@ func ParseFlags(args []string, stdout, stderr io.Writer) (*Config, bool, error) 
 	}
 	if provided["metrics-address"] {
 		cfg.MetricsAddress = flagMetricsAddress
+	}
+	if provided["admin-address"] {
+		cfg.AdminAddress = flagAdminAddress
+	}
+	if provided["admin-allow-remote"] {
+		cfg.AdminAllowRemote = flagAdminAllowRemote
+	}
+	if provided["admin-authz-policy"] {
+		// Reuse the transport parser so the admin console accepts exactly the same
+		// "fp=role,fp=role" syntax as --client-authz-policy.
+		policy, err := transport.ParseAuthzPolicyString(flagAdminAuthzPolicy)
+		if err != nil {
+			return nil, false, fmt.Errorf("config error: invalid --admin-authz-policy: %w", err)
+		}
+		entries := make(map[string]string)
+		for fp, role := range policy.Bindings() {
+			entries[fp] = string(role)
+		}
+		cfg.AdminAuthzPolicy = entries
+	}
+	if provided["admin-authz-policy-file"] {
+		cfg.AdminAuthzPolicyFile = flagAdminAuthzPolicyFile
 	}
 	if provided["node-id"] {
 		cfg.NodeID = flagNodeID
@@ -514,6 +558,85 @@ func (c *Config) Validate() error {
 		if pPort != 0 && portsCollide(c.PprofAddress, c.Address) {
 			_, srvPortStr, _ := net.SplitHostPort(c.Address)
 			return fmt.Errorf("config error: --pprof-address port %s conflicts with server --address port %s", pPortStr, srvPortStr)
+		}
+	}
+
+	// Lattice Console Admin API Security Policy (SEC-6):
+	//
+	// The console exposes engine internals and, in the Lab, the ability to terminate the
+	// process. It is therefore treated more strictly than pprof:
+	//
+	//  1. Disabled by default (empty address means no listener at all).
+	//  2. Loopback-only unless --insecure-transport is set, matching --metrics-address.
+	//  3. AND a second, independent --admin-allow-remote opt-in on top of that. Enabling
+	//     insecure transport for the DATA path must never silently expose the console.
+	//  4. A wildcard bind is refused outright: it would publish the console on every
+	//     interface and yields no derivable Host allowlist.
+	if c.AdminAddress != "" {
+		aHost, aPortStr, err := net.SplitHostPort(c.AdminAddress)
+		if err != nil {
+			return fmt.Errorf("config error: invalid --admin-address %q (expected host:port): %w", c.AdminAddress, err)
+		}
+		aPort, err := strconv.Atoi(aPortStr)
+		if err != nil || aPort < 0 || aPort > 65535 {
+			return fmt.Errorf("config error: invalid port in --admin-address %q (must be between 0 and 65535)", c.AdminAddress)
+		}
+
+		if transport.IsLoopbackAddress(aHost) {
+			// Loopback is fine and needs no extra opt-in.
+		} else if !c.InsecureTransport {
+			return fmt.Errorf("config error: --admin-address %q must be a loopback interface (127.0.0.1, ::1, localhost); "+
+				"a non-loopback admin bind additionally requires --insecure-transport and --admin-allow-remote", c.AdminAddress)
+		} else if !c.AdminAllowRemote {
+			return fmt.Errorf("config error: --admin-address %q is non-loopback; "+
+				"it also requires the explicit --admin-allow-remote opt-in "+
+				"(--insecure-transport alone is deliberately not sufficient)", c.AdminAddress)
+		}
+
+		// A wildcard bind exposes the console on every interface and is never intended.
+		if ip := net.ParseIP(aHost); ip != nil && ip.IsUnspecified() {
+			return fmt.Errorf("config error: --admin-address %q is a wildcard bind; "+
+				"bind a specific address instead", c.AdminAddress)
+		}
+
+		// Port conflicts with the other listeners.
+		if aPort != 0 {
+			if portsCollide(c.AdminAddress, c.Address) {
+				_, srvPortStr, _ := net.SplitHostPort(c.Address)
+				return fmt.Errorf("config error: --admin-address port %s conflicts with server --address port %s", aPortStr, srvPortStr)
+			}
+			if c.MetricsAddress != "" && portsCollide(c.AdminAddress, c.MetricsAddress) {
+				return fmt.Errorf("config error: --admin-address port %s conflicts with --metrics-address", aPortStr)
+			}
+			if c.PprofAddress != "" && portsCollide(c.AdminAddress, c.PprofAddress) {
+				return fmt.Errorf("config error: --admin-address port %s conflicts with --pprof-address", aPortStr)
+			}
+		}
+	} else if c.AdminAllowRemote {
+		// Failing loudly beats silently ignoring a flag the operator believed was doing
+		// something.
+		return fmt.Errorf("config error: --admin-allow-remote was set but --admin-address is empty, " +
+			"so the console is disabled and the flag has no effect")
+	}
+
+	// Admin authorization policy must be present and well-formed before the console can
+	// make any authorization decision.
+	if c.AdminAddress != "" {
+		if c.AdminAuthzPolicyFile != "" && len(c.AdminAuthzPolicy) > 0 {
+			return fmt.Errorf("config error: --admin-authz-policy and --admin-authz-policy-file are mutually exclusive")
+		}
+		if c.AdminAuthzPolicyFile != "" {
+			if _, err := transport.LoadAuthzPolicyFile(c.AdminAuthzPolicyFile); err != nil {
+				return fmt.Errorf("config error: --admin-authz-policy-file: %w", err)
+			}
+		}
+		for fp, role := range c.AdminAuthzPolicy {
+			if _, err := transport.ValidateFingerprint(fp); err != nil {
+				return fmt.Errorf("config error: --admin-authz-policy: %w", err)
+			}
+			if _, err := transport.ParseRole(role); err != nil {
+				return fmt.Errorf("config error: --admin-authz-policy role for fingerprint: %w", err)
+			}
 		}
 	}
 

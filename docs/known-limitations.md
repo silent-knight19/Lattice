@@ -1965,4 +1965,125 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 101. Pre-Authentication Handshake Bounds on Both Listeners
+
+* **What Changed**: On the client listener, `acceptLoop` called `trackConn` — which increments `activeConns` — *before* `handleConn` performed the TLS handshake, and `activeConns` was only released when the connection was fully torn down. An unauthenticated peer holding a stalled handshake therefore occupied a real `MaxConnections` (4096) slot for the duration of `HeaderTimeout`, and enough of them refused every legitimate client. The peer listener had the same shape against `MaxInboundPeerConnections` (64).
+* **Fix**: Both listeners now bound pre-authentication concurrency separately, and a connection shed by that bound never touches the real slot counter.
+  1. *Client*: `ServerConfig.MaxPendingHandshakes` (`DefaultMaxPendingHandshakes` = 256), acquired with a CAS loop before `trackConn` and released the moment the handshake completes or fails. Deliberately far below `MaxConnections`: a legitimate burst handshakes in milliseconds, while an attacker stalling a handshake can hold a slot for the full `HeaderTimeout`.
+  2. *Peer*: `MaxPendingPeerHandshakes` = 16 against `MaxInboundPeerConnections` = 64.
+* **Release Is Saturating, By Design**: Both release helpers stop at zero instead of decrementing past it. A counter driven negative would make the `cur >= cap` acquire guard permanently unsatisfiable, silently turning the bound *unbounded* — the fail-open direction. An over-release is therefore harmless.
+* **Peer Accounting Is Conditional (important)**: The peer bound applies **only when the listener performs a TLS handshake** (`listenerTLS`, set when the listener is constructed). A plaintext loopback peer listener is trusted on first frame and performs no handshake, so bounding its first-frame wait would have silently reduced the documented `MaxInboundPeerConnections` = 64 capacity without addressing the stated threat. This was caught by the pre-existing `TestPeerConnectionManager_InboundConnectionLimit`, which dials 64 non-transmitting plaintext connections and asserts all 64 are admitted.
+* **Verification**: `internal/transport/pending_handshake_test.go` covers cap accounting, idempotent/saturating release, concurrent acquire never exceeding the cap under 64 racers, and defaults being positive and strictly below their ceilings. The decisive test is end-to-end: it starts a TLS server, opens 30 connections that never send a ClientHello, and asserts `activeConns` stays within `MaxPendingHandshakes`. Measured **with** the gate: `pending=3 active=3` of 30 stallers. Measured **without** it: `pending=0 active=30`. `go test -race ./internal/transport/` is clean.
+* **Honest Note On Test Value**: The accounting-only tests pass whether or not the accept-path gate is present, because on a plaintext listener `handleConn` performs no handshake and releases immediately. Only the end-to-end TLS test discriminates. The gate-removal check was run specifically to confirm this rather than assuming the suite proved it.
+* **Residual**: Amplification is bounded, not eliminated. Because each stalled handshake costs the attacker a TCP connection plus a file descriptor, the ratio of attacker cost to shed victim traffic is close to 1:1. This closes a cheap eviction path, not a volumetric flood; volumetric defence remains `MaxConnections`, the global in-flight ceiling, and OS-level limits.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (no change to any established limit; `MaxInboundPeerConnections` = 64 still holds).
+  * Performance: **Negligible** (one CAS per accepted connection).
+  * Security: **Improved** (unauthenticated handshakes can no longer monopolize connection slots).
+
+### 102. Console Loopback Binding Is Not an Authentication Boundary
+
+* **Limitation**: The Lattice Console admin API binds to loopback by default, and loopback binding is often mistaken for authentication. It is not. Any local user, any local process, and any container sharing the host network namespace can reach the port.
+* **Why Accepted**: Loopback is the correct default for an operator console and matches the established `--pprof-address` precedent. Requiring authentication for a loopback service would add an identity system the data path does not need. When mTLS is configured the console does derive a role from the verified client certificate, which is the intended way to add real authentication.
+* **Dimensional Impact**:
+  * Security: **Accepted risk**. Documented rather than mitigated. A unix-domain socket with filesystem permissions would narrow it and is recorded as future work.
+* **Honest Note**: `BindLoopback` supports a remote-bind opt-in because `--insecure-transport` alone is too easy to trigger by accident. That opt-in **is** now operator-reachable as `--admin-allow-remote`, and it requires `--insecure-transport` as well (SEC-6). A wildcard bind is refused outright. Note that this makes the surface reachable, so this limitation is now a **live** risk rather than a theoretical one: any local process that can open a TCP connection to the loopback port can make an unauthenticated attempt. The console fails closed when no authorization policy is configured (limitation 109), which mitigates it, but an operator who configures a policy grants local processes the corresponding reach.
+
+---
+
+### 103. Console CSRF Token Is Per-Daemon-Boot, With No Persistence
+
+* **Limitation**: The anti-CSRF token is 256 bits from `crypto/rand`, regenerated on every daemon start and never persisted. A browser tab that was open across a restart holds a stale token and every mutating request fails until the client re-fetches `GET /api/v1/session`.
+* **Why Accepted**: This is a deliberate simplification with a security benefit. Because the token changes every boot, a token captured from a log, a screenshot, a stale tab, or an old core dump is useless against the running server, so there is no revocation or expiry mechanism to get wrong.
+* **Trade-off**: The console must handle the stale-token case gracefully. `GET /api/v1/session` returns a `boot_id` precisely so a client can detect the restart instead of failing opaquely.
+* **Verification**: `TestCSRFToken_StaleTokenFromPreviousBootRejected` and `TestSecuritySuite_CSRFAndConfirm/stale_token_from_a_previous_boot`.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** — no stale-token window exists.
+  * Security: **Improved** — no persistence means no on-disk secret.
+
+---
+
+### 104. Console Has No Multi-User Session Isolation
+
+* **Limitation**: The console has no login, no sessions, and no per-user view state. Every caller sees the same cluster and engine state, and authorization is re-evaluated per request from the presented principal.
+* **Why Accepted**: The console is an operator tool for a single-administration database, not a multi-tenant product. Inventing a session layer would duplicate identity management that `internal/transport` already owns via certificate fingerprints and the authz policy.
+* **Consequence**: If two operators use the console concurrently, their actions appear together in one audit trail, distinguished only by `principal_fp` and `request_id`. There is no "only my changes" view and no undo of another operator's action.
+* **Dimensional Impact**:
+  * Security: **Neutral** — request-scoped authorization is enforced on every call; per-session state would be a convenience, not a control.
+
+---
+
+### 105. Console Forensics Endpoints Depend on a Three-Part Path Gate
+
+* **Limitation**: The SSTable and WAL inspection endpoints are only as safe as the path-validation gate in front of them. Measured during the security spike: `security.CleanAndValidatePath` **accepts** `../../etc/passwd`, and the CLI forensic helpers (`InspectSSTable`, `DumpWAL`) perform **no** containment check at all — correctly so for a local operator, but unsafe to expose over HTTP.
+* **Why Recorded**: This is a standing hazard rather than a current defect. Any future endpoint that calls the CLI helpers directly, or that validates a filename without `security.ResolvePath`, reintroduces arbitrary file read.
+* **Required Gate** (all three parts):
+  1. `security.ValidateDatabaseFileName` — bare filename, `[a-zA-Z0-9_.-]` only.
+  2. `security.ResolvePath` — containment plus symlink canonicalisation; this is the part that actually blocks traversal.
+  3. An extension allowlist (`.sst`, `^wal_\d{12}\.log$`, `MANIFEST-*`, `CURRENT`).
+* **Verification**: `TestSecuritySuite_SymlinkEscape` pins the primitive. The asset surface is pinned separately by `TestSecuritySuite_RawByteTraversal`, which speaks raw HTTP because `curl` and `net/http` normalise `../` client-side and would make a normal test vacuous.
+* **Dimensional Impact**:
+  * Security: **Enforced at the primitive**; the risk is future code bypassing it, which the completeness test and review are meant to catch.
+
+---
+
+### 106. Console Error Bodies Are Intentionally Uninformative
+
+* **Limitation**: Every failure returns a stable opaque code plus static text (`{"error":{"code":"invalid_path","message":"the supplied path was rejected"}}`). The specific cause — missing file, permission denied, corrupt data — is not distinguishable by a client.
+* **Why Accepted**: Error text is an information channel. `InvalidPathError.Error()` renders the absolute path and root, so forwarding it would disclose filesystem layout; distinguishing "not found" from "denied" turns the API into a probing oracle. The detail goes to the server log, correlated by a per-request `X-Request-Id`.
+* **Operational Cost**: Diagnosing a client-reported failure requires the request id from the response header and access to the server log. That is the intended trade, not an oversight.
+* **Verification**: `TestSecuritySuite_ErrorLeakage`; live proof in [`sec9-verification.md`](user%20interface/sec9-verification.md) showing the client response and the server log side by side.
+* **Dimensional Impact**:
+  * Security: **Improved** — no path, key, or value material can cross the wire in an error.
+  * Observability: **Reduced** — correlated via request id instead of error text.
+
+### 107. Console Admin Server Is Not Yet Wired Into the Daemon
+
+* **Status: RESOLVED by SEC-6.** `--admin-address`, `--admin-allow-remote`,
+  `--admin-authz-policy`, `--admin-authz-policy-file` now exist, `cmd/lattice/admin.go`
+  constructs and drains the console, and a loud startup warning fires whenever it is enabled.
+  See [`sec6-verification.md`](user%20interface/sec6-verification.md). Retained below as the
+  original record of the gap.
+* **Limitation (as originally recorded)**: `internal/admin` is complete and independently tested (430 cases), but no flag starts it. `cmd/lattice` does not yet construct an `admin.Server`, so the console is unreachable from a running daemon. The `--admin-address`, `--admin-allow-remote`, and `--admin-authz-policy` flags do not exist yet.
+* **Why Recorded**: Every other console document describes the security posture of a server that cannot yet be started. Stating that plainly avoids a reader assuming the protections are reachable in production.
+* **What Exists Today**: `BindLoopback` performs pre-bind and post-bind loopback enforcement and refuses wildcard binds; `BindResult` returns derived `HostAllowlist` and `OriginAllowlist`. The middleware chain, router, event bus, and static asset handler are complete and wired together by the test harness in `security_test.go`.
+* **What ADM-7 Must Do**: Add the flags following the existing `cmd/lattice/config.go` pattern, construct the server in the ordered startup (alongside pprof and metrics), register the drop counter and `HasAssets` warning, and drain it in the ordered shutdown — including unregistering every gauge, per the existing `UnregisterGaugeFunc` pattern.
+* **Dimensional Impact**:
+  * Security: **Changed** — the console is now operator-reachable, so this limitation became a live surface rather than dead code. The binding surface is loopback-only unless two independent opt-ins are given, and a wildcard is refused outright.
+
+---
+
+### 108. Console Endpoint Handlers Are Not Yet Registered
+
+* **Limitation**: The console now starts and serves, but only `/api/v1/session` and
+  `/api/v1/events` are implemented. The health, node, config, key/value, compaction, WAL, and
+  admin-exec handlers arrive with their respective phases. `NewServer` registers only the
+  handlers that exist, so an unimplemented endpoint is an **absent route (404)** rather than a
+  stub or an error.
+* **Why Recorded**: A listening console that answers only two endpoints can be mistaken for a
+  finished product, and a 404 may be misread as an authorization failure rather than "not
+  implemented yet".
+* **Dimensional Impact**:
+  * Security: **Neutral** — default-deny holds. An unregistered route is not a permitted one.
+
+---
+
+### 109. Console Fails Closed Without mTLS, So It Serves No Data Until Configured
+
+* **Limitation**: With the default loopback configuration there is no TLS listener and therefore
+  no verified client certificate, so `Server.defaultResolver` returns a nil principal and
+  **every** API request is denied. An operator who starts the console with only
+  `--admin-address` sees a reachable server that authorizes nothing.
+* **Why Recorded**: This is deliberate (granting `admin` to any local process would be worse),
+  but "the console is up and everything returns 403" is a confusing first experience and must be
+  documented rather than left to be discovered.
+* **What Exists Today**: `SetPrincipalResolver` allows an operator-supplied resolver to be
+  installed. The loopback-local-principal versus Host/Origin-protected `/session` bootstrap
+  decision remains open by design; SEC-0's drive-by-localhost finding is a direct argument
+  against granting unauthenticated local access.
+* **Dimensional Impact**:
+  * Security: **Neutral** — fail-closed. Availability impact only.
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*

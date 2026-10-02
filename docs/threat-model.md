@@ -248,6 +248,80 @@
 * **Automated Test**: Multi-tenant write saturation tests verifying low-write tenants maintain bounded latency and unevicted cache reservations under high-write neighbor activity.
 * **Residual Risk**: Low.
 
+### Threat 16: Drive-By Localhost Attack Against the Admin Console (CSRF)
+
+* **Threat**: An unrelated web page visited by an operator causes the operator's browser to send requests to the loopback admin console — including state-changing ones such as triggering a compaction, forcing a Raft election, or (in the Lab) killing the node.
+* **Attack Surface**: `internal/admin` HTTP listener bound to `127.0.0.1`.
+* **Impact**: **Critical** — arbitrary admin actions with zero user interaction; up to process termination.
+* **Likelihood**: High. No user action beyond visiting a page is required.
+* **Evidence**: Reproduced empirically with headless Chrome before any defence existed. The server-side log showed the mutating handler executing **twice** while the page's own JavaScript reported `"Failed to fetch"`. See [`docs/user interface/sec0-spike-findings.md`](user%20interface/sec0-spike-findings.md).
+* **Mitigation**:
+  1. `OriginGuard` (`internal/admin/origin.go`) — exact scheme/host/port match; absent `Origin` permitted (non-browser callers send none, and an attacker cannot suppress it).
+  2. `HostGuard` (`internal/admin/hostguard.go`) — defeats DNS rebinding, where `Origin` is attacker-controlled *and* self-consistent.
+  3. `CSRFGuard` (`internal/admin/csrf.go`) — independent 256-bit per-boot token, compared in constant time over digests.
+  4. The admin server **never** emits `Access-Control-*`, which is the *exfiltration* control (it stops cross-origin reads) but explicitly **not** the CSRF control.
+* **Automated Test**: `internal/admin/security_test.go` → `TestSecuritySuite_DriveByOrigin`, asserting the inner handler never executes.
+* **Residual Risk**: Low, given all four layers. Any single bypass degrades to the next.
+
+---
+
+### Threat 17: Clickjacking of Destructive Console Controls
+
+* **Threat**: An attacker frames the console and induces an operator to click a destructive control — most seriously the Lab "crash this node" action or an orphan-file cleanup.
+* **Attack Surface**: Console HTML served to a browser.
+* **Impact**: High — unintended process termination or data loss.
+* **Likelihood**: Medium.
+* **Mitigation**: `Content-Security-Policy` with `frame-ancestors 'none'`, plus `X-Frame-Options: DENY`, on every response including errors (`internal/admin/headers.go`). The CSP additionally carries **no** `unsafe-inline` and **no** `unsafe-eval`, so injected markup cannot execute even if a rendering flaw appears.
+* **Automated Test**: `TestSecuritySuite_HeaderPresence`; A/B proof in [`sec5-verification.md`](user%20interface/sec5-verification.md) where identical injected markup executes without the headers and is blocked with them.
+* **Residual Risk**: Low.
+
+---
+
+### Threat 18: Arbitrary File Read via Console Forensics Endpoints
+
+* **Threat**: A caller supplies a `file=` parameter naming a path outside the data directory, or a symlink within it pointing outside, to read arbitrary host files.
+* **Attack Surface**: SSTable / WAL inspection endpoints (Phase C; not yet implemented).
+* **Impact**: Critical — disclosure of private keys, SSH material, and other tenants' data.
+* **Likelihood**: High if the CLI path-handling helpers are reused naively.
+* **Evidence**: `security.CleanAndValidatePath` was measured to **accept** `../../etc/passwd`; containment lives only in `security.ResolvePath` / `ValidateContainment`. Both CLI forensic tools (`InspectSSTable`, `DumpWAL`) perform **no** containment — correct for a local operator, unsafe over HTTP.
+* **Mitigation**: Triple gate, all three required: (1) `ValidateDatabaseFileName` (bare filename, `[a-zA-Z0-9_.-]`), (2) `ResolvePath` (containment + symlink canonicalisation), (3) extension allowlist.
+* **Automated Test**: `TestSecuritySuite_SymlinkEscape` pins the primitive; `TestSecuritySuite_RawByteTraversal` pins the asset surface over raw TCP.
+* **Residual Risk**: Low once the gate is in place; **high** if any endpoint ever calls the CLI helpers directly.
+
+---
+
+### Threat 19: Console Resource Exhaustion (SSE Flood, Oversize Bodies)
+
+* **Threat**: A client opens many long-lived event streams, or posts oversized bodies, to exhaust memory, file descriptors, or goroutines.
+* **Attack Surface**: `/api/v1/events` (SSE), all mutating endpoints.
+* **Impact**: High — daemon degradation affecting the data path, not just the console.
+* **Likelihood**: Medium.
+* **Mitigation**:
+  1. `EventBus` **never blocks on a consumer** — a slow subscriber has events dropped and counted, so a stalled browser cannot stall a Raft transition hook running on the engine's critical path.
+  2. Global subscriber cap (8) and per-IP cap (4), enforced *before* a channel is allocated; plus a listener-level connection limiter.
+  3. Per-route `http.MaxBytesReader` caps derived from the **engine's own** limits rather than round numbers.
+  4. `ReadHeaderTimeout` 5s (Slowloris); `WriteTimeout` deliberately **0** so SSE is not severed, with per-request deadlines applied only to non-streaming handlers.
+* **Automated Test**: `TestSecuritySuite_SSEFlood`; `TestSecuritySuite_OversizeBody`; `TestSecuritySuite_NoGoroutineLeakAfterAttacks`.
+* **Residual Risk**: Low for the console; a loopback-bound peer remains the volumetric-flood concern (see the existing connection-limit limitation).
+
+---
+
+### Threat 20: Sensitive Data Disclosure via Console Errors and Logs
+
+* **Threat**: Internal error strings or log fields leak filesystem paths, key/value data, or the CSRF token.
+* **Attack Surface**: HTTP error responses; the audit log.
+* **Impact**: Medium–High — disclosure of filesystem layout and user data; forged log lines.
+* **Likelihood**: Medium. Measured: `InvalidPathError.Error()` renders the absolute path and root, and the base logger's redaction is **purely key-name based** — the same secret logged under a neutral field name was not redacted.
+* **Mitigation**:
+  1. `Fail`/`WriteCoded` (`internal/admin/errors.go`) — the client receives a stable opaque code plus **static** text; `messageFor` performs no interpolation anywhere.
+  2. Request detail goes to the server log, correlated by a 128-bit `X-Request-Id` that is **never** taken from an inbound header.
+  3. `RedactValue` redactions by field name, **PEM shape**, and token shape — not by field name alone.
+  4. Every logged field truncated to 256 bytes and stripped of control characters.
+* **Automated Test**: `TestSecuritySuite_ErrorLeakage`; `TestSecuritySuite_NoCSRFTokenEverLogged`.
+* **Residual Risk**: Low.
+
+---
+
 ---
 
 *End of Security Threat Model — Lattice v1.0.0-THREAT-MODEL*

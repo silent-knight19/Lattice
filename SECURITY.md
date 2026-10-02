@@ -48,7 +48,7 @@ Please include in your report:
 
 ## 4. Trust Boundaries & Scope
 
-As defined in [`docs/threat-model.md`](docs/threat-model.md), Lattice enforces four distinct trust boundaries:
+As defined in [`docs/threat-model.md`](docs/threat-model.md), Lattice enforces five distinct trust boundaries:
 
 1. **Trust Boundary 1: Client / Transport Layer (`internal/transport`)**
    - Defensive TCP binary framing with magic validation (`0x4C415454`), CRC32-IEEE checksum verification, and hard payload length bounds (`MaxPayloadLength = 5 MiB`) enforced before memory allocation.
@@ -65,6 +65,13 @@ As defined in [`docs/threat-model.md`](docs/threat-model.md), Lattice enforces f
    - Automated redaction of sensitive credentials, passwords, cryptographic keys, tokens, session IDs, and seeds across flat attributes, nested structures, maps, slices, structs, and formatted messages.
    - Bounded metric label cardinality (`O(1)` pre-allocated dimension matrices) preventing metric memory exhaustion.
    - Diagnostic pprof endpoints strictly bound to loopback addresses (`127.0.0.1` / `::1`) with pre- and post-bind address assertion.
+5. **Trust Boundary 5: Lattice Console Admin API (`internal/admin`, `web`)**
+   - Loopback-only by default, and **disabled entirely unless `--admin-address` is set**. Pre-**and** post-bind loopback verification, mirroring the pprof precedent; wildcard binds (`0.0.0.0` / `::`) are refused unconditionally. A non-loopback bind requires **two independent opt-ins** — `--insecure-transport` *and* `--admin-allow-remote` — so enabling insecure transport for the data path cannot silently publish engine internals.
+   - Defended against the **drive-by localhost** attack — an unrelated web page causing the operator's browser to issue admin requests. Four independent layers: `OriginGuard` (exact scheme/host/port), `HostGuard` (DNS-rebinding defence), `CSRFGuard` (256-bit per-boot token, constant-time digest comparison), and a permanent no-`Access-Control-*` invariant.
+   - Default-deny routing: a route cannot exist without declaring a permission, enforced by the router itself and by a CI completeness test. Reuses the existing `reader` / `writer` / `admin` RBAC vocabulary from `internal/transport` — no parallel identity system.
+   - Response hardening: strict CSP without `unsafe-inline`/`unsafe-eval`, `frame-ancestors 'none'`, `nosniff`, `no-store`; opaque error envelopes with per-request `X-Request-Id`; bounded request bodies, per-handler deadlines, and SSE-specific connection budgets.
+   - Static assets are served from an `embed.FS` and validated against `fs.ValidPath`, so **no user-supplied path is ever opened**. No filesystem path from request input is concatenated anywhere.
+   - Design and verification records: [`docs/user interface/ui-console-design.md`](docs/user%20interface/ui-console-design.md) and [`docs/user interface/sec0-spike-findings.md`](docs/user%20interface/sec0-spike-findings.md).
 
 ---
 
@@ -81,3 +88,40 @@ Lattice maintains comprehensive security audit artifacts and verification tests:
 - Phase 10–12 Security Seal: [`docs/security/security-audit-phase-10-12.md`](docs/security/security-audit-phase-10-12.md)
 - SSTable Publication Hardening: [`internal/sstable/sec06_remediation_test.go`](internal/sstable/sec06_remediation_test.go)
 - Automated AST Security Linter: [`internal/security/`](internal/security/)
+- Console Security Test Suite (430 cases, `-race` clean): [`internal/admin/security_test.go`](internal/admin/security_test.go)
+
+---
+
+## 6. Lattice Console — Operator Checklist
+
+The console exposes engine internals and, in the Lab, the ability to terminate the process.
+It is a **privileged** surface and should be treated as such.
+
+### 6.1 Deployment
+
+1. **Bind loopback only.** Leave `--admin-address` unset unless you need the console; the console does not exist without it. When set, prefer `127.0.0.1:7070`. Never bind it to a routable interface: a non-loopback bind needs both `--insecure-transport` and `--admin-allow-remote`, and even then a wildcard (`0.0.0.0` / `::`) is refused.
+2. **Do not expose it.** There is no supported reverse-proxy or internet-facing deployment. If you must reach it remotely, use an SSH tunnel to loopback rather than a network bind.
+3. **Prefer mTLS.** When the daemon is configured with client certificates, the console derives the caller's role from the verified certificate fingerprint. Configure it with `--admin-authz-policy` / `--admin-authz-policy-file`, which accept exactly the same `fp=role` syntax as the data path's `--client-authz-policy` — there is no separate console identity system to learn. **Without a policy the console authorizes nothing** and returns `403` for every API request; that is fail-closed by design, not a misconfiguration (limitation 109).
+4. **Grant `admin` sparingly.** `admin` unlocks Raft leadership campaigns, orphan-file cleanup, diagnostics bundles, and the crash Lab. Prefer `reader` for dashboards and `writer` for routine key operations.
+
+### 6.2 Runtime
+
+5. **Expect a loud startup warning.** The daemon logs one line when the admin server is enabled, precisely because it exposes engine internals.
+6. **Watch for degraded mode.** The Overview page surfaces WAL poisoning, failed compactions, orphaned files, and lost quorum. Treat those as incidents.
+7. **Read the startup output.** The daemon logs one line when the admin server is enabled. The `/system` page (Phase H) will additionally flag `--insecure-transport` and report whether a real frontend build is embedded; until then, check the startup flags directly.
+
+### 6.3 Known accepted risks
+
+See [`docs/known-limitations.md`](docs/known-limitations.md) for the full register. The
+console-relevant entries are:
+
+- **Loopback is not authentication.** Any local user or process can reach the port. This is an accepted boundary of the design, not an oversight.
+- **The CSRF token is per-daemon-boot.** A restart invalidates it; a browser tab holding a stale token will fail every write until it re-fetches `/api/v1/session`.
+- **There is no multi-user session isolation in the console.** Every caller sees the same view; authorization is enforced per request, not per session.
+- **A local attacker can read the daemon's process memory**, including the CSRF token, and therefore acts with whatever role that token plus their own identity permits. Loopback is not a sandbox.
+
+### 6.4 Reporting a console vulnerability
+
+Console issues follow the same process as §3. Please state whether the finding requires a
+browser (drive-by, XSS, clickjacking) or only direct HTTP access; the reproduction differs and
+the browser-class issues are the priority.
