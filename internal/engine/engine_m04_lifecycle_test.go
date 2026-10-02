@@ -132,9 +132,13 @@ func compactOnce(t *testing.T, eng *engine.Engine, dir string) (bool, error) {
 // TestEngineM04_CompactionThenShutdown runs a real compaction to completion
 // before Close: flushed L0 files are valid compaction inputs, the L1 output
 // survives shutdown, and reopen serves the compacted state.
+//
+// Background compaction is disabled so this test deterministically exercises the
+// external/manual compaction path. With the Engine's own compactor running it
+// would drain L0 before compactOnce runs, and "found work" would be a race.
 func TestEngineM04_CompactionThenShutdown(t *testing.T) {
 	dir := t.TempDir()
-	eng := newRealWALEngine(t, dir, 4096)
+	eng := newRealWALEngineNoBackgroundCompaction(t, dir, 4096)
 	ctx := testCtx()
 	ref := map[string]string{}
 	for i := 0; i < 240; i++ {

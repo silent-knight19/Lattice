@@ -41,6 +41,33 @@ func newRealWALEngineNoOpen(t *testing.T, dir string) *engine.Engine {
 	})
 }
 
+// newRealWALEngineNoBackgroundCompaction creates a DB-backed Engine with the
+// background leveled compactor disabled.
+//
+// Use this only for tests that drive compaction through an external/manual path
+// (see compactOnce in engine_m04_lifecycle_test.go). With background compaction
+// enabled the Engine may drain L0 on its own before the manual pass runs, which
+// makes "did the manual compactor find work?" non-deterministic. Tests that
+// assert on raw L0 growth, or that simply want production behavior, must use
+// newRealWALEngine instead.
+func newRealWALEngineNoBackgroundCompaction(t *testing.T, dir string, threshold uint64) *engine.Engine {
+	t.Helper()
+	eng := engine.NewEngineWithOptions(engine.EngineOptions{
+		DBPath: dir,
+		Backpressure: engine.BackpressureConfig{
+			MaxMemoryBytes: 256 * 1024 * 1024, HighWatermark: 0.80, HardWatermark: 0.95, MaxWaitTimeout: 5 * time.Second,
+		},
+		DisableCompaction: true,
+	})
+	if threshold > 0 {
+		eng.SetFlushThresholdForTesting(threshold)
+	}
+	if err := eng.Open(); err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	return eng
+}
+
 // TestEngineM02_WriteContinuesDuringBlockedFlush is the mandatory M02 proof:
 // the flusher is deterministically paused mid-I/O, fresh writes must complete
 // without waiting, then the release must preserve the full dataset.

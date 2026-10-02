@@ -20,6 +20,55 @@ func SetRaftSyncDirFnForTesting(fn func(dirPath string) error) func() {
 	}
 }
 
+// SetRaftSyncLogFnForTesting overrides the fdatasync durability barrier on the
+// in-place log append path for fault-injection testing.
+func SetRaftSyncLogFnForTesting(fn func(f *os.File) error) func() {
+	orig := raftSyncLogFn
+	raftSyncLogFn = fn
+	return func() {
+		raftSyncLogFn = orig
+	}
+}
+
+// SetRaftWriteLogFnForTesting overrides the in-place log append write for
+// fault-injection testing.
+func SetRaftWriteLogFnForTesting(fn func(f *os.File, b []byte) (int, error)) func() {
+	orig := raftWriteLogFn
+	raftWriteLogFn = fn
+	return func() {
+		raftWriteLogFn = orig
+	}
+}
+
+// SetRaftSyncStateTmpFnForTesting overrides the fdatasync durability barrier on
+// the HardState staging file for fault-injection testing.
+func SetRaftSyncStateTmpFnForTesting(fn func(f *os.File) error) func() {
+	orig := raftSyncStateTmpFn
+	raftSyncStateTmpFn = fn
+	return func() {
+		raftSyncStateTmpFn = orig
+	}
+}
+
+// SetRaftWriteStateTmpFnForTesting overrides the HardState staging write for
+// fault-injection testing.
+func SetRaftWriteStateTmpFnForTesting(fn func(f *os.File, b []byte) (int, error)) func() {
+	orig := raftWriteStateTmpFn
+	raftWriteStateTmpFn = fn
+	return func() {
+		raftWriteStateTmpFn = orig
+	}
+}
+
+// IsPoisonedForTesting reports whether the Storage entered the terminal poisoned
+// state due to a write or durability-barrier failure.
+func (s *Storage) IsPoisonedForTesting() bool {
+	if s == nil {
+		return false
+	}
+	return s.poisoned.Load()
+}
+
 // SetRaftOpenFileFnForTesting overrides os.OpenFile for fault-injection testing.
 func SetRaftOpenFileFnForTesting(fn func(name string, flag int, perm os.FileMode) (*os.File, error)) func() {
 	orig := raftOpenFileFn

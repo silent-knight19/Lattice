@@ -16,6 +16,7 @@ import (
 
 	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/cache"
+	"github.com/silent-knight19/lattice/internal/compaction"
 	"github.com/silent-knight19/lattice/internal/errors"
 	"github.com/silent-knight19/lattice/internal/memtable"
 	"github.com/silent-knight19/lattice/internal/metrics"
@@ -134,6 +135,12 @@ type Engine struct {
 	closeDone       chan struct{}
 	closeErr        error
 	shutdownTimeout time.Duration
+
+	// Background leveled compaction. compactor is nil when compaction is disabled.
+	// compactionEnabled mirrors the configured intent so CompactionStats can report
+	// it without touching worker internals.
+	compactor         *compactionWorker
+	compactionEnabled bool
 }
 
 const (
@@ -175,6 +182,20 @@ type EngineOptions struct {
 	// This guarantees the L0 stall is always bounded. A write is never blocked
 	// indefinitely by pressure it cannot itself relieve.
 	L0StallTimeout time.Duration
+
+	// DisableCompaction turns off the background leveled compactor. When false
+	// (the default) the Engine compacts L0 and deeper levels in the background
+	// once a level reaches its policy score, which is what keeps L0 bounded and
+	// makes the L0 stall gate transient rather than permanent.
+	//
+	// Disabling compaction is only appropriate for tests that assert on raw L0
+	// file counts; a long-running engine with compaction disabled will accumulate
+	// L0 files without bound and eventually reject writes at the stall gate.
+	DisableCompaction bool
+
+	// CompactionPolicy overrides the leveled compaction scoring thresholds.
+	// Defaults to compaction.DefaultCompactionPolicy() when the zero value.
+	CompactionPolicy compaction.CompactionPolicy
 }
 
 // NewEngine constructs an Engine instance backed by the given backpressure configuration.
@@ -203,18 +224,31 @@ func NewEngineWithOptions(opts EngineOptions) *Engine {
 	if l0Stall <= 0 {
 		l0Stall = DefaultL0StallTimeout
 	}
+	cPolicy := opts.CompactionPolicy
+	if cPolicy.L0TriggerCount == 0 {
+		cPolicy = compaction.DefaultCompactionPolicy()
+	}
 	eng := &Engine{
-		dbPath:          cleanDBPath,
-		activeMem:       memtable.NewSkipList(),
-		backpressure:    bc,
-		vset:            vset,
-		wal:             opts.WAL,
-		blockCache:      opts.BlockCache,
-		shutdownTimeout: shutTimeout,
-		l0StallTimeout:  l0Stall,
-		closeDone:       make(chan struct{}),
+		dbPath:            cleanDBPath,
+		activeMem:         memtable.NewSkipList(),
+		backpressure:      bc,
+		vset:              vset,
+		wal:               opts.WAL,
+		blockCache:        opts.BlockCache,
+		shutdownTimeout:   shutTimeout,
+		l0StallTimeout:    l0Stall,
+		compactionEnabled: !opts.DisableCompaction,
+		closeDone:         make(chan struct{}),
 	}
 	eng.l0Override.Store(-1)
+	if eng.compactionEnabled {
+		// A policy that fails validation must not silently disable compaction and
+		// leave the engine unwired; surface it at Open time via the worker error,
+		// but keep construction total so existing callers are unaffected.
+		if w, werr := newCompactionWorker(eng, cPolicy); werr == nil {
+			eng.compactor = w
+		}
+	}
 	return eng
 }
 
@@ -429,10 +463,17 @@ func (e *Engine) Open() error {
 	// left by recovery.
 	e.mu.Lock()
 	e.startFlushWorkerLocked()
+	compactor := e.compactor
 	needSignal := len(e.immMems) > 0
 	e.mu.Unlock()
 	if needSignal {
 		e.signalFlush()
+	}
+	// Start the background leveled compactor only after recovery has published a
+	// Version, so it never races the recovery pipeline.
+	if compactor != nil {
+		compactor.start()
+		compactor.signal()
 	}
 	return nil
 }
@@ -489,6 +530,26 @@ func (e *Engine) NextSeqNum() uint64 {
 // NextFileNum returns the current next file number watermark (P07-SEC-006).
 func (e *Engine) NextFileNum() uint64 {
 	return e.nextFileNum.Load()
+}
+
+// publishNextFileNum returns the monotonic nextFileNum watermark to record in a
+// VersionEdit for an operation that just allocated up to allocated-1.
+//
+// File numbers are allocated from a single Engine-wide counter by both the flush
+// worker and the background compactor, so a publisher that recorded only its own
+// local allocation could regress the manifest watermark below a value another
+// publisher already committed. LogAndApply rejects a regressing watermark as
+// ErrCorruptedVersionEdit, which would strand the flushed SSTable as an
+// unreferenced orphan. Taking the max of the counter and the local allocation
+// keeps the published watermark strictly monotonic regardless of interleaving.
+func (e *Engine) publishNextFileNum(allocated uint64) uint64 {
+	if e == nil {
+		return allocated
+	}
+	if cur := e.NextFileNum(); cur > allocated {
+		return cur
+	}
+	return allocated
 }
 
 // AllocateFileNum atomically allocates and returns a new unique file number (P07-SEC-006).
@@ -1304,12 +1365,22 @@ func (e *Engine) Close() error {
 	e.state = engineStateClosing
 	stopCh := e.stopCh
 	started := e.flushStarted
+	compactor := e.compactor
+	shutTimeout := e.shutdownTimeout
 	e.mu.Unlock()
 
 	// Phase 2: wake M03 gates (ErrWriterClosed) and stop the worker from
 	// taking new work.
 	if stopCh != nil {
 		close(stopCh)
+	}
+	// Phase 2b: stop the background compactor and wait for any in-flight
+	// compaction. This must happen before the flush drain and before the WAL and
+	// manifest descriptors are closed, because a compaction commits through the
+	// manifest and reads input SSTables. An abandoned compaction (drain timeout)
+	// can never commit, because it observes engineStateClosing and bails out.
+	if compactor != nil {
+		compactor.stop(shutTimeout)
 	}
 	// Phase 3: wait for any in-flight flushOne so the worker never touches
 	// resources we are about to close. The worker exits without draining;

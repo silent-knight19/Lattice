@@ -1,6 +1,7 @@
 package raft
 
 import (
+	stdErrors "errors"
 	"fmt"
 	"io"
 	"os"
@@ -68,6 +69,22 @@ var (
 	raftCloseTmpFn = func(f *os.File) error {
 		return f.Close()
 	}
+	// raftWriteLogFn and raftSyncLogFn are the durability barriers on the in-place
+	// log append path. They are seams so a write or fdatasync failure on the hot
+	// append path can be injected deterministically; without them the Append
+	// failure handling was unreachable from tests.
+	raftWriteLogFn = func(f *os.File, b []byte) (int, error) {
+		return f.Write(b)
+	}
+	raftSyncLogFn = func(f *os.File) error {
+		return fdatasync(f)
+	}
+	raftWriteStateTmpFn = func(f *os.File, b []byte) (int, error) {
+		return f.Write(b)
+	}
+	raftSyncStateTmpFn = func(f *os.File) error {
+		return fdatasync(f)
+	}
 )
 
 // syncDir flushes modified directory entries to persistent storage media.
@@ -84,6 +101,76 @@ func syncDir(dirPath string) error {
 	return nil
 }
 
+// poisonLocked transitions the Storage into a terminal, unrecoverable state,
+// preserving the first root-cause I/O or durability-barrier error.
+//
+// Poisoning is the only safe response to a failed write or fdatasync on the
+// append path. The bytes are already in an O_APPEND descriptor, so the on-disk
+// log is now ahead of memLog; the only way to resynchronize them is to truncate
+// the file back to a known-good offset, which Storage does not track. A caller
+// retry would instead write the same index a second time, and recovery rejects
+// the non-contiguous sequence, permanently bricking the directory. Failing
+// closed converts a silent, permanent corruption into an explicit, observable
+// terminal error that an operator can act on (restart, or restore from a
+// replica).
+//
+// Must be called with s.mu held.
+func (s *Storage) poisonLocked(op string, err error) {
+	if s.poisoned.Load() {
+		return
+	}
+	s.poisoned.Store(true)
+	s.poisonErr = &errors.RaftStoragePoisonedError{Op: op, Reason: err}
+	// Mirror the terminal handling in TruncateSuffix: drop the descriptor so no
+	// further write can reach the diverged file.
+	s.closed.Store(true)
+	if s.logFile != nil {
+		_ = s.logFile.Close()
+		s.logFile = nil
+	}
+}
+
+// checkPoisonLocked reports a typed poison error if the Storage is terminal.
+// poisonOrClosedErr reports a poison error, else a closed error, without
+// requiring the caller to hold s.mu. Poisoned is checked first because it is the
+// more specific condition.
+func (s *Storage) poisonOrClosedErr() error {
+	if s == nil {
+		return errors.ErrNilReceiver
+	}
+	if s.poisoned.Load() {
+		return &errors.RaftStoragePoisonedError{Op: s.poisonErrOp(), Reason: s.poisonErr}
+	}
+	if s.closed.Load() {
+		return errors.ErrRaftStateClosed
+	}
+	return nil
+}
+
+func (s *Storage) checkPoisonLocked() error {
+	if s.poisoned.Load() {
+		return &errors.RaftStoragePoisonedError{Op: s.poisonErrOp(), Reason: s.poisonErr}
+	}
+	return nil
+}
+
+func (s *Storage) poisonErrOp() string {
+	var pe *errors.RaftStoragePoisonedError
+	if stdErrors.As(s.poisonErr, &pe) && pe.Op != "" {
+		return pe.Op
+	}
+	return "raft storage"
+}
+
+// IsPoisoned reports whether the Storage entered the terminal poisoned state.
+// Lock-free and safe for concurrent observability queries.
+func (s *Storage) IsPoisoned() bool {
+	if s == nil {
+		return false
+	}
+	return s.poisoned.Load()
+}
+
 // Storage manages persistent Raft state (`currentTerm`, `votedFor`) and log entries (`log[]`).
 //
 // Durability & Consistency Contract:
@@ -98,6 +185,10 @@ func syncDir(dirPath string) error {
 //     it is truncated cleanly.
 //     4. Mid-log bit flips or corrupted records fail closed with ErrChecksumMismatch.
 //     5. Term regressions are strictly rejected.
+//   - A failed write or durability barrier on any mutator poisons the Storage
+//     terminally (ErrRaftStoragePoisoned). Continuing after such a failure would
+//     let the on-disk log diverge from the in-memory log and, on a retry, write a
+//     duplicate index that makes the directory unrecoverable.
 type Storage struct {
 	mu        sync.RWMutex
 	dir       string
@@ -105,6 +196,12 @@ type Storage struct {
 	hardState HardState
 	memLog    *InMemLog
 	logFile   *os.File // Open append-only file descriptor pinned to disk inode
+
+	// poisoned marks a terminal, unrecoverable I/O failure. Once set, every
+	// mutator fails closed: the on-disk state can no longer be trusted to match
+	// memLog, so continuing would risk duplicate or lost entries.
+	poisoned  atomic.Bool
+	poisonErr error // first root-cause error; written and read only under mu
 }
 
 // StorageOptions configures the Raft persistent storage.
@@ -143,7 +240,10 @@ func OpenStorage(dir string) (*Storage, error) {
 		if os.IsNotExist(err) {
 			// Cold-boot zero state: persist initial state file atomically
 			hs = HardState{Term: 0, VotedFor: cluster.NodeIDNil}
-			if err := writeStateFile(cleanDir, hs); err != nil {
+			// Cold boot: no in-memory state exists yet, so either outcome fails
+			// startup cleanly. `renamed` is deliberately ignored here because there
+			// is no live Storage to poison and no later write that could regress.
+			if _, err := writeStateFile(cleanDir, hs); err != nil {
 				return nil, err
 			}
 		} else {
@@ -250,13 +350,16 @@ func (s *Storage) VotedFor() (cluster.NodeID, error) {
 //   - If term == currentTerm, cannot change an existing vote to a different candidate.
 //   - Metadata is atomically synced and replaced on disk before returning nil.
 func (s *Storage) SetHardState(hs HardState) error {
-	if s.closed.Load() {
-		return errors.ErrRaftStateClosed
+	if err := s.poisonOrClosedErr(); err != nil {
+		return err
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if err := s.checkPoisonLocked(); err != nil {
+		return err
+	}
 	if s.closed.Load() {
 		return errors.ErrRaftStateClosed
 	}
@@ -288,9 +391,21 @@ func (s *Storage) SetHardState(hs HardState) error {
 		}
 	}
 
-	// 3. Durably persist to disk via atomic file replacement
-	if err := writeStateFile(s.dir, hs); err != nil {
-		return fmt.Errorf("raft: failed to persist hard state: %w", err)
+	// 3. Durably persist to disk via atomic file replacement.
+	//
+	// renamed distinguishes "nothing was committed" (recoverable) from "the state
+	// file was replaced but the directory entry was not synced" (terminal). In the
+	// second case the in-memory HardState is intentionally NOT advanced, which
+	// leaves memory behind disk. Updating memory would hide the divergence;
+	// leaving it stale lets a later write regress the durable term. The only safe
+	// response is to poison, mirroring the post-rename handling in TruncateSuffix.
+	renamed, err := writeStateFile(s.dir, hs)
+	if err != nil {
+		werr := fmt.Errorf("raft: failed to persist hard state: %w", err)
+		if renamed {
+			s.poisonLocked("raft hard state write", werr)
+		}
+		return werr
 	}
 
 	s.hardState = hs.Clone()
@@ -304,6 +419,13 @@ func (s *Storage) SetTerm(newTerm Term) error {
 	s.mu.RLock()
 	currTerm := s.hardState.Term
 	s.mu.RUnlock()
+
+	// Checked before the newTerm == currTerm fast path: a terminal Storage must
+	// not report success for a no-op advance, which is exactly what a caller
+	// would interpret as "the term is already persisted".
+	if err := s.poisonOrClosedErr(); err != nil {
+		return err
+	}
 
 	if newTerm < currTerm {
 		return fmt.Errorf("%w: attempted term %d < current term %d",
@@ -381,18 +503,29 @@ func (s *Storage) Entries(from, to LogIndex) ([]LogEntry, error) {
 //   - Entries must have contiguous 1-based indices matching LastIndex() + 1.
 //   - Each entry is encoded with CRC32-IEEE framing header.
 //   - Flushed to disk with fdatasync before mutating in-memory log.
-//   - On write or sync error, in-memory log remains completely untouched (all-or-nothing).
+//   - On write or sync error the in-memory log is left untouched AND the Storage
+//     is poisoned terminally (ErrRaftStoragePoisoned). The claim is NOT
+//     "all-or-nothing" across memory and disk: the bytes have already reached the
+//     O_APPEND descriptor, so the on-disk log is ahead of memLog and cannot be
+//     resynchronized. Failing closed is what prevents a retry from writing a
+//     duplicate index, which recovery would reject and which would make the Raft
+//     directory permanently unopenable.
 func (s *Storage) Append(entries ...LogEntry) error {
 	if len(entries) == 0 {
 		return nil
 	}
-	if s.closed.Load() {
-		return errors.ErrRaftStateClosed
+	// Poisoned is checked before closed because poisoning also marks the Storage
+	// closed; reporting ErrRaftStateClosed here would mask the terminal condition.
+	if err := s.poisonOrClosedErr(); err != nil {
+		return err
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if err := s.checkPoisonLocked(); err != nil {
+		return err
+	}
 	if s.closed.Load() {
 		return errors.ErrRaftStateClosed
 	}
@@ -428,12 +561,19 @@ func (s *Storage) Append(entries ...LogEntry) error {
 		offset += encodedLen
 	}
 
-	// 3. Write and sync to persistent storage media
-	if _, err := s.logFile.Write(buf); err != nil {
-		return fmt.Errorf("raft: failed to append log records to disk: %w", err)
+	// 3. Write and sync to persistent storage media.
+	//
+	// Either step failing means the on-disk log is now ahead of memLog and cannot
+	// be resynchronized, so the Storage is poisoned terminally. See poisonLocked.
+	if _, err := raftWriteLogFn(s.logFile, buf); err != nil {
+		werr := fmt.Errorf("raft: failed to append log records to disk: %w", err)
+		s.poisonLocked("raft log append write", werr)
+		return werr
 	}
-	if err := fdatasync(s.logFile); err != nil {
-		return fmt.Errorf("raft: failed to sync log records to disk: %w", err)
+	if err := raftSyncLogFn(s.logFile); err != nil {
+		serr := fmt.Errorf("raft: failed to sync log records to disk: %w", err)
+		s.poisonLocked("raft log append durability barrier", serr)
+		return serr
 	}
 
 	// 4. Update in-memory log representation only after hardware durability barrier
@@ -450,13 +590,16 @@ func (s *Storage) Append(entries ...LogEntry) error {
 //   - If atomic rename or subsequent reopen fails, the storage enters a terminal fail-closed state.
 //   - If staging or syncing the temp file fails, the original active logFile remains completely untouched.
 func (s *Storage) TruncateSuffix(fromIndex LogIndex) error {
-	if s.closed.Load() {
-		return errors.ErrRaftStateClosed
+	if err := s.poisonOrClosedErr(); err != nil {
+		return err
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if err := s.checkPoisonLocked(); err != nil {
+		return err
+	}
 	if s.closed.Load() {
 		return errors.ErrRaftStateClosed
 	}
@@ -554,15 +697,29 @@ func (s *Storage) TruncateSuffix(fromIndex LogIndex) error {
 // Safe for concurrent and repeated invocation.
 func (s *Storage) Close() error {
 	if !s.closed.CompareAndSwap(false, true) {
+		// Poisoning already marked the Storage closed. Surface the terminal error
+		// rather than nil, otherwise a caller that treats a clean Close as "the
+		// node shut down without incident" would silently swallow a data-integrity
+		// event. Mirrors WALWriter.Close, which returns its poison error too.
+		if s.poisoned.Load() {
+			return &errors.RaftStoragePoisonedError{Op: s.poisonErrOp(), Reason: s.poisonErr}
+		}
 		return nil
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// A poisoned Storage already dropped its descriptor inside poisonLocked, and
+	// running a durability barrier over a log that is known to have diverged
+	// would only give the corruption more chances to reach stable storage.
+	if s.poisoned.Load() {
+		return &errors.RaftStoragePoisonedError{Op: s.poisonErrOp(), Reason: s.poisonErr}
+	}
+
 	var firstErr error
 	if s.logFile != nil {
-		if err := fdatasync(s.logFile); err != nil {
+		if err := raftSyncLogFn(s.logFile); err != nil {
 			firstErr = err
 		}
 		if err := s.logFile.Close(); err != nil && firstErr == nil {
@@ -575,8 +732,25 @@ func (s *Storage) Close() error {
 
 // --- Internal Binary Encoding & Persistence Helpers ---
 
-// writeStateFile writes HardState atomically via temporary file staging, fdatasync, and os.Rename.
-func writeStateFile(dir string, hs HardState) error {
+// writeStateFile writes HardState via temporary file staging, fdatasync, and
+// os.Rename, followed by a parent-directory fsync.
+//
+// The rename is the commit point. The returned `renamed` reports whether it
+// succeeded, because that determines who owns the failure:
+//
+//   - renamed == false: nothing on disk changed, so the caller may report the
+//     error and keep operating. The staging file has been cleaned up.
+//   - renamed == true, err == nil: fully durable.
+//   - renamed == true, err != nil: the durable state file has already been
+//     replaced but the directory entry was not synced. Memory and disk now
+//     disagree. This is NOT a recoverable error: the caller must poison, because
+//     a later write validated against the stale in-memory term could commit a
+//     LOWER term than the one already durable, and the node would then re-announce
+//     and vote in a term it had already abandoned.
+//
+// Callers must therefore never treat a non-nil error from this function as
+// "nothing happened" without consulting `renamed`.
+func writeStateFile(dir string, hs HardState) (renamed bool, err error) {
 	tmpPath := filepath.Join(dir, StateTempFilename)
 	finalPath := filepath.Join(dir, StateFilename)
 
@@ -585,7 +759,7 @@ func writeStateFile(dir string, hs HardState) error {
 
 	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, RaftFileMode)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	writeOk := false
@@ -607,22 +781,26 @@ func writeStateFile(dir string, hs HardState) error {
 	crc := binary.Checksum(buf[0:StatePayloadSize])
 	binary.PutUint32(buf[StatePayloadSize:StateRecordSize], crc)
 
-	if _, err := tmpFile.Write(buf); err != nil {
-		return err
+	if _, werr := raftWriteStateTmpFn(tmpFile, buf); werr != nil {
+		return false, werr
 	}
-	if err := fdatasync(tmpFile); err != nil {
-		return err
+	if serr := raftSyncStateTmpFn(tmpFile); serr != nil {
+		return false, serr
 	}
-	if err := tmpFile.Close(); err != nil {
-		return err
+	if cerr := tmpFile.Close(); cerr != nil {
+		return false, cerr
 	}
 
-	if err := raftRenameFn(tmpPath, finalPath); err != nil {
-		return err
+	// ---- COMMIT POINT: past this line the durable state file is replaced. ----
+	if rerr := raftRenameFn(tmpPath, finalPath); rerr != nil {
+		return false, rerr
 	}
 	writeOk = true
 
-	return raftSyncDirFn(dir)
+	if derr := raftSyncDirFn(dir); derr != nil {
+		return true, fmt.Errorf("raft: hard state renamed into place but parent directory sync failed: %w", derr)
+	}
+	return true, nil
 }
 
 // readStateFile reads and validates the HardState metadata file.

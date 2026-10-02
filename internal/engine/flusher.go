@@ -396,7 +396,7 @@ func (e *Engine) flushOne(imm *memtable.SkipList) error {
 	if err := edit.AddFile(0, fm); err != nil {
 		return err
 	}
-	edit.SetNextFileNum(fileNum + 1)
+	edit.SetNextFileNum(e.publishNextFileNum(fileNum + 1))
 	edit.SetLastSeqNum(maxSeq)
 
 	if applyFn == nil {
@@ -408,6 +408,10 @@ func (e *Engine) flushOne(imm *memtable.SkipList) error {
 		// The immutable MemTable is retained by the caller.
 		return err
 	}
+	// A new L0 file changes the compaction score. Nudge the background compactor so
+	// L0 pressure is relieved promptly instead of waiting for the next tick. This
+	// signal is non-blocking and safe to call from the flush worker.
+	e.SignalCompaction()
 	metrics.FlushDuration.ObserveDuration(time.Since(start))
 	return nil
 }

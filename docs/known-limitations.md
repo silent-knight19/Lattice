@@ -59,12 +59,12 @@ This document tracks all **genuine architectural and operational limitations** o
 ---
 
 ### 4. Temporary Write Stalls During Major Compaction Spikes
-* **Limitation**: Heavy write bursts that significantly outpace compaction speed will trigger progressive write pacing delays ($1\text{ms}-50\text{ms}$).
-* **Why It Exists**: In Leveled Compaction, if $L_0$ accumulates too many overlapping files ($\ge 8$), point lookup performance collapses. Writes must be throttled to allow background compactor threads to merge files into $L_1$.
+* **Limitation**: Heavy write bursts that significantly outpace compaction speed will trigger progressive write pacing delays ($1\text{ms}-30\text{ms}$), and a burst that outpaces compaction entirely is rejected with `ErrL0StallTimeout` after `DefaultL0StallTimeout` (30s) rather than blocking indefinitely.
+* **Why It Exists**: In Leveled Compaction, if $L_0$ accumulates too many overlapping files ($\ge 8$), point lookup performance collapses. Writes are throttled so the background compactor can merge files into $L_1$. The Engine now owns that compactor (see "Background Leveled Compaction"), so L0 pressure is normally transient.
 * **Impact**: High-percentile tail latency (P99 / P99.9) increases during prolonged maximum-throughput write bursts.
 * **How It Was Detected**: Classic LSM-tree compaction dynamics (Section 46 of `docs/architecture-spec.md`).
-* **Current Mitigation**: Progressive two-tier write pacing (1ms delay at 8 files, hard throttle at 12 files) prevents sudden latency cliffs.
-* **Future Solution**: Dynamic compaction thread pools and partitioned sub-compaction runs.
+* **Current Mitigation**: Progressive two-tier write pacing (1ms delay at 8 files, bounded stall at 12 files) prevents sudden latency cliffs, and the Engine's background compactor drains L0 so the stall band is not reached under sustained load. The stall is a *bounded* wait that ends in an explicit retryable error, never an unbounded block.
+* **Future Solution**: Dynamic compaction thread pools and partitioned sub-compaction runs (the current worker compacts one plan at a time).
 * **Dimensional Impact**:
   * Correctness: **None** (Data integrity preserved).
   * Performance: **Moderate** tail latency impact under sustained write overload.
@@ -197,12 +197,12 @@ This document tracks all **genuine architectural and operational limitations** o
 ---
 
 ### 14. Static Security Audit, Storage Dynamic Audit (SEC-03), and In-Memory Engine Audit (SEC-04) Verified
-* **Limitation**: Static analysis (`SEC-01`, `SEC-02`), persistence/storage dynamic auditing (`SEC-03`), and in-memory multi-version engine auditing (`SEC-04`) are fully complete and verified. However, dynamic network protocol fuzzing, distributed consensus fault injection, and multi-node Byzantine testing remain deferred until their respective subsystems are implemented.
-* **Why It Exists**: In accordance with the security roadmap hierarchy, storage persistence (`SEC-03`) and in-memory core ordering/bounds primitives (`SEC-04`) are audited against implemented code. Network transport (Phase 11) and Raft consensus (Phase 13) do not yet exist in the codebase.
-* **Impact**: Storage, WAL, filesystem races, torn writes, malformed framing, permission boundaries, and in-memory InternalKey multi-version ordering/bounds are rigorously verified under adversarial tests. Network and cluster-level dynamic testing will activate when those subsystems are built.
+* **Limitation**: Static analysis (`SEC-01`, `SEC-02`), persistence/storage dynamic auditing (`SEC-03`), and in-memory multi-version engine auditing (`SEC-04`) are fully complete and verified. At the time this audit stage was recorded, dynamic network protocol fuzzing, distributed consensus fault injection, and multi-node Byzantine testing were deferred until their respective subsystems were implemented. Those subsystems now exist and were subsequently audited (see Phases 11 and 14–19).
+* **Why It Exists**: In accordance with the security roadmap hierarchy, storage persistence (`SEC-03`) and in-memory core ordering/bounds primitives (`SEC-04`) were audited against implemented code. At the time of this stage, network transport and Raft consensus had not yet been implemented; both now exist and were audited in later phases (Phase 11 transport; Phases 14–19 for cluster topology, Raft consensus, and transport security hardening).
+* **Impact**: Storage, WAL, filesystem races, torn writes, malformed framing, permission boundaries, and in-memory InternalKey multi-version ordering/bounds are rigorously verified under adversarial tests. Network and cluster-level dynamic testing (protocol fuzzing, partition simulation, chaos/fault injection) was subsequently activated once those subsystems were built (see Phase 18).
 * **How It Was Detected**: Security roadmap staging and architecture boundaries.
 * **Current Mitigation**: Comprehensive dynamic test suites in `internal/wal` (`sec03_*_test.go`), `internal/binary` (`sec04_*_test.go`), native Go fuzzing, fault injection seams, and race detection. IND-M-004 proof in `sec_ind_m004_test.go` verifies truncated headers/bodies fail closed (`ErrHeaderTruncated`/`ErrUnexpectedEOF`) while 1-byte-fragmented valid records still decode exactly.
-* **Future Solution**: Execute `SEC-05` (network protocol fuzzing) and `SEC-06` (distributed consensus chaos testing) once networking and Raft are implemented.
+* **Future Solution**: `SEC-05` (network protocol fuzzing) and `SEC-06` (distributed consensus chaos testing) were subsequently executed once networking and Raft were implemented; see Phase 18 (Fault Injection & Chaos Testing Suite) and the Phase 14–19 security remediation records in [`implementation-plan.md`](implementation-plan.md).
 * **Dimensional Impact**:
   * Correctness: **None** (Existing subsystems verified).
   * Performance: **None**.
@@ -1003,8 +1003,8 @@ This document tracks all **genuine architectural and operational limitations** o
   1. *Authoritative Pressure*: Pacing reads `VersionSet.Current().NumFiles(0)` per gate (pinned only for the read, never across sleeps); no duplicate L0 counter exists. `SetL0CountOverrideForTesting` is test-only.
   2. *Exact Thresholds*: L0 ≤ 8 normal (no timer); 9→1ms, 10→5ms, 11→15ms, 12→30ms single pacing sleep; L0 > 12 stalls in bounded 20ms polls until L0 ≤ 12 (release hysteresis = roadmap boundary; no extra bands). Constants only: no overflow, no unbounded sleep.
   3. *Placement*: Gate runs after key/value validation, before memory backpressure/`Acquire`, sequence allocation, WAL, and MemTable work — stalled writers reserve no seqs and create no internal copies (caller goroutine waits; no pending-write queue, no per-writer goroutine). `Get` is never gated.
-  4. *Relief*: The controller never deletes files; compaction (or VersionSet publication as compaction would publish) reduces L0 and writers observe it on the next poll. No compaction kick, no forced compaction, no second compaction system.
-  5. *Lifecycle*: Stall/pacing selects honor ctx cancellation, `stopCh`, and `closed`; `Close()` terminates waiters with `ErrWriterClosed` (no M04 drain). Stall itself returns no new error type.
+  4. *Relief*: The controller never deletes files; the Engine's background compactor reduces L0 and writers observe it on the next 20ms poll. No forced compaction and no second compaction system. The stall wait is bounded by `Engine.L0StallTimeout` (`DefaultL0StallTimeout` = 30s); if pressure has not subsided by then the write is rejected with `ErrL0StallTimeout` (no sequence number allocated, nothing written, safe to retry). An earlier caller deadline still surfaces as `ctx.Err()`, and shutdown still surfaces `ErrWriterClosed`.
+  5. *Lifecycle*: Stall/pacing selects honor ctx cancellation, `stopCh`, and `closed`; `Close()` terminates waiters with `ErrWriterClosed` (no M04 drain). The only new error type is `ErrL0StallTimeout`, returned exclusively on bounded-stall expiry and never on cancellation or shutdown.
   6. *Explicitly Deferred*: Full graceful shutdown sequencing with compaction coordination (M04). Flush-failure state (`FlushError`) is orthogonal: pacing neither masks nor clears it.
 * **Why It Exists**:
   Self-protection under L0 pressure with deterministic, reviewable policy: progressive latency instead of disk-exhaustion crash, without lock-held sleeps or waiter amplification.
@@ -1023,7 +1023,7 @@ This document tracks all **genuine architectural and operational limitations** o
   1. *Single-Winner Close*: First `Close()` drives RUNNING→CLOSING→CLOSED; concurrent closers wait on `closeDone` and receive the identical remembered error (nil on success). No double channel close, no double final flush, no duplicate publication.
   2. *Drain, Not Background*: After joining the exited worker, `Close` rotates a non-empty active table and flushes every queued generation oldest-first synchronously through `flushOne` (original seqs, same allocator, `LogAndApply`). No Engine mutex is held across this I/O. Engines whose worker never started (memory-only / never Opened) skip the drain, preserving prior behavior.
   3. *Failure Retention*: A failed generation stops the drain with the error recorded (`FlushError`) and state retained; resources are still all closed (best-effort) and the terminal error is remembered. WAL is never truncated by shutdown, so a fresh Engine recovers every accepted mutation past a failed Close.
-  4. *External Compaction*: No Engine-owned compactor exists. In-flight external `LogAndApply` racing `Close` is serialized by existing `applyMu`/manifest locks (fails closed either way; never panics or corrupts). Callers must quiesce external publishers before `Close` for guaranteed inclusion; concurrent Engine-owned publishing is impossible by construction (worker joined before drain).
+  4. *Compaction Coordination*: The Engine owns a background leveled compactor, which `Close` stops and joins (bounded by `ShutdownTimeout`) **before** the flush drain and before the WAL/manifest descriptors are closed, because a compaction commits through the manifest and reads input SSTables. `Close` additionally re-checks the closing state immediately before `LogAndApply`; a compaction that finishes merging after shutdown began discards its output SSTables instead of publishing, so it can never leave an unreferenced file behind. If the join times out, an abandoned compaction still cannot commit (it observes `engineStateClosing`) and unlinks its own output. External `LogAndApply` publishers racing `Close` remain serialized by `applyMu`/manifest locks (fails closed either way; never panics or corrupts).
   5. *Reads Stay Open*: `Get` is never gated by lifecycle (established M01 contract); after a successful drain it serves from published SSTables.
   6. *Cache*: The shared block cache is left untouched (memory-only; may be shared outside Engine).
 * **Why It Exists**:
@@ -1809,6 +1809,67 @@ This document tracks all **genuine architectural and operational limitations** o
   * Correctness: **Optimal** (Deterministic principal resolution, fail-closed authorization, request-context immutability).
   * Security: **Audited & Hardened** (Mandatory external policy, fail-closed on missing/unknown certs, pre-consensus rejection, side-effect freedom, uniform error payload).
   * Performance: **Optimal** (O(1) map lookup in memory post-handshake, zero heap allocations on authorization decision path).
+
+---
+
+### 93. Engine-Owned Background Leveled Compaction
+
+* **What Changed**: `internal/compaction` (policy scoring, deterministic planner with the L0 transitive overlap closure, immutable `CompactionPlan`, k-way merging iterator with per-user-key deduplication, tombstone-safety oracle, crash-safe SSTable output) was fully implemented and unit-tested but had **no production caller**. Every flush appended an L0 file, nothing ever moved data to `L1..LN`, obsolete files were never reclaimed by compaction, and the P10 write-pacing gate eventually rejected every writer with `ErrL0StallTimeout` because L0 could not drain. `Engine` now owns a single background leveled compaction worker (`internal/engine/compaction.go`).
+* **Operational Semantics**:
+  1. *Triggering*: A non-blocking signal is sent after every successful flush publish; a `DefaultCompactionCheckInterval` (2s) tick is the safety net. Up to 16 plans are drained per wake-up. A failure is recorded and not retried in a tight loop, so a corrupt input cannot spin the worker.
+  2. *Selection*: Routed through the existing `Planner`/`CompactionPolicy`, so L0 is prioritized and `L1..L{maxSource-1}` are scored by byte capacity. Compactions are strictly `sourceLevel -> sourceLevel+1`.
+  3. *Version Pinning*: `VersionSet.Current()` is pinned for the whole compaction. Obsolete-file reclamation is refcount-driven (`Version.finalize` -> `VersionSet.collectObsoleteFilesLocked`), so a pinned Version guarantees no input file is unlinked mid-read. `CleanObsoleteFiles()` is also requested after commit so files whose last reference disappeared earlier are reclaimed.
+  4. *Publication*: Output SSTables are durable and **validated** (`SkipValidation` is never set) before `LogAndApply`; they become visible to readers only when the edit commits. Uncommitted output is unlinked on every failure path.
+  5. *Watermark Monotonicity*: File numbers come from the single Engine-wide allocator. Both publishers record the watermark through `Engine.publishNextFileNum`, which takes the max of the counter and the local allocation. Recording only a local allocation would regress the manifest watermark below a value a concurrent publisher committed, which `LogAndApply` rejects as `ErrCorruptedVersionEdit`, stranding the flushed SSTable as an unreferenced orphan.
+  6. *Lifecycle*: Started in `Open()` only after recovery publishes a Version; stopped and joined in `Close()` before the flush drain and before WAL/manifest close. The closing state is re-checked immediately before `LogAndApply`; a compaction finishing after shutdown began discards its output instead of publishing.
+* **Boundaries & Trade-offs**:
+  * *Single worker*: Compactions are serialized. This bounds file-descriptor use and keeps level ordering simple, but deep LSM trees will compact slower than a production engine with parallel sub-compactions.
+  * *Planner granularity*: `Planner.PickCompaction` seeds from a single file, so an L0->L1 pass may relocate one seed plus its overlap closure at a time. That is the tested Phase 08 planning contract and was deliberately not changed here; it can produce many small non-overlapping files at `L1` before the byte-capacity score triggers deeper compaction.
+  * *Fan-in ceiling*: A plan opening more than `DefaultCompactionMaxInputFiles` (= `compaction.MaxMergingIterators`, 10000) inputs is refused rather than executed, capping descriptor and memory use.
+  * *Escape hatch*: `EngineOptions.DisableCompaction` restores append-only L0 growth for tests that assert raw L0 counts. A long-running engine with compaction disabled will accumulate L0 without bound and reject writes at the stall gate — that is the documented purpose, not a supported production configuration.
+* **Verification**: `internal/engine/compaction_test.go` proves L0 drains under sustained writes, that compaction is **lossless** (every key and every newest revision survives), that tombstones do not resurrect, that obsolete files are reclaimed and disk stays bounded, that recovery reclaims orphans, and that `Close` is clean and idempotent. `go test -race ./internal/engine/` is clean.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (validated output, atomic publication, lossless merge, refcount-gated reclamation).
+  * Performance: **Large improvement** (bounded L0, bounded read amplification, bounded disk usage).
+  * Security: **Optimal** (no path traversal: file numbers are `uint64` rendered via `%06d.sst` and containment-checked; no unbounded fan-in).
+
+---
+
+### 94. Raft Persistent Storage Poisoning on Append Durability Failure
+
+* **What Changed**: `Storage.Append` wrote bytes into an `O_APPEND` descriptor and then failed the `fdatasync` durability barrier, returning an error while leaving `memLog` unadvanced. The on-disk log was therefore ahead of memory with no way to resynchronize them (`Storage` tracks no on-disk offset, and `TruncateSuffix` is a no-op when `fromIndex > LastIndex()`). A caller retry wrote the same index a second time, and because the retry reported success the follower looked healthy; on restart `recoverLogFile` rejected the non-contiguous sequence (`index gap at offset N: expected M, got M-1`) and `OpenStorage` failed permanently. **One transient `fdatasync` error followed by one ordinary retry bricked the node.**
+* **Fix**: A failed append write or durability barrier now poisons the `Storage` terminally:
+  1. `ErrRaftStoragePoisoned` plus a typed `RaftStoragePoisonedError{Op, Reason}` that wraps the root cause and names the failing operation.
+  2. The descriptor is closed and cleared, mirroring the terminal handling `TruncateSuffix` already used for the same hazard class.
+  3. Every mutator (`Append`, `TruncateSuffix`, `SetHardState`, `SetTerm`, `SetVote`) fails closed. The pre-lock fast path checks poison **before** closed, because poisoning also marks the Storage closed and `ErrRaftStateClosed` would otherwise mask the terminal condition.
+  4. `Close` returns the poison error instead of `nil` (the failed CAS previously reported a clean shutdown), and skips the durability barrier rather than flushing a known-diverged log.
+  5. `SetTerm` checks lifecycle before its `newTerm == currTerm` fast path, which previously returned `nil` on a terminal Storage.
+  6. `Node.replicateEntries` now returns a distinct terminal error instead of collapsing a poisoned follower into `ok=false`. Reporting a poisoned follower as a retryable log mismatch made the leader decrement `nextIndex` forever against a replication that could never succeed.
+* **Why a distinct sentinel**: `router.go` maps `ErrRaftStateClosed` to `StatusServerClosed`. Reusing it would tell clients the node is draining when it is in fact permanently unable to persist consensus state, and would short-circuit client-side leader discovery.
+* **New fault-injection seams**: `raftWriteLogFn`, `raftSyncLogFn`, `raftWriteStateTmpFn`, `raftSyncStateTmpFn`. The `Append` durability barrier previously had no seam at all, which is exactly why this path survived an otherwise thorough audit. The HardState staging path is now testable for the first time.
+* **Recovery Note**: The orphan record left by the failed append is itself CRC-valid and contiguous, so recovery legitimately adopts it. That is the desired outcome: the directory stays openable and the log stays contiguous. Poisoning exists to stop a *second* write creating a duplicate, not to erase the first.
+* **Verification**: `internal/raft/storage_poison_test.go` proves the directory stays recoverable, every mutator fails closed, the barrier is never retried after poisoning, a cleanly closed Storage still reports `ErrRaftStateClosed`, and healthy appends are unaffected. Each test was confirmed to fail when the poisoning calls are reverted. `go test -race ./internal/raft/` is clean.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (no duplicate index, no unrecoverable directory, explicit terminal signal).
+  * Performance: **None** (the healthy path adds one atomic load per mutator).
+  * Security: **Optimal** (fail-closed; no silent divergence between memory and disk).
+
+---
+
+### 95. HardState Post-Rename Directory-Sync Failure Is Terminal
+
+* **What Changed**: `writeStateFile` staged `raft_state.tmp`, fsynced it, renamed it over `raft_state`, and only then synced the parent directory. When that final directory sync failed the function reported failure, but the rename had already replaced the durable state file. `SetHardState` returned without advancing its in-memory `HardState`, so memory and disk disagreed about the term. Because term monotonicity is validated against **memory**, a subsequent `SetVote` read the stale in-memory term and wrote a **lower** term than the one already durable. Measured: durable term went `6 -> 5`. A node in that state re-announces and may grant votes in a term it had already abandoned, which is a Raft safety violation.
+* **Fix**: `writeStateFile` now returns `(renamed bool, err error)` so the caller knows which side of the commit point it failed on:
+  1. `renamed == false` (staging write, staging fsync, or rename failed): nothing was committed, the staging file was cleaned up, and the caller reports the error and keeps operating. Poisoning here would turn an ordinary transient error into a terminal node failure, so this path is explicitly tested to stay **recoverable**.
+  2. `renamed == true, err != nil`: the state file is replaced but the directory entry is not synced. `SetHardState` poisons the Storage terminally via the Issue 94 primitive, reusing the same handling `TruncateSuffix` already used for this hazard class.
+* **Why not "just advance memory"**: Writing the new term into memory would hide the divergence, but the durable record's durability is still unknown. Any subsequent write would then be validated against a term the filesystem may not have retained after a crash, which is exactly the class of bug this change removes.
+* **Documentation Correction**: The former `writeStateFile` comment claimed the write was "atomic". It is atomic with respect to *readers* (rename is atomic), but not with respect to *the caller's knowledge of the outcome*, which is what the `renamed` return value now makes explicit.
+* **Testability**: The HardState staging path previously had no fault-injection seams, so none of these failure points could be exercised. `raftWriteStateTmpFn` and `raftSyncStateTmpFn` (added with Issue 94) make the staging write and staging fsync injectable for the first time.
+* **Verification**: `internal/raft/storage_hardstate_test.go` proves the durable term never regresses below a committed value, that all three pre-commit failure modes stay recoverable and leave the durable term unchanged, that a committed vote is honored after recovery, that the `OpenStorage` cold-boot path still persists its initial state, and that healthy writes are unaffected. The primary test was confirmed to fail when the poisoning decision is reverted. `go test -race ./internal/raft/` is clean.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (term monotonicity now holds on disk across every failure point).
+  * Performance: **None** (one extra bool return).
+  * Security: **Optimal** (no durable-term regression; no voting in an abandoned term).
 
 ---
 

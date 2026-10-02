@@ -40,6 +40,10 @@ var (
 	// violates structural, level, key-range, or file-uniqueness invariants.
 	ErrInvalidCompactionPlan = stdErrors.New("invalid compaction plan")
 
+	// ErrCompactionDisabled indicates that a manual or synchronous compaction was
+	// requested on an Engine constructed with background compaction disabled.
+	ErrCompactionDisabled = stdErrors.New("background compaction is disabled")
+
 	// ErrByteCountOverflow indicates that accumulating file sizes or resource bounds
 	// exceeded 64-bit unsigned integer capacity (math.MaxUint64).
 	ErrByteCountOverflow = stdErrors.New("byte count overflow")
@@ -494,6 +498,15 @@ var (
 
 	// ErrRaftStateClosed indicates that an operation was attempted on closed Raft persistent state.
 	ErrRaftStateClosed = stdErrors.New("raft state storage is closed")
+
+	// ErrRaftStoragePoisoned indicates that Raft persistent storage hit an
+	// unrecoverable write or durability-barrier failure and is terminally unusable.
+	//
+	// This is deliberately distinct from ErrRaftStateClosed: the Storage did not
+	// shut down cleanly, it lost the guarantee that its on-disk state matches its
+	// in-memory state. Reporting it as "closed" would tell clients the node is
+	// draining when it is in fact permanently unable to persist consensus state.
+	ErrRaftStoragePoisoned = stdErrors.New("raft state storage is poisoned by an unrecoverable io failure")
 
 	// ErrRaftTermRegressed indicates that an attempted term update is less than the current term.
 	ErrRaftTermRegressed = stdErrors.New("raft term cannot regress to a lower value")
@@ -1328,6 +1341,44 @@ func (e *MemTableFullError) Error() string {
 // Is reports whether this error matches target sentinel ErrMemTableFull.
 func (e *MemTableFullError) Is(target error) bool {
 	return target == ErrMemTableFull
+}
+
+// RaftStoragePoisonedError reports that Raft persistent storage entered its
+// terminal poisoned state after a write or durability-barrier failure. It matches
+// ErrRaftStoragePoisoned when interrogated with errors.Is().
+type RaftStoragePoisonedError struct {
+	// Op names the operation that failed ("append", "truncate", "hard state write").
+	Op string
+	// Reason is the underlying I/O or sync error that caused the poisoning.
+	Reason error
+}
+
+func (e *RaftStoragePoisonedError) Error() string {
+	if e == nil {
+		return ErrRaftStoragePoisoned.Error()
+	}
+	op := e.Op
+	if op == "" {
+		op = "raft storage"
+	}
+	if e.Reason != nil {
+		return fmt.Sprintf("%s: %v; persistent state is terminally unusable and every "+
+			"subsequent operation fails closed", op, e.Reason)
+	}
+	return fmt.Sprintf("%s: %s", op, ErrRaftStoragePoisoned.Error())
+}
+
+// Is reports whether this error matches target sentinel ErrRaftStoragePoisoned.
+func (e *RaftStoragePoisonedError) Is(target error) bool {
+	return target == ErrRaftStoragePoisoned
+}
+
+// Unwrap returns the underlying error that poisoned the storage.
+func (e *RaftStoragePoisonedError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Reason
 }
 
 // L0StallTimeoutError provides structured context when a write is rejected after

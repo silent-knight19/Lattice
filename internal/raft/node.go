@@ -2291,10 +2291,24 @@ func (n *Node) HandleAppendEntries(fromPeerID cluster.NodeID, req *transport.App
 		}, nil
 	}
 
-	matchIdx, ok := n.replicateEntries(req.PrevLogIndex, req.PrevLogTerm, entries)
+	matchIdx, ok, terminal := n.replicateEntries(req.PrevLogIndex, req.PrevLogTerm, entries)
 	// Liveness holds for every non-stale legitimate-leader signal, including
 	// mismatches and replication outcomes.
 	n.ResetElectionTimer()
+	if terminal != nil {
+		// Persistent storage is terminally unusable. Report an explicit error so
+		// the leader learns this follower is broken instead of retrying forever
+		// against a phantom log mismatch.
+		// Record the terminal condition on the node so health reporting and the
+		// apply loop surface it instead of the follower looking healthy.
+		n.setApplyError(terminal)
+		return &transport.AppendEntriesResponse{
+			Term:       uint64(currTerm),
+			Success:    false,
+			MatchIndex: 0,
+			Nonce:      req.Nonce,
+		}, terminal
+	}
 	if !ok {
 		return &transport.AppendEntriesResponse{
 			Term:       uint64(currTerm),
@@ -2398,12 +2412,19 @@ func convertPeerEntries(req *transport.AppendEntriesRequest) ([]LogEntry, bool) 
 // replacement. Node.mu is never held here (no role state is mutated); Storage
 // provides its own locking. Lock order: proposeMu -> Storage.mu, consistent
 // with Propose. MatchIndex returned is prevLogIndex + len(entries).
-func (n *Node) replicateEntries(prevLogIndex uint64, prevLogTerm uint64, entries []LogEntry) (LogIndex, bool) {
+// replicateEntries merges and durably appends entries on a follower.
+//
+// The third return value is non-nil only for a terminal storage failure (a
+// poisoned Storage). It is deliberately distinct from ok=false, which means
+// "retryable log mismatch": a poisoned follower must not be reported as a
+// mismatch, or the leader decrements nextIndex forever against a replication
+// that can never succeed while the follower looks healthy to the whole cluster.
+func (n *Node) replicateEntries(prevLogIndex uint64, prevLogTerm uint64, entries []LogEntry) (LogIndex, bool, error) {
 	n.proposeMu.Lock()
 	defer n.proposeMu.Unlock()
 
 	if n.closed.Load() {
-		return 0, false
+		return 0, false, nil
 	}
 
 	// Fresh PrevLog verification: the caller checked this before
@@ -2411,22 +2432,22 @@ func (n *Node) replicateEntries(prevLogIndex uint64, prevLogTerm uint64, entries
 	// since. Mismatch here means no mutation and a retryable rejection.
 	if prevLogIndex == 0 {
 		if prevLogTerm != 0 {
-			return 0, false
+			return 0, false, nil
 		}
 	} else {
 		lastIdx, _, err := n.storage.LastIndexAndTerm()
 		if err != nil || LogIndex(prevLogIndex) > lastIdx {
-			return 0, false
+			return 0, false, nil
 		}
 		termAtPrev, err := n.storage.TermOf(LogIndex(prevLogIndex))
 		if err != nil || termAtPrev != Term(prevLogTerm) {
-			return 0, false
+			return 0, false, nil
 		}
 	}
 
 	lastIdx, _, err := n.storage.LastIndexAndTerm()
 	if err != nil {
-		return 0, false
+		return 0, false, nil
 	}
 
 	// Walk entries against the local log.
@@ -2438,13 +2459,13 @@ func (n *Node) replicateEntries(prevLogIndex uint64, prevLogTerm uint64, entries
 		}
 		localTerm, err := n.storage.TermOf(e.Index)
 		if err != nil {
-			return 0, false
+			return 0, false, nil
 		}
 		if localTerm != e.Term {
 			// Conflict: truncate the divergent suffix, then append this
 			// entry and everything after it.
 			if err := n.storage.TruncateSuffix(e.Index); err != nil {
-				return 0, false
+				return 0, false, nil
 			}
 			appendFrom = i
 			break
@@ -2455,16 +2476,24 @@ func (n *Node) replicateEntries(prevLogIndex uint64, prevLogTerm uint64, entries
 		// Every supplied entry already matches (duplicate or prefix
 		// delivery, possibly with extra local tail beyond — preserved).
 		// No storage writes needed.
-		return LogIndex(prevLogIndex) + LogIndex(len(entries)), true
+		return LogIndex(prevLogIndex) + LogIndex(len(entries)), true, nil
 	}
 
 	// Durably persist the new suffix. Storage.Append re-validates contiguity
 	// (entries[appendFrom].Index == lastIdx+1 by construction above) and
-	// syncs before mutating memory; on failure the log is untouched.
+	// syncs before mutating memory.
+	//
+	// A poisoned Storage is not a log mismatch. Reporting ok=false here would make
+	// the leader decrement nextIndex forever and retry a replication that can never
+	// succeed, while the follower keeps looking healthy to everyone. Propagate the
+	// terminal condition so HandleAppendEntries can answer with an explicit error.
 	if err := n.storage.Append(entries[appendFrom:]...); err != nil {
-		return 0, false
+		if n.storage.IsPoisoned() {
+			return 0, false, err
+		}
+		return 0, false, nil
 	}
-	return LogIndex(prevLogIndex) + LogIndex(len(entries)), true
+	return LogIndex(prevLogIndex) + LogIndex(len(entries)), true, nil
 }
 
 // HandleAppendEntriesResponse processes an incoming AppendEntries response from a peer.
