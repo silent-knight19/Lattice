@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/silent-knight19/lattice/internal/binary"
 	"github.com/silent-knight19/lattice/internal/errors"
 )
 
@@ -292,6 +293,73 @@ func TestVersionSet_AppendVersion_Validation(t *testing.T) {
 	}
 	if err := vs.AppendVersion(v1); !stdErrors.Is(err, errors.ErrVersionAlreadyAppended) {
 		t.Fatalf("expected ErrVersionAlreadyAppended, got: %v", err)
+	}
+}
+
+func TestVersionSet_RollbackAppendedVersion(t *testing.T) {
+	vs := NewVersionSet()
+	origNextFile := uint64(10)
+	origLastSeq := binary.SeqNum(42)
+	vs.SetNextFileNum(origNextFile)
+	vs.SetLastSeqNum(origLastSeq)
+
+	var cleaned bool
+	v := NewVersion([NumLevels][]FileMetadata{
+		0: {
+			{
+				FileNum:        15,
+				FileSize:       100,
+				SmallestKey:    []byte("a"),
+				LargestKey:     []byte("z"),
+				SmallestSeqNum: 50,
+				LargestSeqNum:  100,
+			},
+		},
+	})
+	v.SetCleanupFnForTesting(func() {
+		cleaned = true
+	})
+
+	if err := vs.AppendVersion(v); err != nil {
+		t.Fatalf("AppendVersion failed: %v", err)
+	}
+
+	if !vs.HasCurrent() {
+		t.Fatal("expected vs.HasCurrent() == true after AppendVersion")
+	}
+	if vs.ActiveCount() != 1 {
+		t.Fatalf("expected ActiveCount == 1, got %d", vs.ActiveCount())
+	}
+	if vs.NextFileNum() != 16 {
+		t.Fatalf("expected NextFileNum == 16, got %d", vs.NextFileNum())
+	}
+	if vs.LastSeqNum() != 100 {
+		t.Fatalf("expected LastSeqNum == 100, got %d", vs.LastSeqNum())
+	}
+
+	// Now roll back the appended version
+	vs.RollbackAppendedVersion(v, origNextFile, origLastSeq)
+
+	if vs.HasCurrent() {
+		t.Fatal("expected vs.HasCurrent() == false after RollbackAppendedVersion")
+	}
+	if vs.Current() != nil {
+		t.Fatal("expected vs.Current() == nil after RollbackAppendedVersion")
+	}
+	if vs.ActiveCount() != 0 {
+		t.Fatalf("expected ActiveCount == 0 after rollback, got %d", vs.ActiveCount())
+	}
+	if vs.NextFileNum() != origNextFile {
+		t.Fatalf("expected NextFileNum restored to %d, got %d", origNextFile, vs.NextFileNum())
+	}
+	if vs.LastSeqNum() != origLastSeq {
+		t.Fatalf("expected LastSeqNum restored to %d, got %d", origLastSeq, vs.LastSeqNum())
+	}
+	if !cleaned {
+		t.Fatal("expected version to be finalized and cleaned up after rollback")
+	}
+	if v.RefCount() != 0 {
+		t.Fatalf("expected v.RefCount() == 0, got %d", v.RefCount())
 	}
 }
 

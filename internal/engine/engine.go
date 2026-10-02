@@ -61,8 +61,10 @@ var (
 )
 
 var (
-	recoveryPrePublishHookMu sync.Mutex
-	recoveryPrePublishHook   func(*Engine)
+	recoveryPrePublishHookMu  sync.Mutex
+	recoveryPrePublishHook    func(*Engine)
+	recoveryPostPublishHookMu sync.Mutex
+	recoveryPostPublishHook   func(*Engine) error
 )
 
 // Engine coordinates the active MemTable, immutable flush candidates,
@@ -1416,35 +1418,9 @@ func (e *Engine) RecoverWAL() error {
 		checkpoint = res.LastSeqNum
 	}
 
-	// Step 2: Recover uncommitted WAL records newer than checkpoint
-	if err := e.recoverWALInternal(dbPath, checkpoint, replayRes); err != nil {
-		return err
-	}
-
-	// Step 3: Purge unreferenced crash-window temporary files left by interrupted writes/flushes
-	// Individual orphan cleanup failures (e.g. symlinks, permission errors) do not invalidate
-	// successfully recovered durable state and must not cause startup denial of service (P07-SEC-005).
-	cleanReport, cleanErr := e.CleanOrphanedFilesWithReport()
-	e.mu.Lock()
-	e.lastCleanerReport = cleanReport
-	if cleanErr != nil && isCriticalCleanerError(cleanErr, cleanReport) {
-		if !e.closed.Load() && e.state != engineStateClosed && e.state != engineStateClosing {
-			e.state = engineStateNotRecovering
-		}
-		e.mu.Unlock()
-		return fmt.Errorf("engine: failed to clean orphaned temporary files: %w", cleanErr)
-	}
-
-	if e.closed.Load() || e.state == engineStateClosed || e.state == engineStateClosing {
-		e.mu.Unlock()
-		return errors.ErrWriterClosed
-	}
-
-	// Step 4: Mark Engine recovered
-	e.state = engineStateRecovered
-	e.mu.Unlock()
-
-	return nil
+	// Steps 2-5: Execute unified recovery pipeline with pre-publication validation,
+	// atomic publication, orphan cleanup, and full rollback on failure.
+	return e.executeRecoveryPipeline(dbPath, checkpoint, replayRes)
 }
 
 // RecoverWALFromCheckpoint executes WAL recovery with an explicitly supplied sequence watermark.
@@ -1463,29 +1439,7 @@ func (e *Engine) RecoverWALFromCheckpoint(checkpoint binary.SeqNum) error {
 		return fmt.Errorf("%w: engine dbPath cannot be empty", os.ErrInvalid)
 	}
 
-	if err := e.recoverWALInternal(dbPath, checkpoint, nil); err != nil {
-		return err
-	}
-	cleanReport, cleanErr := e.CleanOrphanedFilesWithReport()
-	e.mu.Lock()
-	e.lastCleanerReport = cleanReport
-	if cleanErr != nil && isCriticalCleanerError(cleanErr, cleanReport) {
-		if !e.closed.Load() && e.state != engineStateClosed && e.state != engineStateClosing {
-			e.state = engineStateNotRecovering
-		}
-		e.mu.Unlock()
-		return fmt.Errorf("engine: failed to clean orphaned temporary files: %w", cleanErr)
-	}
-
-	if e.closed.Load() || e.state == engineStateClosed || e.state == engineStateClosing {
-		e.mu.Unlock()
-		return errors.ErrWriterClosed
-	}
-
-	e.state = engineStateRecovered
-	e.mu.Unlock()
-
-	return nil
+	return e.executeRecoveryPipeline(dbPath, checkpoint, nil)
 }
 
 // RecoverWALWithManifestResult executes WAL recovery composing directly with a pre-computed
@@ -1513,32 +1467,53 @@ func (e *Engine) RecoverWALWithManifestResult(res *version.ReplayResult) error {
 		return fmt.Errorf("%w: engine dbPath cannot be empty", os.ErrInvalid)
 	}
 
-	if err := e.recoverWALInternal(dbPath, res.LastSeqNum, res); err != nil {
-		return err
-	}
-	cleanReport, cleanErr := e.CleanOrphanedFilesWithReport()
+	return e.executeRecoveryPipeline(dbPath, res.LastSeqNum, res)
+}
+
+type recoveryRollbackSnapshot struct {
+	origActiveMem     *memtable.SkipList
+	origImmMems       []*memtable.SkipList
+	origSeqNum        uint64
+	origFileNum       uint64
+	origBackpressure  uint64
+	origCleanerReport CleanOrphanReport
+	versionAppended   bool
+	appendedVersion   *version.Version
+	origVSNextFile    uint64
+	origVSLastSeq     binary.SeqNum
+}
+
+func (e *Engine) rollbackPublishedRecovery(snap recoveryRollbackSnapshot) {
 	e.mu.Lock()
-	e.lastCleanerReport = cleanReport
-	if cleanErr != nil && isCriticalCleanerError(cleanErr, cleanReport) {
-		if !e.closed.Load() && e.state != engineStateClosed && e.state != engineStateClosing {
-			e.state = engineStateNotRecovering
-		}
-		e.mu.Unlock()
-		return fmt.Errorf("engine: failed to clean orphaned temporary files: %w", cleanErr)
+	e.activeMem = snap.origActiveMem
+	e.immMems = snap.origImmMems
+	e.nextSeqNum.Store(snap.origSeqNum)
+	e.nextFileNum.Store(snap.origFileNum)
+	e.lastCleanerReport = snap.origCleanerReport
+
+	if e.backpressure != nil {
+		e.backpressure.RecordUsage(snap.origBackpressure)
 	}
 
-	if e.closed.Load() || e.state == engineStateClosed || e.state == engineStateClosing {
-		e.mu.Unlock()
-		return errors.ErrWriterClosed
-	}
-
-	e.state = engineStateRecovered
+	// Keep state as engineStateRecovering while rolling back VersionSet outside e.mu
 	e.mu.Unlock()
 
-	return nil
+	if snap.versionAppended && snap.appendedVersion != nil && e.vset != nil {
+		e.vset.RollbackAppendedVersion(snap.appendedVersion, snap.origVSNextFile, snap.origVSLastSeq)
+	}
+
+	e.mu.Lock()
+	if !e.closed.Load() && e.state != engineStateClosed && e.state != engineStateClosing {
+		e.state = engineStateNotRecovering
+	}
+	e.mu.Unlock()
 }
 
 func (e *Engine) recoverWALInternal(dbPath string, checkpoint binary.SeqNum, replayRes *version.ReplayResult) error {
+	return e.executeRecoveryPipeline(dbPath, checkpoint, replayRes)
+}
+
+func (e *Engine) executeRecoveryPipeline(dbPath string, checkpoint binary.SeqNum, replayRes *version.ReplayResult) error {
 	recoveryMem := memtable.NewSkipList()
 	var recoveryImm []*memtable.SkipList
 
@@ -1634,62 +1609,15 @@ func (e *Engine) recoverWALInternal(dbPath string, checkpoint binary.SeqNum, rep
 	_ = inBatch
 	batchBuffer = nil
 
-	recoveryPrePublishHookMu.Lock()
-	hook := recoveryPrePublishHook
-	recoveryPrePublishHookMu.Unlock()
-	if hook != nil {
-		hook(e)
-	}
-
-	// State publication atomicity: publish under e.mu.Lock()
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	// If engine was closed while recovery was running, abort publication without mutating engine state
-	if e.closed.Load() || e.state == engineStateClosed {
-		if replayRes != nil && replayRes.Version != nil {
-			replayRes.Version.Unref()
-		}
-		e.state = engineStateClosed
-		return errors.ErrWriterClosed
-	}
-
-	// 1. Install active and immutable MemTables (replace, do not append to prevent accumulation)
-	e.activeMem = recoveryMem
-	e.immMems = recoveryImm
-
-	// 2. Monotonic sequence counter advancement: max(current, checkpoint, wal.LastSeqNum)
-	highestSeq := uint64(checkpoint)
-	if uint64(report.LastSeqNum) > highestSeq {
-		highestSeq = uint64(report.LastSeqNum)
-	}
-	curSeq := e.nextSeqNum.Load()
-	if highestSeq > curSeq {
-		e.nextSeqNum.Store(highestSeq)
-	}
-
-	// 3. Install reconstructed Version into VersionSet (SEC-P07-04)
-	if replayRes != nil && replayRes.Version != nil {
-		if e.vset != nil && !e.vset.HasCurrent() {
-			if err := e.vset.AppendVersion(replayRes.Version); err != nil {
-				replayRes.Version.Unref()
-				e.state = engineStateNotRecovering
-				return fmt.Errorf("engine: failed to install reconstructed version: %w", err)
-			}
-		} else {
-			replayRes.Version.Unref()
-		}
-	}
-
-	// 4. File number watermark initialization and advancement (P07-SEC-004, P07-SEC-006)
-	// Scan dbPath for existing canonical SSTables and staging artifacts to detect any uncommitted crash-window files
+	// Pre-publication Validation: File number watermark initialization and advancement (P07-SEC-004, P07-SEC-006).
+	// Must validate and scan the filesystem BEFORE mutating ANY live Engine state.
 	var maxPhysicalFileNum uint64
 	entries, readErr := os.ReadDir(dbPath)
 	if readErr != nil && !os.IsNotExist(readErr) {
 		if replayRes != nil && replayRes.Version != nil {
 			replayRes.Version.Unref()
 		}
-		e.state = engineStateNotRecovering
+		e.abortRecovery()
 		return fmt.Errorf("engine: failed to scan db directory for existing files: %w", readErr)
 	}
 	for _, entry := range entries {
@@ -1722,7 +1650,7 @@ func (e *Engine) recoverWALInternal(dbPath string, checkpoint binary.SeqNum, rep
 		if replayRes != nil && replayRes.Version != nil {
 			replayRes.Version.Unref()
 		}
-		e.state = engineStateNotRecovering
+		e.abortRecovery()
 		return errors.ErrFileNumOverflow
 	}
 
@@ -1733,21 +1661,123 @@ func (e *Engine) recoverWALInternal(dbPath string, checkpoint binary.SeqNum, rep
 	if targetFileNum < 1 {
 		targetFileNum = 1
 	}
-	curFileNum := e.nextFileNum.Load()
-	if targetFileNum > curFileNum {
+
+	// Monotonic sequence counter advancement: max(current, checkpoint, wal.LastSeqNum)
+	highestSeq := uint64(checkpoint)
+	if uint64(report.LastSeqNum) > highestSeq {
+		highestSeq = uint64(report.LastSeqNum)
+	}
+
+	// Calculate recovered memory bytes for backpressure
+	totalRecoveredBytes := recoveryMem.ByteSize()
+	for _, imm := range recoveryImm {
+		totalRecoveredBytes += imm.ByteSize()
+	}
+
+	recoveryPrePublishHookMu.Lock()
+	preHook := recoveryPrePublishHook
+	recoveryPrePublishHookMu.Unlock()
+	if preHook != nil {
+		preHook(e)
+	}
+
+	// State publication atomicity: publish under e.mu.Lock() with snapshot for rollback
+	e.mu.Lock()
+
+	// If engine was closed while recovery was running, abort publication without mutating engine state
+	if e.closed.Load() || e.state == engineStateClosed || e.state == engineStateClosing {
+		if replayRes != nil && replayRes.Version != nil {
+			replayRes.Version.Unref()
+		}
+		e.state = engineStateClosed
+		e.mu.Unlock()
+		return errors.ErrWriterClosed
+	}
+
+	snap := recoveryRollbackSnapshot{
+		origActiveMem:     e.activeMem,
+		origImmMems:       e.immMems,
+		origSeqNum:        e.nextSeqNum.Load(),
+		origFileNum:       e.nextFileNum.Load(),
+		origCleanerReport: e.lastCleanerReport,
+	}
+	if e.backpressure != nil {
+		snap.origBackpressure = e.backpressure.CurrentBytes()
+	}
+
+	// 1. Install reconstructed Version into VersionSet (SEC-P07-04)
+	if replayRes != nil && replayRes.Version != nil {
+		if e.vset != nil && !e.vset.HasCurrent() {
+			snap.origVSNextFile = e.vset.NextFileNum()
+			snap.origVSLastSeq = e.vset.LastSeqNum()
+			if err := e.vset.AppendVersion(replayRes.Version); err != nil {
+				replayRes.Version.Unref()
+				e.state = engineStateNotRecovering
+				e.mu.Unlock()
+				return fmt.Errorf("engine: failed to install reconstructed version: %w", err)
+			}
+			snap.versionAppended = true
+			snap.appendedVersion = replayRes.Version
+		} else {
+			replayRes.Version.Unref()
+		}
+	}
+
+	// 2. Install active and immutable MemTables
+	e.activeMem = recoveryMem
+	e.immMems = recoveryImm
+
+	// 3. Advance sequence counter
+	if highestSeq > snap.origSeqNum {
+		e.nextSeqNum.Store(highestSeq)
+	}
+
+	// 4. Advance file number counter
+	if targetFileNum > snap.origFileNum {
 		e.nextFileNum.Store(targetFileNum)
 	}
 
-	// 5. Synchronize backpressure accounting with recovered memory
+	// 5. Synchronize backpressure accounting
 	if e.backpressure != nil {
-		totalBytes := e.activeMem.ByteSize()
-		for _, imm := range e.immMems {
-			totalBytes += imm.ByteSize()
-		}
-		e.backpressure.RecordUsage(totalBytes)
+		e.backpressure.RecordUsage(totalRecoveredBytes)
 	}
 
-	// Note: e.state remains engineStateRecovering until orphan cleanup succeeds in caller.
+	// Note: e.state remains engineStateRecovering until orphan cleanup and post-publish checks succeed.
+	e.mu.Unlock()
+
+	// Post-publish hook (testing fault injection / atomicity validation)
+	recoveryPostPublishHookMu.Lock()
+	postHook := recoveryPostPublishHook
+	recoveryPostPublishHookMu.Unlock()
+	if postHook != nil {
+		if hookErr := postHook(e); hookErr != nil {
+			e.rollbackPublishedRecovery(snap)
+			return fmt.Errorf("engine: post-publish failure: %w", hookErr)
+		}
+	}
+
+	// Purge unreferenced crash-window temporary files left by interrupted writes/flushes.
+	// Individual orphan cleanup failures (e.g. symlinks, permission errors) do not invalidate
+	// successfully recovered durable state and must not cause startup denial of service (P07-SEC-005).
+	// Critical cleaner errors (e.g. parent directory swap, fsync failure) fail closed with full rollback.
+	cleanReport, cleanErr := e.CleanOrphanedFilesWithReport()
+	if cleanErr != nil && isCriticalCleanerError(cleanErr, cleanReport) {
+		e.rollbackPublishedRecovery(snap)
+		return fmt.Errorf("engine: failed to clean orphaned temporary files: %w", cleanErr)
+	}
+
+	e.mu.Lock()
+	if e.closed.Load() || e.state == engineStateClosed || e.state == engineStateClosing {
+		e.mu.Unlock()
+		e.rollbackPublishedRecovery(snap)
+		return errors.ErrWriterClosed
+	}
+
+	// Final Step: Mark Engine recovered
+	e.lastCleanerReport = cleanReport
+	e.state = engineStateRecovered
+	e.mu.Unlock()
+
 	return nil
 }
 

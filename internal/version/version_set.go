@@ -265,6 +265,28 @@ func (vs *VersionSet) AppendVersion(v *Version) error {
 	return nil
 }
 
+// RollbackAppendedVersion safely detaches an uncommitted Version that was appended
+// during a failed recovery pipeline, restoring VersionSet current, chain links, and watermarks
+// to their exact pre-recovery state and dropping ownership of the Version.
+func (vs *VersionSet) RollbackAppendedVersion(v *Version, origNextFile uint64, origLastSeq binary.SeqNum) {
+	if vs == nil || v == nil {
+		return
+	}
+	vs.mu.Lock()
+	if vs.current != v || v.vset != vs {
+		vs.mu.Unlock()
+		return
+	}
+	vs.current = nil
+	v.unlinkLocked()
+	v.vset = nil
+	vs.nextFileNum = origNextFile
+	vs.lastSeqNum = origLastSeq
+	vs.mu.Unlock()
+
+	v.Unref()
+}
+
 // Current returns the actively published Version, pinned with an incremented reference count.
 // The caller MUST call Unref() when finished with the Version snapshot.
 // If no Version has been installed yet, Current returns nil.

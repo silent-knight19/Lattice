@@ -504,3 +504,331 @@ func TestCrossFindingInteractions(t *testing.T) {
 		}
 	})
 }
+
+// -----------------------------------------------------------------------------
+// POST-PUBLICATION FAILURE & ATOMIC ROLLBACK TESTS
+// -----------------------------------------------------------------------------
+
+func TestRecoveryAtomicity_PostPublishFailureRollbackAllEntryPoints(t *testing.T) {
+	entryPoints := []string{"RecoverWAL", "RecoverWALFromCheckpoint", "RecoverWALWithManifestResult"}
+
+	for _, ep := range entryPoints {
+		t.Run("EntryPoint_"+ep, func(t *testing.T) {
+			dir := t.TempDir()
+
+			// 1. Create a valid MANIFEST with an active SSTable
+			_ = os.WriteFile(filepath.Join(dir, "CURRENT"), []byte("MANIFEST-000001\n"), 0644)
+			manPath := filepath.Join(dir, "MANIFEST-000001")
+			mw, err := version.CreateManifestWriter(manPath)
+			if err != nil {
+				t.Fatalf("CreateManifestWriter failed: %v", err)
+			}
+			ik, _ := binary.NewInternalKey([]byte("dur_key"), 1, binary.OpTypePut)
+			encKey := binary.EncodeInternalKey(ik)
+			sstPath := filepath.Join(dir, "000001.sst")
+			_ = os.WriteFile(sstPath, []byte("sstable_content_1024"), 0600)
+			sstSize := uint64(len("sstable_content_1024"))
+
+			edit := version.NewVersionEdit()
+			edit.SetNextFileNum(2)
+			edit.SetLastSeqNum(1)
+			_ = edit.AddFile(0, version.FileMetadata{
+				FileNum:        1,
+				FileSize:       sstSize,
+				SmallestKey:    encKey,
+				LargestKey:     encKey,
+				SmallestSeqNum: 1,
+				LargestSeqNum:  1,
+			})
+			_ = mw.LogEditPtr(edit)
+			_ = mw.Close()
+
+			// 2. Create WAL with uncommitted records
+			walDir := filepath.Join(dir, "wal")
+			_ = os.MkdirAll(walDir, 0700)
+			w, err := wal.OpenWriter(filepath.Join(walDir, "wal_000000000001.log"))
+			if err != nil {
+				t.Fatalf("OpenWriter failed: %v", err)
+			}
+			_ = w.AppendSync(wal.Record{Type: wal.RecordTypePut, SeqNum: 2, Timestamp: 100, Key: []byte("wal_k1"), Value: []byte("wal_v1")})
+			_ = w.AppendSync(wal.Record{Type: wal.RecordTypePut, SeqNum: 3, Timestamp: 200, Key: []byte("wal_k2"), Value: []byte("wal_v2")})
+			_ = w.Close()
+
+			// 3. Staging orphan file that should be cleaned on success
+			stagingPath := filepath.Join(dir, ".tmp_000005.sst_temp123")
+			_ = os.WriteFile(stagingPath, []byte("orphan"), 0600)
+
+			vs := version.NewVersionSet()
+			eng := engine.NewEngineWithOptions(engine.EngineOptions{
+				DBPath:     dir,
+				VersionSet: vs,
+			})
+
+			// 4. Inject post-publication failure
+			restoreHook := engine.SetRecoveryPostPublishHookForTesting(func(e *engine.Engine) error {
+				return stdErrors.New("simulated post-publication failure")
+			})
+
+			var recErr error
+			switch ep {
+			case "RecoverWAL":
+				recErr = eng.RecoverWAL()
+			case "RecoverWALFromCheckpoint":
+				recErr = eng.RecoverWALFromCheckpoint(1)
+			case "RecoverWALWithManifestResult":
+				disc, discErr := version.DiscoverActiveManifest(dir)
+				if discErr != nil {
+					t.Fatalf("DiscoverCurrentManifest failed: %v", discErr)
+				}
+				res, repErr := version.ReplayManifest(disc)
+				_ = disc.Close()
+				if repErr != nil {
+					t.Fatalf("ReplayManifest failed: %v", repErr)
+				}
+				recErr = eng.RecoverWALWithManifestResult(res)
+			}
+
+			if recErr == nil {
+				t.Fatalf("[%s] expected recovery to fail on post-publish error, got nil", ep)
+			}
+
+			// 5. Verify 100% atomic rollback to pre-recovery state
+			if eng.IsRecovered() {
+				t.Fatalf("[%s] engine must not be marked recovered after rollback", ep)
+			}
+			if eng.ActiveMemTable().Len() != 0 {
+				t.Fatalf("[%s] activeMem must be rolled back to len 0, got %d", ep, eng.ActiveMemTable().Len())
+			}
+			if len(eng.ImmMemTables()) != 0 {
+				t.Fatalf("[%s] immMems must be rolled back to len 0, got %d", ep, len(eng.ImmMemTables()))
+			}
+			if eng.NextSeqNum() != 0 {
+				t.Fatalf("[%s] nextSeqNum must be rolled back to 0, got %d", ep, eng.NextSeqNum())
+			}
+			if eng.NextFileNum() != 0 {
+				t.Fatalf("[%s] nextFileNum must be rolled back to 0, got %d", ep, eng.NextFileNum())
+			}
+			if eng.VersionSet() != nil && eng.VersionSet().HasCurrent() {
+				t.Fatalf("[%s] VersionSet must not retain current Version after rollback", ep)
+			}
+			if eng.Backpressure().CurrentBytes() != 0 {
+				t.Fatalf("[%s] Backpressure must be rolled back to 0, got %d", ep, eng.Backpressure().CurrentBytes())
+			}
+
+			// Point lookup must fail (not returning uncommitted WAL keys)
+			if _, getErr := eng.Get([]byte("wal_k1")); !stdErrors.Is(getErr, errors.ErrKeyNotFound) {
+				t.Fatalf("[%s] expected ErrKeyNotFound, got %v", ep, getErr)
+			}
+
+			// 6. Clear fault injection and verify second recovery attempt SUCCEEDS
+			restoreHook()
+
+			var secondErr error
+			switch ep {
+			case "RecoverWAL":
+				secondErr = eng.RecoverWAL()
+			case "RecoverWALFromCheckpoint":
+				secondErr = eng.RecoverWALFromCheckpoint(1)
+			case "RecoverWALWithManifestResult":
+				disc, discErr := version.DiscoverActiveManifest(dir)
+				if discErr != nil {
+					t.Fatalf("DiscoverCurrentManifest failed: %v", discErr)
+				}
+				res, repErr := version.ReplayManifest(disc)
+				_ = disc.Close()
+				if repErr != nil {
+					t.Fatalf("ReplayManifest failed: %v", repErr)
+				}
+				secondErr = eng.RecoverWALWithManifestResult(res)
+			}
+
+			if secondErr != nil {
+				t.Fatalf("[%s] second recovery attempt failed: %v", ep, secondErr)
+			}
+
+			if !eng.IsRecovered() {
+				t.Fatalf("[%s] engine must be marked recovered after second recovery", ep)
+			}
+			if eng.NextSeqNum() != 3 {
+				t.Fatalf("[%s] expected NextSeqNum == 3, got %d", ep, eng.NextSeqNum())
+			}
+			val, err := eng.Get([]byte("wal_k1"))
+			if err != nil || string(val) != "wal_v1" {
+				t.Fatalf("[%s] expected wal_k1 = wal_v1, got val=%q, err=%v", ep, string(val), err)
+			}
+			val2, err2 := eng.Get([]byte("wal_k2"))
+			if err2 != nil || string(val2) != "wal_v2" {
+				t.Fatalf("[%s] expected wal_k2 = wal_v2, got val=%q, err=%v", ep, string(val2), err2)
+			}
+
+			_ = eng.Close()
+		})
+	}
+}
+
+func TestRecoveryAtomicity_OrphanCleanupFailureRollback(t *testing.T) {
+	dir := t.TempDir()
+
+	// WAL with uncommitted record
+	walDir := filepath.Join(dir, "wal")
+	_ = os.MkdirAll(walDir, 0700)
+	w, err := wal.OpenWriter(filepath.Join(walDir, "wal_000000000001.log"))
+	if err != nil {
+		t.Fatalf("OpenWriter failed: %v", err)
+	}
+	_ = w.AppendSync(wal.Record{Type: wal.RecordTypePut, SeqNum: 1, Timestamp: 100, Key: []byte("k"), Value: []byte("v")})
+	_ = w.Close()
+
+	// Staging orphan file that cleaner will attempt to clean and sync
+	stagingPath := filepath.Join(dir, ".tmp_000005.sst_temp123")
+	_ = os.WriteFile(stagingPath, []byte("orphan"), 0600)
+
+	vs := version.NewVersionSet()
+	eng := engine.NewEngineWithOptions(engine.EngineOptions{
+		DBPath:     dir,
+		VersionSet: vs,
+	})
+
+	// Inject cleaner sync directory failure (critical cleaner error)
+	restoreSync := engine.SetCleanerSyncDirFnForTesting(func(*os.File) error {
+		return stdErrors.New("simulated directory sync failure")
+	})
+
+	err = eng.RecoverWAL()
+	if err == nil {
+		t.Fatal("expected recovery to fail on critical cleaner directory sync error, got nil")
+	}
+
+	// Verify complete rollback to pre-recovery state
+	if eng.IsRecovered() {
+		t.Fatal("engine must not be marked recovered after cleaner failure rollback")
+	}
+	if eng.ActiveMemTable().Len() != 0 {
+		t.Fatalf("activeMem must be rolled back to len 0, got %d", eng.ActiveMemTable().Len())
+	}
+	if eng.NextSeqNum() != 0 {
+		t.Fatalf("nextSeqNum must be rolled back to 0, got %d", eng.NextSeqNum())
+	}
+	if eng.NextFileNum() != 0 {
+		t.Fatalf("nextFileNum must be rolled back to 0, got %d", eng.NextFileNum())
+	}
+	if eng.VersionSet().HasCurrent() {
+		t.Fatal("VersionSet must not retain current Version after rollback")
+	}
+	if eng.Backpressure().CurrentBytes() != 0 {
+		t.Fatalf("Backpressure must be 0, got %d", eng.Backpressure().CurrentBytes())
+	}
+
+	// Restore sync function and verify second recovery attempt succeeds cleanly
+	restoreSync()
+
+	if err := eng.RecoverWAL(); err != nil {
+		t.Fatalf("second RecoverWAL failed: %v", err)
+	}
+	if !eng.IsRecovered() {
+		t.Fatal("engine must be marked recovered after second recovery")
+	}
+	val, err := eng.Get([]byte("k"))
+	if err != nil || string(val) != "v" {
+		t.Fatalf("expected k = v, got val=%q, err=%v", string(val), err)
+	}
+
+	_ = eng.Close()
+}
+
+func TestRecoveryAtomicity_PreconditionFailureZeroLiveMutation(t *testing.T) {
+	dir := t.TempDir()
+
+	// WAL with uncommitted record
+	walDir := filepath.Join(dir, "wal")
+	_ = os.MkdirAll(walDir, 0700)
+	w, err := wal.OpenWriter(filepath.Join(walDir, "wal_000000000001.log"))
+	if err != nil {
+		t.Fatalf("OpenWriter failed: %v", err)
+	}
+	_ = w.AppendSync(wal.Record{Type: wal.RecordTypePut, SeqNum: 1, Timestamp: 100, Key: []byte("k"), Value: []byte("v")})
+	_ = w.Close()
+
+	// Staging file with math.MaxUint64 file number causing ErrFileNumOverflow
+	maxStagingName := ".tmp_18446744073709551615.sst_overflow"
+	stagingPath := filepath.Join(dir, maxStagingName)
+	_ = os.WriteFile(stagingPath, []byte("overflow"), 0600)
+
+	vs := version.NewVersionSet()
+	eng := engine.NewEngineWithOptions(engine.EngineOptions{
+		DBPath:     dir,
+		VersionSet: vs,
+	})
+
+	err = eng.RecoverWAL()
+	if !stdErrors.Is(err, errors.ErrFileNumOverflow) {
+		t.Fatalf("expected ErrFileNumOverflow, got: %v", err)
+	}
+
+	// Verify zero live state modification
+	if eng.IsRecovered() {
+		t.Fatal("engine must not be marked recovered on overflow")
+	}
+	if eng.ActiveMemTable().Len() != 0 {
+		t.Fatalf("activeMem must be len 0, got %d", eng.ActiveMemTable().Len())
+	}
+	if eng.NextSeqNum() != 0 {
+		t.Fatalf("nextSeqNum must be 0, got %d", eng.NextSeqNum())
+	}
+	if eng.NextFileNum() != 0 {
+		t.Fatalf("nextFileNum must be 0, got %d", eng.NextFileNum())
+	}
+	if eng.VersionSet().HasCurrent() {
+		t.Fatal("VersionSet must not retain current Version on overflow")
+	}
+
+	// Remove overflow staging file and verify second recovery succeeds
+	_ = os.Remove(stagingPath)
+	if err := eng.RecoverWAL(); err != nil {
+		t.Fatalf("second RecoverWAL failed: %v", err)
+	}
+	if !eng.IsRecovered() {
+		t.Fatal("engine must be marked recovered after overflow file removed")
+	}
+
+	_ = eng.Close()
+}
+
+func TestRecoveryAtomicity_ConcurrentCloseRollback(t *testing.T) {
+	dir := t.TempDir()
+
+	walDir := filepath.Join(dir, "wal")
+	_ = os.MkdirAll(walDir, 0700)
+	w, err := wal.OpenWriter(filepath.Join(walDir, "wal_000000000001.log"))
+	if err != nil {
+		t.Fatalf("OpenWriter failed: %v", err)
+	}
+	_ = w.AppendSync(wal.Record{Type: wal.RecordTypePut, SeqNum: 1, Timestamp: 100, Key: []byte("k"), Value: []byte("v")})
+	_ = w.Close()
+
+	vs := version.NewVersionSet()
+	eng := engine.NewEngineWithOptions(engine.EngineOptions{
+		DBPath:     dir,
+		VersionSet: vs,
+	})
+
+	restoreHook := engine.SetRecoveryPostPublishHookForTesting(func(e *engine.Engine) error {
+		return e.Close()
+	})
+	defer restoreHook()
+
+	err = eng.RecoverWAL()
+	if !stdErrors.Is(err, errors.ErrWriterClosed) {
+		t.Fatalf("expected ErrWriterClosed, got: %v", err)
+	}
+
+	if eng.IsRecovered() {
+		t.Fatal("engine must not be marked recovered after concurrent Close")
+	}
+	if eng.ActiveMemTable().Len() != 0 {
+		t.Fatalf("activeMem must be 0, got %d", eng.ActiveMemTable().Len())
+	}
+	if eng.VersionSet().HasCurrent() {
+		t.Fatal("VersionSet must not retain current Version after Close")
+	}
+}

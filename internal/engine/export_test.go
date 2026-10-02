@@ -30,6 +30,20 @@ func SetRecoveryPrePublishHookForTesting(hook func(*Engine)) func() {
 	}
 }
 
+// SetRecoveryPostPublishHookForTesting registers a testing hook called right after recovery state is published,
+// before orphan cleanup and final marking of engineStateRecovered.
+// If the hook returns an error, the recovery pipeline triggers full rollback.
+func SetRecoveryPostPublishHookForTesting(hook func(*Engine) error) func() {
+	recoveryPostPublishHookMu.Lock()
+	recoveryPostPublishHook = hook
+	recoveryPostPublishHookMu.Unlock()
+	return func() {
+		recoveryPostPublishHookMu.Lock()
+		recoveryPostPublishHook = nil
+		recoveryPostPublishHookMu.Unlock()
+	}
+}
+
 // SetCleanerSyncDirFnForTesting overrides cleanerSyncDirFn for testing directory sync failures.
 func SetCleanerSyncDirFnForTesting(fn func(*os.File) error) func() {
 	prev := cleanerSyncDirFn

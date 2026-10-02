@@ -226,12 +226,20 @@ For any number of recovery executions $N \ge 1$:
 $$Replay(S_{disk})_1 \equiv Replay(S_{disk})_2 \equiv \dots \equiv Replay(S_{disk})_N$$
 Repeated recovery executions produce identical active MemTable contents, identical sequence watermarks, identical VersionSet hierarchies, and identical file allocation counters.
 
-### 7.3 Atomic State Installation
-State publication occurs atomically under `Engine.mu.Lock()`:
-1. Active MemTable installed: `e.activeMem = recoveryMem`.
-2. Immutable MemTables installed: `e.immMems = recoveryImm`.
-3. Sequence counter advanced: `e.nextSeqNum.Store(max(checkpoint, wal.LastSeqNum))`. (The subsequent write increments via `Add(1)`).
-4. File number counter advanced: `e.nextFileNum.Store(max(manifest.NextFileNum, maxPhysicalSSTNum + 1))` (scanning both SSTables and staging artifacts, preventing overflow).
-5. Reconstructed `Version` installed into `e.vset`.
-6. Engine lifecycle state remains `engineStateRecovering` throughout subsequent orphan staging cleanup.
-7. After orphan staging cleanup succeeds without critical directory sync error, lifecycle state transitions to `engineStateRecovered`.
+### 7.3 Atomic State Installation & Rollback
+Preconditions and validations (including directory scanning for SSTables and staging artifacts, as well as `math.MaxUint64` overflow checks) are evaluated **prior to** mutating any live Engine state.
+State publication occurs atomically under `Engine.mu.Lock()` with a pre-recovery rollback snapshot:
+1. Capture rollback snapshot: `origActiveMem`, `origImmMems`, `origSeqNum`, `origFileNum`, `origBackpressure`, `origCleanerReport`, and initial `VersionSet` watermarks.
+2. Active MemTable installed: `e.activeMem = recoveryMem`.
+3. Immutable MemTables installed: `e.immMems = recoveryImm`.
+4. Sequence counter advanced: `e.nextSeqNum.Store(max(checkpoint, wal.LastSeqNum))`. (The subsequent write increments via `Add(1)`).
+5. File number counter advanced: `e.nextFileNum.Store(max(manifest.NextFileNum, maxPhysicalSSTNum + 1))` (scanning both SSTables and staging artifacts, preventing overflow).
+6. Reconstructed `Version` installed into `e.vset`.
+7. Backpressure controller synchronized with recovered memory byte count.
+8. Engine lifecycle state remains `engineStateRecovering` throughout subsequent orphan staging cleanup, blocking concurrent mutations and point lookups.
+9. **Atomic Rollback on Critical Failure**: If orphan staging cleanup encounters a critical error (such as directory synchronization failure or parent directory replacement) or if the Engine was closed concurrently, `rollbackPublishedRecovery` is invoked:
+   - Restores `activeMem`, `immMems`, `nextSeqNum`, `nextFileNum`, `lastCleanerReport`, and backpressure usage.
+   - Detaches the reconstructed Version via `vs.RollbackAppendedVersion`, unlinking it from the circular chain, restoring VersionSet watermarks, and dropping ownership references.
+   - Resets Engine lifecycle state to `engineStateNotRecovering`.
+   - Leaves the Engine in its exact pre-recovery state so subsequent recovery attempts succeed.
+10. After orphan staging cleanup succeeds without critical directory sync error, lifecycle state transitions to `engineStateRecovered`.
