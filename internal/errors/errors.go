@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"path/filepath"
+	"time"
 )
 
 // Sentinel errors representing fundamental domain failure conditions in Lattice.
@@ -166,6 +167,16 @@ var (
 
 	// ErrReadIndexThrottled indicates that a read index request was rejected due to saturated active read rounds.
 	ErrReadIndexThrottled = stdErrors.New("read index throttled: active rounds capacity reached")
+
+	// ErrL0StallTimeout indicates that a write was rejected because the L0 stall
+	// gate waited its full bounded interval without the L0 file count falling
+	// back to L0StallThreshold or below.
+	//
+	// The L0 stall is a control-flow throttle, not a durability failure: no
+	// sequence number is allocated and nothing is written. The error is explicit
+	// and retryable so a caller is never blocked indefinitely by write pressure
+	// it cannot itself relieve.
+	ErrL0StallTimeout = stdErrors.New("l0 stall timeout: L0 file count did not fall below threshold")
 
 	// ErrIteratorClosed indicates that an operation was attempted on a closed iterator.
 	ErrIteratorClosed = stdErrors.New("iterator is closed")
@@ -1317,6 +1328,33 @@ func (e *MemTableFullError) Error() string {
 // Is reports whether this error matches target sentinel ErrMemTableFull.
 func (e *MemTableFullError) Is(target error) bool {
 	return target == ErrMemTableFull
+}
+
+// L0StallTimeoutError provides structured context when a write is rejected after
+// the L0 stall gate exhausted its bounded wait. It matches ErrL0StallTimeout when
+// interrogated with errors.Is().
+type L0StallTimeoutError struct {
+	// L0Count is the L0 file count observed at the moment the wait expired.
+	L0Count int
+	// Threshold is the stall threshold that L0Count had to fall to or below.
+	Threshold int
+	// Waited is how long the gate actually waited before giving up.
+	Waited time.Duration
+}
+
+func (e *L0StallTimeoutError) Error() string {
+	if e == nil {
+		return ErrL0StallTimeout.Error()
+	}
+	return fmt.Sprintf(
+		"l0 stall timeout: L0 file count %d did not fall to %d or below after waiting %v; "+
+			"write rejected without allocating a sequence number (retryable)",
+		e.L0Count, e.Threshold, e.Waited)
+}
+
+// Is reports whether this error matches target sentinel ErrL0StallTimeout.
+func (e *L0StallTimeoutError) Is(target error) bool {
+	return target == ErrL0StallTimeout
 }
 
 // ManifestReplayLimitError provides structured context when MANIFEST replay exceeds resource limits.

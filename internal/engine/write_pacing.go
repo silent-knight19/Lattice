@@ -12,9 +12,17 @@ import (
 // Boundary semantics follow the roadmap literally ("exceeds"):
 //   - L0 <= 8: normal writes, no added delay.
 //   - L0 9..12: progressive pacing delay, monotonically increasing.
-//   - L0 > 12: hard stall until pressure falls back to L0 <= 12.
+//   - L0 > 12: bounded stall until pressure falls back to L0 <= 12, after which
+//     the write is rejected with errors.ErrL0StallTimeout.
 //
 // L0 == 8 is normal. L0 == 12 is paced (largest pacing delay), not stalled.
+//
+// The stall is bounded by Engine.l0StallTimeout (default DefaultL0StallTimeout).
+// It is deliberately a bounded wait rather than an unbounded one: the sole
+// pressure relief is background compaction of L0, so an unbounded stall would
+// let a node become permanently unwritable whenever that relief is unavailable.
+// A rejected write allocates no sequence number and writes nothing, so callers
+// may retry.
 const (
 	// L0PacingThreshold is the L0 file count above which writes are paced.
 	L0PacingThreshold = 8
@@ -110,20 +118,37 @@ func (e *Engine) l0FileCount() int {
 // allocation so stalled writers reserve no sequence numbers and retain no
 // internal copies (only caller-owned args). It holds no storage locks while
 // waiting. Reads are never gated. Stall is a control behavior, not a write
-// failure: it returns nil once pressure allows, ctx.Err() on cancellation, or
-// ErrWriterClosed when the Engine is unusable.
+// failure: it returns nil once pressure allows, ctx.Err() on cancellation,
+// ErrWriterClosed when the Engine is unusable, or ErrL0StallTimeout when the
+// bounded stall wait expires.
+//
+// The stall wait is bounded by Engine.l0StallTimeout. It must never be an
+// unbounded block: the stall exists to throttle writes under L0 pressure, and
+// the only pressure relief is a background compaction of L0. Bounding the wait
+// guarantees that a stalled engine rejects writes explicitly instead of hanging
+// every caller forever, which would render a node permanently unwritable. A
+// rejected write allocates no sequence number and writes nothing, so a caller
+// may retry once pressure subsides.
 func (e *Engine) gateL0Write(ctx context.Context) error {
 	if e == nil {
 		return errors.ErrNilReceiver
 	}
-	// Stall phase: wait until L0 <= 12. Bounded polls; each slice honors
-	// cancellation and lifecycle without holding any lock.
+	// Stall phase: wait until L0 <= 12, bounded by the configured stall timeout.
+	// Bounded polls; each slice honors cancellation and lifecycle without
+	// holding any lock.
 	var stallTimer *time.Timer
 	defer func() {
 		if stallTimer != nil {
 			stallTimer.Stop()
 		}
 	}()
+
+	// stallDeadline is the wall-clock bound on the entire stall phase, not on a
+	// single poll slice. Computed once so the total wait is deterministic and
+	// cannot be extended indefinitely by re-polling.
+	var stallDeadline time.Time
+	var stallStart time.Time
+	stallBounded := false
 
 	for {
 		if e.closed.Load() {
@@ -141,8 +166,24 @@ func (e *Engine) gateL0Write(ctx context.Context) error {
 			default:
 			}
 		}
-		if !l0NeedsStall(e.l0FileCount()) {
+		l0Count := e.l0FileCount()
+		if !l0NeedsStall(l0Count) {
 			break
+		}
+
+		// Arm the overall stall bound on the first stalled poll.
+		if !stallBounded {
+			stallBounded = true
+			stallStart = time.Now()
+			stallDeadline = stallStart.Add(e.stallTimeout())
+		} else if !time.Now().Before(stallDeadline) {
+			// Bounded stall expired without pressure subsiding. Surface an
+			// explicit, retryable error instead of blocking indefinitely.
+			return &errors.L0StallTimeoutError{
+				L0Count:   l0Count,
+				Threshold: L0StallThreshold,
+				Waited:    time.Since(stallStart),
+			}
 		}
 
 		if stallTimer == nil {
@@ -217,4 +258,19 @@ func (e *Engine) stopChan() <-chan struct{} {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.stopCh
+}
+
+// stallTimeout returns the bounded stall wait, defaulting to
+// DefaultL0StallTimeout for an Engine constructed without one. The bound is
+// always positive so gateL0Write can never fall back to an unbounded wait.
+func (e *Engine) stallTimeout() time.Duration {
+	if e == nil {
+		return DefaultL0StallTimeout
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.l0StallTimeout <= 0 {
+		return DefaultL0StallTimeout
+	}
+	return e.l0StallTimeout
 }

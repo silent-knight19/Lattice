@@ -120,6 +120,13 @@ type Engine struct {
 	// VersionSet L0 file count. No duplicate L0 counter is maintained.
 	l0Override atomic.Int64
 
+	// l0StallTimeout bounds the total time gateL0Write will wait for the L0 file
+	// count to fall back to L0StallThreshold or below before rejecting the write
+	// with errors.ErrL0StallTimeout. Guards the stall against becoming an
+	// unbounded block, which would make an engine permanently unwritable if the
+	// L0 count cannot be reduced.
+	l0StallTimeout time.Duration
+
 	// P10-S01-M04 shutdown state. closeDone is closed exactly once by the
 	// first Close when terminal cleanup completes; concurrent closers wait on
 	// it and receive the same remembered result. closeErr is the terminal
@@ -133,6 +140,17 @@ const (
 	// DefaultShutdownTimeout is the maximum duration Engine.Close waits for the
 	// flush queue to drain before aborting to prevent hanging the shutdown process (SEC-P10-003).
 	DefaultShutdownTimeout = 10 * time.Second
+
+	// DefaultL0StallTimeout bounds how long gateL0Write waits for L0 write
+	// pressure to subside before rejecting the write with
+	// errors.ErrL0StallTimeout.
+	//
+	// The bound exists so the L0 stall can never become an unbounded block. It is
+	// deliberately generous: a healthy background compactor draining L0 takes
+	// well under this, so the timeout only fires when pressure is not being
+	// relieved at all. The error is explicit and retryable, and no sequence
+	// number is allocated, so a caller may retry safely.
+	DefaultL0StallTimeout = 30 * time.Second
 )
 
 // EngineOptions specifies configuration parameters for initializing an Engine instance.
@@ -150,6 +168,13 @@ type EngineOptions struct {
 	// ShutdownTimeout bounds the duration spent draining immutable MemTables
 	// during Engine.Close. Defaults to DefaultShutdownTimeout (10s) when <= 0.
 	ShutdownTimeout time.Duration
+	// L0StallTimeout bounds the total time a write waits for the L0 file count to
+	// fall to L0StallThreshold or below before being rejected with
+	// errors.ErrL0StallTimeout. Defaults to DefaultL0StallTimeout (30s) when <= 0.
+	//
+	// This guarantees the L0 stall is always bounded. A write is never blocked
+	// indefinitely by pressure it cannot itself relieve.
+	L0StallTimeout time.Duration
 }
 
 // NewEngine constructs an Engine instance backed by the given backpressure configuration.
@@ -174,6 +199,10 @@ func NewEngineWithOptions(opts EngineOptions) *Engine {
 	if shutTimeout <= 0 {
 		shutTimeout = DefaultShutdownTimeout
 	}
+	l0Stall := opts.L0StallTimeout
+	if l0Stall <= 0 {
+		l0Stall = DefaultL0StallTimeout
+	}
 	eng := &Engine{
 		dbPath:          cleanDBPath,
 		activeMem:       memtable.NewSkipList(),
@@ -182,6 +211,7 @@ func NewEngineWithOptions(opts EngineOptions) *Engine {
 		wal:             opts.WAL,
 		blockCache:      opts.BlockCache,
 		shutdownTimeout: shutTimeout,
+		l0StallTimeout:  l0Stall,
 		closeDone:       make(chan struct{}),
 	}
 	eng.l0Override.Store(-1)
