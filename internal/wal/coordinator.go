@@ -64,6 +64,40 @@ type RecoveryReport struct {
 	// LastSeqNum is the highest sequence number observed among all replayed records.
 	// 0 if no records exist in the WAL.
 	LastSeqNum binary.SeqNum
+
+	// SequenceGaps is the number of observed discontinuities where a record's SeqNum
+	// exceeded the previous record's by more than one.
+	//
+	// Informational only, and deliberately not an error. Gaps are legitimately produced
+	// by a write that consumed a sequence number and then failed to persist, by a
+	// partially written batch, and by the post-recovery watermark being seeded from
+	// max(manifest checkpoint, WAL last SeqNum). Enforcing contiguity would therefore
+	// refuse to open databases that are perfectly healthy. See docs/recovery-spec.md 4.2.
+	SequenceGaps int
+
+	// SkippedSequenceNumbers is the total number of sequence numbers absent from the
+	// WAL across all observed gaps. It is an observability signal, not an integrity
+	// verdict: a non-zero value does not by itself indicate data loss.
+	SkippedSequenceNumbers uint64
+}
+
+// observeSequenceGap records a discontinuity between prev and cur without rejecting
+// it. Recovery tolerates gaps because they are produced by legitimate write-failure
+// paths; making them fatal would break healthy databases.
+func (r *RecoveryReport) observeSequenceGap(prev, cur binary.SeqNum) {
+	// Guard the subtraction: cur > prev is guaranteed by the caller's monotonicity
+	// check, but the unsigned wrap is cheap to rule out.
+	if cur <= prev {
+		return
+	}
+	skipped := uint64(cur - prev - 1)
+	if skipped == 0 {
+		// Contiguous: prev+1. Not a gap.
+		return
+	}
+	r.SequenceGaps++
+	r.SkippedSequenceNumbers += skipped
+	metrics.WALSequenceGaps.Add(1)
 }
 
 // RecoverWAL coordinates multi-segment crash recovery across a database WAL directory.
@@ -195,6 +229,10 @@ func RecoverWALFrom(dbPath string, sink ReplaySink, expectedStartID uint64) (Rec
 							Current:  uint64(rec.SeqNum),
 						}
 					}
+					// Gaps are NOT observed here. The historical pass and the replay
+					// pass both traverse segments 1..N-1, so counting in both would
+					// double-count every gap. The replay pass covers all segments and
+					// is the single place gaps are observed.
 					prevHistSeq = rec.SeqNum
 				}
 				continue
@@ -323,6 +361,7 @@ func RecoverWALFrom(dbPath string, sink ReplaySink, expectedStartID uint64) (Rec
 						Current:  uint64(rec.SeqNum),
 					}
 				}
+				report.observeSequenceGap(prevSeqNum, rec.SeqNum)
 				prevSeqNum = rec.SeqNum
 			}
 

@@ -116,22 +116,11 @@ func DefaultConfig() Config {
 	}
 }
 
-// isLoopback reports whether the given address resolves to a local loopback interface.
-func isLoopback(addr string) bool {
-	if addr == "" {
-		return false
-	}
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		host = addr
-	}
-	host = strings.Trim(host, "[]")
-	if strings.EqualFold(host, "localhost") || host == "127.0.0.1" || host == "::1" || host == "pipe" || host == "local" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
-}
+// Loopback classification is owned by internal/transport, which is where every
+// security gate that depends on it lives. This package previously carried its own
+// copy of the rule; two copies of a security decision inevitably drift, and this one
+// had already drifted by classifying the bare hostnames "pipe" and "local" as
+// loopback, which let a non-loopback bind skip the mandatory mTLS requirements.
 
 // ParseFlags parses command line arguments and applies configuration precedence:
 // Defaults -> Config File -> Explicit CLI Flags.
@@ -380,7 +369,7 @@ func portsCollide(addr1, addr2 string) bool {
 	if isWildcard(h1) || isWildcard(h2) {
 		return true
 	}
-	if isLoopback(h1) && isLoopback(h2) {
+	if transport.IsLoopbackAddress(h1) && transport.IsLoopbackAddress(h2) {
 		return true
 	}
 	ip1 := net.ParseIP(h1)
@@ -419,7 +408,7 @@ func (c *Config) Validate() error {
 	// Phase 11 Loopback Security Policy (SEC-P11-001):
 	// Unencrypted plaintext TCP is prohibited on non-loopback addresses without explicit opt-in.
 	hasTLS := c.TLSCertFile != ""
-	if !hasTLS && !c.InsecureTransport && !isLoopback(host) {
+	if !hasTLS && !c.InsecureTransport && !transport.IsLoopbackAddress(host) {
 		return errors.ErrInsecureTransport
 	}
 
@@ -445,7 +434,7 @@ func (c *Config) Validate() error {
 	}
 
 	// Finding A: Non-loopback external client transport with TLS requires mandatory mTLS (Client CA + RequireClientCert)
-	if !isLoopback(host) && hasTLS {
+	if !transport.IsLoopbackAddress(host) && hasTLS {
 		if c.ClientCAFile == "" {
 			return fmt.Errorf("config error: external address %q with TLS requires trusted client CA (--client-ca) for production mTLS", c.Address)
 		}
@@ -477,7 +466,7 @@ func (c *Config) Validate() error {
 	}
 
 	// Problem 6: Non-loopback client authorization security policy enforcement
-	if !isLoopback(host) {
+	if !transport.IsLoopbackAddress(host) {
 		if hasTLS {
 			if c.ClientAuthzPolicy == nil && c.ClientAuthzPolicyFile == "" {
 				return fmt.Errorf("config error: external address %q with TLS requires client authorization policy (--client-authz-policy or --client-authz-policy-file): %w", c.Address, errors.ErrInvalidAuthzPolicy)
@@ -517,7 +506,7 @@ func (c *Config) Validate() error {
 		if err != nil || pPort < 0 || pPort > 65535 {
 			return fmt.Errorf("config error: invalid port in --pprof-address %q (must be between 0 and 65535)", c.PprofAddress)
 		}
-		if !isLoopback(pHost) {
+		if !transport.IsLoopbackAddress(pHost) {
 			return fmt.Errorf("config error: --pprof-address %q must resolve to a local loopback interface (127.0.0.1, ::1, localhost)", c.PprofAddress)
 		}
 
@@ -538,7 +527,7 @@ func (c *Config) Validate() error {
 		if err != nil || mPort < 0 || mPort > 65535 {
 			return fmt.Errorf("config error: invalid port in --metrics-address %q (must be between 0 and 65535)", c.MetricsAddress)
 		}
-		if !c.InsecureTransport && !isLoopback(mHost) {
+		if !c.InsecureTransport && !transport.IsLoopbackAddress(mHost) {
 			return fmt.Errorf("config error: --metrics-address %q requires --insecure-transport for non-loopback interfaces: %w", c.MetricsAddress, errors.ErrInsecureTransport)
 		}
 		if mPort != 0 {
@@ -589,11 +578,11 @@ func (c *Config) Validate() error {
 		// Raft peer transport on non-loopback addresses strictly mandates mutual TLS 1.3 (--peer-tls-cert, --peer-tls-key, --peer-ca).
 		// The client-facing --insecure-transport flag DOES NOT permit unauthenticated peer transport.
 		hasNonLoopbackPeer := false
-		if c.Topology.LocalAddress() != "" && !isLoopback(c.Topology.LocalAddress()) {
+		if c.Topology.LocalAddress() != "" && !transport.IsLoopbackAddress(c.Topology.LocalAddress()) {
 			hasNonLoopbackPeer = true
 		}
 		for _, p := range c.Topology.RemotePeers() {
-			if !isLoopback(p.Address) {
+			if !transport.IsLoopbackAddress(p.Address) {
 				hasNonLoopbackPeer = true
 				break
 			}

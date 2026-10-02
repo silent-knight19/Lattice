@@ -63,6 +63,11 @@ func normalizeAPIPath(p string) string {
 	return p
 }
 
+// PrincipalResolver derives the caller's identity for a request.
+//
+// It returns nil when no identity can be established, which denies the request.
+type PrincipalResolver func(*http.Request) *Principal
+
 // Router dispatches admin API requests to registered routes and enforces the permission
 // declared by each one.
 //
@@ -77,6 +82,15 @@ func normalizeAPIPath(p string) string {
 // /api/v1 exists and is guarded, which is itself a small amount of information.
 type Router struct {
 	routes map[string]RouteSpec
+	// resolve derives the caller's principal. When nil, every request is DENIED.
+	//
+	// This is the field that makes SEC-4's default-deny property structural rather than
+	// advisory. The permission a route requires is recorded once, in its RouteSpec, and
+	// the router enforces it here. An earlier design expected each route to be wrapped in
+	// an Authz middleware instead, which left the declared Permission as decoration:
+	// forgetting the wrapper would have exposed an admin-only route to anyone. Binding
+	// resolution into the router removes that failure mode entirely.
+	resolve PrincipalResolver
 	// fallback handles non-API paths (the SPA, SEC-11). It is never consulted for
 	// /api/v1 paths, so it cannot become a back door into the API.
 	fallback http.Handler
@@ -117,6 +131,15 @@ func (rt *Router) Register(spec RouteSpec) error {
 	}
 	rt.routes[k] = spec
 	return nil
+}
+
+// SetPrincipalResolver installs the resolver used to authenticate each request.
+//
+// Until this is called the resolver is nil and EVERY request is denied. That is the
+// intended fail-closed posture: a router that has not been told how to authenticate must
+// not serve anything.
+func (rt *Router) SetPrincipalResolver(fn PrincipalResolver) {
+	rt.resolve = fn
 }
 
 // Routes returns the registered route keys, for tests and diagnostics.
@@ -164,6 +187,18 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeNotFound(w)
 		return
 	}
+
+	// Enforce the permission DECLARED BY THIS ROUTE, here, unconditionally. This is the
+	// whole point of keeping the requirement in the RouteSpec.
+	principal := (*Principal)(nil)
+	if rt.resolve != nil {
+		principal = rt.resolve(r)
+	}
+	if !Permits(principal, spec.Permission) {
+		writeForbiddenAuthz(w)
+		return
+	}
+
 	spec.Handler.ServeHTTP(w, r)
 }
 

@@ -181,7 +181,16 @@ against other local users. Recorded in `docs/known-limitations.md` at TD-6.
 - **Tests:** missing header → 403 · wrong token → 403 · token from a previous daemon run → 403 ·
   correct token → 200 · response body of a failed attempt contains neither token.
 
-## SEC-4 — Admin authorisation wiring (M) — *Critical*
+## SEC-4 — Admin authorisation wiring (M) — *Critical*  ✅ **COMPLETE + VERIFIED**
+
+> **Status: DONE.** `internal/admin/authz.go`, `internal/admin/router.go`,
+> `internal/admin/routes.go`, `authz_test.go`. Package total: **240 cases**, `-race` clean.
+> **Verified against the real route plan with a `reader` principal and a valid CSRF token:**
+> every read route returned 200, and all destructive routes returned 403 with **exactly one**
+> handler execution server-side. See [`sec4-verification.md`](./sec4-verification.md).
+> **A design weakness was found and fixed during implementation:** the declared `Permission`
+> was initially decoration, unenforced by the router. It now enforces its own declared
+> permission and fails closed with no resolver. Subtasks 4.1–4.6 met.
 
 - **Files:** `internal/admin/authz.go`
 - **4.1** Reuse `transport.Role`, `transport.ParseRole`, `transport.RolePermissions`,
@@ -203,7 +212,15 @@ against other local users. Recorded in `docs/known-limitations.md` at TD-6.
   unregistered `/api/v1/x` → 404 (not 200, not 500) · every route has explicit permission
   metadata (table-driven completeness test).
 
-## SEC-5 — Security response headers + CSP (S) — *High*
+## SEC-5 — Security response headers + CSP (S) — *High*  ✅ **COMPLETE + VERIFIED**
+
+> **Status: DONE.** `internal/admin/headers.go`, `headers_test.go`. Package total: **281 cases**,
+> `-race` clean.
+> **Verified A/B in real Chrome:** identical injected-script markup **executes** without the
+> headers and is **blocked** with them. `img onerror` and `eval()` were also blocked.
+> See [`sec5-verification.md`](./sec5-verification.md). Subtasks 5.1–5.3 met.
+> **Recorded consequence:** CSP forbids `unsafe-inline`, so the SPA build must use bundled CSS
+> (or a nonce) for any dynamic styling — carried into FE-3.
 
 - **File:** `internal/admin/middleware.go`
 - **5.1** `SecurityHeaders(next)` applied to **every** response including errors and static assets:
@@ -238,7 +255,14 @@ against other local users. Recorded in `docs/known-limitations.md` at TD-6.
 - **Tests:** remote bind without the second flag → startup error · with both → starts and warns ·
   empty address → no listener · port conflict → clean fail-fast.
 
-## SEC-7 — Request size caps + handler timeouts (S) — *High*
+## SEC-7 — Request size caps + handler timeouts (S) — *High*  ✅ **COMPLETE + VERIFIED**
+
+> **Status: DONE.** `internal/admin/limits.go`, `internal/admin/httptimeout.go`,
+> `limits_test.go`. Package total: **292 cases**, `-race` clean.
+> **Verified live:** an 8 KiB-capped route accepted 4 KB and rejected 64 KB at exactly 8192
+> bytes with a `MaxBytesError`; a 3 MB legitimate key/value was accepted; `MethodGuard`
+> returned 405 + `Allow: POST` for GET/PUT/DELETE/TRACE/OPTIONS without reaching the handler.
+> See [`sec7-verification.md`](./sec7-verification.md). Subtasks 7.1–7.4 met.
 
 - **File:** `internal/admin/middleware.go`, `internal/admin/server.go`
 - **7.1** Wrap every request body with `http.MaxBytesReader`. Caps:
@@ -254,7 +278,15 @@ against other local users. Recorded in `docs/known-limitations.md` at TD-6.
 - **Tests:** oversize body → 413 · slow-body (Slowloris) → cut off at `ReadHeaderTimeout` ·
   each handler honours its deadline · no unbounded `io.ReadAll` remains (grep-check).
 
-## SEC-8 — SSE resource governance (M) — *High*
+## SEC-8 — SSE resource governance (M) — *High*  ✅ **COMPLETE + VERIFIED**
+
+> **Status: DONE.** `internal/admin/events.go` (bounded bus — also satisfies the core of
+> FND-4), `internal/admin/sse.go` (SSE handler + budgets), `events_test.go`, `sse_test.go`.
+> Package total: **310 cases**, `-race` clean.
+> **Verified live:** a real SSE client received `retry: 3000`, the connect comment, and
+> live `raft.transition` events as proper `event:`/`data:` frames. Under load: **accepted=3,
+> refused=17** at a cap of 3; per-IP cap held at 2; **goroutines 7→3, subscribers 0** after
+> disconnect. See [`sec8-verification.md`](./sec8-verification.md). Subtasks 8.1–8.6 met.
 
 - **File:** `internal/admin/events.go`
 - **8.1** **Separate connection budget.** SSE clients are long-lived; reuse the

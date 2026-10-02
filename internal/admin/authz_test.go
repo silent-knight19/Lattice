@@ -78,14 +78,16 @@ func TestRoutePlan_EveryRouteDeclaresPermission(t *testing.T) {
 		if spec.description == "" {
 			t.Errorf("route %q has no description", path)
 		}
-		// Every mutating route must be a POST and require at least Write.
-		if spec.Mutating {
-			if spec.Method != http.MethodPost {
-				t.Errorf("mutating route %q uses %s, want POST", path, spec.Method)
-			}
-			if spec.Permission&PermissionWrite != PermissionWrite {
-				t.Errorf("mutating route %q does not require PermissionWrite", path)
-			}
+		// Every mutating route must be a POST.
+		//
+		// Note PermissionAdmin is an ORTHOGONAL bit, not a superset of
+		// PermissionWrite: in transport the three are 1<<0, 1<<1 and 1<<2, and
+		// admin-only destructive routes (e.g. /lab/crash, /raft/campaign) are
+		// deliberately NOT write-gated. Requiring Write here would have wrongly
+		// flagged every admin-only mutating route, so the invariant is that a
+		// mutating route requires at least SOME permission, checked above.
+		if spec.Mutating && spec.Method != http.MethodPost {
+			t.Errorf("mutating route %q uses %s, want POST", path, spec.Method)
 		}
 	}
 }
@@ -147,6 +149,9 @@ func TestRouter_DefaultDenyUnknownPaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRouter: %v", err)
 	}
+	// This test is about ROUTING, so authorize the caller. A router with no resolver
+	// denies everything (see TestRouter_FailsClosedWithoutResolver).
+	rt.SetPrincipalResolver(func(*http.Request) *Principal { return principal(RoleReader, true) })
 
 	for _, path := range []string{
 		"/api/v1/nope", "/api/v1/", "/api/v1", "/api/v1/../etc/passwd",
@@ -208,6 +213,7 @@ func TestRouter_PathNormalization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	rt.SetPrincipalResolver(func(*http.Request) *Principal { return principal(RoleReader, true) })
 	for _, p := range []string{"/api/v1/health/", "/api/v1/health//"} {
 		rec := httptest.NewRecorder()
 		rt.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, p, nil))
@@ -337,9 +343,16 @@ func TestPrincipalFromTLS(t *testing.T) {
 	if p.Role != RoleWriter || !p.Authenticated || p.Fingerprint != want {
 		t.Errorf("unexpected principal %+v", p)
 	}
-	// Unauthenticated must not be permitted.
-	if Permits(p, PermissionRead) {
-		t.Error("unauthenticated principal permitted")
+	if !Permits(p, PermissionRead) {
+		t.Error("authenticated writer should be permitted to read")
+	}
+
+	// An unverified certificate must grant nothing, whatever role it claims. This is
+	// the SEC-4.6 property: the role comes from the policy, but trust comes from the
+	// TLS verification result, and an unverified one must not be honoured.
+	unverified := PrincipalFromTLS(want, RoleAdmin, false)
+	if Permits(unverified, PermissionRead) || Permits(unverified, PermissionAdmin) {
+		t.Error("SECURITY: unauthenticated principal was permitted")
 	}
 }
 
@@ -351,9 +364,13 @@ func TestPermissionFromHeaderRole(t *testing.T) {
 	if p := PermissionFromHeaderRole(base, "admin"); p.Role != RoleReader {
 		t.Error("bare role header was honoured; it must require the 'role ' prefix")
 	}
-	// Properly prefixed is honoured (documented fallback).
-	if p := PermissionFromHeaderRole(base, "Role: admin"); p.Role != RoleAdmin {
+	// Properly prefixed is honoured (documented fallback). The prefix is "role "
+	// with a trailing space, so "role: admin" is intentionally NOT accepted.
+	if p := PermissionFromHeaderRole(base, "Role admin"); p.Role != RoleAdmin {
 		t.Errorf("prefixed header not honoured, got %q", p.Role)
+	}
+	if p := PermissionFromHeaderRole(base, "role: admin"); p.Role != RoleReader {
+		t.Errorf("colon form must not be honoured, got %q", p.Role)
 	}
 	// Garbage is ignored.
 	if p := PermissionFromHeaderRole(base, "Role: nonsense"); p.Role != RoleReader {
@@ -370,5 +387,109 @@ func TestPermissionFromHeaderRole(t *testing.T) {
 	}
 	if Permits(p, PermissionRead) {
 		t.Error("header-derived principal must remain unauthorized")
+	}
+}
+
+// TestRouter_EnforcesDeclaredPermission is the core SEC-4 property: a route's declared
+// permission is enforced by the router itself, so a reader cannot reach an admin-only
+// route even though the route exists and the request is otherwise well formed.
+func TestRouter_EnforcesDeclaredPermission(t *testing.T) {
+	cases := []struct {
+		name     string
+		path     string
+		role     Role
+		wantCode int
+	}{
+		{"reader reaches read route", RouteHealth, RoleReader, http.StatusOK},
+		{"reader blocked from admin route", RouteLabCrash, RoleReader, http.StatusForbidden},
+		{"reader blocked from write route", RouteKeyPut, RoleReader, http.StatusForbidden},
+		{"writer blocked from admin route", RouteRaftCamp, RoleWriter, http.StatusForbidden},
+		{"writer reaches write route", RouteKeyPut, RoleWriter, http.StatusOK},
+		{"admin reaches admin route", RouteLabCrash, RoleAdmin, http.StatusOK},
+		{"admin reaches read route", RouteHealth, RoleAdmin, http.StatusOK},
+		{"unknown role blocked everywhere", RouteHealth, Role("root"), http.StatusForbidden},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec, ok := routePlan[tc.path]
+			if !ok {
+				t.Fatalf("route %q not in plan", tc.path)
+			}
+			spec.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			})
+			rt, err := NewRouter([]RouteSpec{spec}, nil)
+			if err != nil {
+				t.Fatalf("NewRouter: %v", err)
+			}
+			rt.SetPrincipalResolver(func(*http.Request) *Principal {
+				return principal(tc.role, true)
+			})
+			rec := httptest.NewRecorder()
+			rt.ServeHTTP(rec, httptest.NewRequest(spec.Method, apiPathOf(tc.path), nil))
+			if rec.Code != tc.wantCode {
+				t.Errorf("role %q on %s = %d, want %d", tc.role, tc.path, rec.Code, tc.wantCode)
+			}
+		})
+	}
+}
+
+// apiPathOf renders a planned route path as a full request path.
+func apiPathOf(p string) string { return APIPrefix + p }
+
+// TestRouter_FailsClosedWithoutResolver verifies a router that has not been configured
+// with an identity source denies EVERYTHING rather than defaulting to open.
+func TestRouter_FailsClosedWithoutResolver(t *testing.T) {
+	spec, _ := routePlan[RouteHealth]
+	spec.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("SECURITY: handler reached with no principal resolver installed")
+	})
+	rt, err := NewRouter([]RouteSpec{spec}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately do NOT call SetPrincipalResolver.
+	rec := httptest.NewRecorder()
+	rt.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/health", nil))
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("no resolver: status = %d, want 403", rec.Code)
+	}
+}
+
+// TestRouter_NilResolverDenies verifies a resolver returning nil denies the request.
+func TestRouter_NilResolverDenies(t *testing.T) {
+	spec, _ := routePlan[RouteHealth]
+	spec.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("SECURITY: handler reached with a nil principal")
+	})
+	rt, _ := NewRouter([]RouteSpec{spec}, nil)
+	rt.SetPrincipalResolver(func(*http.Request) *Principal { return nil })
+	rec := httptest.NewRecorder()
+	rt.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/health", nil))
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("nil principal: status = %d, want 403", rec.Code)
+	}
+}
+
+// TestBuildRoutes_RegistersOnlyImplementedHandlers verifies nil handlers are omitted
+// rather than registered as reachable stubs.
+func TestBuildRoutes_RegistersOnlyImplementedHandlers(t *testing.T) {
+	if got := len(BuildRoutes(nil)); got != 0 {
+		t.Errorf("BuildRoutes(nil) = %d routes, want 0", got)
+	}
+	if got := len(BuildRoutes(&Handlers{})); got != 0 {
+		t.Errorf("BuildRoutes(empty) = %d routes, want 0", got)
+	}
+	full := &Handlers{Health: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})}
+	specs := BuildRoutes(full)
+	if len(specs) != 1 {
+		t.Fatalf("BuildRoutes(health only) = %d routes, want 1", len(specs))
+	}
+	if specs[0].Permission != PermissionRead {
+		t.Errorf("health route permission = %d, want PermissionRead", specs[0].Permission)
+	}
+	if len(AllPlannedRoutes()) < 30 {
+		t.Errorf("route plan has only %d entries; expected the full planned surface", len(AllPlannedRoutes()))
 	}
 }

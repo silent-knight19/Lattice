@@ -56,6 +56,15 @@ var (
 	// unverifiable posture rather than failing recovery.
 	WALAttestationAbsent = NewCounter()
 
+	// WALSequenceGaps counts observed discontinuities in WAL sequence numbers during
+	// recovery, where a record's SeqNum exceeds the previous record's by more than one.
+	//
+	// Informational only: recovery never rejects on a gap. Gaps are legitimately
+	// produced by failed writes that consumed a sequence number without persisting a
+	// record, by partial batch writes, and by the post-recovery watermark being seeded
+	// from max(manifest checkpoint, WAL last SeqNum). See docs/recovery-spec.md 4.2.
+	WALSequenceGaps = NewCounter()
+
 	// CompactionDuration tracks leveled compaction execution duration.
 	CompactionDuration = NewHistogramVec(
 		DefaultCompactionBuckets,
@@ -127,6 +136,11 @@ func init() {
 		"lattice_wal_attestation_mismatches_total",
 		"Total WAL segments whose contents diverged from their attestation during recovery",
 		WALAttestationMismatches,
+	)
+	DefaultRegistry.RegisterCounter(
+		"lattice_wal_sequence_gaps_total",
+		"Total observed discontinuities in WAL sequence numbers during recovery (informational; never fatal)",
+		WALSequenceGaps,
 	)
 	DefaultRegistry.RegisterCounter(
 		"lattice_wal_attestation_absent_total",

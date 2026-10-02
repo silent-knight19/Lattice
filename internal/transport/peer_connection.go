@@ -499,7 +499,7 @@ func (s *peerSupervisor) run(ctx context.Context, wg *sync.WaitGroup) {
 		s.mu.Unlock()
 
 		var activeConn net.Conn
-		if !isLoopbackAddress(s.address) {
+		if !IsLoopbackAddress(s.address) {
 			// Invariant: On non-loopback peers, custom dialers must NOT return an already-authenticated *tls.Conn.
 			// Lattice mandates that the transport layer itself establishes and verifies the TLS 1.3 mTLS connection.
 			if _, isTLS := rawConn.(*tls.Conn); isTLS {
@@ -724,7 +724,7 @@ func assertAdmissiblePeerConnection(conn net.Conn, expectedPeerID cluster.NodeID
 	if conn == nil {
 		return errors.ErrNilReceiver
 	}
-	if isLoopbackAddress(addr) {
+	if IsLoopbackAddress(addr) {
 		return nil
 	}
 	tc, ok := conn.(*tls.Conn)
@@ -1001,7 +1001,7 @@ func NewPeerConnectionManager(topology *cluster.Topology, cfg PeerConnectionConf
 		if topology.IsSelf(p.ID) {
 			continue
 		}
-		if !isLoopbackAddress(p.Address) {
+		if !IsLoopbackAddress(p.Address) {
 			if cfg.PeerTLSCertFile == "" && cfg.TLSConfig == nil && cfg.ListenerTLSConfig == nil {
 				return nil, fmt.Errorf("%w: remote peer %d address %q is non-loopback; Raft peer transport mandates mutual TLS 1.3",
 					errors.ErrInsecureTransport, p.ID, p.Address)
@@ -1051,7 +1051,7 @@ func NewPeerConnectionManager(topology *cluster.Topology, cfg PeerConnectionConf
 		} else if cfg.TLSConfig != nil {
 			peerTLS := WrapPeerClientTLSConfig(cfg.TLSConfig, p.ID, p.Address, topology)
 			peerCfg.TLSConfig = peerTLS
-		} else if !isLoopbackAddress(p.Address) {
+		} else if !IsLoopbackAddress(p.Address) {
 			cancel()
 			return nil, fmt.Errorf("%w: remote peer %d address %q is non-loopback; Raft peer transport mandates mutual TLS 1.3",
 				errors.ErrInsecureTransport, p.ID, p.Address)
@@ -1133,7 +1133,7 @@ func (m *PeerConnectionManager) StartListener(addr string) error {
 		return nil
 	}
 
-	if !isLoopbackAddress(addr) {
+	if !IsLoopbackAddress(addr) {
 		if err := ValidatePeerTLSConfig(m.cfg.ListenerTLSConfig); err != nil {
 			return fmt.Errorf("%w: peer listener address %q is non-loopback; Raft peer transport mandates mutual TLS 1.3: %v",
 				errors.ErrInsecureTransport, addr, err)
@@ -1171,7 +1171,7 @@ func (m *PeerConnectionManager) ServeListener(ln net.Listener) error {
 		return errors.ErrNilReceiver
 	}
 
-	if !isLoopbackAddress(ln.Addr().String()) {
+	if !IsLoopbackAddress(ln.Addr().String()) {
 		if err := ValidatePeerTLSConfig(m.cfg.ListenerTLSConfig); err != nil {
 			return fmt.Errorf("%w: peer listener address %q is non-loopback; Raft peer transport mandates mutual TLS 1.3: %v",
 				errors.ErrInsecureTransport, ln.Addr().String(), err)
@@ -1269,7 +1269,7 @@ func (m *PeerConnectionManager) handleInboundConn(conn net.Conn) {
 		authenticatedNodeID = nodeID
 	}
 
-	if !isLoopbackAddress(conn.RemoteAddr().String()) && authenticatedNodeID == 0 {
+	if !IsLoopbackAddress(conn.RemoteAddr().String()) && authenticatedNodeID == 0 {
 		_ = conn.Close()
 		return
 	}

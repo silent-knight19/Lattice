@@ -146,8 +146,28 @@ func DefaultServerConfig() ServerConfig {
 	}
 }
 
-// isLoopbackAddress reports whether the given TCP address specifies a loopback interface.
-func isLoopbackAddress(addr string) bool {
+// IsLoopbackAddress reports whether the given TCP address specifies a loopback interface.
+//
+// It is the single source of truth for loopback classification, and deliberately
+// conservative, because every security gate in this package keys off it: a bind that
+// is not recognized as loopback must present TLS 1.3 mTLS and a client authorization
+// policy, while a loopback bind is exempt from both.
+//
+// Classification rules:
+//   - An empty address is not loopback.
+//   - The host is extracted with net.SplitHostPort, tolerating a bare host with no port.
+//   - IPv6 brackets are trimmed.
+//   - "localhost" is accepted by name. Any other *name* is not: resolving a hostname
+//     here would make a security decision depend on DNS, which an attacker able to
+//     influence resolution could steer. Names are honored only when they are the
+//     well-known loopback alias.
+//   - Anything parsing as an IP literal is accepted exactly when it falls in a loopback
+//     range, which covers all of 127.0.0.0/8 and ::1.
+//
+// Bare words such as "pipe" or "local" are NOT loopback. They were previously treated
+// as such, which let an address like "local:9099" skip the mandatory mTLS and
+// authorization requirements and be served with no TLS at all.
+func IsLoopbackAddress(addr string) bool {
 	if addr == "" {
 		return false
 	}
@@ -156,14 +176,11 @@ func isLoopbackAddress(addr string) bool {
 		host = addr
 	}
 	host = strings.Trim(host, "[]")
-	if strings.EqualFold(host, "localhost") || host == "127.0.0.1" || host == "::1" || host == "pipe" || host == "local" {
+	if strings.EqualFold(host, "localhost") {
 		return true
 	}
 	ip := net.ParseIP(host)
-	if ip != nil && ip.IsLoopback() {
-		return true
-	}
-	return false
+	return ip != nil && ip.IsLoopback()
 }
 
 // Server manages the TCP listener, connection lifecycle, Slowloris defenses, and Engine request dispatching.
@@ -241,7 +258,7 @@ func NewServer(cfg ServerConfig, eng Engine) (*Server, error) {
 		authzPolicy = p
 	}
 
-	isLoopback := isLoopbackAddress(cfg.Address)
+	isLoopback := IsLoopbackAddress(cfg.Address)
 	hasTLS := cfg.TLSConfig != nil || cfg.TLSCertFile != ""
 
 	// Finding A & Problem 6: Non-loopback client transport security policy enforcement
@@ -414,7 +431,7 @@ func (s *Server) Listen(addr string) error {
 	if bindAddr == "" {
 		bindAddr = s.cfg.Address
 	}
-	isLoopback := isLoopbackAddress(s.cfg.Address) && isLoopbackAddress(bindAddr)
+	isLoopback := IsLoopbackAddress(s.cfg.Address) && IsLoopbackAddress(bindAddr)
 	if !isLoopback {
 		if s.cfg.TLSConfig == nil && !s.cfg.InsecureTransport {
 			s.started.Store(false)
@@ -468,7 +485,7 @@ func (s *Server) Serve(l net.Listener) error {
 	}
 
 	addrStr := l.Addr().String()
-	isLoopback := isLoopbackAddress(s.cfg.Address) && isLoopbackAddress(addrStr)
+	isLoopback := IsLoopbackAddress(s.cfg.Address) && IsLoopbackAddress(addrStr)
 	if !isLoopback {
 		if s.cfg.TLSConfig == nil && !s.cfg.InsecureTransport {
 			s.started.Store(false)
@@ -602,11 +619,11 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.untrackConn(conn)
 	}()
 
-	isLoopback := isLoopbackAddress(s.cfg.Address)
-	if conn.LocalAddr() != nil && !isLoopbackAddress(conn.LocalAddr().String()) {
+	isLoopback := IsLoopbackAddress(s.cfg.Address)
+	if conn.LocalAddr() != nil && !IsLoopbackAddress(conn.LocalAddr().String()) {
 		isLoopback = false
 	}
-	if conn.RemoteAddr() != nil && !isLoopbackAddress(conn.RemoteAddr().String()) {
+	if conn.RemoteAddr() != nil && !IsLoopbackAddress(conn.RemoteAddr().String()) {
 		isLoopback = false
 	}
 
@@ -1050,7 +1067,7 @@ func (s *Server) dispatchWithContext(parentCtx context.Context, req *Request) (f
 			resp.Message = "permission denied"
 			return resp
 		}
-	} else if (!isLoopbackAddress(s.cfg.Address) || (s.addr != nil && !isLoopbackAddress(s.addr.String()))) && (s.cfg.TLSConfig != nil || s.cfg.TLSCertFile != "") {
+	} else if (!IsLoopbackAddress(s.cfg.Address) || (s.addr != nil && !IsLoopbackAddress(s.addr.String()))) && (s.cfg.TLSConfig != nil || s.cfg.TLSCertFile != "") {
 		// Defense-in-depth: non-loopback production TLS without an authorization policy fails closed
 		resp.Status = StatusPermissionDenied
 		resp.Message = "permission denied"

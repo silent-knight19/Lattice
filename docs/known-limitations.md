@@ -1911,4 +1911,41 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 98. WAL Sequence Gaps Are Observable but Intentionally Not Enforced
+
+* **Limitation**: `internal/wal` enforces sequence **monotonicity** — a regression fails closed with `SequenceOutOfOrderError` — but not **contiguity**. A record whose `SeqNum` exceeds the previous record's by more than one is accepted silently, so records could in principle be omitted from a WAL without any signal.
+* **Why It Is Not Enforced (the load-bearing part)**: Three code paths produce legitimate gaps, so requiring `SeqNum == prev + 1` would refuse to open healthy databases.
+  1. `Engine.Put` / `Delete` allocate a `SeqNum` and then fail to persist a record; `nextSeqNum` is never rolled back on any error path.
+  2. `Engine.Batch` reserves `N+2` sequence numbers up front, then appends them one at a time, so a mid-loop failure leaves the remainder unpersisted.
+  3. **Decisive:** after recovery the engine seeds `nextSeqNum` from `max(manifest checkpoint, WAL last SeqNum)`. When the MANIFEST checkpoint exceeds the WAL's highest `SeqNum` — precisely what happens once WAL segment GC removes segments already covered by a flush — every later write begins above the WAL's last sequence number. Strict contiguity would then reject **every** database on **every** boot, permanently. WAL segment GC is already specified in `docs/architecture-spec.md`, so this is a scheduled landmine, not a hypothetical.
+* **Mitigation Added**: Gaps are now observed rather than invisible. `RecoveryReport` gained `SequenceGaps` and `SkippedSequenceNumbers`, and each discontinuity increments `lattice_wal_sequence_gaps_total`. Observation only — recovery never rejects. Both fields are purely additive; the engine consumes only `LastSeqNum`, so no caller changed behavior.
+* **Scope Of The Signal**: A non-zero `SkippedSequenceNumbers` is an observability signal, not an integrity verdict. Whole-record *loss* by truncation is detected separately by segment attestation (entry 96). A gap in numbering does not by itself indicate missing data, and the counter is expected to fire in the checkpoint-above-WAL scenario above without any fault being present.
+* **Where Observation Happens**: In the replay pass only. The historical and replay passes both traverse segments `1..N-1`, so counting in both double-counts every gap in sealed segments.
+* **Explicit Warning In The Spec**: `docs/recovery-spec.md` §4.2 now carries a table of the three gap sources and an explicit instruction not to enforce contiguity without first making the allocator roll back `nextSeqNum` and reconciling the manifest checkpoint against the WAL. That change would require a migration story for existing databases.
+* **Verification**: `internal/wal/seqgap_test.go` proves a gapped WAL still recovers and replays every record, that gaps are counted with correct magnitudes, that contiguous and single-record WALs report zero gaps, that a regression still fails closed with `*errors.SequenceOutOfOrderError`, and that gaps spanning a segment boundary are handled. `go test -race ./internal/wal/` is clean.
+* **Dimensional Impact**:
+  * Correctness: **Adequate** (monotonicity preserved; gap non-detection is a known, documented, deliberately accepted limitation).
+  * Performance: **None**.
+  * Security: **Adequate** (loss and tampering are covered by attestation; this signal is diagnostic only).
+
+---
+
+### 99. Loopback Classification Fail-Open on Magic Hostnames
+
+* **What Changed**: `IsLoopbackAddress` (formerly `isLoopbackAddress`) classified the bare hostnames `pipe` and `local` as loopback. Neither is a loopback address on any operating system. Because every security gate in `internal/transport` keys off this single predicate — a bind not recognized as loopback must present TLS 1.3 mTLS and a client authorization policy — an address such as `local:9099` was treated as loopback and skipped those requirements entirely. Measured before the fix: `NewServer` with `Address: "local:9099"`, no TLS, and `InsecureTransport=false` returned a **nil error**, i.e. a fully functional storage server reachable in cleartext with no authentication and no authorization.
+* **Root Cause**: The predicate had drifted. `internal/transport` and `cmd/lattice` each carried their own copy of the rule, and neither had a test asserting that arbitrary words are *not* loopback.
+* **Fix**:
+  1. Removed `pipe` and `local` from the loopback set.
+  2. Deleted the `cmd/lattice` duplicate entirely; `cmd/lattice` now calls `transport.IsLoopbackAddress`. Loopback classification is owned by the package whose security gates consume it. Two copies of a security decision inevitably drift, and this one had.
+  3. Exported the predicate as `IsLoopbackAddress` (17 call sites in `internal/transport`, compiler-verified) and documented the rules, including *why* only `localhost` is honored by name.
+* **Name Resolution Is Deliberately Not Done**: Only `localhost` is accepted as a name; everything else must be an IP literal in a loopback range. Resolving arbitrary hostnames here would make a security decision depend on DNS, which an attacker able to influence resolution could steer toward a routable address and thereby re-open this same bypass.
+* **No Coverage Was Lost**: The old literal checks `127.0.0.1` and `::1` were redundant — `net.ParseIP(...).IsLoopback()` already covered them, plus the rest of `127.0.0.0/8` which the literals missed (so `127.0.0.2` was already loopback and still is).
+* **Verification**: `internal/transport/loopback_test.go` asserts 20 classification cases plus 3 security-level and 2 no-regression groups (29 subtests): the magic hostnames now fail closed with `ErrInsecureTransport`, genuine loopback binds stay exempt, and the explicit `InsecureTransport` opt-in still works. Confirmed the suite fails when the magic strings are reintroduced. `go test -race ./internal/transport/` is clean.
+* **Dimensional Impact**:
+  * Correctness: **Optimal** (single source of truth, no duplicated security predicate).
+  * Performance: **None**.
+  * Security: **Material** (closes a cleartext, unauthenticated bind path reachable via a plausible-looking address).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*

@@ -145,7 +145,23 @@ Entrypoint: `(e *Engine) RecoverWAL() error`
 3. Every WAL record's framing and **CRC32-IEEE** checksum (polynomial `0xEDB88320`, Go `hash/crc32.IEEETable`) are physically validated before checkpoint comparison.
 
    **Integrity, not authenticity.** CRC32-IEEE is an unkeyed 32-bit checksum. It reliably detects *accidental* corruption — bit rot, hardware faults, partial writes — and it is fail-closed for those. It provides **no** protection against a deliberate attacker holding segment write access: any field (`Type`, `SeqNum`, `Timestamp`, key, value) can be altered and a valid CRC recomputed in linear time. This is asserted by the project's own suite in `internal/wal/corruption_test.go`, which forges a record, recomputes its CRC, and shows it decodes cleanly. Detecting tampering therefore depends on segment attestation (`wal_%012d.log.att`, see §4.4.1) and filesystem permissions (`0600` files in a `0700` directory), never on the per-record checksum.
-4. Global sequence monotonicity is strictly enforced across all segments. Sequence regressions fail closed with `*errors.SequenceOutOfOrderError`.
+4. **Global sequence monotonicity is strictly enforced across all segments.** Sequence *regressions* fail closed with `*errors.SequenceOutOfOrderError`.
+
+5. **Sequence *gaps* are intentionally NOT enforced.** A record whose `SeqNum` exceeds the previous record's by more than one is observed, counted, and accepted. `RecoveryReport` exposes `SequenceGaps` (number of discontinuities) and `SkippedSequenceNumbers` (total sequence numbers absent), and each event increments `lattice_wal_sequence_gaps_total`. Recovery never rejects on a gap.
+
+   **Why this must stay non-enforcing.** Three code paths produce legitimate gaps, so requiring `SeqNum == prev + 1` would refuse to open healthy databases:
+
+   | Source | Location |
+   |---|---|
+   | `Put` / `Delete` allocate a `SeqNum`, then fail to persist a record; `nextSeqNum` is never rolled back | `internal/engine/engine.go` (`allocSeqNumLocked` precedes `wal.AppendSync` on every write path) |
+   | `Batch` reserves `N+2` sequence numbers up front and can fail mid-loop, leaving the remainder unpersisted | `internal/engine/engine.go` (batch append loop) |
+   | Post-recovery the engine seeds `nextSeqNum` from `max(manifest checkpoint, WAL last SeqNum)`, so the next write legitimately jumps | `internal/engine/engine.go` recovery publication step |
+
+   The third is decisive. When the MANIFEST checkpoint exceeds the WAL's highest `SeqNum` — which is exactly what happens once WAL segment GC removes segments already covered by a flush — every subsequent write starts above the WAL's last sequence number. Strict contiguity would then reject **every** database on **every** boot, permanently. Segment GC is already specified (`docs/architecture-spec.md` §WAL retention), so this is a scheduled landmine rather than a hypothetical.
+
+   **What a gap does and does not mean.** A non-zero `SkippedSequenceNumbers` is an observability signal, not an integrity verdict. Whole-record *loss* from truncation is detected separately by segment attestation (§4.4.1); a gap in sequence numbering does not by itself indicate missing data.
+
+   > **Do not "fix" this by enforcing `SeqNum == prev + 1`.** It will appear to work in testing (where the engine is the only writer and gaps are rare) and will brick every existing database in production. If contiguity is ever wanted, the allocator must first roll back `nextSeqNum` on every failure path *and* reconcile the manifest checkpoint against the WAL, which requires a migration story for existing databases.
 
 ### 4.3 Batch Atomicity & Resource Ceilings
 1. Atomic batches are delimited by `BATCH_START` and `BATCH_COMMIT`.

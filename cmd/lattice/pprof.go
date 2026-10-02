@@ -12,6 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/silent-knight19/lattice/internal/transport"
 )
 
 // PprofServer manages an isolated HTTP diagnostics server exposing Go runtime/pprof
@@ -38,7 +40,7 @@ func NewPprofServer(addr string) (*PprofServer, error) {
 	if err != nil || port < 0 || port > 65535 {
 		return nil, fmt.Errorf("pprof server error: invalid port in address %q", addr)
 	}
-	if !isLoopback(host) {
+	if !transport.IsLoopbackAddress(host) {
 		return nil, fmt.Errorf("pprof server error: address %q must be a loopback interface (127.0.0.1, ::1, localhost)", addr)
 	}
 

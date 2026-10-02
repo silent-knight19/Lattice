@@ -15,3 +15,8 @@ func SetPolicyPostOpenHookForTesting(fn func(path string, f *os.File) error) fun
 		policyHookMu.Unlock()
 	}
 }
+
+// IsLoopbackAddressForTesting exposes the loopback classification for tests.
+func IsLoopbackAddressForTesting(addr string) bool {
+	return IsLoopbackAddress(addr)
+}
