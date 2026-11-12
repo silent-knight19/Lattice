@@ -2,6 +2,7 @@
 
 > **A High-Performance Distributed Key-Value Storage Engine Being Built from the Ground Up**
 
+[![Live Demo: Active](https://img.shields.io/badge/Live%20Demo-Console%20Active-brightgreen.svg)](https://lattice-dydy.onrender.com)
 [![Status: Phases 00–21 Complete](https://img.shields.io/badge/Status-Phases%2000--21%20Complete-brightgreen.svg)](#)
 [![Design Spec](https://img.shields.io/badge/Docs-Architecture%20Spec-blue.svg)](docs/architecture-spec.md)
 [![Implementation Plan](https://img.shields.io/badge/Docs-Implementation%20Plan-green.svg)](docs/implementation-plan.md)
