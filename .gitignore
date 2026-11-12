@@ -49,6 +49,7 @@ testdata/fuzz/
 
 # Profiling & Diagnostics (pprof)
 *.pprof
+*.prof
 cpu.pprof
 mem.pprof
 block.pprof
