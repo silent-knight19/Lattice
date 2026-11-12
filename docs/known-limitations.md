@@ -2104,4 +2104,15 @@ This document tracks all **genuine architectural and operational limitations** o
 
 ---
 
+### 110. Web Admin Console Security Posture & Scope (Phases A–I Complete)
+
+* **Current Posture**: The Lattice Web Admin Console (`internal/admin` + `web/dist` embedded SPA) is disabled by default unless `--admin-address` is supplied. When enabled:
+  * **Loopback-First Binding**: Binds strictly to loopback (`127.0.0.1` / `::1`) unless both `--admin-allow-remote` and `--insecure-transport` are explicitly provided.
+  * **Multi-Layer Request Guards**: Every request passes through `RequestID`, `SecurityHeaders` (strict CSP `default-src 'self'`, `frame-ancestors 'none'`), `NoStoreAPI`, `BodyLimit`, `HandlerTimeout`, `HostGuard`, `OriginGuard`, and `CSRFGuard`.
+  * **Anti-CSRF & Operator Confirmation**: State-mutating routes (`POST`) require a per-boot CSPRNG token in `X-Lattice-CSRF` (fetched in-memory from `GET /api/v1/session`, never persisted in cookies or `localStorage`) plus `X-Lattice-Admin: confirm`.
+  * **Authorization**: When an authz policy is configured, client certificates are verified against SHA-256 leaf fingerprints; on unconfigured loopback sockets, `defaultResolver` grants local `RoleAdmin` gated by Host/Origin/CSRF checks.
+* **Scope**: The Web Console connects to a single node's admin endpoint and renders its local engine, host telemetry, and Raft peer state. Switching between independent remote nodes' admin endpoints from a single browser tab is not implemented (by design for strict same-origin CSP).
+
+---
+
 *End of Known Limitations — To be updated continuously throughout implementation.*

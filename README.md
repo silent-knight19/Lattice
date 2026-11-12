@@ -195,11 +195,32 @@ To verify measurement consistency and eliminate one-off anomalies, three indepen
 * [x] **Phase 19: Comprehensive Security Hardening** — Completed
 * [x] **Phase 20: Production Hardening & Operational Observability** — Completed
 * [x] **Phase 21: Resume & Technical Interview Portfolio Validation** — Completed
+* [x] **Web Admin Console (Phases A–I)** — Completed in [`internal/admin/`](internal/admin/) & [`web/`](web/)
+
+---
+
+## Web Admin Console & Quickstart
+
+Lattice includes an embedded, security-hardened Web Admin Console (`internal/admin` + `web/dist` React SPA) that connects directly to the live storage engine, Raft consensus state, and host runtime telemetry.
+
+```bash
+# Build binaries
+go build -o bin/lattice ./cmd/lattice
+go build -o bin/lattice-cli ./cmd/lattice-cli
+
+# Start Lattice with the Web Admin Console enabled on loopback
+./bin/lattice --data-dir=./data --port=9099 --admin-address=127.0.0.1:7070
+```
+
+* **Security Architecture**: Off by default unless `--admin-address` is supplied; loopback-only binding unless explicitly overridden, strict `HostGuard` + `OriginGuard`, per-boot CSPRNG `CSRFGuard` (`X-Lattice-CSRF` + `X-Lattice-Admin: confirm`), strict CSP, and fail-closed RBAC.
+* **Live Capabilities**: Real-time host OS/CPU/RAM/disk telemetry, LSM-Tree level visualization with on-demand `Flush` and `Compact`, SSTable block/Bloom filter inspection, WAL segment replay verification, Raft peer status, Keyspace browser, in-browser REPL, and live workload/crash diagnostics.
+* **Guided Walkthrough**: See [`docs/DEMO.md`](docs/DEMO.md) for the full CLI + Web Console demo script.
 
 ---
 
 ## Core Engineering Documentation
 
+* [Interactive CLI & Web Console Demo Walkthrough](docs/DEMO.md)
 * [Full Architecture & System Design Specification (48 Sections & Diagrams)](docs/architecture-spec.md)
 * [Micro-Phase Implementation Plan (184 Verifiable Micro-Steps)](docs/implementation-plan.md)
 * [Technical Interview Knowledge Base & Defense Guide](docs/interview-knowledge.md)
