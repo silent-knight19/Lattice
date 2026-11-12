@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -250,6 +251,10 @@ func (h *engineHandlers) handleNode(w http.ResponseWriter, r *http.Request) {
 		uptime = 0
 	}
 
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+	hostname, _ := os.Hostname()
+
 	writeJSONPayload(w, http.StatusOK, map[string]any{
 		"nodeId":        nodeID,
 		"role":          role,
@@ -258,11 +263,22 @@ func (h *engineHandlers) handleNode(w http.ResponseWriter, r *http.Request) {
 		"commitIndex":   commitIndex,
 		"appliedIndex":  appliedIndex,
 		"uptimeSeconds": uptime,
-		"version":       "Lattice (Go 1.23)",
+		"version":       fmt.Sprintf("Lattice (%s/%s, %s)", runtime.GOOS, runtime.GOARCH, runtime.Version()),
 		"dataDirBase":   dataDirBase,
 		"storageEngine": "LSM-Tree + Raft Consensus",
 		"peersCount":    peersCount,
 		"quorumSize":    quorumSize,
+		"system": map[string]any{
+			"os":             runtime.GOOS,
+			"arch":           runtime.GOARCH,
+			"numCPU":         runtime.NumCPU(),
+			"numGoroutine":   runtime.NumGoroutine(),
+			"heapAllocBytes": memStats.Alloc,
+			"sysMemBytes":    memStats.Sys,
+			"gcRuns":         memStats.NumGC,
+			"hostname":       hostname,
+			"pid":            os.Getpid(),
+		},
 	})
 }
 
@@ -334,6 +350,9 @@ func (h *engineHandlers) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	opsPerSec, readOps, writeOps := h.calcThroughput()
 	writeP99, readP99 := h.calcLatencyP99()
 
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+
 	writeJSONPayload(w, http.StatusOK, map[string]any{
 		"opsPerSec":             opsPerSec,
 		"readOpsPerSec":         readOps,
@@ -348,6 +367,9 @@ func (h *engineHandlers) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"diskTotalBytes":        diskTotal,
 		"activeConnections":     1,
 		"walActiveSegmentBytes": walActiveBytes,
+		"heapAllocBytes":        memStats.Alloc,
+		"sysMemBytes":           memStats.Sys,
+		"goroutines":            runtime.NumGoroutine(),
 	})
 }
 

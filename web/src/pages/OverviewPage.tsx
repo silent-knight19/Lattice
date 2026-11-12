@@ -4,7 +4,7 @@ import { Card } from '../components/common/Card';
 import { Badge } from '../components/common/Badge';
 import { StatusDot } from '../components/common/StatusDot';
 import { Sparkline } from '../components/common/Sparkline';
-import { CheckCircleIcon, AlertCircleIcon } from '../components/common/Icons';
+import { CheckCircleIcon, AlertCircleIcon, ServerIcon, CpuIcon, ActivityIcon, DatabaseIcon } from '../components/common/Icons';
 
 interface OverviewPageProps {
   nodeInfo: NodeInfo | null;
@@ -163,10 +163,14 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
         <Card className="p-4">
           <div className="text-[11px] font-mono text-neutral-400 font-medium">LSM TOTAL SIZE</div>
           <div className="text-xl font-bold text-neutral-100 mt-1 font-mono">
-            {metrics ? `${(metrics.lsmTotalSizeBytes / (1024 * 1024)).toFixed(1)} MB` : '—'}
+            {metrics
+              ? metrics.lsmTotalSizeBytes > 0 && metrics.lsmTotalSizeBytes < 1024 * 1024
+                ? `${metrics.lsmTotalSizeBytes} B`
+                : `${(metrics.lsmTotalSizeBytes / (1024 * 1024)).toFixed(1)} MB`
+              : '—'}
           </div>
-          <div className="mt-2 text-[10px] text-neutral-500 font-mono">
-            {metrics ? `WAL: ${(metrics.walActiveSegmentBytes / (1024 * 1024)).toFixed(1)} MB` : 'Unavailable'}
+          <div className="mt-2 text-[10px] text-neutral-400 font-mono">
+            {metrics ? `WAL: ${(metrics.walActiveSegmentBytes / 1024).toFixed(1)} KB` : 'Unavailable'}
           </div>
         </Card>
 
@@ -175,15 +179,22 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
           <div className="text-[11px] font-mono text-neutral-400 font-medium">MEMTABLE FILL</div>
           <div className="text-xl font-bold text-neutral-100 mt-1 font-mono">
             {metrics && metrics.memtableLimitBytes > 0
-              ? `${Math.round((metrics.memtableBytes / metrics.memtableLimitBytes) * 100)}%`
+              ? metrics.memtableBytes > 0
+                ? metrics.memtableBytes < 1024
+                  ? `${metrics.memtableBytes} B`
+                  : `${(metrics.memtableBytes / 1024).toFixed(1)} KB`
+                : '0 B'
               : '—'}
           </div>
-          <div className="mt-2">
+          <div className="mt-1 text-[10px] text-neutral-400 font-mono">
+            {metrics && metrics.memtableLimitBytes > 0
+              ? `${((metrics.memtableBytes / metrics.memtableLimitBytes) * 100).toFixed(2)}% of ${(metrics.memtableLimitBytes / (1024 * 1024)).toFixed(0)}MB`
+              : 'Unavailable'}
+          </div>
+          <div className="mt-1">
             {memHistory.length >= 2 ? (
-              <Sparkline data={memHistory} color="#EC4899" width={120} height={24} />
-            ) : (
-              <span className="text-[10px] font-mono text-neutral-500">No samples</span>
-            )}
+              <Sparkline data={memHistory} color="#EC4899" width={120} height={18} />
+            ) : null}
           </div>
         </Card>
 
@@ -194,13 +205,72 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
             {metrics ? `${(metrics.diskFreeBytes / (1024 * 1024 * 1024)).toFixed(1)} GB` : '—'}
           </div>
           <div className="mt-2 text-[10px] text-neutral-400 flex items-center justify-between font-mono">
-            <span>Cache Hit Rate</span>
+            <span>Cache Rate</span>
             <span className="text-emerald-400">
               {metrics ? `${metrics.blockCacheHitRate.toFixed(1)}%` : '—'}
             </span>
           </div>
         </Card>
       </div>
+
+      {/* Real Host & Runtime Environment */}
+      {nodeInfo?.system && (
+        <Card title="Host System & Runtime Telemetry" subtitle="Real-time host environment and Go runtime resources">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-2">
+            <div className="p-3 rounded-lg bg-neutral-950/80 border border-neutral-800 font-mono">
+              <div className="flex items-center gap-1.5 text-neutral-400 text-[10px] uppercase">
+                <ServerIcon size={12} className="text-emerald-400" />
+                <span>Host Platform</span>
+              </div>
+              <div className="text-sm font-bold text-neutral-100 mt-1">
+                {nodeInfo.system.os.toUpperCase()} / {nodeInfo.system.arch}
+              </div>
+              <div className="text-[10px] text-neutral-400 mt-0.5 truncate" title={nodeInfo.system.hostname}>
+                Host: {nodeInfo.system.hostname || 'Cloud Container'}
+              </div>
+            </div>
+
+            <div className="p-3 rounded-lg bg-neutral-950/80 border border-neutral-800 font-mono">
+              <div className="flex items-center gap-1.5 text-neutral-400 text-[10px] uppercase">
+                <CpuIcon size={12} className="text-blue-400" />
+                <span>CPU & Concurrency</span>
+              </div>
+              <div className="text-sm font-bold text-neutral-100 mt-1">
+                {nodeInfo.system.numCPU} CPU Cores
+              </div>
+              <div className="text-[10px] text-neutral-400 mt-0.5">
+                {nodeInfo.system.numGoroutine} Active Goroutines
+              </div>
+            </div>
+
+            <div className="p-3 rounded-lg bg-neutral-950/80 border border-neutral-800 font-mono">
+              <div className="flex items-center gap-1.5 text-neutral-400 text-[10px] uppercase">
+                <ActivityIcon size={12} className="text-purple-400" />
+                <span>Runtime Memory</span>
+              </div>
+              <div className="text-sm font-bold text-neutral-100 mt-1">
+                {(nodeInfo.system.heapAllocBytes / (1024 * 1024)).toFixed(1)} MB Heap
+              </div>
+              <div className="text-[10px] text-neutral-400 mt-0.5">
+                {(nodeInfo.system.sysMemBytes / (1024 * 1024)).toFixed(1)} MB OS Allocated
+              </div>
+            </div>
+
+            <div className="p-3 rounded-lg bg-neutral-950/80 border border-neutral-800 font-mono">
+              <div className="flex items-center gap-1.5 text-neutral-400 text-[10px] uppercase">
+                <DatabaseIcon size={12} className="text-amber-400" />
+                <span>Process & GC</span>
+              </div>
+              <div className="text-sm font-bold text-neutral-100 mt-1">
+                PID #{nodeInfo.system.pid}
+              </div>
+              <div className="text-[10px] text-neutral-400 mt-0.5">
+                {nodeInfo.system.gcRuns} GC Cycles Completed
+              </div>
+            </div>
+          </div>
+        </Card>
+      )}
 
       {/* 3. Cluster Strip & Live Event Stream */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

@@ -2,6 +2,18 @@
 
 export type NodeRole = 'Leader' | 'Follower' | 'Candidate' | 'Standalone';
 
+export interface SystemHostStats {
+  os: string;
+  arch: string;
+  numCPU: number;
+  numGoroutine: number;
+  heapAllocBytes: number;
+  sysMemBytes: number;
+  gcRuns: number;
+  hostname: string;
+  pid: number;
+}
+
 export interface NodeInfo {
   nodeId: number;
   role: NodeRole;
@@ -15,6 +27,7 @@ export interface NodeInfo {
   storageEngine: string;
   peersCount: number;
   quorumSize: number;
+  system?: SystemHostStats;
 }
 
 export interface HealthStatus {
@@ -42,6 +55,9 @@ export interface MetricSnapshot {
   diskTotalBytes: number;
   activeConnections: number;
   walActiveSegmentBytes: number;
+  heapAllocBytes?: number;
+  sysMemBytes?: number;
+  goroutines?: number;
 }
 
 export interface SSTableFile {
