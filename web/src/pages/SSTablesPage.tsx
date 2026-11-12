@@ -109,7 +109,7 @@ export const SSTablesPage: React.FC = () => {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-neutral-800/60 text-neutral-200">
-                  {inspection.blocks.map((b) => (
+                  {(inspection.blocks || []).map((b) => (
                     <tr key={b.index} className="hover:bg-neutral-800/30">
                       <td className="py-2 px-3">#{b.index}</td>
                       <td className="py-2 px-3">{b.offset}</td>

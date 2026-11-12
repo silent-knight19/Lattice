@@ -29,7 +29,7 @@ export const KeysPage: React.FC = () => {
     setLoadError(null);
     try {
       const data = await api.getKeys(prefix);
-      setKeys(data);
+      setKeys(Array.isArray(data) ? data : []);
     } catch (err) {
       setKeys([]);
       setLoadError(err instanceof Error ? err.message : 'Failed to load keys');
@@ -40,7 +40,7 @@ export const KeysPage: React.FC = () => {
     loadKeys(searchTerm);
   }, [loadKeys, searchTerm]);
 
-  const filtered = keys
+  const filtered = (keys || [])
     .filter((k) => k.key.toLowerCase().includes(searchTerm.toLowerCase()))
     .filter((k) => showTombstones || !k.isTombstone);
 

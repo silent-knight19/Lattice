@@ -169,7 +169,7 @@ export const LSMTreePage: React.FC<LSMTreePageProps> = ({ treeState, onRefresh }
         subtitle="Visual level hierarchy with overlapping range detection and key bounds"
       >
         <div className="grid grid-cols-1 md:grid-cols-3 gap-5 mt-2">
-          {levels.map((lvl) => (
+          {(levels || []).map((lvl) => (
             <div key={lvl.level} className="p-4 rounded-xl bg-neutral-950/80 border border-neutral-800 flex flex-col">
               <div className="flex items-center justify-between border-b border-neutral-800 pb-2.5 mb-3">
                 <div className="flex items-center gap-2">
@@ -191,7 +191,7 @@ export const LSMTreePage: React.FC<LSMTreePageProps> = ({ treeState, onRefresh }
 
               {/* Stack of files */}
               <div className="space-y-2.5 flex-1">
-                {lvl.files.map((file) => (
+                {(lvl.files || []).map((file) => (
                   <div
                     key={file.fileNum}
                     className={`p-3 rounded-lg border transition-all ${

@@ -51,10 +51,10 @@ export const RaftPage: React.FC<RaftPageProps> = ({ raftState }) => {
       </div>
 
       <Card title="Consensus Term Timeline" subtitle="Historical leadership tenure across Raft terms">
-        {raftState.timeline.length > 0 ? (
+        {(raftState.timeline || []).length > 0 ? (
           <div className="space-y-3 mt-2">
             <div className="h-10 w-full rounded-lg bg-neutral-950 border border-neutral-800 p-1 flex gap-1 select-none font-mono text-[11px]">
-              {raftState.timeline.map((t) => (
+              {(raftState.timeline || []).map((t) => (
                 <div
                   key={t.term}
                   className="flex-1 rounded bg-neutral-800 border border-neutral-700 flex items-center justify-center text-neutral-200 px-2 truncate"

@@ -176,7 +176,7 @@ func (h *engineHandlers) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	status := "healthy"
-	var incidents []string
+	incidents := []string{}
 	if walPoisoned {
 		status = "unhealthy"
 		incidents = append(incidents, "WAL is poisoned")
@@ -426,10 +426,10 @@ func (h *engineHandlers) handleLSMTree(w http.ResponseWriter, r *http.Request) {
 		Score          float64    `json:"score"`
 	}
 
-	var levels []levelItem
+	levels := make([]levelItem, 0, 7)
 	for lvl := 0; lvl < 7; lvl++ {
 		files := ver.Files(lvl)
-		var fList []fileItem
+		fList := []fileItem{}
 		var totalBytes uint64
 		for _, f := range files {
 			totalBytes += f.FileSize
@@ -580,7 +580,7 @@ func (h *engineHandlers) handleSSTables(w http.ResponseWriter, r *http.Request) 
 		ModTime   string `json:"modTime"`
 	}
 
-	var files []sstFile
+	files := []sstFile{}
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sst") {
 			continue
@@ -655,7 +655,7 @@ func (h *engineHandlers) handleSSTInspect(w http.ResponseWriter, r *http.Request
 		LastKey      string `json:"lastKey"`
 	}
 
-	var blocks []blockDTO
+	blocks := []blockDTO{}
 	totalEntries := 0
 	if idx != nil {
 		entries := idx.Entries()
@@ -792,7 +792,7 @@ func (h *engineHandlers) handleWALSegments(w http.ResponseWriter, r *http.Reques
 		AttestationStatus string `json:"attestationStatus"`
 	}
 
-	var segs []walDTO
+	segs := []walDTO{}
 	maxID := uint64(0)
 	for _, id := range ids {
 		if id > maxID {
@@ -871,7 +871,7 @@ func (h *engineHandlers) handleWALDump(w http.ResponseWriter, r *http.Request) {
 		Timestamp    string `json:"timestamp"`
 	}
 
-	var records []recDTO
+	records := []recDTO{}
 	count := 0
 	for count < 1000 {
 		rec, err := reader.Next()
@@ -945,7 +945,7 @@ func (h *engineHandlers) handleRaftStatus(w http.ResponseWriter, r *http.Request
 		Reachable       bool   `json:"reachable"`
 	}
 
-	var peers []peerDTO
+	peers := []peerDTO{}
 	if h.raft != nil {
 		nodeID = int(h.raft.LocalID())
 		role = string(h.raft.Role())
@@ -1008,7 +1008,7 @@ func (h *engineHandlers) handleRaftPeers(w http.ResponseWriter, r *http.Request)
 		writeJSONPayload(w, http.StatusOK, []any{})
 		return
 	}
-	var peers []map[string]any
+	peers := []map[string]any{}
 	matchIdxMap := h.raft.MatchIndex()
 	nextIdxMap := h.raft.NextIndex()
 	if top := h.raft.Topology(); top != nil {
@@ -1107,7 +1107,7 @@ func (h *engineHandlers) handleKeys(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var results []keyScanEntry
+	results := []keyScanEntry{}
 	seen := make(map[string]bool)
 
 	// 1. Scan active MemTable

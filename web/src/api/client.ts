@@ -110,7 +110,11 @@ export async function fetchSession(): Promise<string | null> {
 // Live API methods (no simulated fallbacks)
 export const api = {
   async getHealth(): Promise<HealthStatus> {
-    return request<HealthStatus>('/api/v1/health');
+    const h = await request<HealthStatus>('/api/v1/health');
+    return {
+      ...h,
+      activeIncidents: Array.isArray(h?.activeIncidents) ? h.activeIncidents : [],
+    };
   },
 
   async getNodeInfo(): Promise<NodeInfo> {
@@ -122,15 +126,28 @@ export const api = {
   },
 
   async getLSMTree(): Promise<LSMTreeState> {
-    return request<LSMTreeState>('/api/v1/lsm/tree');
+    const tree = await request<LSMTreeState>('/api/v1/lsm/tree');
+    return {
+      ...tree,
+      levels: (Array.isArray(tree?.levels) ? tree.levels : []).map((lvl) => ({
+        ...lvl,
+        files: Array.isArray(lvl?.files) ? lvl.files : [],
+      })),
+    };
   },
 
   async getRaftState(): Promise<RaftState> {
-    return request<RaftState>('/api/v1/raft/status');
+    const state = await request<RaftState>('/api/v1/raft/status');
+    return {
+      ...state,
+      peers: Array.isArray(state?.peers) ? state.peers : [],
+      timeline: Array.isArray(state?.timeline) ? state.timeline : [],
+    };
   },
 
   async getKeys(prefix = ''): Promise<KeyEntry[]> {
-    return request<KeyEntry[]>(`/api/v1/keys?prefix=${encodeURIComponent(prefix)}`);
+    const res = await request<KeyEntry[]>(`/api/v1/keys?prefix=${encodeURIComponent(prefix)}`);
+    return Array.isArray(res) ? res : [];
   },
 
   async putKey(key: string, value: string): Promise<void> {
@@ -148,11 +165,16 @@ export const api = {
   },
 
   async getWALSegments(): Promise<WALSegment[]> {
-    return request<WALSegment[]>('/api/v1/wal/segments');
+    const res = await request<WALSegment[]>('/api/v1/wal/segments');
+    return Array.isArray(res) ? res : [];
   },
 
   async inspectSSTable(filename: string): Promise<SSTableInspection> {
-    return request<SSTableInspection>(`/api/v1/sstables/inspect?file=${encodeURIComponent(filename)}`);
+    const ins = await request<SSTableInspection>(`/api/v1/sstables/inspect?file=${encodeURIComponent(filename)}`);
+    return {
+      ...ins,
+      blocks: Array.isArray(ins?.blocks) ? ins.blocks : [],
+    };
   },
 
   async triggerCompaction(): Promise<{ success: boolean; message: string }> {

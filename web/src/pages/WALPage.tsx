@@ -15,9 +15,9 @@ export const WALPage: React.FC = () => {
     setError(null);
     try {
       const data = await api.getWALSegments();
-      setSegments(data);
+      setSegments(Array.isArray(data) ? data : []);
     } catch (err) {
-      setSegments(null);
+      setSegments([]);
       setError(err instanceof Error ? err.message : 'Failed to load WAL segments');
     } finally {
       setLoading(false);
@@ -80,7 +80,7 @@ export const WALPage: React.FC = () => {
                 </tr>
               </thead>
               <tbody className="divide-y divide-neutral-800/60 text-neutral-200">
-                {segments.map((seg) => (
+                {(segments || []).map((seg) => (
                   <tr key={seg.segmentNumber} className="hover:bg-neutral-800/30">
                     <td className="py-2.5 px-3 font-semibold">{seg.filename}</td>
                     <td className="py-2.5 px-3">

@@ -239,7 +239,7 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
                 </div>
               </div>
 
-              {raftState.peers.map((peer) => (
+              {(raftState.peers || []).map((peer) => (
                 <div
                   key={peer.nodeId}
                   className="p-3 rounded-lg bg-neutral-950/70 border border-neutral-800 flex items-center justify-between"
@@ -290,9 +290,9 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({
             </span>
           }
         >
-          {events.length > 0 ? (
+          {(events || []).length > 0 ? (
             <div className="space-y-2 mt-1 font-mono text-xs max-h-[220px] overflow-y-auto pr-1">
-              {events.map((ev) => (
+              {(events || []).map((ev) => (
                 <div
                   key={ev.id}
                   className="p-2.5 rounded bg-neutral-950/60 border border-neutral-800/80 flex items-start gap-2.5"

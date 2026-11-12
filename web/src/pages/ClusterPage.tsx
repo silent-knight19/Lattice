@@ -105,7 +105,7 @@ export const ClusterPage: React.FC<ClusterPageProps> = ({ raftState }) => {
                 <td className="py-3 px-3 text-right"><StatusDot status="healthy" text="Online" /></td>
               </tr>
 
-              {raftState.peers.map((peer) => (
+              {(raftState.peers || []).map((peer) => (
                 <tr key={peer.nodeId} className="hover:bg-neutral-800/30 transition-colors">
                   <td className="py-3 px-3 font-semibold">node-{peer.nodeId}</td>
                   <td className="py-3 px-3 text-neutral-300">{peer.address}</td>
