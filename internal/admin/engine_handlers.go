@@ -75,14 +75,16 @@ type engineHandlers struct {
 }
 
 type workloadJob struct {
-	id         string
-	cancel     context.CancelFunc
-	running    atomic.Bool
-	targetQPS  int
-	readRatio  int
-	opsDone    atomic.Int64
-	startedAt  time.Time
-	errorsDone atomic.Int64
+	id          string
+	cancel      context.CancelFunc
+	running     atomic.Bool
+	targetQPS   int
+	readRatio   int
+	durationSec int
+	opsDone     atomic.Int64
+	startedAt   time.Time
+	endedAtNano atomic.Int64
+	errorsDone  atomic.Int64
 }
 
 // NewEngineHandlers assembles endpoint handlers backed by the live engine and raft subsystems.
@@ -133,6 +135,7 @@ func NewEngineHandlers(opts EngineHandlerOptions) *Handlers {
 		KeyDelete: http.HandlerFunc(h.handleKeyDelete),
 
 		LabWorkloadStart: http.HandlerFunc(h.handleLabWorkloadStart),
+		LabWorkloadStop:  http.HandlerFunc(h.handleLabWorkloadStop),
 		LabWorkloadStat:  http.HandlerFunc(h.handleLabWorkloadStat),
 		LabCrash:         http.HandlerFunc(h.handleLabCrash),
 		LabRecoverReport: http.HandlerFunc(h.handleLabRecoverReport),
@@ -1434,9 +1437,10 @@ func (h *engineHandlers) handleLabWorkloadStart(w http.ResponseWriter, r *http.R
 		return
 	}
 	var req struct {
-		Concurrency int `json:"concurrency"`
-		QPS         int `json:"qps"`
-		ReadRatio   int `json:"readRatio"`
+		Concurrency int  `json:"concurrency"`
+		QPS         int  `json:"qps"`
+		ReadRatio   int  `json:"readRatio"`
+		DurationSec *int `json:"durationSec"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	if req.Concurrency <= 0 || req.Concurrency > 64 {
@@ -1448,19 +1452,37 @@ func (h *engineHandlers) handleLabWorkloadStart(w http.ResponseWriter, r *http.R
 	if req.ReadRatio < 0 || req.ReadRatio > 100 {
 		req.ReadRatio = 80
 	}
+	durationSec := 30
+	if req.DurationSec != nil {
+		durationSec = *req.DurationSec
+		if durationSec < 0 {
+			durationSec = 30
+		} else if durationSec > 3600 {
+			durationSec = 3600
+		}
+	}
 
 	h.workloadMu.Lock()
 	if h.activeWorkload != nil && h.activeWorkload.running.Load() {
 		h.activeWorkload.cancel()
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	var (
+		ctx    context.Context
+		cancel context.CancelFunc
+	)
+	if durationSec > 0 {
+		ctx, cancel = context.WithTimeout(context.Background(), time.Duration(durationSec)*time.Second)
+	} else {
+		ctx, cancel = context.WithCancel(context.Background())
+	}
 	job := &workloadJob{
-		id:        fmt.Sprintf("job-%d", time.Now().UnixNano()),
-		cancel:    cancel,
-		targetQPS: req.QPS,
-		readRatio: req.ReadRatio,
-		startedAt: time.Now(),
+		id:          fmt.Sprintf("job-%d", time.Now().UnixNano()),
+		cancel:      cancel,
+		targetQPS:   req.QPS,
+		readRatio:   req.ReadRatio,
+		durationSec: durationSec,
+		startedAt:   time.Now(),
 	}
 	job.running.Store(true)
 	h.activeWorkload = job
@@ -1469,15 +1491,50 @@ func (h *engineHandlers) handleLabWorkloadStart(w http.ResponseWriter, r *http.R
 	// Launch background workers
 	go h.runWorkload(ctx, job, req.Concurrency)
 
+	msg := fmt.Sprintf("Workload running with %d goroutines at %d target QPS (%ds)", req.Concurrency, req.QPS, durationSec)
+	if durationSec == 0 {
+		msg = fmt.Sprintf("Workload running with %d goroutines at %d target QPS (continuous)", req.Concurrency, req.QPS)
+	}
 	writeJSONPayload(w, http.StatusOK, map[string]any{
+		"jobId":       job.id,
+		"status":      "running",
+		"durationSec": durationSec,
+		"message":     msg,
+	})
+}
+
+func (h *engineHandlers) handleLabWorkloadStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeMethodNotAllowed(w)
+		return
+	}
+	h.workloadMu.Lock()
+	job := h.activeWorkload
+	h.workloadMu.Unlock()
+
+	if job == nil || !job.running.Load() {
+		writeJSONPayload(w, http.StatusOK, map[string]any{
+			"stopped": false,
+			"message": "No active workload running",
+		})
+		return
+	}
+
+	job.cancel()
+	writeJSONPayload(w, http.StatusOK, map[string]any{
+		"stopped": true,
 		"jobId":   job.id,
-		"status":  "running",
-		"message": fmt.Sprintf("Workload running with %d goroutines at %d target QPS", req.Concurrency, req.QPS),
+		"opsDone": job.opsDone.Load(),
+		"message": fmt.Sprintf("Workload stopped after %d ops", job.opsDone.Load()),
 	})
 }
 
 func (h *engineHandlers) runWorkload(ctx context.Context, job *workloadJob, concurrency int) {
-	defer job.running.Store(false)
+	defer func() {
+		job.endedAtNano.Store(time.Now().UnixNano())
+		job.running.Store(false)
+		job.cancel()
+	}()
 	var wg sync.WaitGroup
 
 	for i := 0; i < concurrency; i++ {
@@ -1525,13 +1582,19 @@ func (h *engineHandlers) handleLabWorkloadStat(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	elapsedMs := time.Since(job.startedAt).Milliseconds()
+	if endNano := job.endedAtNano.Load(); endNano > 0 {
+		elapsedMs = time.Unix(0, endNano).Sub(job.startedAt).Milliseconds()
+	}
+
 	writeJSONPayload(w, http.StatusOK, map[string]any{
-		"jobId":     job.id,
-		"running":   job.running.Load(),
-		"opsDone":   job.opsDone.Load(),
-		"targetQPS": job.targetQPS,
-		"readRatio": job.readRatio,
-		"elapsedMs": time.Since(job.startedAt).Milliseconds(),
+		"jobId":       job.id,
+		"running":     job.running.Load(),
+		"opsDone":     job.opsDone.Load(),
+		"targetQPS":   job.targetQPS,
+		"readRatio":   job.readRatio,
+		"durationSec": job.durationSec,
+		"elapsedMs":   elapsedMs,
 	})
 }
 

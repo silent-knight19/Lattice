@@ -105,6 +105,7 @@ func TestRoutePlan_DestructiveRoutesAreAdminOnly(t *testing.T) {
 		RouteWALDump,  // raw user key/value data
 		RouteEvents,   // high-value drive-by target
 		RouteLabStart, // load generator
+		RouteLabStop,  // stop load generator
 		RouteLabStat,  // workload introspection
 	}
 	for _, path := range adminOnly {

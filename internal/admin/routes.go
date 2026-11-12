@@ -35,6 +35,7 @@ const (
 	RouteKeyPut    = "/keys/put"
 	RouteKeyDelete = "/keys/delete"
 	RouteLabStart  = "/lab/workload/start"
+	RouteLabStop   = "/lab/workload/stop"
 	RouteLabStat   = "/lab/workload"
 	RouteLabCrash  = "/lab/crash"
 	RouteLabRecov  = "/lab/recover-report"
@@ -83,6 +84,7 @@ type Handlers struct {
 	KeyDelete http.Handler
 
 	LabWorkloadStart http.Handler
+	LabWorkloadStop  http.Handler
 	LabWorkloadStat  http.Handler
 	LabCrash         http.Handler
 	LabRecoverReport http.Handler
@@ -210,6 +212,9 @@ var routePlan = map[string]RouteSpec{
 	RouteLabStart: {Method: http.MethodPost, Path: RouteLabStart, Permission: PermissionAdmin, Mutating: true,
 		description: "start a synthetic workload"},
 
+	RouteLabStop: {Method: http.MethodPost, Path: RouteLabStop, Permission: PermissionAdmin, Mutating: true,
+		description: "stop the active synthetic workload"},
+
 	RouteLabStat: {Method: http.MethodGet, Path: RouteLabStat, Permission: PermissionAdmin,
 		description: "workload progress and latency series"},
 
@@ -256,7 +261,7 @@ func BuildRoutes(h *Handlers) []RouteSpec {
 
 		RouteKeys: h.Keys, RouteKeyGet: h.KeyGet, RouteKeyPut: h.KeyPut, RouteKeyDelete: h.KeyDelete,
 
-		RouteLabStart: h.LabWorkloadStart, RouteLabStat: h.LabWorkloadStat,
+		RouteLabStart: h.LabWorkloadStart, RouteLabStop: h.LabWorkloadStop, RouteLabStat: h.LabWorkloadStat,
 		RouteLabCrash: h.LabCrash, RouteLabRecov: h.LabRecoverReport, RouteLabClean: h.LabCleanup,
 
 		RouteDiag: h.Diagnostics, RouteConsole: h.ConsoleExec,

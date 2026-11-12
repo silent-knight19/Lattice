@@ -207,14 +207,20 @@ export const api = {
     });
   },
 
-  async startWorkload(concurrency = 8, qps = 5000, readRatio = 80): Promise<{ jobId: string; status: string; message: string }> {
+  async startWorkload(concurrency = 8, qps = 5000, readRatio = 80, durationSec = 30): Promise<{ jobId: string; status: string; durationSec?: number; message: string }> {
     return request('/api/v1/lab/workload/start', {
       method: 'POST',
-      body: JSON.stringify({ concurrency, qps, readRatio }),
+      body: JSON.stringify({ concurrency, qps, readRatio, durationSec }),
     });
   },
 
-  async getWorkloadStatus(): Promise<{ running: boolean; opsDone: number; targetQPS?: number; readRatio?: number; elapsedMs?: number }> {
+  async stopWorkload(): Promise<{ stopped: boolean; opsDone?: number; message: string }> {
+    return request('/api/v1/lab/workload/stop', {
+      method: 'POST',
+    });
+  },
+
+  async getWorkloadStatus(): Promise<{ running: boolean; opsDone: number; targetQPS?: number; readRatio?: number; durationSec?: number; elapsedMs?: number }> {
     return request('/api/v1/lab/workload');
   },
 

@@ -7,6 +7,7 @@ export const LabPage: React.FC = () => {
   const [concurrency, setConcurrency] = useState(8);
   const [qps, setQps] = useState(5000);
   const [readRatio, setReadRatio] = useState(80);
+  const [durationSec, setDurationSec] = useState(30);
 
   const [isRunning, setIsRunning] = useState(false);
   const [opsDone, setOpsDone] = useState(0);
@@ -49,11 +50,26 @@ export const LabPage: React.FC = () => {
     setLoading(true);
     setActionMsg(null);
     try {
-      const res = await api.startWorkload(concurrency, qps, readRatio);
+      const res = await api.startWorkload(concurrency, qps, readRatio, durationSec);
       setIsRunning(true);
       setActionMsg(res.message);
     } catch (err: unknown) {
       setActionMsg(`Failed to start: ${(err as Error).message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleStopWorkload = async () => {
+    setLoading(true);
+    setActionMsg(null);
+    try {
+      const res = await api.stopWorkload();
+      setIsRunning(false);
+      if (typeof res.opsDone === 'number') setOpsDone(res.opsDone);
+      setActionMsg(res.message);
+    } catch (err: unknown) {
+      setActionMsg(`Failed to stop: ${(err as Error).message}`);
     } finally {
       setLoading(false);
     }
@@ -112,7 +128,7 @@ export const LabPage: React.FC = () => {
         {/* Workload Generation */}
         <Card title="Workload Generator" subtitle="Generate live concurrent traffic against the storage engine">
           <div className="space-y-4">
-            <div className="grid grid-cols-3 gap-3">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
               <div>
                 <label className="text-[10px] font-mono uppercase tracking-wider text-neutral-400 block mb-1">
                   Concurrency
@@ -156,6 +172,24 @@ export const LabPage: React.FC = () => {
                   className="w-full bg-neutral-950 border border-neutral-800 rounded px-2.5 py-1.5 text-xs text-neutral-100 font-mono focus:outline-none focus:border-emerald-500"
                 />
               </div>
+              <div>
+                <label className="text-[10px] font-mono uppercase tracking-wider text-neutral-400 block mb-1">
+                  Duration (s)
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  max={3600}
+                  value={durationSec}
+                  onChange={(e) => {
+                    const parsed = parseInt(e.target.value, 10);
+                    setDurationSec(Number.isNaN(parsed) ? 0 : Math.max(0, Math.min(3600, parsed)));
+                  }}
+                  disabled={isRunning}
+                  title="0 = run until stopped"
+                  className="w-full bg-neutral-950 border border-neutral-800 rounded px-2.5 py-1.5 text-xs text-neutral-100 font-mono focus:outline-none focus:border-emerald-500"
+                />
+              </div>
             </div>
 
             <div className="p-3 rounded-lg border border-neutral-800 bg-neutral-950 flex items-center justify-between">
@@ -182,18 +216,29 @@ export const LabPage: React.FC = () => {
               </div>
             </div>
 
-            <button
-              onClick={handleStartWorkload}
-              disabled={loading || isRunning}
-              className={`w-full py-2 px-3 rounded-lg font-mono text-xs font-semibold flex items-center justify-center gap-2 transition-colors ${
-                isRunning
-                  ? 'bg-neutral-800 text-neutral-500 cursor-not-allowed'
-                  : 'bg-emerald-500 hover:bg-emerald-400 text-neutral-950 shadow-md shadow-emerald-500/20'
-              }`}
-            >
-              <ActivityIcon size={14} />
-              {isRunning ? 'Workload in Progress...' : 'Start Real Workload'}
-            </button>
+            <div className="flex gap-2">
+              <button
+                onClick={handleStartWorkload}
+                disabled={loading || isRunning}
+                className={`flex-1 py-2 px-3 rounded-lg font-mono text-xs font-semibold flex items-center justify-center gap-2 transition-colors ${
+                  isRunning
+                    ? 'bg-neutral-800 text-neutral-500 cursor-not-allowed'
+                    : 'bg-emerald-500 hover:bg-emerald-400 text-neutral-950 shadow-md shadow-emerald-500/20'
+                }`}
+              >
+                <ActivityIcon size={14} />
+                {isRunning ? 'Workload in Progress...' : 'Start Real Workload'}
+              </button>
+              {isRunning && (
+                <button
+                  onClick={handleStopWorkload}
+                  disabled={loading}
+                  className="py-2 px-4 rounded-lg font-mono text-xs font-semibold border border-rose-500/40 bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 transition-colors"
+                >
+                  Stop
+                </button>
+              )}
+            </div>
           </div>
         </Card>
 

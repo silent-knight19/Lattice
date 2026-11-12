@@ -60,7 +60,7 @@ func bodyLimitFor(path string) int64 {
 		return MaxKeyPutBody
 	case RouteConsole:
 		return MaxConsoleBody
-	case RouteLabStart:
+	case RouteLabStart, RouteLabStop:
 		return MaxWorkloadBody
 	default:
 		return DefaultMaxBody
