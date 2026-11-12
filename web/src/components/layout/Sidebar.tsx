@@ -69,9 +69,11 @@ export const Sidebar: React.FC<SidebarProps> = ({ currentTab, onSelectTab }) => 
     <aside className="w-64 bg-neutral-950 border-r border-neutral-800 flex flex-col h-screen select-none">
       {/* Brand & Engine header */}
       <div className="p-5 border-b border-neutral-800/80 flex items-center gap-3">
-        <div className="w-9 h-9 rounded-lg bg-gradient-to-br from-emerald-500 to-teal-700 flex items-center justify-center text-white shadow-lg shadow-emerald-500/20 font-mono font-bold text-lg">
-          L
-        </div>
+        <img
+          src="/logo.png"
+          alt="Lattice Logo"
+          className="w-9 h-9 rounded-lg object-cover border border-neutral-800 shadow-lg shadow-emerald-500/15"
+        />
         <div>
           <div className="flex items-center gap-1.5">
             <h1 className="text-sm font-bold tracking-tight text-neutral-100">LATTICE</h1>

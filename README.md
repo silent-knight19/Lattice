@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/lattice-logo.png" alt="Lattice Logo" width="140" />
+</p>
+
 # Lattice
 
 > **A High-Performance Distributed Key-Value Storage Engine Being Built from the Ground Up**
