@@ -661,8 +661,14 @@ func TestSEC006_ObjectIdentityMatrix(t *testing.T) {
 		// Capture tmpPath BEFORE hook to avoid deadlock
 		capturedTmp := w.TempPath()
 		w.SetPreLinkHookForTesting(func() error {
+			// Write the rogue file first while capturedTmp still exists to ensure
+			// a distinct inode is allocated across all filesystems (including ext4/tmpfs inode reuse).
+			rogue := capturedTmp + ".rogue"
+			if err := os.WriteFile(rogue, []byte("replaced_inode"), 0600); err != nil {
+				return err
+			}
 			_ = os.Remove(capturedTmp)
-			return os.WriteFile(capturedTmp, []byte("replaced_inode"), 0600)
+			return os.Rename(rogue, capturedTmp)
 		})
 		// Verify that replacing the staging inode causes Finish to fail closed
 		_, err = w.Finish()

@@ -1503,12 +1503,17 @@ func TestSetCurrentManifest_PreRenameSwapDetection(t *testing.T) {
 
 	// Intercept close to swap CURRENT.tmp with a different file
 	restoreClose := SetCurrentCloseFnForTesting(func(f *os.File) error {
-		// Close the real file first
-		_ = f.Close()
 		tmpPath := filepath.Join(dir, CurrentTempFilename)
+		// Attacker writes a rogue file to a distinct path first while f is open,
+		// ensuring a distinct inode across all filesystems (including ext4/tmpfs inode reuse).
+		roguePath := filepath.Join(dir, "rogue.tmp")
+		if err := os.WriteFile(roguePath, []byte("MANIFEST-999999\n"), 0600); err != nil {
+			_ = f.Close()
+			return err
+		}
+		_ = f.Close()
 		_ = os.Remove(tmpPath)
-		// Attacker writes a rogue file
-		if err := os.WriteFile(tmpPath, []byte("MANIFEST-999999\n"), 0600); err != nil {
+		if err := os.Rename(roguePath, tmpPath); err != nil {
 			return err
 		}
 		return nil

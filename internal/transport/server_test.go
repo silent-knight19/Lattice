@@ -1162,8 +1162,8 @@ func TestServer_Slowloris_FragmentedPayloadTrickle(t *testing.T) {
 
 func TestServer_SlowResponseReader_WriteTimeout(t *testing.T) {
 	eng := newMockEngine()
-	// Store a 2MB payload to force multiple TCP buffers
-	largeVal := make([]byte, 2*1024*1024)
+	// Store a 3MB payload to force multiple TCP buffers
+	largeVal := make([]byte, 3*1024*1024)
 	_ = eng.Put(context.Background(), []byte("bigkey"), largeVal)
 
 	cfg := transport.DefaultServerConfig()
@@ -1182,14 +1182,16 @@ func TestServer_SlowResponseReader_WriteTimeout(t *testing.T) {
 		_ = tcpConn.SetReadBuffer(1024)
 	}
 
-	// Send GET for the 2MB key
-	req := &transport.Request{
-		OpCode: transport.OpGet,
-		SeqID:  103,
-		Key:    []byte("bigkey"),
-	}
-	if err := transport.WriteRequest(conn, req); err != nil {
-		t.Fatalf("write request failed: %v", err)
+	// Pipeline multiple GET requests for the 3MB key to exceed any OS TCP socket buffer (18MB total)
+	for i := uint64(1); i <= 6; i++ {
+		req := &transport.Request{
+			OpCode: transport.OpGet,
+			SeqID:  100 + i,
+			Key:    []byte("bigkey"),
+		}
+		if err := transport.WriteRequest(conn, req); err != nil {
+			t.Fatalf("write request %d failed: %v", i, err)
+		}
 	}
 
 	// Read only the first 100 bytes and then STOP reading, intentionally blocking the server's Write()
@@ -1213,7 +1215,7 @@ func TestServer_SlowResponseReader_WriteTimeout(t *testing.T) {
 	}
 
 	// Active connection should be cleaned up
-	deadline := time.Now().Add(500 * time.Millisecond)
+	deadline := time.Now().Add(1000 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		if srv.ActiveConnections() == 0 {
 			break
