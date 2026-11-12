@@ -818,7 +818,11 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	// Dedicated response writer goroutine: guarantees exactly one goroutine writes to conn,
 	// preventing response frame byte interleaving under concurrent request dispatch.
-	// SeqIDs remain strictly reserved until the response frame is completely written to the wire.
+	// SeqIDs remain strictly reserved until the writer is about to flush the response
+	// frame to the wire (after any test write hook). Releasing immediately before
+	// writeResponseWithDeadline guarantees a happens-before edge for clients that reuse
+	// a SeqID as soon as they read the response, while keeping the SeqID reserved while
+	// queued in respCh or paused in responseWriteHook.
 	go func() {
 		defer close(writerDone)
 		for env := range respCh {
@@ -829,12 +833,12 @@ func (s *Server) handleConn(conn net.Conn) {
 				hook(env.resp)
 			}
 
-			err := s.writeResponseWithDeadline(conn, env.resp)
 			if env.shouldRelease {
 				activeMu.Lock()
 				delete(activeSeqIDs, env.releaseID)
 				activeMu.Unlock()
 			}
+			err := s.writeResponseWithDeadline(conn, env.resp)
 			if err != nil {
 				// Socket write failure (client disconnect, timeout, or broken pipe).
 				// Abort the connection context and close the connection descriptor
