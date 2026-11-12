@@ -418,13 +418,12 @@ func (e *Engine) flushOne(imm *memtable.SkipList) error {
 	if err := edit.AddFile(0, fm); err != nil {
 		return err
 	}
-	edit.SetNextFileNum(e.publishNextFileNum(fileNum + 1))
 	edit.SetLastSeqNum(maxSeq)
 
 	if applyFn == nil {
 		applyFn = vset.LogAndApply
 	}
-	if err := applyFn(edit); err != nil {
+	if err := e.commitVersionEdit(edit, fileNum+1, applyFn); err != nil {
 		// SSTable is finalized but invisible (orphan). Leave it on disk;
 		// recovery bumps nextFileNum past it and manifest replay ignores it.
 		// The immutable MemTable is retained by the caller.

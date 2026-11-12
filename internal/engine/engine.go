@@ -141,6 +141,11 @@ type Engine struct {
 	// it without touching worker internals.
 	compactor         *compactionWorker
 	compactionEnabled bool
+
+	// manifestMu serializes VersionEdit watermark publication with VersionSet
+	// LogAndApply so concurrent flush and compaction publishers never commit
+	// NextFileNum out of monotonic order.
+	manifestMu sync.Mutex
 }
 
 const (
@@ -550,6 +555,18 @@ func (e *Engine) publishNextFileNum(allocated uint64) uint64 {
 		return cur
 	}
 	return allocated
+}
+
+// commitVersionEdit atomically sets the monotonic NextFileNum watermark on edit
+// (when minNextFile > 0) and applies it under manifestMu so concurrent flush
+// and compaction workers cannot interleave and regress NextFileNum.
+func (e *Engine) commitVersionEdit(edit *version.VersionEdit, minNextFile uint64, applyFn func(*version.VersionEdit) error) error {
+	e.manifestMu.Lock()
+	defer e.manifestMu.Unlock()
+	if minNextFile > 0 {
+		edit.SetNextFileNum(e.publishNextFileNum(minNextFile))
+	}
+	return applyFn(edit)
 }
 
 // AllocateFileNum atomically allocates and returns a new unique file number (P07-SEC-006).

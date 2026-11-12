@@ -369,12 +369,9 @@ func (w *compactionWorker) compactOnce() (bool, error) {
 			return false, fmt.Errorf("engine: failed to stage compaction output file %d: %w", out.FileNum, err)
 		}
 	}
+	var minNextFile uint64
 	if maxAllocated != 0 {
-		// The flush worker allocates file numbers concurrently and publishes its own
-		// watermark. Publishing only this run's maximum could regress the manifest
-		// watermark below a value the flusher already committed, which LogAndApply
-		// rejects as corrupted. publishNextFileNum keeps it strictly monotonic.
-		edit.SetNextFileNum(e.publishNextFileNum(maxAllocated + 1))
+		minNextFile = maxAllocated + 1
 	}
 
 	// Re-check lifecycle immediately before publishing. Close may have begun while
@@ -389,7 +386,7 @@ func (w *compactionWorker) compactOnce() (bool, error) {
 		return false, nil
 	}
 
-	if err := vset.LogAndApply(edit); err != nil {
+	if err := e.commitVersionEdit(edit, minNextFile, vset.LogAndApply); err != nil {
 		cleanupCompactionOutputs(output, dbPath)
 		return false, fmt.Errorf("engine: failed to commit compaction edit: %w", err)
 	}
