@@ -173,4 +173,27 @@ export const api = {
       body: JSON.stringify({ command }),
     });
   },
+
+  async startWorkload(concurrency = 8, qps = 5000, readRatio = 80): Promise<{ jobId: string; status: string; message: string }> {
+    return request('/api/v1/lab/workload/start', {
+      method: 'POST',
+      body: JSON.stringify({ concurrency, qps, readRatio }),
+    });
+  },
+
+  async getWorkloadStatus(): Promise<{ running: boolean; opsDone: number; targetQPS?: number; readRatio?: number; elapsedMs?: number }> {
+    return request('/api/v1/lab/workload');
+  },
+
+  async triggerCrash(): Promise<{ success: boolean; message: string }> {
+    return request('/api/v1/lab/crash', { method: 'POST' });
+  },
+
+  async getRecoveryReport(): Promise<{ segmentsReplayed: number; recordsApplied: number; recordsTruncated: number; finalSequence: number; durationMs: number; integrityVerified: boolean }> {
+    return request('/api/v1/lab/recover-report');
+  },
+
+  async cleanupOrphans(): Promise<{ success: boolean; cleanedCount: number; message: string }> {
+    return request('/api/v1/lab/cleanup-orphans', { method: 'POST' });
+  },
 };

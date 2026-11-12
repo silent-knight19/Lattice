@@ -543,6 +543,7 @@ func runDaemon(ctx context.Context, cfg *Config, stdout, stderr io.Writer, ready
 
 	// Step 5b: Start the Lattice Console if configured.
 	if adminSrv != nil {
+		adminSrv.AttachEngine(eng, raftNode, cfg)
 		if err := adminSrv.Start(); err != nil {
 			cleanup()
 			fmt.Fprintf(stderr, "lattice: failed to start admin console server: %v\n", err)

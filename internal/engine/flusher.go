@@ -170,6 +170,28 @@ func (e *Engine) signalFlush() {
 	}
 }
 
+// ForceFlush freezes the active MemTable into the immutable queue regardless of
+// threshold, starts the flusher if needed, and signals the flush worker.
+func (e *Engine) ForceFlush() error {
+	e.mu.Lock()
+	if e.closed.Load() || e.state == engineStateClosed {
+		e.mu.Unlock()
+		return os.ErrClosed
+	}
+	if e.activeMem != nil && e.activeMem.Len() > 0 {
+		e.activeMem.Freeze()
+		e.immMems = append(e.immMems, e.activeMem)
+		e.activeMem = memtable.NewSkipList()
+		e.startFlushWorkerLocked()
+		e.mu.Unlock()
+		e.signalFlush()
+		return nil
+	}
+	e.mu.Unlock()
+	e.signalFlush()
+	return nil
+}
+
 // maybeRotateLocked freezes the active MemTable into the immutable queue when
 // its size reaches the threshold. Caller must hold e.mu.Lock(). It performs
 // no I/O; the background worker flushes asynchronously. Returns true if a

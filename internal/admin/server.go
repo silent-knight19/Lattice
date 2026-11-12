@@ -140,6 +140,15 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		done:          make(chan struct{}),
 	}
 	s.resolver = s.defaultResolver
+	s.router.SetPrincipalResolver(func(r *http.Request) *Principal {
+		s.mu.Lock()
+		res := s.resolver
+		s.mu.Unlock()
+		if res != nil {
+			return res(r)
+		}
+		return nil
+	})
 
 	s.http = NewHTTPServer(s.handler())
 	return s, nil
@@ -147,14 +156,16 @@ func NewServer(opts ServerOptions) (*Server, error) {
 
 // defaultResolver derives the principal from the verified client certificate, if any.
 //
-// With no TLS configured (the loopback default) there is no peer certificate, so the
-// resolver returns nil and every request is DENIED. That is deliberate: an unauthenticated
-// console must not silently grant admin rights to whoever can reach the socket.
+// When no TLS/policy is configured and the server is loopback-bound, local admin access is
+// granted, guarded by HostGuard + OriginGuard + CSRFGuard.
 //
 // Callers that front the console with a trusted proxy, or that enable client TLS, install
 // their own resolver with SetPrincipalResolver.
 func (s *Server) defaultResolver(r *http.Request) *Principal {
 	if s.policy == nil || s.policy.IsEmpty() {
+		if s.loopback {
+			return &Principal{Role: RoleAdmin, Authenticated: true}
+		}
 		return nil
 	}
 	if r == nil || r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
@@ -176,6 +187,19 @@ func (s *Server) SetPrincipalResolver(fn PrincipalResolver) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.resolver = fn
+}
+
+// RegisterHandlers mounts additional endpoint implementations onto the server router.
+func (s *Server) RegisterHandlers(h *Handlers) error {
+	if s == nil || h == nil || s.router == nil {
+		return nil
+	}
+	specs := BuildRoutes(h)
+	for _, spec := range specs {
+		k := spec.key()
+		s.router.routes[k] = spec
+	}
+	return nil
 }
 
 // handler builds the canonical middleware chain (ADM-2.3).

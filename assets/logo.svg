@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="120 104 272 272" width="512" height="512">
+  <defs>
+    <linearGradient id="topFace" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#34D399" />
+      <stop offset="100%" stop-color="#A7F3D0" />
+    </linearGradient>
+    <linearGradient id="rightFace" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#14B8A6" />
+      <stop offset="100%" stop-color="#0F766E" />
+    </linearGradient>
+    <linearGradient id="leftFace" x1="100%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#10B981" />
+      <stop offset="100%" stop-color="#047857" />
+    </linearGradient>
+  </defs>
+  <polygon points="256.00,240.00 292.37,261.00 292.37,303.00 256.00,282.00" fill="url(#leftFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="219.63,177.00 256.00,198.00 256.00,240.00 219.63,219.00" fill="url(#leftFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="256.00,240.00 219.63,261.00 219.63,303.00 256.00,282.00" fill="url(#rightFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="292.37,177.00 256.00,198.00 256.00,240.00 292.37,219.00" fill="url(#rightFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="219.63,219.00 256.00,240.00 219.63,261.00 183.25,240.00" fill="url(#topFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="292.37,219.00 328.75,240.00 292.37,261.00 256.00,240.00" fill="url(#topFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="146.88,261.00 183.25,282.00 183.25,324.00 146.88,303.00" fill="url(#leftFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="219.63,135.00 256.00,156.00 256.00,198.00 219.63,177.00" fill="url(#leftFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="219.63,261.00 183.25,282.00 183.25,324.00 219.63,303.00" fill="url(#rightFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="365.12,261.00 328.75,282.00 328.75,324.00 365.12,303.00" fill="url(#rightFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="328.75,240.00 365.12,261.00 328.75,282.00 292.37,261.00" fill="url(#topFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="256.00,114.00 292.37,135.00 256.00,156.00 219.63,135.00" fill="url(#topFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="146.88,219.00 183.25,240.00 183.25,282.00 146.88,261.00" fill="url(#leftFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="256.00,156.00 292.37,177.00 292.37,219.00 256.00,198.00" fill="url(#leftFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="328.75,282.00 292.37,303.00 292.37,345.00 328.75,324.00" fill="url(#rightFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="219.63,219.00 183.25,240.00 183.25,282.00 219.63,261.00" fill="url(#rightFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="292.37,261.00 328.75,282.00 292.37,303.00 256.00,282.00" fill="url(#topFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="292.37,135.00 328.75,156.00 292.37,177.00 256.00,156.00" fill="url(#topFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="219.63,303.00 256.00,324.00 256.00,366.00 219.63,345.00" fill="url(#leftFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="146.88,177.00 183.25,198.00 183.25,240.00 146.88,219.00" fill="url(#leftFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="292.37,177.00 328.75,198.00 328.75,240.00 292.37,219.00" fill="url(#leftFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="292.37,303.00 256.00,324.00 256.00,366.00 292.37,345.00" fill="url(#rightFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="219.63,177.00 183.25,198.00 183.25,240.00 219.63,219.00" fill="url(#rightFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="365.12,177.00 328.75,198.00 328.75,240.00 365.12,219.00" fill="url(#rightFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="256.00,282.00 292.37,303.00 256.00,324.00 219.63,303.00" fill="url(#topFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="183.25,156.00 219.63,177.00 183.25,198.00 146.88,177.00" fill="url(#topFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+  <polygon points="328.75,156.00 365.12,177.00 328.75,198.00 292.37,177.00" fill="url(#topFace)" stroke="#0A0A0A" stroke-width="2.5" stroke-linejoin="round" />
+</svg>

@@ -13,9 +13,12 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"time"
 
 	"github.com/silent-knight19/lattice/internal/admin"
+	"github.com/silent-knight19/lattice/internal/engine"
 	"github.com/silent-knight19/lattice/internal/metrics"
+	"github.com/silent-knight19/lattice/internal/raft"
 	"github.com/silent-knight19/lattice/internal/transport"
 )
 
@@ -108,6 +111,37 @@ func hostOf(addr string) string {
 		return ""
 	}
 	return h
+}
+
+// AttachEngine wires the storage engine, Raft node, and node configuration into the admin console.
+func (a *AdminServer) AttachEngine(eng *engine.Engine, raftNode *raft.Node, cfg *Config) {
+	if a == nil || a.server == nil {
+		return
+	}
+	var nodeCfg admin.NodeConfigInfo
+	if cfg != nil {
+		nodeCfg = admin.NodeConfigInfo{
+			NodeID:              int(cfg.NodeID),
+			Address:             cfg.Address,
+			AdminAddress:        cfg.AdminAddress,
+			MetricsAddress:      cfg.MetricsAddress,
+			DataDir:             cfg.DataDir,
+			MaxMemtableBytes:    64 * 1024 * 1024,
+			CompactionL0Trigger: 4,
+			InsecureTransport:   cfg.InsecureTransport,
+			ClientTLSRequired:   cfg.RequireClientCert,
+			PeerTLSEnabled:      cfg.PeerTLSCertFile != "",
+			AuthzPolicySummary:  "Role-based access control (Admin, Writer, Reader)",
+		}
+	}
+	handlers := admin.NewEngineHandlers(admin.EngineHandlerOptions{
+		Engine:    eng,
+		Raft:      raftNode,
+		Config:    nodeCfg,
+		StartTime: time.Now(),
+		Bus:       a.bus,
+	})
+	_ = a.server.RegisterHandlers(handlers)
 }
 
 // Addr reports the bound admin address.

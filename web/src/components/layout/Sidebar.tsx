@@ -72,7 +72,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ currentTab, onSelectTab }) => 
         <img
           src="/logo.svg"
           alt="Lattice Logo"
-          className="w-9 h-9 rounded-lg object-cover border border-neutral-800 shadow-lg shadow-emerald-500/15"
+          className="w-14 h-14 object-contain flex-shrink-0"
         />
         <div>
           <div className="flex items-center gap-1.5">
