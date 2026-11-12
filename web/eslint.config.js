@@ -30,6 +30,7 @@ export default tseslint.config(
       ...react.configs.flat['jsx-runtime'].rules,
       ...reactHooks.configs.recommended.rules,
       'react-refresh/only-export-components': ['warn', { allowConstantExport: true }],
+      'react/prop-types': 'off',
 
       // SEC-2.3: keys, values and error strings are attacker-controlled bytes. They must
       // only ever be rendered as React children, which auto-escape. This rule forbids the
