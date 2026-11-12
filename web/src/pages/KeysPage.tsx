@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import type { KeyEntry } from '../api/types';
 import { Card } from '../components/common/Card';
 import { Badge } from '../components/common/Badge';
@@ -17,58 +17,28 @@ export const KeysPage: React.FC = () => {
   const [showPutModal, setShowPutModal] = useState(false);
   const [newKey, setNewKey] = useState('');
   const [newValue, setNewValue] = useState('');
-  const [putStatus, setPutStatus] = useState<string | null>(null);
+  const [putStatus, setPutStatus] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   // Delete modal state
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
 
-  const [keys, setKeys] = useState<KeyEntry[]>([
-    {
-      key: 'user:000142:profile',
-      value: '{"name":"Alice Zhao","tier":"enterprise","region":"us-east-1"}',
-      valueSizeBytes: 64,
-      seqNumber: 128442,
-      originLevel: 'MemTable',
-      isTombstone: false,
-      timestamp: '2026-11-12T11:05:12Z',
-    },
-    {
-      key: 'user:000143:session',
-      value: 'sess_9dfa80bc23489fe001',
-      valueSizeBytes: 24,
-      seqNumber: 128440,
-      originLevel: 'MemTable',
-      isTombstone: false,
-      timestamp: '2026-11-12T11:04:58Z',
-    },
-    {
-      key: 'user:000144:cache',
-      value: '',
-      valueSizeBytes: 0,
-      seqNumber: 128420,
-      originLevel: 'L0',
-      isTombstone: true,
-      timestamp: '2026-11-12T10:55:00Z',
-    },
-    {
-      key: 'user:000145:orders',
-      value: '{"count":14,"total":4298.50,"currency":"USD"}',
-      valueSizeBytes: 47,
-      seqNumber: 110250,
-      originLevel: 'L1',
-      isTombstone: false,
-      timestamp: '2026-11-12T10:30:15Z',
-    },
-    {
-      key: 'user:000146:settings',
-      value: '{"mfa":true,"theme":"dark","notifications":false}',
-      valueSizeBytes: 49,
-      seqNumber: 94200,
-      originLevel: 'L2',
-      isTombstone: false,
-      timestamp: '2026-11-12T09:12:00Z',
-    },
-  ]);
+  const [keys, setKeys] = useState<KeyEntry[]>([]);
+
+  const loadKeys = useCallback(async (prefix: string) => {
+    setLoadError(null);
+    try {
+      const data = await api.getKeys(prefix);
+      setKeys(data);
+    } catch (err) {
+      setKeys([]);
+      setLoadError(err instanceof Error ? err.message : 'Failed to load keys');
+    }
+  }, []);
+
+  useEffect(() => {
+    loadKeys(searchTerm);
+  }, [loadKeys, searchTerm]);
 
   const filtered = keys
     .filter((k) => k.key.toLowerCase().includes(searchTerm.toLowerCase()))
@@ -80,25 +50,18 @@ export const KeysPage: React.FC = () => {
 
     try {
       await api.putKey(newKey, newValue);
-    } catch {
-      // In offline/demo mode, add locally
+      setPutStatus({ type: 'ok', text: `Key "${newKey}" written.` });
+      setNewKey('');
+      setNewValue('');
+      setShowPutModal(false);
+      loadKeys(searchTerm);
+    } catch (err) {
+      setPutStatus({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Failed to write key',
+      });
+      setShowPutModal(false);
     }
-
-    const newEntry: KeyEntry = {
-      key: newKey,
-      value: newValue,
-      valueSizeBytes: newValue.length,
-      seqNumber: 128451,
-      originLevel: 'MemTable',
-      isTombstone: false,
-      timestamp: new Date().toISOString(),
-    };
-
-    setKeys([newEntry, ...keys.filter((k) => k.key !== newKey)]);
-    setPutStatus(`Key "${newKey}" written successfully to Active MemTable (Seq #128451)`);
-    setNewKey('');
-    setNewValue('');
-    setShowPutModal(false);
   };
 
   const handleDeleteKey = async () => {
@@ -106,28 +69,37 @@ export const KeysPage: React.FC = () => {
 
     try {
       await api.deleteKey(deleteTarget);
-    } catch {
-      // Offline/demo fallback
+      setPutStatus({ type: 'ok', text: `Key "${deleteTarget}" deleted.` });
+      setDeleteTarget(null);
+      loadKeys(searchTerm);
+    } catch (err) {
+      setPutStatus({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Failed to delete key',
+      });
+      setDeleteTarget(null);
     }
-
-    setKeys(
-      keys.map((k) =>
-        k.key === deleteTarget
-          ? { ...k, isTombstone: true, value: '', originLevel: 'MemTable', seqNumber: 128452 }
-          : k
-      )
-    );
-    setPutStatus(`Tombstone appended for "${deleteTarget}" in MemTable (Seq #128452)`);
-    setDeleteTarget(null);
   };
 
   return (
     <div className="space-y-6">
       {/* Feedback banner */}
       {putStatus && (
-        <div className="p-3 rounded-lg bg-emerald-950/40 border border-emerald-500/30 text-emerald-400 text-xs font-mono flex items-center justify-between">
-          <span>{putStatus}</span>
+        <div
+          className={`p-3 rounded-lg text-xs font-mono flex items-center justify-between border ${
+            putStatus.type === 'ok'
+              ? 'bg-emerald-950/40 border-emerald-500/30 text-emerald-400'
+              : 'bg-red-950/40 border-red-500/30 text-red-400'
+          }`}
+        >
+          <span>{putStatus.text}</span>
           <button type="button" onClick={() => setPutStatus(null)} className="text-neutral-400 hover:text-white">✕</button>
+        </div>
+      )}
+
+      {loadError && (
+        <div className="p-3 rounded-lg bg-red-950/40 border border-red-500/30 text-red-400 text-xs font-mono">
+          {loadError}
         </div>
       )}
 

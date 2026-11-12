@@ -24,19 +24,21 @@ export const Header: React.FC<HeaderProps> = ({
         <div className="flex items-center gap-2">
           <span className="text-xs text-neutral-400 font-mono">Node:</span>
           <span className="text-xs font-semibold text-neutral-200 font-mono">
-            node-{nodeInfo?.nodeId ?? 1}
+            {nodeInfo ? `node-${nodeInfo.nodeId}` : '—'}
           </span>
-          <Badge variant={nodeInfo?.role === 'Leader' ? 'leader' : 'follower'}>
-            {nodeInfo?.role ?? 'Leader'}
-          </Badge>
+          {nodeInfo && (
+            <Badge variant={nodeInfo.role === 'Leader' ? 'leader' : 'follower'}>
+              {nodeInfo.role}
+            </Badge>
+          )}
         </div>
 
         <div className="h-4 w-px bg-neutral-800" />
 
         {/* Term & Commit */}
         <div className="hidden sm:flex items-center gap-3 text-xs font-mono text-neutral-400">
-          <span>Term: <strong className="text-neutral-200">{nodeInfo?.term ?? 4}</strong></span>
-          <span>Commit: <strong className="text-neutral-200">#{nodeInfo?.commitIndex ?? 128450}</strong></span>
+          <span>Term: <strong className="text-neutral-200">{nodeInfo ? nodeInfo.term : '—'}</strong></span>
+          <span>Commit: <strong className="text-neutral-200">{nodeInfo ? `#${nodeInfo.commitIndex}` : '—'}</strong></span>
         </div>
       </div>
 
@@ -44,7 +46,7 @@ export const Header: React.FC<HeaderProps> = ({
         {/* Overall Health indicator */}
         <StatusDot
           status={health?.status === 'healthy' ? 'healthy' : 'warning'}
-          text={health?.status === 'healthy' ? 'Cluster Healthy (3/3 Quorum)' : 'Degraded'}
+          text={health ? health.status : 'Unavailable'}
         />
 
         <div className="h-4 w-px bg-neutral-800" />

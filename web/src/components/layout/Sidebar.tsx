@@ -70,16 +70,15 @@ export const Sidebar: React.FC<SidebarProps> = ({ currentTab, onSelectTab }) => 
       {/* Brand & Engine header */}
       <div className="p-5 border-b border-neutral-800/80 flex items-center gap-3">
         <img
-          src="/logo.png"
+          src="/logo.svg"
           alt="Lattice Logo"
           className="w-9 h-9 rounded-lg object-cover border border-neutral-800 shadow-lg shadow-emerald-500/15"
         />
         <div>
           <div className="flex items-center gap-1.5">
             <h1 className="text-sm font-bold tracking-tight text-neutral-100">LATTICE</h1>
-            <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-neutral-800 text-neutral-300 font-medium">v1.1</span>
           </div>
-          <p className="text-[11px] text-neutral-400 font-mono">Distributed Storage Engine</p>
+          <p className="text-[11px] text-neutral-400 font-mono">Admin Console</p>
         </div>
       </div>
 
@@ -115,17 +114,6 @@ export const Sidebar: React.FC<SidebarProps> = ({ currentTab, onSelectTab }) => 
           </div>
         ))}
       </nav>
-
-      {/* Engine Status pill at bottom */}
-      <div className="p-3 border-t border-neutral-800/80 bg-neutral-950/60">
-        <div className="p-2.5 rounded-lg bg-neutral-900 border border-neutral-800 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full bg-emerald-500 shadow-sm shadow-emerald-500/50" />
-            <span className="text-[11px] font-mono text-neutral-300">Engine Active</span>
-          </div>
-          <span className="text-[10px] font-mono text-neutral-500">Go 1.23</span>
-        </div>
-      </div>
     </aside>
   );
 };

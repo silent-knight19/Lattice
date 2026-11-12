@@ -16,180 +16,17 @@ export const LSMTreePage: React.FC<LSMTreePageProps> = ({ treeState, onRefresh }
   const [isFlushing, setIsFlushing] = useState(false);
   const [showCompactDialog, setShowCompactDialog] = useState(false);
   const [showFlushDialog, setShowFlushDialog] = useState(false);
-  const [feedback, setFeedback] = useState<string | null>(null);
-
-  const levels = treeState?.levels ?? [
-    {
-      level: 0,
-      score: 0.8,
-      totalSizeBytes: 18.2 * 1024 * 1024,
-      files: [
-        {
-          fileNum: 104,
-          level: 0,
-          sizeBytes: 4.8 * 1024 * 1024,
-          entryCount: 14200,
-          smallestKey: 'usr:000100',
-          largestKey: 'usr:008900',
-          smallestSeqNum: 110200,
-          largestSeqNum: 124400,
-          hasOverlap: true,
-        },
-        {
-          fileNum: 105,
-          level: 0,
-          sizeBytes: 4.6 * 1024 * 1024,
-          entryCount: 13900,
-          smallestKey: 'usr:000450',
-          largestKey: 'usr:009400',
-          smallestSeqNum: 124401,
-          largestSeqNum: 138301,
-          hasOverlap: true,
-        },
-        {
-          fileNum: 106,
-          level: 0,
-          sizeBytes: 4.5 * 1024 * 1024,
-          entryCount: 13400,
-          smallestKey: 'usr:000210',
-          largestKey: 'usr:007800',
-          smallestSeqNum: 138302,
-          largestSeqNum: 151702,
-          hasOverlap: true,
-        },
-        {
-          fileNum: 107,
-          level: 0,
-          sizeBytes: 4.3 * 1024 * 1024,
-          entryCount: 12800,
-          smallestKey: 'usr:001200',
-          largestKey: 'usr:009950',
-          smallestSeqNum: 151703,
-          largestSeqNum: 164503,
-          hasOverlap: true,
-        },
-      ],
-    },
-    {
-      level: 1,
-      score: 0.35,
-      totalSizeBytes: 38.4 * 1024 * 1024,
-      files: [
-        {
-          fileNum: 92,
-          level: 1,
-          sizeBytes: 9.6 * 1024 * 1024,
-          entryCount: 28000,
-          smallestKey: 'usr:000000',
-          largestKey: 'usr:002499',
-          smallestSeqNum: 80000,
-          largestSeqNum: 105000,
-        },
-        {
-          fileNum: 93,
-          level: 1,
-          sizeBytes: 9.6 * 1024 * 1024,
-          entryCount: 28000,
-          smallestKey: 'usr:002500',
-          largestKey: 'usr:004999',
-          smallestSeqNum: 80000,
-          largestSeqNum: 105000,
-        },
-        {
-          fileNum: 94,
-          level: 1,
-          sizeBytes: 9.6 * 1024 * 1024,
-          entryCount: 28000,
-          smallestKey: 'usr:005000',
-          largestKey: 'usr:007499',
-          smallestSeqNum: 80000,
-          largestSeqNum: 105000,
-        },
-        {
-          fileNum: 95,
-          level: 1,
-          sizeBytes: 9.6 * 1024 * 1024,
-          entryCount: 28000,
-          smallestKey: 'usr:007500',
-          largestKey: 'usr:009999',
-          smallestSeqNum: 80000,
-          largestSeqNum: 105000,
-        },
-      ],
-    },
-    {
-      level: 2,
-      score: 0.12,
-      totalSizeBytes: 120.0 * 1024 * 1024,
-      files: [
-        {
-          fileNum: 71,
-          level: 2,
-          sizeBytes: 30.0 * 1024 * 1024,
-          entryCount: 88000,
-          smallestKey: 'usr:000000',
-          largestKey: 'usr:002999',
-          smallestSeqNum: 10000,
-          largestSeqNum: 79999,
-        },
-        {
-          fileNum: 72,
-          level: 2,
-          sizeBytes: 30.0 * 1024 * 1024,
-          entryCount: 88000,
-          smallestKey: 'usr:003000',
-          largestKey: 'usr:005999',
-          smallestSeqNum: 10000,
-          largestSeqNum: 79999,
-        },
-        {
-          fileNum: 73,
-          level: 2,
-          sizeBytes: 30.0 * 1024 * 1024,
-          entryCount: 88000,
-          smallestKey: 'usr:006000',
-          largestKey: 'usr:008999',
-          smallestSeqNum: 10000,
-          largestSeqNum: 79999,
-        },
-        {
-          fileNum: 74,
-          level: 2,
-          sizeBytes: 30.0 * 1024 * 1024,
-          entryCount: 88000,
-          smallestKey: 'usr:009000',
-          largestKey: 'usr:009999',
-          smallestSeqNum: 10000,
-          largestSeqNum: 79999,
-        },
-      ],
-    },
-  ];
-
-  const memtable = treeState?.memtable ?? {
-    activeBytes: 24.8 * 1024 * 1024,
-    activeEntries: 64200,
-    immutableCount: 1,
-    immutableBytes: 32.0 * 1024 * 1024,
-    flushThresholdBytes: 64.0 * 1024 * 1024,
-  };
-
-  const compaction = treeState?.compaction ?? {
-    running: false,
-    totalRuns: 148,
-    failures: 0,
-    lastCompactionDesc: 'L0 → L1: 4 files compacted into 2 non-overlapping runs',
-    lastDurationMs: 412,
-    writeAmplification: 2.14,
-  };
+  const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
 
   const handleManualCompaction = async () => {
     setIsCompacting(true);
     setShowCompactDialog(false);
     try {
       const res = await api.triggerCompaction();
-      setFeedback(res.message);
+      setFeedback({ type: 'ok', text: res.message });
       if (onRefresh) onRefresh();
+    } catch (err) {
+      setFeedback({ type: 'err', text: err instanceof Error ? err.message : 'Compaction request failed' });
     } finally {
       setIsCompacting(false);
     }
@@ -200,19 +37,39 @@ export const LSMTreePage: React.FC<LSMTreePageProps> = ({ treeState, onRefresh }
     setShowFlushDialog(false);
     try {
       const res = await api.triggerFlush();
-      setFeedback(res.message);
+      setFeedback({ type: 'ok', text: res.message });
       if (onRefresh) onRefresh();
+    } catch (err) {
+      setFeedback({ type: 'err', text: err instanceof Error ? err.message : 'Flush request failed' });
     } finally {
       setIsFlushing(false);
     }
   };
 
+  if (!treeState) {
+    return (
+      <Card title="LSM Tree Explorer" subtitle="Live storage tree state from /api/v1/lsm/tree">
+        <div className="p-8 text-center text-xs font-mono text-neutral-500">
+          LSM tree telemetry unavailable. No data received from /api/v1/lsm/tree.
+        </div>
+      </Card>
+    );
+  }
+
+  const { levels, memtable, compaction } = treeState;
+
   return (
     <div className="space-y-6">
       {/* Feedback banner */}
       {feedback && (
-        <div className="p-3 rounded-lg bg-emerald-950/40 border border-emerald-500/30 text-emerald-400 text-xs font-mono flex items-center justify-between">
-          <span>{feedback}</span>
+        <div
+          className={`p-3 rounded-lg text-xs font-mono flex items-center justify-between border ${
+            feedback.type === 'ok'
+              ? 'bg-emerald-950/40 border-emerald-500/30 text-emerald-400'
+              : 'bg-red-950/40 border-red-500/30 text-red-400'
+          }`}
+        >
+          <span>{feedback.text}</span>
           <button type="button" onClick={() => setFeedback(null)} className="text-neutral-400 hover:text-white">✕</button>
         </div>
       )}

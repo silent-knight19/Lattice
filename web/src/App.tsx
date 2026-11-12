@@ -41,11 +41,17 @@ export default function App() {
       ]);
 
       if (n.status === 'fulfilled') setNodeInfo(n.value);
+      else setNodeInfo(null);
       if (h.status === 'fulfilled') setHealth(h.value);
+      else setHealth(null);
       if (m.status === 'fulfilled') setMetrics(m.value);
+      else setMetrics(null);
       if (l.status === 'fulfilled') setLsmState(l.value);
+      else setLsmState(null);
       if (r.status === 'fulfilled') setRaftState(r.value);
+      else setRaftState(null);
       if (c.status === 'fulfilled') setConfig(c.value);
+      else setConfig(null);
     } finally {
       setIsRefreshing(false);
     }
@@ -66,7 +72,7 @@ export default function App() {
   const renderActivePage = () => {
     switch (currentTab) {
       case 'overview':
-        return <OverviewPage nodeInfo={nodeInfo} health={health} metrics={metrics} />;
+        return <OverviewPage nodeInfo={nodeInfo} health={health} metrics={metrics} raftState={raftState} />;
       case 'cluster':
         return <ClusterPage raftState={raftState} />;
       case 'storage-lsm':
@@ -88,7 +94,7 @@ export default function App() {
       case 'system':
         return <SystemPage config={config} />;
       default:
-        return <OverviewPage nodeInfo={nodeInfo} health={health} metrics={metrics} />;
+        return <OverviewPage nodeInfo={nodeInfo} health={health} metrics={metrics} raftState={raftState} />;
     }
   };
 
