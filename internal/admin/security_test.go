@@ -359,6 +359,12 @@ func TestSecuritySuite_SSEFlood(t *testing.T) {
 
 	client := &http.Client{Timeout: 3 * time.Second}
 	var opened, refused int
+	var bodies []io.Closer
+	defer func() {
+		for _, b := range bodies {
+			_ = b.Close()
+		}
+	}()
 	for i := 0; i < 12; i++ {
 		req, err := http.NewRequest(http.MethodGet, h.server.URL+APIPrefix+RouteEvents, nil)
 		if err != nil {
@@ -372,10 +378,13 @@ func TestSecuritySuite_SSEFlood(t *testing.T) {
 		}
 		if resp.StatusCode == http.StatusOK {
 			opened++
-		} else if resp.StatusCode == http.StatusServiceUnavailable {
-			refused++
+			bodies = append(bodies, resp.Body)
+		} else {
+			if resp.StatusCode == http.StatusServiceUnavailable {
+				refused++
+			}
+			_ = resp.Body.Close()
 		}
-		_ = resp.Body.Close()
 	}
 	if opened > cap {
 		t.Errorf("%d SSE streams opened with a cap of %d", opened, cap)

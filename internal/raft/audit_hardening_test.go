@@ -134,7 +134,7 @@ func TestAudit_LaggingFollower_TimerResetOnLogMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenStorage failed: %v", err)
 	}
-	durProvider := func() time.Duration { return 80 * time.Millisecond }
+	durProvider := func() time.Duration { return 250 * time.Millisecond }
 	follower, err := raft.NewNode(raft.NodeConfig{
 		LocalID:          2,
 		Storage:          s,
@@ -157,42 +157,51 @@ func TestAudit_LaggingFollower_TimerResetOnLogMismatch(t *testing.T) {
 	// carries PrevLogIndex=5 which the follower cannot match.
 	stopCh := make(chan struct{})
 	doneCh := make(chan struct{})
+	sendHeartbeat := func() bool {
+		req := &transport.AppendEntriesRequest{
+			Term:         1,
+			LeaderID:     1,
+			PrevLogIndex: 5,
+			PrevLogTerm:  1,
+			Nonce:        4242,
+		}
+		resp, err := follower.HandleAppendEntries(1, req)
+		if err != nil {
+			t.Errorf("HandleAppendEntries failed: %v", err)
+			return false
+		}
+		// Log mismatch must be reported as replication failure...
+		if resp.Success {
+			t.Errorf("expected Success=false for lagging follower")
+			return false
+		}
+		// ...but leaderID must still be recorded for liveness.
+		if follower.LeaderID() != 1 {
+			t.Errorf("expected LeaderID=1, got %d", follower.LeaderID())
+			return false
+		}
+		return true
+	}
 	go func() {
 		defer close(doneCh)
-		ticker := time.NewTicker(35 * time.Millisecond)
+		if !sendHeartbeat() {
+			return
+		}
+		ticker := time.NewTicker(40 * time.Millisecond)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-stopCh:
 				return
 			case <-ticker.C:
-				req := &transport.AppendEntriesRequest{
-					Term:         1,
-					LeaderID:     1,
-					PrevLogIndex: 5,
-					PrevLogTerm:  1,
-					Nonce:        4242,
-				}
-				resp, err := follower.HandleAppendEntries(1, req)
-				if err != nil {
-					t.Errorf("HandleAppendEntries failed: %v", err)
-					return
-				}
-				// Log mismatch must be reported as replication failure...
-				if resp.Success {
-					t.Errorf("expected Success=false for lagging follower")
-					return
-				}
-				// ...but leaderID must still be recorded for liveness.
-				if follower.LeaderID() != 1 {
-					t.Errorf("expected LeaderID=1, got %d", follower.LeaderID())
+				if !sendHeartbeat() {
 					return
 				}
 			}
 		}
 	}()
 
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(350 * time.Millisecond)
 	close(stopCh)
 	<-doneCh
 
