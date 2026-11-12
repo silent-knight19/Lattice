@@ -49,12 +49,21 @@ async function request<T>(
     ...(options.headers as Record<string, string>),
   };
 
-  // Attach CSRF token on mutating requests if present
+  // Attach CSRF and confirmation headers on mutating requests
   const method = (options.method || 'GET').toUpperCase();
   if (['POST', 'PUT', 'DELETE', 'PATCH'].includes(method)) {
+    if (!inMemoryCSRFToken && path !== '/api/v1/session') {
+      try {
+        await fetchSession();
+      } catch {
+        // Continue with whatever headers we have
+      }
+    }
     if (inMemoryCSRFToken) {
+      headers['X-Lattice-CSRF'] = inMemoryCSRFToken;
       headers['X-CSRF-Token'] = inMemoryCSRFToken;
     }
+    headers['X-Lattice-Admin'] = 'confirm';
   }
 
   try {
@@ -95,11 +104,13 @@ async function request<T>(
 
 // Bootstrap CSRF session
 export async function fetchSession(): Promise<string | null> {
+  if (inMemoryCSRFToken) return inMemoryCSRFToken;
   try {
-    const data = await request<{ token?: string }>('/api/v1/session');
-    if (data.token) {
-      inMemoryCSRFToken = data.token;
-      return data.token;
+    const data = await request<{ csrf_token?: string; token?: string }>('/api/v1/session');
+    const token = data.csrf_token || data.token || null;
+    if (token) {
+      inMemoryCSRFToken = token;
+      return token;
     }
   } catch {
     // Session token absent or rejected, continue with unauthenticated mode
