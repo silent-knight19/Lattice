@@ -1,0 +1,10 @@
+{
+    admin off
+    auto_https off
+}
+
+:{$PORT:8080} {
+    reverse_proxy 127.0.0.1:7070 {
+        header_up Host 127.0.0.1:7070
+    }
+}
